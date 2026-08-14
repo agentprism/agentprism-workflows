@@ -129,7 +129,7 @@ test("(4) no-schema completion returns the final assistant text; onHistory fires
     cwd,
     onHistory: (h) => history.push(h),
   });
-  assert.equal(out, "Hello, world!"); // chunks concatenated, then trimmed
+  assert.equal(out, "Hello, world!"); // streamed deltas concatenate verbatim, then trim
   assert.equal(history.length, 1);
   assert.ok(history[0].length >= 1, "history captured assistant chunks");
 });
@@ -274,6 +274,63 @@ test("(2b) schema result is the FINAL assistant message — a schema-shaped prog
     cwd,
   });
   assert.deepEqual(out, { city: "LA", hot: true });
+});
+
+// ---- (2c) the §5 result fold: assistant messages join with "\n\n" ----------------------
+
+test("(2c) a single assistant message streamed as small deltas folds byte-identically", async () => {
+  const deltas = ["L", "I", "VE", "_SM", "OKE", "_OK"];
+  const { cwd } = configure({ turns: [{ text: deltas }] });
+
+  const out = await makeRunner().run("smoke", { model: "pi", cwd });
+
+  assert.equal(out, deltas.join(""));
+  assert.equal(out, "LIVE_SMOKE_OK");
+});
+
+test("(2c) distinct assistant messages separated by non-text updates join with exactly one \"\\n\\n\"", async () => {
+  const { cwd } = configure({
+    turns: [
+      {
+        updates: [
+          // The narration message.
+          { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "won't modify any files." } },
+          // A tool call ends the narration and starts the answer message.
+          { sessionUpdate: "tool_call", toolCallId: "tc-fold-1", title: "search the codebase", kind: "search", status: "in_progress" },
+          { sessionUpdate: "tool_call_update", toolCallId: "tc-fold-1", status: "completed" },
+          // The answer is a new message, itself streamed in realistic deltas.
+          { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Type" } },
+          { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Script files " } },
+          { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "under src stay untouched." } },
+        ],
+        text: [],
+      },
+    ],
+  });
+  const out = await makeRunner().run("check", { model: "pi", cwd });
+  assert.equal(
+    out,
+    "won't modify any files.\n\nTypeScript files under src stay untouched.",
+    "one separator belongs to the tool-delimited message boundary, never to streaming deltas",
+  );
+});
+
+test("(2c) a changed ACP messageId delimits adjacent assistant messages without an intervening update", async () => {
+  const { cwd } = configure({
+    turns: [{
+      updates: [
+        { sessionUpdate: "agent_message_chunk", messageId: "message-1", content: { type: "text", text: "First " } },
+        { sessionUpdate: "agent_message_chunk", messageId: "message-1", content: { type: "text", text: "message." } },
+        { sessionUpdate: "agent_message_chunk", messageId: "message-2", content: { type: "text", text: "Second " } },
+        { sessionUpdate: "agent_message_chunk", messageId: "message-2", content: { type: "text", text: "message." } },
+      ],
+      text: [],
+    }],
+  });
+
+  const out = await makeRunner().run("check", { model: "pi", cwd });
+
+  assert.equal(out, "First message.\n\nSecond message.");
 });
 
 // ---- (3b) Claude schema channel + structured_output read ----------------------------

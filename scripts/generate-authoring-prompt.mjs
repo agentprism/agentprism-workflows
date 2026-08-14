@@ -152,7 +152,7 @@ export function buildAuthoringPromptContent() {
     reference.trimEnd(),
     "\n\n---\n\n",
     "# Complete example — quick-wins.workflow.js\n\n",
-    "A complete, validated script (`loopUntilDry()` with per-round vendor rotation, dedup threading via a `seen` list, and an in-round budget floor; runs standalone or nested):\n\n",
+    "A complete, validated script (`loopUntilDry()` with per-round vendor rotation, dedup threading via a `seen` list, and an args-controlled round cap; runs standalone or nested):\n\n",
     "```js\n",
     quickWins.trimEnd(),
     "\n```\n",

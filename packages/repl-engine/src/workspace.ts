@@ -24,8 +24,9 @@ import {
   type ProvenanceView,
 } from './provenance.js';
 import { SnapshotRestoreError } from './snapshot-envelope.js';
-import { ReplVm, getVmShim, loadShippedWasm, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome } from './vm.js';
+import { ReplVm, getVmShim, loadShippedWasm, type ReplDrainOptions, type ReplEvalOptions, type ReplEvalOutcome, type ReplJobLease } from './vm.js';
 import type { ReplSnapshot, WasmInput } from './types.js';
+import { instrumentTopLevelAwaits } from './await-instrument.js';
 import {
   GUEST_LEASE_GLOBAL,
   clearContinuationLease,
@@ -40,7 +41,7 @@ import {
   type GuestSurface,
 } from './bridge.js';
 import { rawLexicalKeys } from './global-lexical.js';
-import { inspectGlobal, manifestBinding, renderGlobalLine } from './preview.js';
+import { headTailDescription, inspectGlobal, manifestBinding } from './preview.js';
 import { rawOwnKeys } from './trapfree.js';
 
 /** One user binding of the workspace manifest (see `Workspace.manifest`). */
@@ -73,8 +74,9 @@ export interface WorkspaceBinding {
 export interface WorkspaceManifest {
   /** Every user top-level binding, sorted by name. */
   bindings: WorkspaceBinding[];
-  /** The `$N` log-ref globals as a range (mirroring the harness manifest's
-   *  logs breakdown). */
+  /** The `$N` log-ref globals as a range — always empty since 0.4.0
+   *  (the `$N` capture system is deleted); the field stays for
+   *  report-shape compatibility with the older manifest surface. */
   logs: { first: number | null; last: number | null; count: number };
   /** The registry's snapshot-durable eval counter. */
   evalSeq: number;
@@ -153,6 +155,35 @@ export class Workspace {
    *  share the id space (review regression: the bridge rejected every
    *  answer with `false`, leaving the original promise pending forever). */
   private readonly parkedCheckpointCalls = new Map<string, GuestCall>();
+  /** The parking bridge's per-call KIND (agent/steer/checkpoint) and
+   *  per-call question text — the introspection handlers (`workspace()`/
+   *  `agents()`) serve them in the §4.5 shapes. */
+  private readonly parkedKinds = new Map<string, 'agent' | 'steer' | 'checkpoint'>();
+  private readonly parkedQuestions = new Map<string, string>();
+  /** The parking bridge's per-call AGENT data (the §4.5 agents() shape
+   *  serves the real model spec and task — a parked call records what
+   *  the guest asked for; never fabricated empties). */
+  private readonly parkedModelSpecs = new Map<string, string>();
+  private readonly parkedTasks = new Map<string, string>();
+  /** The parking bridge's code-phase/current-eval `reset()` request. */
+  private pendingReset = false;
+  /** The parking bridge's retained SUSPENDED-eval completions (one per
+   *  suspended eval — `eval` keeps the wrapper; the drain's sweep reads
+   *  the settled value into `_` and releases it). */
+  private readonly suspendedCompletions = new Set<JSValueHandle>();
+  /** Continuation identity for suspended parking-bridge evals. */
+  private readonly suspendedEvalTokens = new Map<JSValueHandle, string>();
+  /** Suspended eval completions whose own code/continuation called reset. */
+  private readonly resetOwningCompletions = new Set<JSValueHandle>();
+  private parkingEvalTokenSeq = 0;
+  private currentParkingEvalToken: string | undefined;
+  private inParkingEval = false;
+  /** The guest continuation lease mirrored per drained job. */
+  private readonly parkingJobLease: ReplJobLease = {
+    read: () => this.readContinuationLease(),
+    clear: () => this.clearContinuationLease(),
+    cell: { current: undefined },
+  };
   private disposed = false;
 
   private constructor(projectDir: string, vm: ReplVm, baseline: Set<string>) {
@@ -191,8 +222,8 @@ export class Workspace {
   /**
    * Restore a workspace from a quickjs-wasi snapshot: the VM is restored
    * and the host callbacks are re-registered by name (`registerGuestHostCallbacks`
-   * — the guest library, its pending-call registry and the `$N` store
-   * travel INSIDE the snapshot; the library is never re-evaluated). The
+   * — the guest library and its pending-call registry travel INSIDE the
+   * snapshot; the library is never re-evaluated). The
    * provenance registry travels with the snapshot too; a PRE-PROVENANCE
    * snapshot (whose library predates the registry) gets the registry
    * installed by the host bootstrap and its pre-existing bindings are
@@ -263,9 +294,9 @@ export class Workspace {
 
   /**
    * Snapshot the workspace's VM: raw WASM linear memory plus runtime
-   * pointers (the quickjs-wasi snapshot). The guest library, the `$N`
-   * store and the pending-call registry travel inside; the host callbacks
-   * do not (re-register by name after restore — `rehost`). The at-rest
+   * pointers (the quickjs-wasi snapshot). The guest library and the
+   * pending-call registry travel inside; the host callbacks do not
+   * (re-register by name after restore — `rehost`). The at-rest
    * identity envelope (wasm hash + format version + gzip) is the daemon
    * layer's wrap, a later phase; this is the raw snapshot seam.
    */
@@ -279,10 +310,90 @@ export class Workspace {
    * report. See `ReplVm.evalCode` for the outcome shapes. The returned
    * promise is fulfilled synchronously (the VM layer performs no `await`),
    * so an eval cannot race `dispose()`.
+   *
+   * The §4.4 result-history global is maintained HERE (the workspace
+   * level owns `_` for its own evals — the broker sets it for its evals
+   * through the same `setGlobal` seam): a RESOLVED eval's completion
+   * value becomes `_` — an undefined completion (an empty poll) makes
+   * `_` undefined too: the previous eval's completion value IS
+   * undefined (the review probe: `42`, then `""`, then `_` must read
+   * undefined, never the stale 42). An error leaves `_` unchanged; a
+   * SUSPENDED eval retains its completion wrapper and `drainJobs`'s
+   * sweep sets `_` once the continuation settles.
+   *
+   * The parking bridge's `reset()` teardown runs AFTER the current eval
+   * completes (the doc's §4.5): a completed eval disposes now; a
+   * SUSPENDED eval keeps the workspace alive until its continuation
+   * settles at the drain (`drainJobs`'s sweep), then disposes — the
+   * continuation runs to completion first, and the eval that called
+   * reset() is the one whose completion owes the teardown.
    */
   eval(code: string, options?: ReplEvalOptions): Promise<ReplEvalOutcome> {
     this.assertAlive();
-    return this.vm.evalCode(code, options);
+    // `cell.current` names a continuation only while that continuation's
+    // job executes. A completed earlier drain must never make this eval's
+    // synchronous code look like the earlier suspended eval.
+    this.parkingJobLease.cell.current = undefined;
+    const token = `w${++this.parkingEvalTokenSeq}`;
+    this.currentParkingEvalToken = token;
+    this.pendingReset = false;
+    let instrumented = code;
+    try {
+      const surface = this.surface();
+      if (surface?.supportsContinuationLease === true) {
+        instrumented = instrumentTopLevelAwaits(code, token, {
+          wrapIterables: surface.supportsIterableLease === true,
+        });
+      }
+    } catch {
+      // A legacy/broken surface keeps native await semantics; reset()
+      // during the current eval is still handled by the local flag.
+    }
+    const usesParkingJobLease = instrumented !== code;
+    this.inParkingEval = true;
+    let evaluated: ReturnType<ReplVm['evalCodeWithCompletion']>;
+    try {
+      evaluated = this.vm.evalCodeWithCompletion(instrumented, {
+        ...options,
+        jobLease: options?.jobLease ?? (usesParkingJobLease ? this.parkingJobLease : undefined),
+      });
+    } finally {
+      this.inParkingEval = false;
+      this.parkingJobLease.cell.current = undefined;
+    }
+    const { outcome, completion } = evaluated;
+    const resetByThisEval = this.pendingReset;
+    this.pendingReset = false;
+    if (completion !== undefined) {
+      if (outcome.kind === 'value') {
+        try {
+          // Every resolved eval's completion value becomes `_` — even
+          // undefined (an empty script — the documented poll idiom —
+          // overwrites the older value with undefined).
+          this.setGlobal('_', completion);
+        } catch {
+          // A failed `_` write must not fail the eval that produced the
+          // value.
+        }
+        (completion as JSValueHandle).dispose();
+      } else {
+        // A suspended eval: retain the wrapper — the drain's sweep reads
+        // the settled value into `_` and releases the handle. The
+        // reset-owning completion is tracked separately (a reset() the
+        // eval called owes its teardown only once THIS eval completes).
+        this.suspendedCompletions.add(completion as JSValueHandle);
+        this.suspendedEvalTokens.set(completion as JSValueHandle, token);
+        if (resetByThisEval) this.resetOwningCompletions.add(completion as JSValueHandle);
+      }
+    }
+    // The teardown for an eval that COMPLETED within this call runs now
+    // (its output above is already captured); a suspended eval's
+    // teardown runs at the drain (see `drainJobs`). Earlier suspended
+    // reset-owning evals remain tracked until their own completion.
+    if (outcome.kind !== 'pending' && resetByThisEval) {
+      this.dispose();
+    }
+    return Promise.resolve(outcome);
   }
 
   /**
@@ -328,10 +439,65 @@ export class Workspace {
    * later phase) has made progress. Because a suspended eval's interrupt
    * handler is no longer armed, the drain accepts its own per-drain
    * `interruptHandler` so a resumed runaway continuation stays bounded.
+   *
+   * After the drain, the RETAINED-SUSPENDED-EVAL sweep runs: a
+   * continuation that completed during the drain is the PREVIOUS eval —
+   * its completion value becomes `_` — and a reset() the settled eval
+   * requested tears the workspace down now that the eval completed (the
+   * §4.5 host-side effect).
    */
   drainJobs(options?: ReplDrainOptions): number {
     this.assertAlive();
-    return this.vm.drainJobs(options);
+    const count = this.vm.drainJobs({
+      ...options,
+      jobLease:
+        options?.jobLease ??
+        (this.suspendedEvalTokens.size > 0 ? this.parkingJobLease : undefined),
+    });
+    this.sweepSuspendedEvals();
+    return count;
+  }
+
+  /**
+   * One pass over the retained suspended-eval completions (the parking
+   * bridge's `_` / reset() bookkeeping): a settled wrapper's fulfilled
+   * value becomes `_` (a rejection — the eval errored late — leaves `_`
+   * unchanged), the handle is released, and when the reset-requesting
+   * eval's own completion settled the teardown runs (the workspace is
+   * disposed after its last eval completed). Runs after every drain;
+   * between VM operations only.
+   */
+  private sweepSuspendedEvals(): void {
+    if (this.suspendedCompletions.size === 0) return;
+    let resetOwnerCompleted = false;
+    for (const completion of [...this.suspendedCompletions]) {
+      if (completion.promiseState === 0) continue; // still pending
+      this.suspendedCompletions.delete(completion);
+      this.suspendedEvalTokens.delete(completion);
+      if (this.resetOwningCompletions.delete(completion)) resetOwnerCompleted = true;
+      try {
+        const value = this.vm.readRetainedCompletion(completion) as JSValueHandle | undefined;
+        if (value !== undefined) {
+          try {
+            this.setGlobal('_', value);
+          } catch {
+            // A failed `_` write must not fail the drain.
+          }
+          value.dispose();
+        }
+      } catch {
+        // Best-effort bookkeeping: a hostile completion shape must not
+        // break the drain.
+      }
+      completion.dispose();
+    }
+    if (resetOwnerCompleted) {
+      // The reset-requesting eval completed (its continuation settled at
+      // this drain): the teardown runs now — the host-side effect the
+      // deleted `reset` action performed.
+      this.pendingReset = false;
+      this.dispose();
+    }
   }
 
   /**
@@ -343,6 +509,12 @@ export class Workspace {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    for (const completion of this.suspendedCompletions) completion.dispose();
+    this.suspendedCompletions.clear();
+    this.suspendedEvalTokens.clear();
+    this.resetOwningCompletions.clear();
+    this.currentParkingEvalToken = undefined;
+    this.parkingJobLease.cell.current = undefined;
     this.vm.dispose();
   }
 
@@ -368,6 +540,29 @@ export class Workspace {
   }
 
   /**
+   * @internal Write a live guest value into a realm global slot — the
+   * `_` seam (the broker sets the previous eval's completion value; see
+   * `ReplVm.setGlobal`).
+   */
+  setGlobal(name: string, value: unknown): void {
+    this.assertAlive();
+    this.vm.setGlobal(name, value);
+  }
+
+  /**
+   * @internal Read a RETAINED suspended-eval completion wrapper after it
+   *  settled (the broker's active-eval sweep, and this workspace's own
+   *  parking-bridge sweep): the fulfilled completion value handle,
+   *  owned by the caller (dispose after use), or undefined for a
+   *  rejected/still-pending completion (`_` stays unchanged then). See
+   *  `ReplVm.readRetainedCompletion`. Called between VM operations.
+   */
+  readRetainedCompletion(completion: unknown): unknown {
+    this.assertAlive();
+    return this.vm.readRetainedCompletion(completion as JSValueHandle);
+  }
+
+  /**
    * @internal The continuation-lease CLEAR seam (see
    * `readContinuationLease`): the drain loop clears the lease at drain
    * start and after every lease-carrying job.
@@ -380,8 +575,8 @@ export class Workspace {
   /**
    * The console events accumulated by the default parking bridge, in
    * order (only populated when `options.handlers` was omitted — custom
-   * handlers own their events). The tool layer renders each event's
-   * `$N` refs through the previewer and caps the result.
+   * handlers own their events). Each event carries the guest-rendered
+   * ONE line per console.* call.
    */
   consoleEvents(): readonly ConsoleEvent[] {
     return this.consoleEventBuffer;
@@ -414,19 +609,6 @@ export class Workspace {
   surface(): GuestSurface | undefined {
     this.assertAlive();
     return readGuestSurface(this.vm);
-  }
-
-  /**
-   * Render the preview line for a realm global slot (`$N` refs and any
-   * other top-level binding): `[$14 · object · 48kB] {…}` — trap-free
-   * (never executes guest getters; a slot rebound to an accessor renders
-   * the sabotage marker instead of firing it). This is the tool-result
-   * rendering seam; `fallbackArg` is used when the slot cannot be
-   * previewed.
-   */
-  renderRef(ref: string, fallbackArg?: unknown): string {
-    this.assertAlive();
-    return renderGlobalLine(this.vm, ref, fallbackArg);
   }
 
   /**
@@ -523,13 +705,7 @@ export class Workspace {
       return false;
     });
     const bindings: WorkspaceBinding[] = [];
-    const logRefs: number[] = [];
     for (const name of user) {
-      const ref = /^\$(\d+)$/.exec(name)?.[1];
-      if (ref !== undefined) {
-        logRefs.push(Number(ref));
-        continue;
-      }
       const info = manifestBinding(this.vm, name);
       if (info === null) continue;
       const origin = view.origins.get(name);
@@ -544,14 +720,12 @@ export class Workspace {
       });
     }
     bindings.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    logRefs.sort((a, b) => a - b);
     return {
       bindings,
-      logs: {
-        first: logRefs.length > 0 ? logRefs[0] : null,
-        last: logRefs.length > 0 ? logRefs[logRefs.length - 1] : null,
-        count: logRefs.length,
-      },
+      // The `$N` capture system is deleted (0.4.0): the range is always
+      // empty. Kept for report-shape compatibility with the older
+      // manifest surface.
+      logs: { first: null, last: null, count: 0 },
       evalSeq: view.evalSeq,
     };
   }
@@ -584,11 +758,23 @@ export class Workspace {
     const events = this.consoleEventBuffer;
     const parked = this.parkedCallsBuffer;
     const parkedCheckpoints = this.parkedCheckpointCalls;
+    const parkedKinds = this.parkedKinds;
+    const parkedQuestions = this.parkedQuestions;
+    const parkedModelSpecs = this.parkedModelSpecs;
+    const parkedTasks = this.parkedTasks;
+    const workspace = this;
     return {
-      agent: (call, callId) => {
+      agent: (call, callId, modelSpec, task) => {
         parked.set(callId, call);
+        parkedKinds.set(callId, 'agent');
+        // The §4.5 agents() shape serves the call's REAL model spec and
+        // task (the parking bridge keeps them verbatim; a later broker
+        // that takes over the workspace reads them from the registry
+        // surface).
+        parkedModelSpecs.set(callId, modelSpec);
+        parkedTasks.set(callId, task);
       },
-      checkpoint: (call, callId, _question, _optionsJson, answerJson) => {
+      checkpoint: (call, callId, question, _optionsJson, answerJson) => {
         if (answerJson !== null) {
           // Answer mode: the orchestrator is delivering the user's answer
           // for a parked checkpoint. Find the matching pending checkpoint
@@ -606,6 +792,10 @@ export class Workspace {
           if (pending === undefined) return false;
           parkedCheckpoints.delete(callId);
           parked.delete(callId);
+          parkedKinds.delete(callId);
+          parkedQuestions.delete(callId);
+          parkedModelSpecs.delete(callId);
+          parkedTasks.delete(callId);
           let answer: unknown;
           try {
             answer = JSON.parse(answerJson);
@@ -623,14 +813,92 @@ export class Workspace {
         // or takes over) and the checkpoint table (answer delivery).
         parked.set(callId, call!);
         parkedCheckpoints.set(callId, call!);
+        parkedKinds.set(callId, 'checkpoint');
+        parkedQuestions.set(callId, question ?? '');
         return undefined;
       },
       steer: (call, callId) => {
         parked.set(callId, call);
+        parkedKinds.set(callId, 'steer');
       },
       console: (event) => {
         events.push(event);
       },
+      // The eval-plane helpers under the parking bridge: `sleep` is a
+      // real host-side timer (the VM itself stays timer-free); the
+      // introspection pair serve the parking state in the doc's §4.5
+      // shapes (no backends attached — diagnostics are all empty);
+      // `reset` marks the teardown the eval consumes after completing.
+      sleep: (call, ms) => {
+        const delay = Number.isFinite(ms) && ms > 0 ? Math.min(ms, 2 ** 31 - 1) : 0;
+        setTimeout(() => {
+          try {
+            call.resolve(undefined);
+          } catch {
+            // The workspace was disposed before the timer fired — the
+            // call is gone with it; nothing to settle.
+          }
+        }, delay);
+      },
+      workspace: () => {
+        const manifest = workspace.manifest();
+        const inFlightIds: string[] = [];
+        for (const id of parked.keys()) {
+          if (!inFlightIds.includes(id)) inFlightIds.push(id);
+        }
+        return JSON.stringify({
+          bindings: manifest.bindings.map((b) => ({
+            name: b.name,
+            type: b.type,
+            sizeBytes: b.sizeBytes,
+            provenance: b.provenance,
+            task: null,
+            ...(b.handleCallId !== null ? { callId: b.handleCallId } : {}),
+            ...(b.handleCallId !== null
+              ? { status: parked.has(b.handleCallId) ? 'pending' : 'settled' }
+              : {}),
+          })),
+          inFlight: inFlightIds,
+          checkpoints: [...parkedCheckpoints.keys()].map((id) => ({
+            id,
+            question: headTailDescription(parkedQuestions.get(id) ?? '', 200),
+          })),
+          diagnostics: { reconcile: null, drainError: null, childrenClosed: false },
+        });
+      },
+      agents: () =>
+        JSON.stringify(
+          [...parked.entries()]
+            .filter(([callId]) => parkedKinds.get(callId) === 'agent')
+            .map(([callId]) => ({
+              callId,
+              // The §4.5 shape: the call's REAL model spec and task (the
+              // parking bridge recorded them verbatim at issue — never
+              // fabricated empties). The task keeps the engine seam's
+              // retained 200-character metadata preview.
+              modelSpec: parkedModelSpecs.get(callId) ?? '',
+              task: metadataHeadTail(parkedTasks.get(callId) ?? '', 200),
+              state: 'opening',
+              supportsSteering: false,
+              queuedSteers: 0,
+            })),
+        ),
+      reset: () => {
+        const token = workspace.parkingJobLease.cell.current;
+        if (
+          token !== undefined &&
+          (!workspace.inParkingEval || token !== workspace.currentParkingEvalToken)
+        ) {
+          for (const [completion, evalToken] of workspace.suspendedEvalTokens) {
+            if (evalToken === token) {
+              workspace.resetOwningCompletions.add(completion);
+              return;
+            }
+          }
+        }
+        workspace.pendingReset = true;
+      },
+      defaultBackend: () => undefined,
     };
   }
 
@@ -639,6 +907,15 @@ export class Workspace {
       throw new Error(`Workspace ${this.projectDir}: operation on a disposed workspace`);
     }
   }
+}
+
+/** Retained task metadata preview: exactly `max` UTF-16 characters,
+ *  matching the broker's existing agents() task formatting. */
+function metadataHeadTail(value: string, max: number): string {
+  if (value.length <= max) return value;
+  const keep = Math.max(0, max - 1);
+  const half = Math.floor(keep / 2);
+  return `${value.slice(0, half)}…${value.slice(value.length - (keep - half))}`;
 }
 
 /** The realm global's string-key set, trap-free (raw own-key read). */

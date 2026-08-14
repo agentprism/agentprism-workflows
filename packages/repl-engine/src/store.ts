@@ -111,6 +111,13 @@ export interface CallRecord {
    *  return: a restored broker must never re-deliver a marked steer
    *  (replay without duplication). */
   deliveredAtMs: number | null;
+  /** The unix-ms moment a §4.2 followUp/steer was QUEUED for a delivery
+   *  turn (cap pressure on an idle session, the answer semantics — its
+   *  promise stays pending until the delivery runs, so it carries NO
+   *  completion). The durable counterpart of the delivery-outcome
+   *  completion: the restore's queue rebuild re-queues these exactly
+   *  once (see `recordQueued`); null otherwise. */
+  queuedAtMs: number | null;
   /** The unix-ms moment a queued steer's delivery was DROPPED (the
    *  founding call was cancelled, its delivery turn was cancelled, or
    *  the founding session never opened) — the durable counterpart of
@@ -157,6 +164,16 @@ export interface CallStore {
    * Throws for an id the store has never seen dispatched.
    */
   recordDelivery(callId: string, state: 'delivered' | 'dropped', atMs: number): void;
+  /**
+   * Record that a §4.2 followUp/steer was QUEUED for a delivery turn
+   * (the answer semantics — its completion is deliberately NOT
+   * recorded here: the promise resolves with the turn's answer when
+   * the delivery runs, and the store's first completion is the
+   * settlement authority). First-wins; the restore's queue rebuild
+   * keys on this marker. Throws for an id the store has never seen
+   * dispatched.
+   */
+  recordQueued(callId: string, atMs: number): void;
   lookup(callId: string): CallRecord | undefined;
   /** Every record, in first-dispatch order. */
   all(): CallRecord[];
@@ -186,6 +203,7 @@ export class InMemoryCallStore implements CallStore {
       backendId: record.backendId ?? null,
       deliveredAtMs: record.deliveredAtMs ?? null,
       droppedAtMs: record.droppedAtMs ?? null,
+      queuedAtMs: record.queuedAtMs ?? null,
     });
   }
 
@@ -224,6 +242,13 @@ export class InMemoryCallStore implements CallStore {
     record.droppedAtMs = atMs;
   }
 
+  recordQueued(callId: string, atMs: number): void {
+    const record = this.records.get(callId);
+    if (record === undefined) throw unknownCall(callId);
+    if (record.queuedAtMs !== null) return; // first-wins
+    record.queuedAtMs = atMs;
+  }
+
   lookup(callId: string): CallRecord | undefined {
     return this.records.get(callId);
   }
@@ -243,7 +268,8 @@ type LogLine =
   | { event: 'reissued'; callId: string; atMs: number }
   | { event: 'attached'; callId: string; sessionId: string; atMs: number; backendId?: string | null }
   | { event: 'completed'; callId: string; outcome: CallOutcome }
-  | { event: 'delivery'; callId: string; state: 'delivered' | 'dropped'; atMs: number };
+  | { event: 'delivery'; callId: string; state: 'delivered' | 'dropped'; atMs: number }
+  | { event: 'queued'; callId: string; atMs: number };
 
 function isLogLine(value: unknown): value is LogLine {
   if (typeof value !== 'object' || value === null) return false;
@@ -292,6 +318,10 @@ function isLogLine(value: unknown): value is LogLine {
       (d.state === 'delivered' || d.state === 'dropped') &&
       typeof d.atMs === 'number'
     );
+  }
+  if (v.event === 'queued') {
+    const q = value as { callId?: unknown; atMs?: unknown };
+    return typeof q.callId === 'string' && typeof q.atMs === 'number';
   }
   return false;
 }
@@ -472,6 +502,14 @@ export class JsonlCallStore implements CallStore {
     this.index.recordDelivery(callId, state, atMs);
   }
 
+  recordQueued(callId: string, atMs: number): void {
+    const existing = this.index.lookup(callId);
+    if (existing === undefined) throw unknownCall(callId);
+    if (existing.queuedAtMs !== null) return; // first-wins
+    this.append({ event: 'queued', callId, atMs });
+    this.index.recordQueued(callId, atMs);
+  }
+
   lookup(callId: string): CallRecord | undefined {
     return this.index.lookup(callId);
   }
@@ -531,6 +569,7 @@ function replay(index: InMemoryCallStore, line: LogLine): void {
   else if (line.event === 'reissued') index.recordReissued(line.callId, line.atMs);
   else if (line.event === 'attached') index.recordAttached(line.callId, line.sessionId, line.atMs, line.backendId ?? null);
   else if (line.event === 'completed') index.recordCompleted(line.callId, line.outcome);
+  else if (line.event === 'queued') index.recordQueued(line.callId, line.atMs);
   else index.recordDelivery(line.callId, line.state, line.atMs);
 }
 

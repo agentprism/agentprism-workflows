@@ -20,12 +20,17 @@
  * trap-counting proxy cannot influence anything rendered here.
  *
  * `estimateByteSize` is the bounded, trap-free byte-size estimate for the
- * header (FORMAT.md leaves the estimate to the caller); `renderRefLine`
- * is the tool-side seam: resolve a `$N` realm slot trap-free, preview it,
- * render the line. A slot rebound to an accessor renders an explicit
- * sabotage marker (the getter is never invoked); a slot that cannot be
- * previewed degrades to a line built from the console event's best-effort
- * `args` encoding — preview failure must never lose output.
+ * header (FORMAT.md leaves the estimate to the caller); `inspectGlobal`
+ * is the workspace-manifest seam (content-free name/type/size metadata
+ * for one realm global slot, read through its own property descriptor —
+ * an accessor-rebound slot is marked, never invoked). The v1 `$N`
+ * capture-unit previewer surface (renderRefLine/renderGlobalLine/
+ * renderPreviewLine/previewGlobal) is DELETED with the redesign's §7
+ * sweep — the retained surface is the §4.4 completion repr
+ * (`renderCompletionLine`), the retained metadata-formatting tokens
+ * (stringDescription/shortString/headTailDescription/formatNumber/
+ * formatByteSize), and the manifest seams (inspectGlobal/
+ * manifestBinding).
  */
 
 import { JSValueHandle, type QuickJS } from 'quickjs-wasi';
@@ -44,7 +49,6 @@ import {
   type OwnDescriptor,
   type TypedArrayInfo,
 } from './trapfree.js';
-import { OUTPUT_MAX_BYTES } from './caps.js';
 
 // ---- Caps (normative — FORMAT.md §3). All character counts are Unicode
 // scalar values (code points), not bytes and not UTF-16 units. ----
@@ -63,27 +67,12 @@ export const PROPERTY_STRING_TAIL_CHARS = 8;
 export const MAX_ERROR_MESSAGE_CHARS = 120;
 /** Longest top-level string rendered whole in a PREVIEW (a string shown to
  *  convey shape — a nested/inspected value, a checkpoint question). This is
- *  the FORMAT.md §5.5 constant; emission uses `EMISSION_STRING_MAX_CHARS`. */
+ *  the FORMAT.md §5.5 constant. */
 export const MAX_STRING_PREVIEW_CHARS = 200;
 /** Head kept when a preview string is elided (= MAX_STRING_PREVIEW_CHARS × 3/5). */
 export const STRING_HEAD_CHARS = 120;
 /** Tail kept when a preview string is elided (= MAX_STRING_PREVIEW_CHARS × 1/5). */
 export const STRING_TAIL_CHARS = 40;
-/**
- * Longest top-level string rendered whole in an EMISSION — a string the
- * orchestrator directly emits (a `console.log` argument, or the eval
- * result). Such a string is OUTPUT the agent explicitly asked to see, not
- * a preview of a value's shape, so it is carried up to the tool-result
- * byte budget ("200 chars OR the KB max, whichever is greater") rather than
- * clamped to the 200-char preview length. Beyond it the string head/tail-
- * elides (proportionally, keeping its `$N` ref) so the rendered line stays
- * bounded. A small reserve below `OUTPUT_MAX_BYTES` leaves room for the
- * `[$N · … ]` header, the surrounding quotes, and a few multi-byte code
- * points, so a whole-rendered string fits the byte budget rather than being
- * dropped as a single over-budget line by `applyOutputCaps`. Nested and
- * property strings are unaffected — they stay preview-short.
- */
-export const EMISSION_STRING_MAX_CHARS = Math.max(MAX_STRING_PREVIEW_CHARS, OUTPUT_MAX_BYTES - 512);
 /** Hard backstop on the rendered collapsed body. */
 export const MAX_COLLAPSED_CHARS = 400;
 
@@ -207,10 +196,9 @@ function truncateChars(s: string, cap: number): string {
 
 /** FORMAT.md §5.5: top-level strings — whole ≤ `wholeCap`, else head AND
  *  tail (proportional 3/5 head, 1/5 tail — the FORMAT.md 120/40 split at the
- *  default 200 cap). `wholeCap` defaults to the preview length; emission
- *  callers (a directly logged string, the eval result) pass
- *  `EMISSION_STRING_MAX_CHARS` so output is carried up to the byte budget
- *  rather than clamped to a preview. */
+ *  default 200 cap). The §4.4 completion/console reprs bypass this
+ *  (direct strings print whole there); `stringDescription` is the
+ *  metadata/preview form (checkpoint questions, manifest tokens). */
 export function stringDescription(s: string, wholeCap: number = MAX_STRING_PREVIEW_CHARS): string {
   const chars = toChars(s);
   if (chars.length <= wholeCap) {
@@ -253,8 +241,8 @@ function leaf(
  * shim handle, so it is not exported from this module's public surface
  * (the published declarations must stay free of quickjs-wasi types — a
  * signature naming `JSValueHandle` would drag the shim's DOM-dependent
- * declarations into the consumer's program); the public seams are
- * `renderGlobalLine`/`renderRefLine`/`inspectGlobal`, and the broker
+ * declarations into the consumer's program); the public seam is
+ * `inspectGlobal`, and the broker
  * layer reaches it through `renderCompletionLine` below.
  */
 function previewHandle(handle: JSValueHandle): ObjectPreview {
@@ -268,7 +256,7 @@ function previewHandle(handle: JSValueHandle): ObjectPreview {
   // the manifest — which ignores this description (metadata only, see
   // `describeManifest`) — so widening it carries directly-emitted output up
   // to the byte budget without leaking string content into the manifest.
-  if (handle.isString) return leaf('string', undefined, stringDescription(handle.toString(), EMISSION_STRING_MAX_CHARS));
+  if (handle.isString) return leaf('string', undefined, stringDescription(handle.toString()));
   if (handle.isBigInt) return leaf('bigint', undefined, handle.toBigInt().toString() + 'n');
   if (handle.isSymbol) {
     // The description is not readable trap-free (it sits behind
@@ -574,7 +562,7 @@ function ownStringProperties(
       // must still be disposed — an omitted property is not listed, yet
       // its handle is just as owned as a listed one's (review regression:
       // every omitted data-property handle leaked, pinning one JSValue
-      // box per preview call; a 20,000-call previewGlobal() probe on a
+      // box per preview call; a 20,000-call inspectGlobal() probe on a
       // 100-property object grew WASM memory from 1.31 MB to 30.74 MB).
       if (desc.kind === 'data') desc.value.dispose();
       overflow = true;
@@ -692,19 +680,181 @@ export function isCanonicalIndex(name: string): boolean {
  * The broker's completion-preview seam: preview the eval completion
  * value (an opaque quickjs-wasi handle, `unknown` here so the published
  * declaration graph stays self-contained — see the module docs) and
- * render the FORMAT.md collapsed line. Trap-free by construction (module
- * docs); the handle is NOT consumed or disposed here — the caller owns
- * it.
+ * render the §4.4 depth-limited repr (direct strings whole, objects/
+ * arrays to depth 2, 20 entries per level, nested strings head-limited
+ * at 200 chars — printing conventions, NOT budgets: there is no byte
+ * ceiling on this path, the Python posture). Trap-free by construction
+ * (module docs); the handle is NOT consumed or disposed here — the
+ * caller owns it.
  */
 export function renderCompletionLine(completion: unknown): string {
-  return renderCollapsed(previewHandle(completion as JSValueHandle));
+  return reprHandle(completion as JSValueHandle, 0, new Set());
 }
 
-/**
- * The header label: the CDP subtype when present, else the type.
- */
-function label(preview: ObjectPreview): string {
-  return preview.subtype ?? preview.type;
+// ── The §4.4 depth-limited repr (docs/roadmap/repl-eval-redesign.md) ──
+//
+// Printing conventions, not budgets — the same rules the guest library's
+// console repr follows, kept in parity by tests:
+//
+//   - strings rendered DIRECTLY (the top-level completion value) print
+//     WHOLE, unquoted — they are the output the orchestrator asked for,
+//     with no upper bound;
+//   - objects/arrays render to DEPTH 2; deeper levels render as
+//     `{…}` / `[…]`;
+//   - collections render their first 20 entries per level, then
+//     `… +N more`;
+//   - NESTED strings (inside a collection) render head-limited at
+//     200 chars, quoted, with a trailing `…` marker when clipped;
+//   - branded objects (Date/Map/Set/…) render as their brand word;
+//   - everything deeper/longer is reached by evaluating a narrower
+//     expression — the values are alive in the VM; slicing is the API.
+//
+// Trap-free throughout: descriptor reads only (never `[[Get]]`), engine
+// brand checks, no proxy enumeration, no recursion beyond depth 2.
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Expand levels 0..1, collapse level 2+ (the doc's depth-2 rule). */
+export const REPR_MAX_DEPTH = 2;
+/** Entries rendered per collection level (the doc's 20-entry rule). */
+export const REPR_MAX_ENTRIES = 20;
+/** Nested-string head bound in chars (the doc's 200-char rule). */
+export const REPR_NESTED_STRING_CHARS = 200;
+
+/** The guest-parity head-limited nested-string form: `'<first 200 chars>…'`. */
+function reprNestedString(s: string): string {
+  const chars = toChars(s);
+  if (chars.length <= REPR_NESTED_STRING_CHARS) return `'${s}'`;
+  return `'${chars.slice(0, REPR_NESTED_STRING_CHARS).join('')}…'`;
+}
+
+/** The brand word for a branded object (guest parity — see the guest
+ *  library's `reprValue`). */
+function reprBrand(handle: JSValueHandle): string | undefined {
+  if (handle.isPromise) return 'Promise';
+  if (handle.isMap) return 'Map';
+  if (handle.isSet) return 'Set';
+  if (handle.isWeakMap) return 'WeakMap';
+  if (handle.isWeakSet) return 'WeakSet';
+  if (handle.isWeakRef) return 'WeakRef';
+  if (handle.isDate) return 'Date';
+  if (handle.isRegExp) return 'RegExp';
+  if (handle.isDataView) return 'DataView';
+  if (handle.isArrayBuffer) {
+    const len = arrayBufferByteLength(handle) ?? 0;
+    return `ArrayBuffer(${len})`;
+  }
+  const tinfo = typedArrayInfo(handle);
+  if (tinfo !== undefined) return typedArrayKind(handle, tinfo);
+  return undefined;
+}
+
+/** The depth-limited repr of one guest value handle. Trap-free; the
+ *  recursion is bounded by `REPR_MAX_DEPTH` (depth 2 collapses). `seen`
+ *  tracks the current render path's object pointers (cycles and shared
+ *  refs collapse to `{…}`/`[…]` instead of recursing). */
+function reprHandle(handle: JSValueHandle, depth: number, seen: Set<number>): string {
+  // ---- Primitives (brand-checked before any conversion) ----
+  if (handle.isUndefined) return 'undefined';
+  if (handle.isNull) return 'null';
+  if (handle.isBool) return handle.toBoolean() ? 'true' : 'false';
+  if (handle.isNumber) return formatNumber(handle.toNumber());
+  if (handle.isString) {
+    // The §4.4 rule: a DIRECT string prints whole, unbounded; a NESTED
+    // string (inside a collection) is head-limited at 200 chars.
+    return depth === 0 ? handle.toString() : reprNestedString(handle.toString());
+  }
+  if (handle.isBigInt) return handle.toBigInt().toString() + 'n';
+  if (handle.isSymbol) return 'Symbol';
+
+  // ---- Proxy: detected BEFORE any other object handling — never
+  // enumerated (descriptor reads would fire traps). ----
+  if (handle.isProxy) {
+    const preview = proxyPreview(handle);
+    return preview.description === 'Proxy(revoked)' ? 'Proxy' : preview.description;
+  }
+
+  if (handle.isFunction) return functionDescription(handle);
+
+  // ---- Error: `name: message` (head-limited like a nested string),
+  // with the §4.6 attribution when the error came from a subagent call
+  // (replCallId stamped by the guest library, replBackend by the host).
+  if (handle.isError) {
+    const body = errorDescription(handle, REPR_NESTED_STRING_CHARS);
+    const callId = ownDataString(handle, 'replCallId');
+    const backend = ownDataString(handle, 'replBackend');
+    const attributed =
+      callId === undefined
+        ? body
+        : `${body} (call ${callId}${backend !== undefined ? ` on backend ${backend}` : ''})`;
+    return headTailDescription(attributed, REPR_NESTED_STRING_CHARS);
+  }
+
+  // ---- Branded objects: the brand word (a predictable leaf — their
+  // content is reached by slicing a narrower expression) ----
+  const brand = reprBrand(handle);
+  if (brand !== undefined) return brand;
+
+  // ---- Objects/arrays: depth-2 entry rendering ----
+  if (depth >= REPR_MAX_DEPTH) {
+    return handle.isArray ? '[…]' : '{…}';
+  }
+  if (seen.has(handle.identity)) {
+    return handle.isArray ? '[…]' : '{…}';
+  }
+  seen.add(handle.identity);
+  try {
+    if (handle.isArray) {
+      const lengthHandle = readOwnDataProperty(handle, 'length');
+      const len = lengthHandle === undefined ? 0 : lengthHandle.toNumber();
+      lengthHandle?.dispose();
+      const show = Math.min(len, REPR_MAX_ENTRIES);
+      const parts: string[] = [];
+      for (let i = 0; i < show; i++) {
+        const desc = readOwnDescriptor(handle, String(i));
+        if (desc === undefined) {
+          // A hole — the guest's `value[i]` read renders undefined; the
+          // host mirrors it without ever reading through the prototype
+          // chain.
+          parts.push('undefined');
+          continue;
+        }
+        if (desc.kind === 'accessor') {
+          parts.push('(…)'); // never invoke the getter
+          continue;
+        }
+        try {
+          parts.push(reprHandle(desc.value, depth + 1, seen));
+        } finally {
+          desc.value.dispose();
+        }
+      }
+      if (len > show) parts.push(`… +${len - show} more`);
+      return `[${parts.join(', ')}]`;
+    }
+    const { keys, corrupted } = rawOwnKeysAll(handle);
+    if (corrupted) return '{…}';
+    const stringKeys = keys.filter((key) => !key.symbol) as Array<{ name: string }>;
+    const show = Math.min(stringKeys.length, REPR_MAX_ENTRIES);
+    const parts: string[] = [];
+    for (let i = 0; i < show; i++) {
+      const name = stringKeys[i].name;
+      const desc = readOwnDescriptor(handle, name);
+      if (desc === undefined) continue; // vanished between reads
+      if (desc.kind === 'accessor') {
+        parts.push(`${name}: (…)`);
+        continue;
+      }
+      try {
+        parts.push(`${name}: ${reprHandle(desc.value, depth + 1, seen)}`);
+      } finally {
+        desc.value.dispose();
+      }
+    }
+    if (stringKeys.length > show) parts.push(`… +${stringKeys.length - show} more`);
+    return `{${parts.join(', ')}}`;
+  } finally {
+    seen.delete(handle.identity);
+  }
 }
 
 /** Render the collapsed preview body (everything after the header), capped
@@ -712,13 +862,11 @@ function label(preview: ObjectPreview): string {
 export function renderCollapsed(preview: ObjectPreview): string {
   let body: string;
   if (preview.type === 'string') {
-    // A top-level string that IS the emitted value (a console.log argument
-    // or the eval result) is OUTPUT, not a preview of shape: its
-    // description is already bounded by EMISSION_STRING_MAX_CHARS in
-    // `previewHandle`, so it is returned whole rather than re-clamped to the
-    // 400-char collapsed-preview backstop. The result byte budget
-    // (`applyOutputCaps`) is the real bound. Non-string primitives and
-    // composites keep the backstop below.
+    // A top-level string that IS the emitted value is OUTPUT, not a
+    // preview of shape: its description is returned whole rather than
+    // re-clamped to the collapsed-preview backstop (the §4.4 rule —
+    // direct strings print whole; there is no byte ceiling). Non-string
+    // primitives and composites keep the backstop below.
     return preview.description;
   }
   if (preview.type !== 'object') {
@@ -778,14 +926,7 @@ function renderPromise(preview: ObjectPreview): string {
 }
 
 /**
- * The full context line (FORMAT.md §2):
- * `[$14 · object · 48kB] {sections: Array(12), title: "Auth flow", …}`.
- */
-export function renderPreviewLine(address: number, byteSize: number, preview: ObjectPreview): string {
-  return `[$${address} · ${label(preview)} · ${formatByteSize(byteSize)}] ${renderCollapsed(preview)}`;
-}
-
-/** Decimal byte-size formatting (FORMAT.md §2.2): `B`, then `kB`/`MB`/`GB`/
+ * Decimal byte-size formatting (FORMAT.md §2.2): `B`, then `kB`/`MB`/`GB`/
  *  `TB` at multiples of 1000, one decimal with a trailing `.0` stripped.
  *  The DISPLAYED value is kept below 1000: a value that one-decimal
  *  rounding would render as `1000.0` (anything ≥ 999.95) moves to the next
@@ -815,7 +956,7 @@ const SIZE_MAX_DEPTH = 32;
 
 /**
  * Bounded, trap-free byte-size estimate of a guest value (internal; the
- * public seams are `renderGlobalLine`/`inspectGlobal`). Uses only the
+ * public seams are `inspectGlobal`/`manifestBinding`). Uses only the
  * introspection surface (brand checks, own-key listing, descriptor access
  * that never fires getters, engine object identity), an explicit work
  * stack (no recursion), a real VISITED SET (each object counts once,
@@ -923,34 +1064,7 @@ function byteLength(s: string): number {
   return Buffer.byteLength(s, 'utf8');
 }
 
-// ---- The $N slot seam ----
-
-/** The explicit marker line for a `$N` slot rebound to an accessor: the
- *  preview names the sabotage instead of firing the getter (or lying with
- *  the stale logged args). */
-function sabotagedSlotLine(ref: string): string {
-  return `[${ref} · accessor · ?B] (slot rebound to a getter — not invoked; the logged value was replaced)`;
-}
-
-/** Last-resort line when the realm global is unavailable: the guest's
- *  best-effort JSON encoding, capped. */
-function fallbackLine(ref: string | undefined, arg: unknown): string {
-  const CAP = 400;
-  let body: string;
-  if (arg !== undefined) {
-    let s: string;
-    try {
-      s = JSON.stringify(arg);
-    } catch {
-      s = String(arg);
-    }
-    const chars = toChars(s);
-    body = chars.length > CAP ? chars.slice(0, CAP - 1).join('') + '…' : s;
-  } else {
-    body = '…';
-  }
-  return ref === undefined ? body : `[${ref}] ${body}`;
-}
+// ---- Trap-free global-slot reads (the manifest seam's resolver) ----
 
 /**
  * Resolve a realm global slot trap-free and return the VALUE handle, or
@@ -997,87 +1111,10 @@ function readSlotValue(vm: ReplVm, name: string): JSValueHandle | undefined {
 }
 
 /**
- * Render the preview line for one `$N` ref: `[$14 · object · 48kB] {…}`.
- * See `renderGlobalLine` for the full resolution contract.
- */
-export function renderRefLine(vm: ReplVm, ref: string, fallbackArg?: unknown): string {
-  if (/^\$\d+$/.test(ref)) {
-    return renderGlobalLine(vm, ref, fallbackArg);
-  }
-  return fallbackLine(ref, fallbackArg);
-}
-
-/**
- * Render the preview line for any realm global slot (a `$N` ref or any
- * other top-level binding): `[name · object · 48kB] {…}`.
- *
- * Resolution is trap-free: the slot is read through its own property
- * descriptor — a slot rebound to a getter renders the explicit sabotage
- * marker (the getter is never invoked), an absent slot reads as
- * `undefined`, and any preview failure degrades to a line built from the
- * caller's best-effort fallback encoding (`fallbackArg`) — preview
- * failure must never lose output.
- */
-export function renderGlobalLine(vm: ReplVm, name: string, fallbackArg?: unknown): string {
-  const value = readSlotValue(vm, name);
-  if (value === undefined) {
-    // The slot is absent (reads as undefined — the same thing a [[Get]]
-    // would have said, minus the trap risk), an accessor (sabotage
-    // marker), or unreadable. Distinguish the accessor case for the
-    // marker line.
-    const slot = readRealmSlotKind(vm, name);
-    if (slot === 'accessor') return sabotagedSlotLine(name);
-    return fallbackLine(name, fallbackArg);
-  }
-  try {
-    const preview = previewHandle(value);
-    const size = estimateSize(value);
-    return renderPreviewLine(slotAddress(name), size, preview);
-  } catch {
-    return fallbackLine(name, fallbackArg);
-  } finally {
-    value.dispose();
-  }
-}
-
-/** The numeric address of a `$N`-style name (0 for arbitrary names — the
- *  header renders `[name · …]` in that case). */
-function slotAddress(name: string): number {
-  const n = /^\$(\d+)$/.exec(name)?.[1];
-  return n === undefined ? 0 : Number(n);
-}
-
-/**
- * The structured preview of a realm global slot — the ObjectPreview
- * object behind `renderGlobalLine`'s rendered line: the CDP model the
- * tool-result seam is built on, as plain data (JSON-serializable, with
- * the FORMAT.md §4 normative field order preserved — pinned by the
- * serialization-vector test). Trap-free by construction (module docs):
- * own-property-descriptor reads only, no guest getters, no guest code.
- * Returns `undefined` when the slot is absent, rebound to an accessor
- * (never invoked), or unreadable — the same resolution contract as
- * `renderGlobalLine` (which degrades to a fallback line; callers that
- * need the structured form instead can degrade themselves).
- */
-export function previewGlobal(vm: ReplVm, name: string): ObjectPreview | undefined {
-  const value = readSlotValue(vm, name);
-  if (value === undefined) return undefined;
-  try {
-    return previewHandle(value);
-  } catch {
-    return undefined;
-  } finally {
-    value.dispose();
-  }
-}
-
-/**
  * Metadata for one realm global slot, content-free: the CDP label (type
  * or subtype), the byte-size estimate, and the resolution kind. This is
  * the workspace-manifest seam — `ls` for the data plane (the doc: top-
- * level bindings with name, type, size; metadata, never content). The
- * full preview is available through `renderGlobalLine` (or the
- * structured form through `previewGlobal`).
+ * level bindings with name, type, size; metadata, never content).
  */
 export function inspectGlobal(vm: ReplVm, name: string): {
   kind: 'data' | 'accessor' | 'absent';

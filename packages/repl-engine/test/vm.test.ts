@@ -204,6 +204,7 @@ test('a thrown proxy is reported trap-free (no descriptor/prototype traps)', asy
   );
   assert.equal(e.name, 'Error');
   assert.equal(e.message, '[Proxy]');
+  assert.match(e.stack ?? '', /<repl>:\d+:\d+/, 'the proxy throw keeps its submitted-code frame');
   assert.equal(value(await v.evalCode('globalThis.__traps')), 0, 'no proxy trap ran');
 });
 
@@ -252,6 +253,99 @@ test('thrown values report trap-free error info (name via prototype read)', asyn
   const e3 = error(await v.evalCode('throw "plain string"'));
   assert.equal(e3.name, 'Error');
   assert.equal(e3.message, 'plain string');
+  assert.match(e3.stack ?? '', /<repl>:1:\d+/, 'a thrown string keeps the submitted-code line');
+  const e4 = error(await v.evalCode('\nthrow null'));
+  assert.equal(e4.message, 'null');
+  assert.match(e4.stack ?? '', /<repl>:2:\d+/, 'a thrown null keeps the submitted-code line');
+  const e5 = error(await v.evalCode('\nthrow undefined'));
+  assert.equal(e5.message, 'undefined');
+  assert.match(e5.stack ?? '', /<repl>:2:\d+/, 'a thrown undefined keeps the submitted-code line');
+});
+
+test('throw-site capture preserves user errors when globalThis is shadowed around a function', async () => {
+  using topLevel = await vm();
+  assert.equal(
+    value(
+      await topLevel.evalCode(
+        'const globalThis = 7; function f() { throw new Error("T") } try { f() } catch (e) { e.message }',
+      ),
+    ),
+    'T',
+    'a top-level lexical globalThis shadow cannot replace the thrown error',
+  );
+  assert.equal(
+    value(
+      await topLevel.evalCode(
+        'class C { m() { throw new Error("M") } } try { new C().m() } catch (e) { e.message }',
+      ),
+    ),
+    'M',
+    'a class method keeps the user error after a persistent globalThis shadow',
+  );
+
+  using parameter = await vm();
+  assert.equal(
+    value(
+      await parameter.evalCode(
+        'function f(globalThis) { throw new Error("P") } try { f(7) } catch (e) { e.message }',
+      ),
+    ),
+    'P',
+    'a globalThis parameter cannot replace the thrown error',
+  );
+
+  using local = await vm();
+  assert.equal(
+    value(
+      await local.evalCode(
+        'function f() { const globalThis = 7; throw new Error("L") } try { f() } catch (e) { e.message }',
+      ),
+    ),
+    'L',
+    'a function-local globalThis binding cannot replace the thrown error',
+  );
+
+  using uncaught = await vm();
+  const e = error(
+    await uncaught.evalCode('const globalThis = 7;\nfunction g() { throw new Error("shadowed") }\ng()'),
+  );
+  assert.equal(e.message, 'shadowed', 'the uncaught error itself is preserved');
+  assert.match(e.stack ?? '', /<repl>:2:\d+/, 'the preserved error keeps its submitted-code frame');
+
+  using reserved = await vm();
+  assert.equal(
+    value(
+      await reserved.evalCode(
+        'function f(__replCaptureThrownValueV2) { throw new Error("R") } ' +
+          'try { f(() => "corrupt") } catch (e) { e.message }',
+      ),
+    ),
+    'R',
+    'a local binding with the reserved helper name makes capture skip the throw instead of changing it',
+  );
+});
+
+test('throw-site capture never reuses a handled primitive throw for an uninstrumented throw', async () => {
+  using acrossEvals = await vm();
+  assert.equal(value(await acrossEvals.evalCode('try { throw "boom" } catch (e) { "handled" }')), 'handled');
+  const later = error(
+    await acrossEvals.evalCode(
+      'with ({}) { 1 }\n\n\n\nfunction f() { throw "boom" }\nf();',
+    ),
+  );
+  assert.equal(later.message, 'boom');
+  assert.equal(later.stack, undefined, 'an uninstrumented throw cannot inherit a frame from an earlier eval');
+
+  using withinEval = await vm();
+  const dynamic = error(
+    await withinEval.evalCode(
+      'try { throw "boom" } catch (e) {}\n' +
+        'const f = new Function(\'throw "boom"\');\n' +
+        'f();',
+    ),
+  );
+  assert.equal(dynamic.message, 'boom');
+  assert.equal(dynamic.stack, undefined, 'a handled throw cannot leak its frame to later dynamic code');
 });
 
 test('rejected top-level awaits report the raw thrown value', async () => {

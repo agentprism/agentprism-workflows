@@ -111,6 +111,14 @@ class FakeSession implements BrokerSession {
 class FakeRunner implements BrokerRunner {
   readonly sessions: FakeSession[] = [];
 
+  listBackends(): string[] {
+    return ['claude', 'codex', 'opencode', 'pi'];
+  }
+
+  defaultBackendId(): string {
+    return 'claude';
+  }
+
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
     const session = new FakeSession(opts);
     this.sessions.push(session);
@@ -209,7 +217,8 @@ test('review round 4: the manifest\'s provenance is COMPLETE — 300 bindings al
     // canonical `const research = agent(...)` state at scale).
     const code = Array.from({ length: 300 }, (_, i) => `const b${i} = ${i};`).join('\n') + '\n"created"';
     const a = await broker.eval(code);
-    assert.equal(a.result, '"created"');    const manifest = broker.workspaceManifest();
+    assert.equal(a.result, 'created');
+    const manifest = broker.workspaceManifest();
     const named = manifest.bindings.filter((binding) => /^b\d+$/.test(binding.name));
     assert.equal(named.length, 300, 'every binding is listed');
     for (const binding of named) {

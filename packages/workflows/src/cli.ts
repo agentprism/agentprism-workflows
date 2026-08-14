@@ -69,7 +69,6 @@ Options:
   --cwd <dir>            base cwd for the dry run (default: a throwaway temp dir;
                          point it at a real repo only if you want worktree isolation
                          to create — and clean up — real git worktrees)
-  --token-budget <n>     set budget.total so budget-guarded paths execute
                          (the mock backend reports 1000 tokens per agent call)
   --max-agents <n>       cap dry-run agent calls
   --timeout-ms <n>       dry-run wall-clock limit (default 30000)
@@ -405,9 +404,6 @@ async function main(argv: string[]): Promise<void> {
         break;
       case "--cwd":
         options.cwd = resolve(rest[++i] ?? fail("--cwd expects a directory"));
-        break;
-      case "--token-budget":
-        options.tokenBudget = parseIntFlag("--token-budget", rest[++i]);
         break;
       case "--max-agents":
         options.maxAgents = parseIntFlag("--max-agents", rest[++i]);

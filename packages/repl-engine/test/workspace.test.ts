@@ -64,10 +64,9 @@ test('the guest bridge is installed at VM creation: DSL globals, console bridge,
   assert.equal(logged.kind, 'value');
   const events = ws.consoleEvents();
   assert.equal(events.length, 1);
-  assert.deepEqual(events[0].refs, ['$1', '$2']);
-  // The rendered line is the previewer seam the tool layer uses.
-  assert.match(ws.renderRef('$1'), /^\[\$1 · object · \d+B\] \{a: 1\}$/);
-  assert.equal(ws.renderRef('$2'), '[$2 · string · 4B] "text"');
+  // The §4.4 one-line repr (guest-rendered): args joined with one space.
+  assert.equal(events[0].level, 'log');
+  assert.equal(events[0].line, '{a: 1} text');
 
   // The default parking bridge parks agent calls (honest no-backend state:
   // nothing is fabricated, the calls pend until a later phase attaches
@@ -100,6 +99,102 @@ test('the guest bridge is installed at VM creation: DSL globals, console bridge,
   assert.equal(meta.kind, 'data');
   assert.equal(meta.label, 'object');
   assert.ok(meta.sizeBytes > 0);
+  ws.dispose();
+});
+
+test('parking bridge: agents() serves the REAL model spec and task of parked agent calls (§4.5 plain-value shape — never fabricated empties)', async () => {
+  const ws = await workspace();
+  await ws.eval('const research = agent("pi/deepseek-v4-flash-max", "research X"); "started"');
+  const out = await ws.eval('agents()');
+  assert.equal(out.kind, 'value');
+  if (out.kind === 'value') {
+    const agents = out.value as Array<{ callId: string; modelSpec: string; task: string; state: string; supportsSteering: boolean; queuedSteers: number }>;
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].callId, 'c1');
+    assert.equal(agents[0].modelSpec, 'pi/deepseek-v4-flash-max', 'the real model spec, never ""');
+    assert.equal(agents[0].task, 'research X', 'the real task, never ""');
+  }
+  ws.dispose();
+});
+
+test('workspace-level evals maintain the §4.4 `_` result history — resolved, LATE (settled at the drain), and empty-poll evals', async () => {
+  const ws = await workspace();
+  await ws.eval('40 + 2');
+  const first = await ws.eval('_');
+  assert.equal(first.kind, 'value');
+  if (first.kind === 'value') assert.equal(first.value, 42);
+  // A suspended eval's completion value becomes `_` once its
+  // continuation settles at the drain (the parking bridge's sleep timer).
+  const suspended = await ws.eval('await sleep(10); "late"');
+  assert.equal(suspended.kind, 'pending');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  ws.drainJobs();
+  const second = await ws.eval('_');
+  assert.equal(second.kind, 'value');
+  if (second.kind === 'value') assert.equal(second.value, 'late');
+  // An empty poll (eval "") COMPLETES with undefined — `_` becomes
+  // undefined: the previous eval's completion value IS undefined (the
+  // review probe: `42`, then an empty eval, then `_` must read
+  // undefined, never the stale 42).
+  await ws.eval('"kept"');
+  await ws.eval('');
+  const third = await ws.eval('_');
+  assert.equal(third.kind, 'value');
+  if (third.kind === 'value') assert.equal(third.value, undefined);
+  ws.dispose();
+});
+
+test('parking bridge: reset() in a SUSPENDED eval tears the workspace down after the continuation completes — the workspace stays alive while the eval is in flight', async () => {
+  const ws = await workspace();
+  const out = await ws.eval('reset(); await sleep(30); "finished"');
+  assert.equal(out.kind, 'pending');
+  assert.equal(ws.isDisposed, false, 'the workspace is ALIVE while the reset eval is suspended');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  ws.drainJobs();
+  assert.equal(ws.isDisposed, true, 'the teardown ran after the eval completed (the continuation settled at the drain)');
+});
+
+test('parking bridge: reset() called after a suspended eval resumes is attributed to that eval and tears down in the completing drain', async () => {
+  const ws = await workspace();
+  const out = await ws.eval('await sleep(30); reset(); 42');
+  assert.equal(out.kind, 'pending');
+  assert.equal(ws.isDisposed, false, 'the workspace stays alive until the reset-calling eval resumes');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  ws.drainJobs();
+  assert.equal(ws.isDisposed, true, 'the drain that completed the reset-calling eval performed teardown');
+});
+
+test('parking bridge: a completed drain cannot misattribute a later plain reset() to an eval still suspended mid-continuation', async () => {
+  const ws = await workspace();
+  const first = await ws.eval('await sleep(20); await agent("pi/x", "hold"); 1');
+  assert.equal(first.kind, 'pending');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  ws.drainJobs();
+  assert.equal(ws.isDisposed, false, 'the first eval remains suspended on its parked agent');
+
+  const reset = await ws.eval('reset(); 2');
+  assert.equal(reset.kind, 'value');
+  if (reset.kind === 'value') assert.equal(reset.value, 2);
+  assert.equal(ws.isDisposed, true, 'the plain reset belongs to the eval that called it');
+});
+
+test('default parking bridge: workspace() checkpoint questions and agents() tasks retain their 200-character metadata previews', async () => {
+  const ws = await workspace();
+  const out = await ws.eval(`
+    checkpoint("q".repeat(300));
+    agent("pi/x", "t".repeat(300));
+    const question = workspace().checkpoints[0].question;
+    const task = agents()[0].task;
+    ({ question, task });
+  `);
+  assert.equal(out.kind, 'value');
+  if (out.kind === 'value') {
+    const value = out.value as { question: string; task: string };
+    assert.ok(value.question.length < 300, 'the raw checkpoint question is not exposed');
+    assert.ok(value.question.includes('chars elided'), value.question);
+    assert.equal(value.task.length, 200, 'the parked agent task uses the engine\'s 200-character preview');
+    assert.equal(value.task, `${'t'.repeat(99)}…${'t'.repeat(100)}`);
+  }
   ws.dispose();
 });
 
@@ -177,6 +272,11 @@ test('custom bridge handlers passed to create override the parking bridge', asyn
       checkpoint: () => undefined,
       steer: () => undefined,
       console: () => undefined,
+      sleep: () => undefined,
+      workspace: () => '{}',
+      agents: () => '[]',
+      reset: () => undefined,
+      defaultBackend: () => undefined,
     },
   });
   const out = await ws.eval('await agent("pi/custom", "do it")');
@@ -437,7 +537,7 @@ test('manifest: a top-level LEXICAL `const globalThis = 7` (a legitimate user pr
     // internal references use the captured global too): a fresh eval
     // still reaches host functions and the realm globals.
     const live = await broker.eval('typeof console.log');
-    assert.equal(live.result, '"function"', 'the library internals are immune to the globalThis shadow');
+    assert.equal(live.result, 'function', 'the library internals are immune to the globalThis shadow');
   } finally {
     await broker.dispose();
     ws.dispose();
@@ -456,7 +556,7 @@ test('manifest: a SAME-TYPE overwrite of a baseline global (`Math = { userOwned:
     // registry was created in the pristine realm) is the detector that
     // catches it: the manifest lists the overwrite with its provenance.
     const r = await broker.eval('Math = { userOwned: true }; "rebound"');
-    assert.equal(r.result, '"rebound"');
+    assert.equal(r.result, 'rebound');
     let manifest = broker.workspaceManifest();
     let byName = new Map(manifest.bindings.map((b) => [b.name, b]));
     const math = byName.get('Math');

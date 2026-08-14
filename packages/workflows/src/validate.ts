@@ -64,9 +64,6 @@ export interface ValidateWorkflowOptions {
   cwd?: string;
   /** false => static parse only, no dry run. Default true. */
   dryRun?: boolean;
-  /** Set budget.total for the dry run so budget-guarded paths execute. The mock runner
-   *  reports 1000 tokens per agent call. */
-  tokenBudget?: number;
   /** Cap on dry-run agent calls (defaults to the engine's own cap). */
   maxAgents?: number;
   /** Dry-run wall-clock limit. Default 30_000 ms. */
@@ -754,8 +751,7 @@ interface MockRunOptions {
   onUsage?: (usage: AgentUsage) => void;
 }
 
-/** Tokens the mock runner reports per agent call, so `--token-budget` exercises
- *  budget-guarded script paths deterministically. */
+/** Tokens the mock runner reports per agent call (the dry-run token accounting). */
 export const MOCK_TOKENS_PER_AGENT = 1000;
 
 /** Maximum advertised model count for client-side ordered thought-domain enumeration.
@@ -1440,7 +1436,6 @@ export async function validateWorkflowScript(
     const run = await manager.runSync(script, options.args, {
       journaling: false,
       signal: controller.signal,
-      tokenBudget: options.tokenBudget,
       maxAgents: options.maxAgents,
       scriptBackends: declaredBackends,
       confirm: async (promptText: string, checkpointOptions: unknown) => {

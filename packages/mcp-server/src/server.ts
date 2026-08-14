@@ -113,8 +113,9 @@ export const SERVER_INSTRUCTIONS = [
     "for it when the orchestration is known up front and you want it repeatable and resumable. The " +
     "user-invocable author-workflow prompt helps write scripts.",
   "• repl — INTERACTIVE STATEFUL orchestration. A persistent per-project JavaScript VM you drive " +
-    "incrementally with action:\"eval\"; bindings, pending subagents, checkpoints, and logged $N " +
-    "values persist in the VM between calls and survive daemon restarts. Reach for it when you want " +
+    "incrementally with action:\"eval\"; named bindings, pending subagent calls, raised checkpoints, " +
+    "and `_` (the previous eval's completion value) persist between calls and survive daemon restarts. " +
+    "Console logging produces output text only and creates no persistent value. Reach for it when you want " +
     "to inspect intermediate results and decide the next step adaptively, or keep a human in the " +
     "loop via checkpoint().",
   "Rule of thumb: use workflow when you can script the whole plan ahead of time; use repl when you " +
@@ -1772,7 +1773,6 @@ export function createWorkflowServer(
           concurrency: input.concurrency,
           agentRetries: input.agentRetries,
           agentTimeoutMs: input.agentTimeoutMs,
-          tokenBudget: input.tokenBudget,
           resumeFromRunId: input.resumeFromRunId,
           resumePolicy: input.resumePolicy,
           checkpointReplies: input.checkpointReplies,

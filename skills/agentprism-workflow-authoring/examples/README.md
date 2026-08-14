@@ -7,8 +7,8 @@ worked examples aren't enough. The first two are **verbatim copies** of the runn
 
 | script | what it teaches |
 |---|---|
-| [`repo-triage.workflow.js`](repo-triage.workflow.js) | The broadest support-API tour, autonomous end-to-end (no `checkpoint()` — every gate is another agent): `pipeline` with no inter-stage barrier, a cross-vendor adversarial verification panel (`parallel`), `gate()` where the writer and reviewer are always *different* vendors and the terminal review verdict is returned, nesting a saved workflow by name (`workflow("quick-wins", …)`), `completenessCheck()`, budget headroom reservation before an optional stage, string-form `args` hardening, path guards on schema outputs, the unverified-vs-confirmed bucket split, and rethrowing pause-class errors (`PROVIDER_USAGE_LIMIT` / `AUTH_REQUIRED`) out of `try/catch` so managed runs pause resumably instead of fake-completing. |
-| [`quick-wins.workflow.js`](quick-wins.workflow.js) | A small nested-or-standalone hunter: `loopUntilDry()` with a per-round vendor rotation, dedup threading via a `seen` list interpolated into each prompt, and a budget floor check inside the round (reads the *parent* run's shared budget when nested). |
+| [`repo-triage.workflow.js`](repo-triage.workflow.js) | The broadest support-API tour, autonomous end-to-end (no `checkpoint()` — every gate is another agent): `pipeline` with no inter-stage barrier, a cross-vendor adversarial verification panel (`parallel`), `gate()` where the writer and reviewer are always *different* vendors and the terminal review verdict is returned, nesting a saved workflow by name (`workflow("quick-wins", …)`), `completenessCheck()`, stage gating before an optional stage, string-form `args` hardening, path guards on schema outputs, the unverified-vs-confirmed bucket split, and rethrowing pause-class errors (`PROVIDER_USAGE_LIMIT` / `AUTH_REQUIRED`) out of `try/catch` so managed runs pause resumably instead of fake-completing. |
+| [`quick-wins.workflow.js`](quick-wins.workflow.js) | A small nested-or-standalone hunter: `loopUntilDry()` with a per-round vendor rotation, dedup threading via a `seen` list interpolated into each prompt, and a tracked round bound inside the round. |
 | [`resume-loop-cap.workflow.js`](resume-loop-cap.workflow.js) | Content-addressed journal replay: run with `maxRounds: 6`, then resume with `maxRounds: 8` so identity matching serves the six unchanged calls from the recording for zero tokens and only two new calls run live. No filesystem-safety annotation is needed. |
 
 `resume-loop-cap.workflow.js` defaults to eight rounds and therefore validates successfully without args. Its six-round failure is intentional: call the MCP `workflow` tool with `args: { "maxRounds": 6 }`, then repeat the script with `args: { "maxRounds": 8 }` and the returned `runId` as `resumeFromRunId`. Identity matching pairs each call by its content (prompt, model, options, input fingerprint), so keep the cap out of the agent prompt — a changed prompt is a changed identity and that round runs live. Filesystem/world drift is diagnostic only and does not force the unchanged rounds live.
@@ -65,8 +65,7 @@ script does not call MCP actions itself):
 {
   "script": "<contents of repo-triage.workflow.js>",
   "args": { "target": "." },
-  "background": true,
-  "tokenBudget": 500000
+  "background": true
 }
 ```
 

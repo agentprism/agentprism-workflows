@@ -309,7 +309,7 @@ describe("isolation preflight", () => {
 });
 
 describe("replay runner", () => {
-  it("serves exact and unique-path outcomes clone-fresh with provenance and budget ordinals", async () => {
+  it("serves exact and unique-path outcomes clone-fresh with provenance", async () => {
     const source = recording();
     source.calls = [resultRow({ label: "held" }), resultRow({ index: 1, hash: "target-hash", path: "2:1", label: "target", settlementOrdinal: 2 })];
     source.callsAllocated = 2;
@@ -320,7 +320,6 @@ describe("replay runner", () => {
     ];
     const runner = replay(source, { live: [{ callIndex: 1, model: "candidate" }] });
     const provenances: unknown[] = [];
-    const ordinals: number[] = [];
     const options = {
       callIndex: 0,
       callHash: "different-live-hash",
@@ -328,13 +327,11 @@ describe("replay runner", () => {
       callInputsHash: "anything",
       runId: "isolation-run",
       onResultProvenance: (value: unknown) => provenances.push(value),
-      onBudgetReplay: (value: { settlementOrdinal: number }) => ordinals.push(value.settlementOrdinal),
     } as RunOptions;
     const first = (await runner.run("changed", options)) as unknown as { nested: { value: number } };
     first.nested.value = 99;
     const second = (await runner.run("changed", options)) as unknown as { nested: { value: number } };
     assert.equal(second.nested.value, 1);
-    assert.deepEqual(ordinals, [1, 1]);
     assert.deepEqual(provenances, [
       { source: "replay", recordedRunId: "baseline-run", recordedIndex: 0, hashMatched: false },
       { source: "replay", recordedRunId: "baseline-run", recordedIndex: 0, hashMatched: false },
@@ -544,41 +541,13 @@ describe("replay runner", () => {
 });
 
 describe("runIsolation harness", () => {
-  it("pre-applies lower settlement ordinals once before a faster higher-ordinal call is exposed", async () => {
-    const result = await runWorkflow<{ values: number[] }>(
-      `export const meta = { name: 'budget-cursor', description: 'parallel replay' }
-const values = await parallel([
-  async () => { await agent('higher', { label: 'higher' }); return budget.spent() },
-  async () => { await agent('lower', { label: 'lower' }); return budget.spent() },
-])
-return { values }`,
-      {
-        runId: "budget-cursor-run",
-        persistLogs: false,
-        budgetReplay: { trajectory: [{ ordinal: 1, debit: 3 }, { ordinal: 2, debit: 5 }] },
-        agent: {
-          async run(prompt, options) {
-            options?.onUsage?.(usage(99));
-            options?.onBudgetReplay?.({ settlementOrdinal: prompt === "higher" ? 2 : 1 });
-            if (prompt === "lower") await new Promise((resolve) => setTimeout(resolve, 5));
-            return prompt;
-          },
-        },
-      },
-    );
-    assert.deepEqual(result.result.values, [8, 8]);
-    assert.equal(result.calls?.[0].budgetDebit, 99);
-    assert.equal(result.calls?.[1].budgetDebit, 99);
-  });
-
-  it("records, isolates, persists quarantine/provenance/report, and replays budget debits", async () => {
+  it("records, isolates, persists quarantine/provenance/report, and per-call token debits (the deleted budget's recording survives as a metric)", async () => {
     const root = mkdtempSync(join(tmpdir(), "isolation-harness-"));
     const cwd = mkdtempSync(join(tmpdir(), "isolation-cwd-"));
     const script = `export const meta = { name: 'harness', description: 'integration' }
 const first = await agent('first', { label: 'first', model: 'baseline/model' })
-const afterFirst = budget.spent()
 const target = await agent('target:' + first, { label: 'target', model: 'baseline/model' })
-return { first, target, afterFirst, finalSpent: budget.spent() }`;
+return { first, target }`;
     const baselineRunner: AgentRunner = {
       async run(prompt, options) {
         options?.onModelResolved?.("baseline/concrete");
@@ -596,7 +565,6 @@ return { first, target, afterFirst, finalSpent: budget.spent() }`;
       const baseline = await manager.runSync(script, undefined, {
         runId: "baseline-harness",
         maxAgents: 10,
-        tokenBudget: 100,
         concurrency: 1,
         agentRetries: 0,
         agentTimeoutMs: null,
@@ -606,7 +574,7 @@ return { first, target, afterFirst, finalSpent: budget.spent() }`;
       const target = baseline.calls?.find((row) => row.label === "target");
       assert.ok(target);
       let liveCalls = 0;
-      const isolated = await runIsolation<{ afterFirst: number; finalSpent: number }>({
+      const isolated = await runIsolation<{ first: unknown; target: unknown }>({
         baselineRunId: "baseline-harness",
         cwd,
         persistenceRoot: root,
@@ -623,8 +591,8 @@ return { first, target, afterFirst, finalSpent: budget.spent() }`;
       });
       assert.equal(isolated.status, "completed");
       assert.equal(liveCalls, 1);
-      assert.equal(isolated.run?.result.afterFirst, 5);
-      assert.equal(isolated.run?.result.finalSpent, 12);
+      assert.equal(isolated.run?.result.first, "held");
+      assert.equal(isolated.run?.result.target, "candidate-target");
       assert.equal(isolated.report.calls.find((row) => row.mode === "live-target")?.liveUsage?.total, 99);
       const artifact = createRunPersistence(cwd, undefined, { persistenceRoot: root }).load(
         isolated.report.isolationRunId,

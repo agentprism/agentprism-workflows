@@ -32,7 +32,6 @@ test(
       const baseline = await manager.runSync(SCRIPT, undefined, {
         runId: "isolation-live-baseline",
         maxAgents: 10,
-        tokenBudget: null,
         concurrency: 1,
         agentRetries: 0,
         agentTimeoutMs: null,

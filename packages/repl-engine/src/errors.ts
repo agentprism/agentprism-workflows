@@ -44,6 +44,19 @@ export interface EvalErrorInfo {
   /** Guest stack trace when it is available as an own data property. */
   stack?: string;
   /**
+   * The repl call id of the subagent call this error came from, when the
+   * guest library attached it (the §4.6 error attribution: an uncaught
+   * error from a rejected agent/steer call names the call). Own data
+   * string only — guest-forgeable like the message itself.
+   */
+  replCallId?: string;
+  /**
+   * The RESOLVED backend of the subagent call this error came from,
+   * when the host stamped it onto the rejection value (the §4.6
+   * attribution's second half).
+   */
+  replBackend?: string;
+  /**
    * True when the per-eval `interruptHandler` fired, aborting execution
    * with quickjs's `InternalError: interrupted` (or the drain threw the
    * same as a job error). This is how `interrupt` breaks runaway evals.
@@ -64,11 +77,19 @@ export interface EvalErrorInfo {
  * else is guest-authored, so classification matches the exact built-in
  * message strings and nothing fuzzier.
  */
-export function classifyError(name: string, message: string, stack?: string): EvalErrorInfo {
+export function classifyError(
+  name: string,
+  message: string,
+  stack?: string,
+  replCallId?: string,
+  replBackend?: string,
+): EvalErrorInfo {
   return {
     name,
     message,
     stack,
+    ...(replCallId !== undefined ? { replCallId } : {}),
+    ...(replBackend !== undefined ? { replBackend } : {}),
     interrupted: name === 'InternalError' && message === 'interrupted',
     outOfMemory: name === 'InternalError' && message === 'out of memory',
   };

@@ -217,7 +217,7 @@ return { a, c }`,
     assert.equal(engineRows[0].aborted, true);
   });
 
-  it("returns all five effective limits and exact provider/estimate budget debits", async () => {
+  it("returns the effective limits (tokenBudget pinned null — the budget is deleted) and exact provider/estimate budget debits", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "manifest-cwd-"));
     try {
       let call = 0;
@@ -238,7 +238,6 @@ return [a, b]`,
             },
           },
           maxAgents: 7,
-          tokenBudget: 99,
           concurrency: 3,
           agentRetries: 99,
           agentTimeoutMs: 123,
@@ -247,7 +246,7 @@ return [a, b]`,
       );
       assert.deepEqual(result.effectiveLimits, {
         maxAgents: 7,
-        tokenBudget: 99,
+        tokenBudget: null,
         concurrency: 3,
         agentRetries: 3,
         agentTimeoutMs: 123,

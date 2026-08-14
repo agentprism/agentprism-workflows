@@ -58,6 +58,10 @@ export {
   HOST_CHECKPOINT,
   HOST_CONSOLE,
   HOST_STEER,
+  HOST_SLEEP,
+  HOST_WORKSPACE,
+  HOST_AGENTS,
+  HOST_RESET,
 } from './guest/guest-library.js';
 export {
   installGuestBridge,
@@ -74,11 +78,7 @@ export {
   type RealmSlot,
 } from './bridge.js';
 export {
-  renderPreviewLine,
   renderCollapsed,
-  renderRefLine,
-  renderGlobalLine,
-  previewGlobal,
   inspectGlobal,
   manifestBinding,
   formatByteSize,
@@ -95,17 +95,21 @@ export {
   PROPERTY_STRING_TAIL_CHARS,
   MAX_ERROR_MESSAGE_CHARS,
   MAX_STRING_PREVIEW_CHARS,
-  EMISSION_STRING_MAX_CHARS,
   STRING_HEAD_CHARS,
   STRING_TAIL_CHARS,
   MAX_COLLAPSED_CHARS,
+  REPR_MAX_DEPTH,
+  REPR_MAX_ENTRIES,
+  REPR_NESTED_STRING_CHARS,
   type PreviewType,
   type PreviewSubtype,
   type PropertyPreviewKind,
   type PropertyPreview,
   type ObjectPreview,
 } from './preview.js';
-export { applyOutputCaps, capFinalText, OUTPUT_MAX_LINES, OUTPUT_MAX_BYTES, type OutputCapResult } from './caps.js';
+// The output-cap apparatus (applyOutputCaps / capFinalText / the caps
+// constants) was deleted with the eval-plane redesign's §7 budget sweep —
+// the engine applies NO caps to guest output.
 
 // Phase F review round 2: the out-of-band eval-break channel (the
 // interrupt tool's no-id path deliverable to a synchronously running

@@ -80,6 +80,19 @@ function mockBridge(): MockBridge {
       console: (event) => {
         bridge.events.push(event);
       },
+      sleep: (call, ms) => {
+        setTimeout(() => {
+          try {
+            call.resolve(undefined);
+          } catch {
+            // vm disposed mid-sleep — nothing to settle.
+          }
+        }, ms);
+      },
+      workspace: () => '{}',
+      agents: () => '[]',
+      reset: () => undefined,
+      defaultBackend: () => 'claude',
     },
     events: [],
     agentCalls: [],
@@ -141,12 +154,8 @@ async function installGuestLibraryAtVersion(
       (args) => {
         const level = args[0];
         const payload = args[1] !== null ? JSON.parse(args[1]) : null;
-        if (level !== null && payload !== null) {
-          bridge.events.push({
-            level: level as ConsoleLevel,
-            refs: payload.refs as string[],
-            args: payload.args as unknown[],
-          });
+        if (level !== null && payload !== null && typeof payload.line === 'string') {
+          bridge.events.push({ level: level as ConsoleLevel, line: payload.line as string });
         }
         return undefined;
       },
@@ -184,6 +193,8 @@ test('install: the doc-mandated globals exist; phase() and the budget surface ar
       parallel: typeof parallel, pipeline: typeof pipeline, verify: typeof verify,
       judgePanel: typeof judgePanel, gate: typeof gate, retry: typeof retry,
       loopUntilDry: typeof loopUntilDry,
+      sleep: typeof sleep, workspace: typeof workspace, agents: typeof agents,
+      reset: typeof reset, underscore: typeof _,
       phase: typeof phase, budget: typeof budget,
       hostBudget: typeof globalThis.__host_budget,
       marker: globalThis[Symbol.for(${JSON.stringify(GUEST_SURFACE_KEY)})] !== undefined,
@@ -197,6 +208,11 @@ test('install: the doc-mandated globals exist; phase() and the budget surface ar
     console: 'object',
     log: 'function',
     parallel: 'function',
+    sleep: 'function',
+    workspace: 'function',
+    agents: 'function',
+    reset: 'function',
+    underscore: 'undefined',
     pipeline: 'function',
     verify: 'function',
     judgePanel: 'function',
@@ -225,15 +241,16 @@ test('install: the doc-mandated globals exist; phase() and the budget surface ar
 
 test('install is idempotent: re-evaluating the library never wipes state or counters', async () => {
   const { vm } = await createGuest();
-  value(await vm.evalCode('console.log("first"); "done"'));
+  value(await vm.evalCode('agent("pi/x", "first"); "done"'));
   // The library guards itself: re-evaluation is a no-op.
   const outcome = await vm.evalCode(buildGuestLibrarySource());
   assert.equal(outcome.kind, 'value');
-  value(await vm.evalCode('console.log("second"); "done"'));
+  value(await vm.evalCode('agent("pi/x", "second"); "done"'));
   assert.equal(value(await vm.evalCode('typeof agent')), 'function');
-  // The $N counter kept counting across the re-evaluation.
+  // The call-id counter kept counting across the re-evaluation.
   const stats = readGuestSurface(vm)!;
-  assert.equal(stats.stats().logSeq, 2);
+  assert.equal(stats.stats().callSeq, 2);
+  assert.equal(stats.stats().pendingCalls, 2);
   // installGuestBridge over an installed workspace is a no-op too.
   await installGuestBridge(vm, mockBridge().handlers);
   assert.equal(value(await vm.evalCode('1 + 1')), 2);
@@ -264,14 +281,116 @@ test('agent() round trip: the mocked host receives modelSpec + task and its resu
   vm.dispose();
 });
 
-test('agent() options cross the bridge as JSON (schema, cwd, backend config)', async () => {
+test('agent() options cross the bridge as JSON (schema, cwd, configOptions, mode)', async () => {
   const { vm, bridge } = await createGuest();
-  const options = { schema: { type: 'object', required: ['x'] }, cwd: '/tmp', backend: { model: 'm' } };
+  const options = {
+    schema: { type: 'object', required: ['x'] },
+    cwd: '/tmp',
+    configOptions: { thinkingLevel: 'high' },
+    mode: 'read-only',
+  };
   bridge.script.push({ resolveWith: { x: 1 } });
   const result = value(await vm.evalCode(`await agent("pi/default", "p", ${JSON.stringify(options)})`));
   assert.deepEqual(result, { x: 1 });
   const parsed = JSON.parse(bridge.agentCalls[0].optionsJson!);
   assert.deepEqual(parsed, options);
+  vm.dispose();
+});
+
+test('agent() preserves unknown option keys with non-JSON-representable values for host validation', async () => {
+  const { vm, bridge } = await createGuest();
+  const rejection = {
+    rejectWith: {
+      message: 'agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
+      code: 'SCRIPT_VALIDATION_ERROR',
+      recoverable: false,
+      replBackend: 'pi',
+    },
+  };
+  bridge.script.push(rejection, rejection, rejection, rejection);
+  const values = ['undefined', 'function () {}', 'Symbol("s")', '10n'];
+  for (const optionValue of values) {
+    const message = value(
+      await vm.evalCode(
+        `await agent("pi/x", "task", { bogus: ${optionValue} }).then(() => "accepted", (err) => err.code + "|" + err.message)`,
+      ),
+    );
+    assert.equal(
+      message,
+      'SCRIPT_VALIDATION_ERROR|agent options: unknown option "bogus" (valid options: schema, cwd, configOptions, mode)',
+    );
+  }
+  assert.equal(bridge.agentCalls.length, 4);
+  assert.deepEqual(
+    bridge.agentCalls.map((call) => call.optionsJson),
+    ['{"bogus":null}', '{"bogus":null}', '{"bogus":null}', '{"bogus":null}'],
+    'every present unknown key survives the JSON bridge regardless of its value',
+  );
+  assert.equal(readGuestSurface(vm)!.stats().pendingCalls, 0, 'the synchronous host refusal settled the registry');
+  vm.dispose();
+});
+
+test('agent() omits undefined known options while still dispatching the call', async () => {
+  const { vm, bridge } = await createGuest();
+  const options = [
+    '{ schema: undefined }',
+    '{ cwd: undefined }',
+    '{ configOptions: undefined }',
+    '{ mode: undefined }',
+    '{ cwd: "/tmp", schema: undefined }',
+    '{ configOptions: { thinkingLevel: undefined } }',
+  ];
+  bridge.script.push(...options.map(() => ({ resolveWith: 'accepted' })));
+  for (const option of options) {
+    assert.equal(
+      value(await vm.evalCode(`await agent("pi/x", "task", ${option})`)),
+      'accepted',
+      `${option} dispatches`,
+    );
+  }
+  assert.deepEqual(
+    bridge.agentCalls.map((call) => call.optionsJson),
+    ['{}', '{}', '{}', '{}', '{"cwd":"/tmp"}', '{"configOptions":{}}'],
+    'known undefined values retain ordinary JSON omission semantics at every depth',
+  );
+  vm.dispose();
+});
+
+test('handle options omit undefined promptMeta but preserve undefined unknown keys for host validation', async () => {
+  const { vm, bridge } = await createGuest();
+  bridge.script.push(
+    { resolveWith: 'initial result' },
+    { resolveWith: 'follow-up result' },
+    {
+      rejectWith: {
+        message: 'steer options: unknown option "bogus"',
+        code: 'SCRIPT_VALIDATION_ERROR',
+        recoverable: false,
+        replBackend: 'pi',
+      },
+    },
+  );
+  const result = value(
+    await vm.evalCode(`
+      const h = agent("pi/x", "task");
+      const accepted = await h.followUp("next", { promptMeta: undefined });
+      const rejected = await h.steer("redirect", { bogus: undefined })
+        .then(() => "accepted", (err) => err.code + "|" + err.message);
+      ({ accepted, rejected })
+    `),
+  );
+  assert.deepEqual(result, {
+    accepted: 'follow-up result',
+    rejected: 'SCRIPT_VALIDATION_ERROR|steer options: unknown option "bogus"',
+  });
+  assert.deepEqual(
+    bridge.steerCalls.map((call) => call.payloadJson === null ? null : JSON.parse(call.payloadJson)),
+    [
+      { prompt: 'next', options: {} },
+      { prompt: 'redirect', options: { bogus: null } },
+    ],
+    'known undefined steer options are omitted while unknown keys survive the JSON bridge',
+  );
   vm.dispose();
 });
 
@@ -444,7 +563,7 @@ test('parallel: runs thunks concurrently, resolves in input order, recoverable f
   const out = value(await vm.evalCode('await parallel([() => agent("pi/x", "a"), () => agent("pi/x", "b"), () => agent("pi/x", "c")])'));
   assert.deepEqual(out, ['a', null, 'c']);
   // The swallowed failure was reported through console.warn (the bridge).
-  assert.ok(bridge.events.some((e) => e.level === 'warn' && e.args.some((a) => typeof a === 'string' && a.includes('parallel[1] failed: boom'))));
+  assert.ok(bridge.events.some((e) => e.level === 'warn' && e.line.includes('parallel[1] failed: boom')));
   vm.dispose();
 });
 
@@ -635,18 +754,20 @@ test('verify: reviewers vote; passes when the real-share meets threshold', async
     ],
   });
   // Reviewers were spawned as schema-carrying agent calls, all routed
-  // through the reserved "default" sentinel (host policy routes it to its
-  // configured default backend). The DSL options are exactly
-  // { reviewers, threshold, lens } — there is no per-call model option
-  // (an invented opts.model was removed in review; dsl.d.ts's verify lets
-  // reviewers inherit the run's default model).
+  // through the HOST's configured default backend id (served by
+  // '__host_default_backend' — a real registered segment; the v1
+  // reserved 'default' sentinel that bypassed registry validation is
+  // deleted). The DSL options are exactly { reviewers, threshold, lens }
+  // — there is no per-call model option (an invented opts.model was
+  // removed in review; dsl.d.ts's verify lets reviewers inherit the
+  // run's default model).
   assert.equal(bridge.agentCalls.length, 3);
   for (const call of bridge.agentCalls) {
     const options = JSON.parse(call.optionsJson!);
     assert.equal(options.schema.type, 'object');
     assert.ok(call.task.includes('claim'));
   }
-  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'default'), 'reviewers route through the default sentinel');
+  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'claude'), 'reviewers route through the host default backend id');
   vm.dispose();
 });
 
@@ -681,9 +802,10 @@ test('judgePanel: highest mean score wins; stable tie-break by index', async () 
   assert.ok(Math.abs(out.score - 0.7) < 1e-9);
   assert.equal(out.judgments.length, 2);
   // Judge prompts carried the rubric, and the graders all routed through
-  // the "default" sentinel (no opts.model in the DSL's { judges, rubric }).
+  // the host's configured default backend id (no opts.model in the DSL's
+  // { judges, rubric } — the reserved 'default' sentinel is deleted).
   assert.ok(bridge.agentCalls.some((c) => c.task.includes('quality')));
-  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'default'), 'graders route through the default sentinel');
+  assert.ok(bridge.agentCalls.every((c) => c.modelSpec === 'claude'), 'graders route through the host default backend id');
   vm.dispose();
 });
 
@@ -691,55 +813,117 @@ test('judgePanel: highest mean score wins; stable tie-break by index', async () 
 // The console bridge and $N freezing
 // ────────────────────────────────────────────────────────────────────────
 
-test('console.log freezes arguments into $N: mutation after the log does not change the store', async () => {
-  const { vm } = await createGuest();
-  value(
-    await vm.evalCode(`
-      const x = { a: 1, nested: { b: [1, 2, 3] } };
-      console.log(x);
-      x.a = 999;
-      x.nested.b.push(4);
-      const y = [1, 2];
-      console.log(y);
-      y[0] = 'changed';
-      'done'
-    `),
-  );
-  assert.deepEqual(value(await vm.evalCode('$1')), { a: 1, nested: { b: [1, 2, 3] } });
-  assert.deepEqual(value(await vm.evalCode('$2')), [1, 2]);
+test('§4.4: console.log renders ONE joined line per call — args joined with a single space; direct strings print whole', async () => {
+  const { vm, bridge } = await createGuest();
+  value(await vm.evalCode('console.log("a", "b", "c"); "done"'));
+  assert.equal(bridge.events.length, 1);
+  assert.equal(bridge.events[0].level, 'log');
+  assert.equal(bridge.events[0].line, 'a b c');
+  // A directly logged long string prints WHOLE — no upper bound (the
+  // Python posture). The length EXCEEDS the deleted 49 488-char
+  // emission budget: reintroducing the cap would clip this string, so
+  // the assertion is a real over-threshold probe.
+  const long = 'x'.repeat(60_000);
+  value(await vm.evalCode(`console.log(${JSON.stringify(long)}); "done"`));
+  assert.equal(bridge.events[1].line, long);
   vm.dispose();
 });
 
-test('$N freezing is immune to structuredClone pollution (native clone captured at installation)', async () => {
-  // Review regression: freezeValue consulted globalThis.structuredClone at
-  // USE time, so a guest that replaced the global with an aliasing
-  // function (structuredClone = v => v) made $N hold LIVE references —
-  // mutation after the log changed the frozen store. The library captures
-  // the extension's native function at installation (before any guest
-  // code can run), so the replacement is ignored and the freeze is a
-  // faithful copy.
-  const { vm } = await createGuest();
-  value(await vm.evalCode(`
-    globalThis.structuredClone = (v) => v; // alias instead of copy
-    "polluted"
-  `));
-  value(await vm.evalCode(`
-    const x = { a: 1, nested: { b: [1, 2] } };
-    console.log(x);
-    x.a = 999;
-    x.nested.b.push(3);
-    "done"
-  `));
-  assert.deepEqual(value(await vm.evalCode('$1')), { a: 1, nested: { b: [1, 2] } });
-  // The store holds a copy, not the original object (the sabotage would
-  // alias the ORIGINAL — mutating it after the log must not move $N).
-  value(await vm.evalCode(`
-    const original = { k: 'v' };
-    console.log(original);
-    original.k = 'changed';
-    "done"
-  `));
-  assert.deepEqual(value(await vm.evalCode('$2')), { k: 'v' });
+test('§4.4: objects/arrays render to depth 2; deeper levels render as {…}/[…]', async () => {
+  const { vm, bridge } = await createGuest();
+  value(
+    await vm.evalCode(`
+      console.log({ a: 1, nested: { b: { c: 2 } }, arr: [1, [2, [3]]] });
+      "done"
+    `),
+  );
+  assert.equal(bridge.events[0].line, '{a: 1, nested: {b: {…}}, arr: [1, […]]}');
+  // Depth 2 means levels 0 and 1 expand; the level-2 values collapse.
+  value(await vm.evalCode('console.log([[1, 2], { x: { y: "deep" } }]); "done"'));
+  assert.equal(bridge.events[1].line, "[[1, 2], {x: {…}}]");
+  vm.dispose();
+});
+
+test('§4.4: collections render their first 20 entries per level, then … +N more', async () => {
+  const { vm, bridge } = await createGuest();
+  value(
+    await vm.evalCode(`
+      console.log(Array.from({ length: 25 }, (_, i) => i));
+      const o = {}; for (let i = 0; i < 23; i++) o['k' + i] = i;
+      console.log(o);
+      "done"
+    `),
+  );
+  assert.equal(bridge.events[0].line, '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, … +5 more]');
+  assert.match(bridge.events[1].line, /^\{k0: 0, k1: 1, /);
+  assert.ok(bridge.events[1].line.endsWith('… +3 more}'));
+  vm.dispose();
+});
+
+test('§4.4: nested strings (inside a collection) render head-limited at 200 chars, quoted', async () => {
+  const { vm, bridge } = await createGuest();
+  const long = 'y'.repeat(500);
+  value(await vm.evalCode(`console.log({ long: ${JSON.stringify(long)}, short: 'hi', list: [${JSON.stringify(long)}] }); "done"`));
+  const line = bridge.events[0].line;
+  assert.ok(line.includes(`long: '${'y'.repeat(200)}…'`), line);
+  assert.ok(line.includes("short: 'hi'"), line);
+  assert.ok(line.includes(`['${'y'.repeat(200)}…'`), line);
+  const belowLimitEmoji = '😀'.repeat(150);
+  value(await vm.evalCode(`console.log({ emoji: ${JSON.stringify(belowLimitEmoji)} }); "done"`));
+  assert.equal(
+    bridge.events[1].line,
+    `{emoji: '${belowLimitEmoji}'}`,
+    '150 Unicode characters are below the 200-character bound even though they occupy 300 UTF-16 units',
+  );
+  const aboveLimitEmoji = '😀'.repeat(250);
+  value(await vm.evalCode(`console.log({ emoji: ${JSON.stringify(aboveLimitEmoji)} }); "done"`));
+  assert.equal(bridge.events[2].line, `{emoji: '${'😀'.repeat(200)}…'}`);
+  vm.dispose();
+});
+
+test('§4.4: primitives, brands and hostile values render predictably; console.* NEVER throws', async () => {
+  const { vm, bridge } = await createGuest();
+  value(
+    await vm.evalCode(`
+      console.log(undefined, null, true, 42, -0, NaN, Infinity, 123n, Symbol('s'));
+      console.log(new Date(0), /ab+c/gi, new Map(), new Set(), new WeakMap(), new WeakSet(), new ArrayBuffer(8), new Error('boom'));
+      console.warn("warned"); console.error("errored"); console.info("infoed"); console.debug("debugged");
+      "done"
+    `),
+  );
+  assert.equal(bridge.events[0].line, 'undefined null true 42 -0 NaN Infinity 123n Symbol');
+  assert.equal(bridge.events[1].line, 'Date RegExp Map Set WeakMap WeakSet ArrayBuffer Error: boom');
+  assert.deepEqual(bridge.events.slice(2).map((e) => [e.level, e.line]), [
+    ['warn', 'warned'],
+    ['error', 'errored'],
+    ['info', 'infoed'],
+    ['debug', 'debugged'],
+  ]);
+  // A revoked proxy degrades to a marker — console never throws.
+  const out = value(
+    await vm.evalCode(`
+      const { proxy, revoke } = Proxy.revocable({}, {});
+      revoke();
+      let threw = false;
+      try { console.log(proxy, { ok: 1 }); } catch (e) { threw = true; }
+      threw
+    `),
+  );
+  assert.equal(out, false);
+  vm.dispose();
+});
+
+test('§4.4: cycles and shared refs collapse to {…}/[…] instead of recursing forever', async () => {
+  const { vm, bridge } = await createGuest();
+  value(
+    await vm.evalCode(`
+      const o = { name: 'ring' }; o.self = o;
+      const a = [1]; a.push(a);
+      console.log(o, a);
+      "done"
+    `),
+  );
+  assert.equal(bridge.events[0].line, "{name: 'ring', self: {…}} [1, […]]");
   vm.dispose();
 });
 
@@ -756,160 +940,87 @@ test('console.* and pipeline are immune to Array.prototype.slice / Function.prot
     Function.prototype.call = () => { throw new Error('sabotaged call'); };
     "polluted"
   `));
-  // console.log still bridges every argument, complete with refs and args.
+  // console.log still bridges its one joined line.
   value(await vm.evalCode('console.log("a", 42, { k: 1 }); "done"'));
   assert.equal(bridge.events.length, 1);
-  assert.deepEqual(bridge.events[0].refs, ['$1', '$2', '$3']);
-  assert.deepEqual(bridge.events[0].args, ['a', 42, { k: 1 }]);
+  assert.equal(bridge.events[0].line, 'a 42 {k: 1}');
   // pipeline still gathers its stage list under the same pollution.
   const out = value(await vm.evalCode('await pipeline([1, 2], (x) => x * 10, (x) => x + 1)'));
   assert.deepEqual(out, [11, 21]);
   vm.dispose();
 });
 
-test('the $N store is the agent workspace: slots are writable, deletable, transformable', async () => {
+test('sleep(ms) is a guest helper settled by a host-side timer (the VM itself stays timer-free)', async () => {
   const { vm } = await createGuest();
-  value(await vm.evalCode('console.log({ v: 1 }); "done"'));
-  assert.equal(value(await vm.evalCode('$1.v = 2; $1.v')), 2);
-  assert.equal(value(await vm.evalCode('delete globalThis.$1; typeof $1')), 'undefined');
+  // The eval suspends on the sleep; the host timer settles it; a later
+  // drain resumes the continuation with the elapsed wall clock.
+  const started = await vm.evalCode('await sleep(30); 42');
+  assert.equal(started.kind, 'pending');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  vm.drainJobs();
+  assert.equal(value(await vm.evalCode('typeof sleep')), 'function');
+  // A second sleep round-trips through the bridge too.
+  const again = await vm.evalCode('await sleep(5); "slept"');
+  assert.equal(again.kind, 'pending');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  vm.drainJobs();
+  assert.equal(value(await vm.evalCode('"still alive"')), 'still alive');
   vm.dispose();
 });
 
-test('the console payload carries refs and best-effort args; every level routes through the bridge', async () => {
-  const { vm, bridge } = await createGuest();
-  value(
-    await vm.evalCode(`
-      console.log("plain", 42);
-      console.warn("careful");
-      console.error("boom");
-      console.info("note");
-      console.debug("detail");
-      "done"
-    `),
+test('sleep validates its argument synchronously', async () => {
+  const { vm } = await createGuest();
+  assert.equal(
+    value(await vm.evalCode('await sleep(-1).then(() => "no", (err) => err.name)')),
+    'TypeError',
   );
-  assert.equal(bridge.events.length, 5);
-  assert.deepEqual(bridge.events.map((e) => e.level), ['log', 'warn', 'error', 'info', 'debug']);
-  assert.deepEqual(bridge.events[0].refs, ['$1', '$2']);
-  assert.deepEqual(bridge.events[0].args, ['plain', 42]);
-  // Long strings are capped in args (the full value lives in $N).
-  value(await vm.evalCode(`console.log(${JSON.stringify('x'.repeat(5000))}); "done"`));
-  const last = bridge.events[5];
-  assert.equal(typeof last.args[0], 'string');
-  assert.ok(last.args[0].length < 5000);
-  assert.match(last.args[0] as string, /full value in \$N/);
+  assert.equal(
+    value(await vm.evalCode('await sleep("x").then(() => "no", (err) => err.name)')),
+    'TypeError',
+  );
   vm.dispose();
 });
 
-test('nested weak collections keep typed markers in $N (recursive uncloneable detection)', async () => {
-  // Review regression: isUncloneable only checked the logged ROOT, so a
-  // WeakMap/WeakSet/WeakRef nested anywhere in the graph reached the
-  // structured-clone extension, which silently normalized it to an empty
-  // plain object — $N was not a faithful frozen copy (a WeakMap read as
-  // a deleted property). The pre-flight now scans the whole reachable
-  // graph; every nested weak collection becomes a typed marker.
-  const { vm } = await createGuest();
-  value(
-    await vm.evalCode(`
-      const wm = new WeakMap(); const ws = new WeakSet(); const wr = new WeakRef({});
-      console.log({
-        map: wm,
-        list: [ws, { inner: wr }],
-        deep: { deeper: { weakest: wm } },
-        viaMap: new Map([['k', wm]]),
-      });
-      "done"
-    `),
-  );
+test('workspace()/agents() round-trip the host JSON into plain sliceable values; reset() returns nothing meaningful', async () => {
+  const vm = await ReplVm.create();
+  const bridge = mockBridge();
+  bridge.handlers.workspace = () => JSON.stringify({ bindings: [{ name: 'x', type: 'number', sizeBytes: 8, provenance: 'eval 1', task: null }], inFlight: ['c1'], checkpoints: [{ id: 'c2', question: 'why?' }], diagnostics: { reconcile: null, drainError: null, childrenClosed: false } });
+  bridge.handlers.agents = () => JSON.stringify([{ callId: 'c1', modelSpec: 'pi/x', task: 'do it', state: 'running', supportsSteering: true, queuedSteers: 0 }]);
+  await installGuestBridge(vm, bridge.handlers);
   const out = value(
     await vm.evalCode(`
-      const m = (o) => (o && o.__unclonable__) || null;
+      const w = workspace();
+      const a = agents();
       ({
-        map: m(globalThis.$1.map),
-        list0: m(globalThis.$1.list[0]),
-        inner: m(globalThis.$1.list[1].inner),
-        weakest: m(globalThis.$1.deep.deeper.weakest),
-        viaMap: m(globalThis.$1.viaMap.get('k')),
-        mapMarkerKeys: Object.keys(globalThis.$1.map),
+        binding: w.bindings[0].name,
+        inFlight: w.inFlight[0],
+        question: w.checkpoints[0].question,
+        drained: w.diagnostics.childrenClosed,
+        agent: a[0].callId,
+        slice: a.filter((x) => x.state === 'running').length,
+        resetReturn: reset(),
       })
     `),
   );
   assert.deepEqual(out, {
-    map: 'weakmap',
-    list0: 'weakset',
-    inner: 'weakref',
-    weakest: 'weakmap',
-    viaMap: 'weakmap',
-    mapMarkerKeys: ['__unclonable__'],
+    binding: 'x',
+    inFlight: 'c1',
+    question: 'why?',
+    drained: false,
+    agent: 'c1',
+    slice: 1,
+    resetReturn: undefined,
   });
   vm.dispose();
 });
 
-test('console.* never throws: hostile values degrade to typed markers in their own slots', async () => {
+test('rejected registry calls carry replCallId on their Errors (§4.6 attribution)', async () => {
   const { vm, bridge } = await createGuest();
-  value(
-    await vm.evalCode(`
-      console.log(Symbol('s'), function named() {}, new Promise(() => {}), new WeakMap(), new WeakSet());
-      "done"
-    `),
-  );
-  assert.equal(bridge.events.length, 1);
-  assert.equal(bridge.events[0].refs.length, 5);
-  // Symbols/functions/promises became __unclonable__ markers in $N.
-  const kinds = value(
-    await vm.evalCode(`[1, 2, 3, 4, 5].map((n) => globalThis['$' + n].__unclonable__)`),
-  );
-  assert.deepEqual(kinds, ['symbol', 'function', 'promise', 'weakmap', 'weakset']);
-  // A revoked proxy degrades to a marker too — and console never throws.
+  bridge.script.push({ rejectWith: { message: 'boom', replBackend: 'pi' } });
   const out = value(
-    await vm.evalCode(`
-      const { proxy, revoke } = Proxy.revocable({}, {});
-      revoke();
-      let threw = false;
-      try { console.log(proxy, { ok: 1 }); } catch (e) { threw = true; }
-      ({ threw, second: globalThis.$7 })
-    `),
+    await vm.evalCode('await agent("pi/x", "task").then(() => "no", (err) => ({ id: err.replCallId, backend: err.replBackend, message: err.message }))'),
   );
-  assert.equal(out.threw, false);
-  assert.deepEqual(out.second, { ok: 1 });
-  vm.dispose();
-});
-
-test('deeply nested logged values do not crash the VM (iterative fallback, no depth bound)', async () => {
-  const { vm } = await createGuest();
-  value(
-    await vm.evalCode(`
-      let root = {}; let cur = root;
-      for (let i = 0; i < 2000; i++) { cur.next = {}; cur = cur.next; }
-      cur.leaf = 'bottom';
-      console.log(root);
-      "done"
-    `),
-  );
-  // The full 2000-deep structure was frozen into $1 (iterative copy).
-  const depth = value(
-    await vm.evalCode(`
-      let d = 0; let walk = $1;
-      while (walk && typeof walk === 'object' && 'next' in walk) { walk = walk.next; d++; }
-      ({ d, leaf: walk ? walk.leaf : null })
-    `),
-  );
-  assert.equal(depth.d, 2000);
-  assert.equal(depth.leaf, 'bottom');
-  // The VM is fully usable.
-  assert.equal(value(await vm.evalCode('1 + 1')), 2);
-  vm.dispose();
-});
-
-test('console.log of a cyclic value freezes a cycle-preserving copy into $N', async () => {
-  const { vm } = await createGuest();
-  value(
-    await vm.evalCode(`
-      const o = { name: 'ring' }; o.self = o;
-      console.log(o);
-      "done"
-    `),
-  );
-  assert.equal(value(await vm.evalCode('$1.self.self.name')), 'ring');
+  assert.deepEqual(out, { id: 'c1', backend: 'pi', message: 'boom' });
   vm.dispose();
 });
 
@@ -921,7 +1032,7 @@ test('surface.pending() lists parked calls oldest-first with verbatim details', 
   const { vm, bridge } = await createGuest();
   bridge.script.push({}); // park
   value(await vm.evalCode('agent("pi/deepseek-v4-flash-max", "first"); "ok"'));
-  value(await vm.evalCode('agent("codex/gpt-5.6-sol", "second", { label: "l" }); "ok"'));
+  value(await vm.evalCode('agent("codex/gpt-5.6-sol", "second", { mode: "read-only" }); "ok"'));
   value(await vm.evalCode('checkpoint("question?"); "ok"'));
   const surface = readGuestSurface(vm)!;
   assert.equal(surface.version, GUEST_LIBRARY_VERSION);
@@ -930,7 +1041,7 @@ test('surface.pending() lists parked calls oldest-first with verbatim details', 
     pendingList.map((e) => ({ id: e.id, kind: e.kind, detail: e.detail, optionsJson: e.optionsJson, sessionId: e.sessionId, modelSpec: e.modelSpec })),
     [
       { id: 'c1', kind: 'agent', detail: 'first', optionsJson: null, sessionId: 'c1', modelSpec: 'pi/deepseek-v4-flash-max' },
-      { id: 'c2', kind: 'agent', detail: 'second', optionsJson: '{"label":"l"}', sessionId: 'c2', modelSpec: 'codex/gpt-5.6-sol' },
+      { id: 'c2', kind: 'agent', detail: 'second', optionsJson: '{"mode":"read-only"}', sessionId: 'c2', modelSpec: 'codex/gpt-5.6-sol' },
       { id: 'c3', kind: 'checkpoint', detail: 'question?', optionsJson: null, sessionId: 'c3', modelSpec: null },
     ],
   );
@@ -967,7 +1078,6 @@ test('surface.stats() reports the counters; settlement empties the registry', as
   assert.deepEqual(surface.stats(), {
     version: GUEST_LIBRARY_VERSION,
     callSeq: 2,
-    logSeq: 0,
     pendingCalls: 2,
   });
   surface.settle('c1', 'resolve', 1);
@@ -1003,12 +1113,12 @@ test('the surface survives Map.prototype pollution (captured intrinsics)', async
 // snapshots; the host re-registers callbacks by name after restore)
 // ────────────────────────────────────────────────────────────────────────
 
-test('snapshot/restore: state, $N store, pending registry and version marker travel; callbacks re-register by name', async () => {
+test('snapshot/restore: state, pending registry and version marker travel; callbacks re-register by name', async () => {
   const { vm, bridge } = await createGuest();
-  // Park one agent call and one checkpoint; log something; hold state.
+  // Park one agent call and one checkpoint; hold state.
   bridge.script.push({}); // park c1
   value(await vm.evalCode('const findings = [1, 2, 3]; const research = agent("pi/deepseek-v4-flash-max", "deep dive"); "ok"'));
-  value(await vm.evalCode('const q = checkpoint("still there?"); console.log(findings); "ok"'));
+  value(await vm.evalCode('const q = checkpoint("still there?"); "ok"'));
   const snapshot = (getVmShim(vm) as QuickJS).snapshot();
   const surfaceBefore = readGuestSurface(vm)!;
   assert.equal(surfaceBefore.pending().length, 2);
@@ -1026,9 +1136,8 @@ test('snapshot/restore: state, $N store, pending registry and version marker tra
   assert.deepEqual(pendingList.map((e) => e.kind), ['agent', 'checkpoint']);
   assert.equal(pendingList[0].detail, 'deep dive');
   assert.equal(pendingList[0].modelSpec, 'pi/deepseek-v4-flash-max', 'model spec survives for re-issue');
-  // State and the $N store survived.
+  // State survived.
   assert.deepEqual(value(await restored.evalCode('findings')), [1, 2, 3]);
-  assert.deepEqual(value(await restored.evalCode('$1')), [1, 2, 3]);
   // Settle the parked calls (three-way reconciliation: completed while
   // down → settle from the store; here the mock settles both).
   assert.equal(surface.settle('c1', 'resolve', { report: 'done' }), true);
@@ -1041,11 +1150,6 @@ test('snapshot/restore: state, $N store, pending registry and version marker tra
   assert.equal(value(await restored.evalCode('typeof agent')), 'function');
   restoredBridge.script.push({ resolveWith: 'after' });
   assert.equal(value(await restored.evalCode('await agent("pi/x", "next")')), 'after');
-  // $N freezing still works after restore: the captured native
-  // structuredClone travels inside the snapshot like every other value in
-  // the library's closure.
-  value(await restored.evalCode('console.log({ z: 1 }); "ok"'));
-  assert.deepEqual(value(await restored.evalCode('$2')), { z: 1 });
   restored.dispose();
 });
 
@@ -1082,7 +1186,6 @@ test('a host serves a workspace whose resident library is OLDER than the one it 
   assert.deepEqual(surface.stats(), {
     version: '0.0.1',
     callSeq: 0,
-    logSeq: 0,
     pendingCalls: 0,
   });
 
@@ -1094,7 +1197,7 @@ test('a host serves a workspace whose resident library is OLDER than the one it 
   assert.equal(surface.pending().length, 1);
   assert.equal(surface.pending()[0].modelSpec, 'pi/x');
   assert.equal(bridge.events.length, 1);
-  assert.deepEqual(bridge.events[0].refs, ['$1']);
+  assert.deepEqual(bridge.events[0].line, '{a: 1}');
 
   // The current host's install path over the old library is a no-op: the
   // resident (older) copy stays authoritative.
@@ -1390,7 +1493,7 @@ test('5,000 sequential resolved agent calls leave a 2 MiB VM healthy (no handle 
 });
 
 test('unsettled parked calls do not leak either (promise handles are released after return)', async () => {
-  const vm = await ReplVm.create({ memoryLimit: 4 * 1024 * 1024 });
+  const vm = await ReplVm.create({ memoryLimit: 8 * 1024 * 1024 });
   const bridge = mockBridge();
   await installGuestBridge(vm, bridge.handlers);
   // 5,000 parked calls (never settled): each returned promise handle must
@@ -1401,10 +1504,10 @@ test('unsettled parked calls do not leak either (promise handles are released af
   // have an honest footprint of ~2.09 MB — 99.9% of a 2 MiB limit, a
   // knife-edge where any library-source evolution (even comment growth)
   // tipped the GC/malloc interplay into a hard failure at ~725 calls. The
-  // limit is 4 MiB here: the honest footprint (library source + live
-  // registry entries) plateaus near ~3.15 MB under the GC even at 5,000
-  // parked calls, leaving the headroom the round-7 library growth (the
-  // iterable-wrap rewrite and the captured-intrinsic comments) needs —
+  // limit is 8 MiB here: the honest footprint (library source + live
+  // registry entries) grows with the 0.4.0 library (the §4.4 repr, the
+  // eval-plane helpers) and plateaus comfortably under 8 MiB even at
+  // 5,000 parked calls —
   // while the leak class this test pins (an undisposed promise handle
   // plus a marshalled value per call, ~400 B/call) is GC-proof: it adds
   // ~2 MB of PINNED guest memory over 5,000 calls, pushing the plateau to

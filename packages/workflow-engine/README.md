@@ -1,8 +1,8 @@
 # @automatalabs/workflow-engine
 
 The deterministic core that runs a workflow script. It is a **vm-realm script runtime**
-plus a small DSL (`agent()`, `parallel()`, `pipeline()`, …), a resume journal, a token
-budget, and optional git-worktree isolation. It drives subagents **only** through an
+plus a small DSL (`agent()`, `parallel()`, `pipeline()`, …), a resume journal,
+and optional git-worktree isolation. It drives subagents **only** through an
 injected `AgentRunner` seam — it never imports or names a concrete agent backend.
 
 > **Most users want [`@automatalabs/workflows`](../workflows).** That package wires this
@@ -148,7 +148,7 @@ Inside a workflow body these are available as globals (no imports):
   concurrency limiter).
 - `pipeline(items, stage1, stage2, ...)` — map each item through ordered stages.
 - `workflow(nameOrScript, args?)` — run a saved/inline workflow inline (one level deep),
-  sharing the parent run's caps and budget.
+  sharing the parent run's caps.
 - `checkpoint(prompt, opts?)` — a deterministic, journaled human-in-the-loop gate
   (resolved via the host's live `confirm`; headless defaults to `default ?? true`, can abort
   with `headless: "abort"`, or durably pause with `headless: "pause"`).
@@ -157,13 +157,13 @@ Inside a workflow body these are available as globals (no imports):
   `{ ok, value, verdict, attempts }`, where `value` is the final producer result and
   `verdict` is the exact last validator return. Its inner `agent()` calls are journaled;
   the aggregate gate result is not a separate journal entry.
-- `phase(title, { budget? })`, `log(msg)`, and the read-only `args`, `cwd`, `budget`.
+- `phase(title)`, `log(msg)`, and the read-only `args`, `cwd`.
 
 The realm is hardened for determinism: `Math.random()`, `Date.now()`, and `new Date()`
 throw, so a re-run reproduces the journaled values. Pass any timestamps/randomness in via
 `args`.
 
-## Resume & token budget
+## Resume & run limits
 
 Every `agent()` / `checkpoint()` result is journaled by a deterministic call index. For
 edited-script/current-args resume, name a terminal persisted source on a **new** manager run:
@@ -226,8 +226,8 @@ const [audit, experiment] = await parallel([
 The worktree and its edits are discarded; return the diff as data. Both calls replay from matching
 journal rows without a filesystem-safety declaration.
 
-`tokenBudget` caps total spend (per-phase sub-budgets via `phase(title, { budget })`);
-`maxAgents`, `concurrency`, `agentTimeoutMs`, and `agentRetries` bound the run. `agentTimeoutMs` is a
+`maxAgents`, `concurrency`, `agentTimeoutMs`, and `agentRetries` bound the run.
+`phase(title)` groups subsequent calls under a named phase. `agentTimeoutMs` is a
 total wall-clock ceiling for each attempt. A finite per-call `timeoutMs` can tighten the ceiling but
 cannot raise or disable it; with no host ceiling, per-call `null`/omission is uncapped. Every retry
 gets a fresh clock (at most `(retries + 1) × timeout`, with retries clamped to 3). Exhaustion is a

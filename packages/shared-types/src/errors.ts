@@ -16,7 +16,6 @@ export enum WorkflowErrorCode {
   AGENT_CANCELLED = "AGENT_CANCELLED",
   WORKFLOW_ABORTED = "WORKFLOW_ABORTED",
   AGENT_LIMIT_EXCEEDED = "AGENT_LIMIT_EXCEEDED",
-  TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED",
   /** Provider subscription/usage/quota/rate limit. Non-recoverable => engine PAUSES (resumable), not failed. */
   PROVIDER_USAGE_LIMIT = "PROVIDER_USAGE_LIMIT",
   /** The agent requires authentication. Non-recoverable: retrying cannot succeed until the host

@@ -5,7 +5,7 @@
  *
  * `GUEST_LIBRARY_SOURCE` is a plain script evaluated exactly ONCE at VM
  * creation, inside the capability-free QuickJS realm — no modules, no
- * imports, no host assumptions beyond the four documented `__host_*`
+ * imports, no host assumptions beyond the documented `__host_*`
  * functions (see the package README's "Guest library ⇄ host contract").
  * After the first snapshot this library travels INSIDE the snapshot: it is
  * versioned with the workspace, not with the host, and a host must accept
@@ -28,12 +28,27 @@
  *   - `checkpoint(question, options?)` → Promise (host effect), and
  *     `checkpoint.answer(callId, value)` → boolean — answer delivery
  *     through the same host function's trailing-argument mode.
- *   - `console.{log,info,warn,error,debug}` — the bridge: every argument
- *     is frozen (structuredClone, with an iterative marker-copy fallback)
- *     into a real `$N` global, then forwarded to `__host_console`.
+ *   - `console.{log,info,warn,error,debug}` — the bridge: every call
+ *     renders ONE joined line (the arguments' §4.4 reprs joined with a
+ *     single space — direct strings whole, objects/arrays to depth 2,
+ *     20 entries per level, nested strings head-limited at 200 chars)
+ *     and forwards it to `__host_console`.
+ *   - `sleep(ms)` → Promise (host effect — a host-side timer; the VM
+ *     itself stays timer-free).
+ *   - `workspace()` / `agents()` → plain JSON-round-tripped values
+ *     served by the host (`__host_workspace` / `__host_agents`);
+ *     `reset()` → void, asking the host to tear the workspace down
+ *     after the current eval completes (`__host_reset`). The
+ *     verify/judgePanel reviewers/graders resolve their model spec
+ *     through `__host_default_backend` (the host's configured default
+ *     backend id — a real registered segment; the v1 reserved
+ *     'default' sentinel is deleted).
  *   - `parallel` / `pipeline` / `verify` / `judgePanel` / `gate` /
  *     `retry` / `loopUntilDry` — pure JavaScript layered on `agent()`,
  *     following `packages/workflows/src/dsl.d.ts` semantics.
+ *   - `_` — the previous eval's completion value (IPython-style result
+ *     history; set by the host after every eval that resolved with a
+ *     value). The per-argument `$N` capture globals are deleted.
  *   - `__REPL_GUEST_VERSION` — the version marker global.
  *   - `globalThis[Symbol.for("repl.guest")]` — the frozen reconciliation
  *     surface (version / pending / settle / stats) the host uses after a
@@ -104,6 +119,20 @@
  *  (the 0.3.0 lease-set defect is the older copy's own, never
  *  re-injected).
  *
+ *  0.4.0 is the eval-plane redesign surface (docs/roadmap/repl-eval-redesign.md):
+ *  the `$N` capture system is deleted (console renders one joined line per call
+ *  with the §4.4 depth-limited repr; `_` is the sole result-history global),
+ *  `sleep(ms)` / `workspace()` / `agents()` / `reset()` join the guest library,
+ *  rejections of registry calls carry `replCallId` (and `replBackend` when the
+ *  host stamps it) for the §4.6 error attribution, the agent options bag is
+ *  narrowed to exactly `{ schema, cwd, configOptions, mode }`, and the
+ *  verify/judgePanel combinators resolve their reviewer/grader spec through
+ *  `__host_default_backend` (the reserved 'default' sentinel that bypassed
+ *  registry validation is deleted) while rejected calls augment their Error
+ *  with the CALL-SITE stack (the §4.6 submitted-code line numbers). The guest
+ *  environment changed, so this version invalidates older stored snapshots
+ *  (they take the §6.1 auto-reset path on first touch).
+ *
  *  The 0.3.1 copy also hardens the instrumentation surface (phase-E
  *  review rejection round 7, same version — nothing shipped between):
  *  the await/iterable helpers run on the CAPTURED pristine Promise
@@ -131,7 +160,7 @@
  *  instrumentation: no eval-break targeting, honest refusal (phase-E
  *  review rejection round 7: the flag alone re-armed the original
  *  defect on a supported older snapshot). */
-export const GUEST_LIBRARY_VERSION = '0.3.1';
+export const GUEST_LIBRARY_VERSION = '0.4.0';
 
 /** `Symbol.for` key of the reconciliation surface on `globalThis`. */
 export const GUEST_SURFACE_KEY = 'repl.guest';
@@ -508,6 +537,11 @@ export const HOST_AGENT = '__host_agent';
 export const HOST_CHECKPOINT = '__host_checkpoint';
 export const HOST_CONSOLE = '__host_console';
 export const HOST_STEER = '__host_agent_steer';
+export const HOST_SLEEP = '__host_sleep';
+export const HOST_WORKSPACE = '__host_workspace';
+export const HOST_AGENTS = '__host_agents';
+export const HOST_RESET = '__host_reset';
+export const HOST_DEFAULT_BACKEND = '__host_default_backend';
 
 /**
  * Build the injectable library script. `version` is substituted into the
@@ -540,8 +574,8 @@ const GUEST_LIBRARY_SOURCE = `/*
   // lexical 'const globalThis = 7' is a legitimate user program, and the
   // lexical binding shadows the library's free-variable globalThis at
   // call time, breaking every internal reference (the provenance
-  // registry's descriptor reads, the host-function lookups, the $N
-  // store, the global installs). Everything below that means "the realm's
+  // registry's descriptor reads, the host-function lookups, the global
+  // installs). Everything below that means "the realm's
   // global object" reads 'g' — the same discipline as the provenance
   // factory's capture (phase-E review rejection round 7).
   var g = globalThis;
@@ -556,20 +590,9 @@ const GUEST_LIBRARY_SOURCE = `/*
 
   // Evaluating this script twice in one realm (e.g. a host bug that
   // re-injects it into a restored snapshot) must never wipe the live
-  // registry or the $N counter. If the surface is already installed, this
-  // evaluation is a no-op.
+  // registry. If the surface is already installed, this evaluation is a
+  // no-op.
   if (g[Symbol.for(SURFACE_KEY)]) return;
-
-  // ────────────────────────────────────────────────────────────────────────
-  // Tunables (payload best-effort encoding; the $N store is never truncated)
-  // ────────────────────────────────────────────────────────────────────────
-
-  var PAYLOAD_STRING_LIMIT = 4096; // chars per string in the console payload
-  var PAYLOAD_ARRAY_LIMIT = 256;   // elements per array in the console payload
-  var PAYLOAD_OBJECT_LIMIT = 256;  // keys per object in the console payload
-  var PAYLOAD_ENTRY_LIMIT = 64;    // entries per Map/Set in the console payload
-  var PAYLOAD_DEPTH_LIMIT = 8;     // nesting depth in the console payload
-  var CLONE_DEPTH_LIMIT = 512;     // structuredClone pre-flight nesting bound
 
   // ────────────────────────────────────────────────────────────────────────
   // Internal state — all of it lives in this closure, so all of it travels
@@ -578,7 +601,6 @@ const GUEST_LIBRARY_SOURCE = `/*
 
   var state = {
     callSeq: 0,          // monotonic call-id counter ("c1", "c2", ...)
-    logSeq: 0,           // monotonic $N counter
     registry: new Map(), // callId -> { id, kind, detail, optionsJson, createdAt, resolve, reject }
     // The eval-await tracking surface (version 0.2.0): the registry
     // entries' 'promise' field maps every registry promise
@@ -617,18 +639,12 @@ const GUEST_LIBRARY_SOURCE = `/*
   var registryForEach = Map.prototype.forEach;
   var registrySize = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get;
 
-  // Captured intrinsics for the $N freeze path and the argument gatherers.
+  // Captured intrinsics for the argument gatherers.
   // This library is evaluated exactly once, at VM creation, BEFORE any
   // guest code runs — so everything captured here is pristine, and a guest
   // that later pollutes a realm global or prototype cannot change what the
   // captured functions do:
   //
-  // - nativeStructuredClone is the structured-clone extension's native
-  //   function. The $N freezing discipline is what-you-saw-is-what-you-
-  //   have: mutation after a log must never change $N. Reading the global
-  //   at USE time would let a guest replace it with an aliasing function
-  //   (structuredClone = v => v), making $N hold LIVE references instead
-  //   of frozen copies (review regression, pinned by test).
   // - arraySlice is a BOUND copy of Array.prototype.slice (created via
   //   Function.prototype.call.bind at installation — both pristine).
   //   console.* and pipeline() gather their arguments through it; a guest
@@ -637,8 +653,8 @@ const GUEST_LIBRARY_SOURCE = `/*
   //   console.* NEVER throws by contract (review regression, pinned by
   //   test). A bound function performs no property lookups at call time,
   //   so neither replacement can reach it.
-  var nativeStructuredClone = g.structuredClone;
   var arraySlice = Function.prototype.call.bind(Array.prototype.slice);
+  var arrayFrom = Array.from.bind(Array);
 
   // The continuation-lease instrumentation's pristine PROMISE intrinsics
   // (phase-E review rejection round 7): \`__replAwait\` /
@@ -685,16 +701,37 @@ const GUEST_LIBRARY_SOURCE = `/*
    * an Error carrying code/recoverable when present.
    */
   function toError(value) {
-    if (value instanceof Error) return value;
+    if (value instanceof Error) {
+      copyErrorAttribution(value, value);
+      return value;
+    }
     if (value && typeof value === 'object') {
       var err = new Error(typeof value.message === 'string' ? value.message : safeString(value));
       if (typeof value.name === 'string') err.name = value.name;
       if (typeof value.stack === 'string') err.stack = value.stack;
       if (value.code !== undefined) err.code = value.code;
       if (value.recoverable !== undefined) err.recoverable = !!value.recoverable;
+      copyErrorAttribution(err, value);
       return err;
     }
     return new Error(safeString(value));
+  }
+
+  /**
+   * Copy the §4.6 error-attribution fields onto a rejected call's Error:
+   * 'replBackend' is stamped by the host onto the rejection value (the
+   * resolved backend the subagent call failed on); 'replCallId' is the
+   * registry entry's own id, attached by settleCall (see there). Both
+   * render in the host's uncaught-error line so a failure that came from
+   * a subagent call names the call and its backend.
+   */
+  function copyErrorAttribution(err, source) {
+    try {
+      if (typeof source.replBackend === 'string') err.replBackend = source.replBackend;
+    } catch (_e) {}
+    try {
+      if (typeof source.replCallId === 'string') err.replCallId = source.replCallId;
+    } catch (_e) {}
   }
 
   /**
@@ -724,7 +761,33 @@ const GUEST_LIBRARY_SOURCE = `/*
     if (!entry) return false;
     registryDelete.call(state.registry, callId);
     if (outcome === 'resolve') entry.resolve(value);
-    else entry.reject(toError(value));
+    else {
+      var err = toError(value);
+      // The §4.6 attribution: the rejecting call's id rides the error
+      // into the eval's uncaught-error rendering (the host stamps the
+      // backend). A guest-visible own property; a hostile realm that
+      // forges it is forging only its own error attribution.
+      if (typeof err.replCallId !== 'string') {
+        try {
+          err.replCallId = callId;
+        } catch (_e) {}
+      }
+      // The §4.6 submitted-code frames: the error was created HERE (its
+      // own stack names only library frames) — augment it with the
+      // CALL-SITE stack captured at issue time (see 'issueCall'), which
+      // carries the user's '<repl>' frames. The host's renderer filters
+      // to exactly those frames; the library frames in both halves are
+      // skipped.
+      if (entry && typeof entry.siteStack === 'string' && entry.siteStack.length > 0) {
+        try {
+          err.stack =
+            typeof err.stack === 'string' && err.stack.length > 0
+              ? err.stack + '\\n' + entry.siteStack
+              : entry.siteStack;
+        } catch (_e) {}
+      }
+      entry.reject(err);
+    }
     return true;
   }
 
@@ -758,6 +821,21 @@ const GUEST_LIBRARY_SOURCE = `/*
           'guest code (and re-register it by name after every snapshot restore)',
       );
     }
+    // The §4.6 CALL-SITE STACK: captured HERE, synchronously inside the
+    // library function the user code invoked, so the stack carries the
+    // SUBMITTED-CODE frames (the agent()/steer()/checkpoint() call site
+    // at '<repl>') below the library's own. A rejection's Error is
+    // created at settlement time in this library (its own stack names
+    // only library frames) — settleCall AUGMENTS it with these frames so
+    // the host's uncaught-error rendering can show line numbers in the
+    // submitted code. Best-effort: a failure to capture leaves the
+    // rejection with its library-only stack.
+    var siteStack;
+    try {
+      siteStack = new Error('repl call site').stack;
+    } catch (_err) {
+      siteStack = undefined;
+    }
     var id = 'c' + ++state.callSeq;
     var resolveFn;
     var rejectFn;
@@ -770,6 +848,7 @@ const GUEST_LIBRARY_SOURCE = `/*
       kind: kind,
       detail: detail,
       optionsJson: optionsJson === undefined ? null : optionsJson,
+      siteStack: siteStack,
       createdAt: Date.now(),
       // The id the host addresses this call by: the founding session id for
       // steering calls, this call's own id for everything else. Recorded so
@@ -822,14 +901,31 @@ const GUEST_LIBRARY_SOURCE = `/*
 
   /** Shallow-copy options (plain data by construction — they cross the
    *  bridge as JSON). */
-  function normalizeAgentOptions(options) {
+  function normalizeAgentOptions(options, knownKey1, knownKey2, knownKey3, knownKey4) {
     if (options === undefined || options === null) return undefined;
     if (typeof options !== 'object') {
       throw new TypeError('agent options must be an object');
     }
     var out = {};
     var keys = Object.keys(options);
-    for (var i = 0; i < keys.length; i++) out[keys[i]] = options[keys[i]];
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var optionValue = options[key];
+      var knownKey = key === knownKey1 || key === knownKey2 || key === knownKey3 || key === knownKey4;
+      // Classify the top-level key BEFORE JSON serialization can erase it.
+      // Known undefined/function/symbol values keep ordinary JSON omission
+      // semantics (the host treats them as absent). An unknown key must
+      // survive long enough for host admission validation to reject it and
+      // enumerate the valid vocabulary, even when its value is otherwise
+      // not JSON-representable.
+      out[key] = !knownKey &&
+        (optionValue === undefined ||
+          typeof optionValue === 'function' ||
+          typeof optionValue === 'symbol' ||
+          typeof optionValue === 'bigint')
+        ? null
+        : optionValue;
+    }
     return out;
   }
 
@@ -842,10 +938,14 @@ const GUEST_LIBRARY_SOURCE = `/*
     if (typeof task !== 'string') {
       throw new TypeError('agent(modelSpec, task, options?) needs a task string');
     }
-    var normalized = normalizeAgentOptions(options);
+    var normalized = normalizeAgentOptions(options, 'schema', 'cwd', 'configOptions', 'mode');
     // Options cross the bridge as JSON: plain data by construction, one
     // flat, unambiguous decoding host-side (functions or cycles in options
-    // would be meaningless host-side).
+    // would be meaningless host-side). normalizeAgentOptions has already
+    // preserved non-representable UNKNOWN top-level keys for host admission;
+    // ordinary JSON semantics intentionally erase undefined KNOWN values, so
+    // the { cwd: maybeCwd } idiom continues to mean "omit cwd" when maybeCwd is
+    // undefined.
     var optionsJson = normalized === undefined ? undefined : JSON.stringify(normalized);
     // The registry entry records the model spec verbatim so a restore can
     // re-issue the call against the same backend routing. The host
@@ -881,7 +981,7 @@ const GUEST_LIBRARY_SOURCE = `/*
         if (typeof prompt !== 'string') {
           throw new TypeError('handle.' + action + '(prompt, options?) needs a prompt string');
         }
-        var normalized = normalizeAgentOptions(options);
+        var normalized = normalizeAgentOptions(options, 'promptMeta');
         payloadJson = JSON.stringify({ prompt: prompt, options: normalized === undefined ? {} : normalized });
       }
       return issueCall('steer', '__host_agent_steer', action, payloadJson, foundingCallId, null, function (hostFn, id) {
@@ -1020,6 +1120,99 @@ const GUEST_LIBRARY_SOURCE = `/*
   };
 
   // ────────────────────────────────────────────────────────────────────────
+  // The eval-plane helpers: sleep (host-side timer — the VM itself stays
+  // timer-free), the introspection pair (workspace()/agents() — plain
+  // values served by the host as JSON), and reset (teardown after the
+  // current eval completes).
+  // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Sleep for 'ms' milliseconds: the universal idiom agents reach for,
+   * implemented HOST-side (the VM itself stays timer-free — the promise
+   * is settled by a host timer through '__host_sleep'). Returns a
+   * promise resolving undefined after the host timer fires; the eval's
+   * continuation resumes at the next settlement drain, exactly like a
+   * subagent call's.
+   */
+  function sleep(ms) {
+    try {
+      if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) {
+        throw new TypeError('sleep(ms) needs a non-negative number of milliseconds');
+      }
+      if (typeof g.__host_sleep !== 'function') {
+        throw new Error(
+          '__host_sleep is not installed — the host must register it before evaluating ' +
+            'guest code (and re-register it by name after every snapshot restore)',
+        );
+      }
+      return g.__host_sleep(ms);
+    } catch (err) {
+      // Like agent(): the validation failure is a REJECTED promise, never
+      // a synchronous throw from the DSL surface.
+      return Promise.reject(err);
+    }
+  }
+
+  /**
+   * The introspection host round-trip: call the host function, parse the
+   * returned JSON string, hand back the plain value. The value is an
+   * ORDINARY object/array in the realm — sliceable in the same eval
+   * (the 'dir()' / '%who' idiom).
+   */
+  function introspect(hostName, apiName) {
+    var hostFn = g[hostName];
+    if (typeof hostFn !== 'function') {
+      throw new Error(
+        hostName + ' is not installed — the host must register it before evaluating ' +
+          'guest code (and re-register it by name after every snapshot restore)',
+      );
+    }
+    var raw = hostFn();
+    if (typeof raw !== 'string') {
+      throw new TypeError(apiName + ': the host returned a non-string (host contract violation)');
+    }
+    return JSON.parse(raw);
+  }
+
+  /**
+   * The workspace manifest as a plain value (the roadmap doc's 'status'
+   * replacement): { bindings, inFlight, checkpoints, diagnostics } — see
+   * the doc for the exact shape. Bindings are name/type/size/provenance/
+   * task/callId/status records (the status is the honest one — 'failed'
+   * for rejected handle calls).
+   */
+  function workspace() {
+    return introspect('__host_workspace', 'workspace()');
+  }
+
+  /**
+   * The live subagents as a plain value: one { callId, modelSpec, task,
+   * state, supportsSteering, queuedSteers } entry per live agent,
+   * including in-flight followUp/steer turns (each with its own
+   * addressable call id).
+   */
+  function agents() {
+    return introspect('__host_agents', 'agents()');
+  }
+
+  /**
+   * Ask the host to tear the workspace down AFTER the current eval
+   * completes (the host-side effect the roadmap doc's deleted 'reset'
+   * action performed). Returns nothing meaningful; the eval that called
+   * this still completes normally first.
+   */
+  function reset() {
+    if (typeof g.__host_reset !== 'function') {
+      throw new Error(
+        '__host_reset is not installed — the host must register it before evaluating ' +
+          'guest code (and re-register it by name after every snapshot restore)',
+      );
+    }
+    g.__host_reset();
+    return undefined;
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
   // Combinators — pure JavaScript over agent(). No host effects of their
   // own; every one of them bottoms out in agent() (or in caller-supplied
   // thunks). Semantics follow packages/workflows/src/dsl.d.ts, adapted for
@@ -1101,6 +1294,37 @@ const GUEST_LIBRARY_SOURCE = `/*
   };
 
   /**
+   * The reviewer/grader model spec for verify/judgePanel: the HOST's
+   * configured default backend id, served by '__host_default_backend'
+   * (§4.7 — the DSL options carry no per-call model, so the spawned
+   * workers inherit the run's default model; §4.1 — the spec is a REAL
+   * registered backend segment, validated at admission like any agent()
+   * call; the v1 reserved 'default' sentinel that bypassed registry
+   * validation is deleted). A host with no backend registry (the parking
+   * bridge) returns undefined and the combinators reject NON-recoverably
+   * (they cannot work without a backend).
+   */
+  function defaultBackendSpec() {
+    if (typeof g.__host_default_backend !== 'function') {
+      var err = new Error(
+        '__host_default_backend is not installed — the host must register it before evaluating ' +
+          'guest code (and re-register it by name after every snapshot restore)',
+      );
+      err.recoverable = false;
+      throw err;
+    }
+    var id = g.__host_default_backend();
+    if (typeof id !== 'string' || id.length === 0) {
+      var err2 = new Error(
+        'verify/judgePanel need a default backend, but no backend registry is attached to this workspace',
+      );
+      err2.recoverable = false;
+      throw err2;
+    }
+    return id;
+  }
+
+  /**
    * Adversarial verification panel: 'reviewers' workers vote on whether
    * 'item' is real/correct; passes when the share voting real meets
    * 'threshold'. Reviewers that fail recoverably are dropped from the vote
@@ -1110,15 +1334,15 @@ const GUEST_LIBRARY_SOURCE = `/*
    * (packages/workflows/src/dsl.d.ts) — there is no per-call model option
    * (an invented opts.model was removed in review; the dsl.d.ts verify
    * lets reviewers inherit the run's default model, so the spawned
-   * reviewers always route through the reserved ''default'' sentinel,
-   * which host policy routes to its configured default backend).
+   * reviewers route through the host's configured default backend id —
+   * a real registered segment, never the deleted 'default' sentinel).
    */
   async function verify(item, opts) {
     opts = opts || {};
     var reviewers = Math.max(1, opts.reviewers !== undefined ? opts.reviewers : 2);
     var threshold = opts.threshold !== undefined ? opts.threshold : 0.5;
     var lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
-    var modelSpec = 'default';
+    var modelSpec = defaultBackendSpec();
     var claim;
     if (typeof item === 'string') {
       claim = item;
@@ -1140,7 +1364,7 @@ const GUEST_LIBRARY_SOURCE = `/*
               'Adversarially review whether the following is REAL/correct. Try to refute it; default to real=false if unsure.' +
                 (lenses.length ? ' Focus lens: ' + lenses[i % lenses.length] + '.' : '') +
                 '\\n\\n' + claim,
-              { label: 'verify ' + (i + 1), schema: VERIFY_SCHEMA },
+              { schema: VERIFY_SCHEMA },
             );
           };
         }),
@@ -1167,14 +1391,14 @@ const GUEST_LIBRARY_SOURCE = `/*
    * as { index, attempt, score, judgments } (stable tie-break by index).
    * The DSL options are EXACTLY { judges, rubric }
    * (packages/workflows/src/dsl.d.ts) — no per-call model option; the
-   * spawned graders route through the reserved ''default'' sentinel
-   * (host-routed, same decision as verify).
+   * spawned graders route through the host's configured default backend id
+   * (same decision as verify).
    */
   async function judgePanel(attempts, opts) {
     opts = opts || {};
     var judges = Math.max(1, opts.judges !== undefined ? opts.judges : 3);
     var rubric = opts.rubric !== undefined ? opts.rubric : 'overall quality and correctness';
-    var modelSpec = 'default';
+    var modelSpec = defaultBackendSpec();
     var scored = (
       await parallel(
         (Array.isArray(attempts) ? attempts : []).map(function (att, idx) {
@@ -1188,7 +1412,7 @@ const GUEST_LIBRARY_SOURCE = `/*
                       modelSpec,
                       'Score this candidate from 0 to 1 on: ' + rubric +
                         '. Reply with the score.\\n\\nCandidate:\\n' + text,
-                      { label: 'judge ' + (idx + 1) + '.' + (j + 1), schema: JUDGE_SCHEMA },
+                      { schema: JUDGE_SCHEMA },
                     );
                   };
                 }),
@@ -1320,433 +1544,143 @@ const GUEST_LIBRARY_SOURCE = `/*
   }
 
   // ────────────────────────────────────────────────────────────────────────
-  // The bridge: console -> $N store -> __host_console
+  // ────────────────────────────────────────────────────────────────────────
+  // The §4.4 depth-limited repr (docs/roadmap/repl-eval-redesign.md):
+  // printing conventions, not budgets — there is NO byte ceiling anywhere
+  // on this path. The rules, chosen for familiarity with Python's defaults:
+  //
+  //   - strings passed DIRECTLY to console.* print WHOLE, unquoted (they
+  //     are the output the orchestrator asked for);
+  //   - objects/arrays render to DEPTH 2; deeper levels render as
+  //     '{…}' / '[…]';
+  //   - collections render their first 20 entries per level, then
+  //     '… +N more';
+  //   - NESTED strings (inside a collection) render head-limited at
+  //     200 chars, quoted, with a trailing '…' marker when clipped;
+  //   - everything deeper/longer is reached by evaluating a narrower
+  //     expression — the values are alive in the VM; slicing is the API.
   // ────────────────────────────────────────────────────────────────────────
 
-  /**
-   * Freeze a copy of a logged value into the $N store: what-you-saw-is-
-   * what-you-have. Prefers structuredClone — the quickjs-wasi prebuilt
-   * extension's native function, CAPTURED at installation (a guest that
-   * replaces the globalThis binding with an aliasing function must not
-   * make $N hold live references; see the captured-intrinsics note) —
-   * and falls back to a guest-side deep copy that substitutes typed
-   * markers for non-cloneables instead of throwing.
-   *
-   * DEPTH SAFETY: on WASI, deep recursion is a fatal wasm trap, not a
-   * catchable exception (agentprism/quickjs-wasi#2) — and that applies to
-   * the native structuredClone's own C recursion too (observed hard-crash
-   * around 10k nesting). So the fallback copy is fully ITERATIVE
-   * (explicit-stack, no recursion at any depth), and structuredClone is
-   * only attempted after an iterative pre-flight confirms the graph's
-   * first-visit nesting stays within CLONE_DEPTH_LIMIT — far below the
-   * observed native crash threshold. Deeper (or hostile, or non-cloneable)
-   * graphs take the iterative fallback, which has NO depth bound of its
-   * own (it is bounded only by VM memory; an allocation failure surfaces
-   * as an "unfreezable" marker, never a throw).
-   */
-  /**
-   * Values the structured-clone algorithm cannot carry. Checked by the
-   * clone PRE-FLIGHT on every reachable node of the logged graph, not
-   * just the root: the extension's clone silently normalizes weak
-   * collections to empty plain objects at ANY depth, but the $N store
-   * must keep typed markers for them (what-you-saw-is-what-you-have — an
-   * orchestrator must be able to tell a WeakMap from a deleted property,
-   * even nested inside an object, array, or Map/Set). Functions, symbols
-   * and promises throw in structuredClone anyway; the marker fallback
-   * handles them identically.
-   */
-  function isUncloneable(value) {
-    var t = typeof value;
-    if (t === 'function' || t === 'symbol') return true;
-    if (t !== 'object' || value === null) return false;
+  var REPR_DEPTH_LIMIT = 2;   // expand levels 0..1, collapse level 2+
+  var REPR_ENTRY_LIMIT = 20;  // entries rendered per level
+  var REPR_NESTED_STRING_CHARS = 200; // nested-string head bound
+
+  /** The depth-limited repr of one value ('depth' is the distance from
+   *  the top-level console argument). NEVER throws — a hostile value
+   *  degrades to '[unstringifiable]' (console.* never throws by
+   *  contract). */
+  function reprValue(value, depth, seen) {
     try {
-      if (value instanceof Promise) return true;
-      if (value instanceof WeakMap) return true;
-      if (value instanceof WeakSet) return true;
-      if (typeof WeakRef === 'function' && value instanceof WeakRef) return true;
-    } catch (_err) {
-      // instanceof probing threw (revoked/all-trap proxy) — treat as
-      // uncloneable; the fallback's own guards produce a marker.
-      return true;
-    }
-    return false;
-  }
-
-  function freezeValue(value) {
-    if (
-      typeof nativeStructuredClone === 'function' &&
-      clonePreflight(value, CLONE_DEPTH_LIMIT)
-    ) {
-      try {
-        return nativeStructuredClone(value);
-      } catch (_err) {
-        // Graph contains a non-cloneable — fall through to the marker copy.
+      var t = typeof value;
+      if (value === null) return 'null';
+      if (t === 'string') {
+        if (depth === 0) return value; // direct strings print whole
+        var stringChars = arrayFrom(value);
+        if (stringChars.length <= REPR_NESTED_STRING_CHARS) return "'" + value + "'";
+        return "'" + stringChars.slice(0, REPR_NESTED_STRING_CHARS).join('') + "…'";
       }
-    }
-    try {
-      return safeDeepCopy(value);
-    } catch (_err) {
-      return unclonableMarker('unfreezable', safeString(value));
-    }
-  }
-
-  /** Typed marker stored in place of a value that cannot be copied. */
-  function unclonableMarker(type, description) {
-    var m = { __unclonable__: type };
-    if (description !== undefined) m.description = description;
-    return m;
-  }
-
-  /**
-   * Iterative (explicit-stack) pre-flight that answers the two questions
-   * structuredClone cannot answer safely, in one walk over the reachable
-   * graph: is the first-visit nesting within 'limit', AND does the graph
-   * contain ANY uncloneable value (function, symbol, promise, weak
-   * collection) anywhere — root or nested? A 'false' routes the value to
-   * the marker-copy fallback, which substitutes typed markers at every
-   * depth instead of normalizing (or throwing). Cycles/shared refs are
-   * handled with a visited set — which also mirrors structuredClone's own
-   * memoization, so this bounds ITS recursion depth. Any throw during
-   * traversal (revoked or all-trap proxies, hostile getters) means "not
-   * structuredClone-safe".
-   */
-  function clonePreflight(root, limit) {
-    try {
-      if (root === null || typeof root !== 'object') return true;
-      var visited = new Set();
-      var stack = [{ v: root, d: 1 }];
-      while (stack.length) {
-        var frame = stack.pop();
-        if (frame.d > limit) return false;
-        var v = frame.v;
-        if (visited.has(v)) continue;
-        visited.add(v);
-        // Nested uncloneables — including weak collections — route the
-        // whole graph to the marker-copy fallback: the clone extension
-        // silently normalizes them to {} at any depth (review
-        // regression: the root-only check let nested WeakMap/WeakSet/
-        // WeakRef through as empty plain objects).
-        if (isUncloneable(v)) return false;
-        var children = [];
-        if (v instanceof Date || v instanceof RegExp ||
-            v instanceof ArrayBuffer || ArrayBuffer.isView(v)) {
-          continue; // leaves
-        } else if (v instanceof Map) {
-          v.forEach(function (val, key) { children.push(key, val); });
-        } else if (v instanceof Set) {
-          v.forEach(function (val) { children.push(val); });
-        } else if (Array.isArray(v)) {
-          for (var i = 0; i < v.length; i++) children.push(v[i]);
-        } else {
-          var ks = Object.keys(v);
-          for (var j = 0; j < ks.length; j++) children.push(v[ks[j]]);
-        }
-        for (var c = 0; c < children.length; c++) {
-          var child = children[c];
-          if (child !== null && typeof child === 'object' && !visited.has(child)) {
-            stack.push({ v: child, d: frame.d + 1 });
-          }
-        }
-      }
-      return true;
-    } catch (_err) {
-      return false;
-    }
-  }
-
-  /**
-   * Deep-copy fallback for freezeValue — ITERATIVE, driven by an explicit
-   * task stack, so arbitrary nesting depth cannot touch the (fatal-on-WASI)
-   * call stack. Preserves cycles and shared references (via 'seen'), copies
-   * Date/RegExp/Map/Set/Error/ArrayBuffer/typed arrays structurally, keeps
-   * own enumerable string-keyed properties of plain objects (matching
-   * structuredClone's property selection), and substitutes typed markers
-   * for functions, promises, symbols, and weak collections. Hostile
-   * getters/proxies cannot make it throw: every property read and every
-   * container fill is individually guarded.
-   */
-  function copyNode(value, tasks, seen) {
-    if (value === null) return value;
-    var t = typeof value;
-    if (t === 'number' || t === 'string' || t === 'boolean' ||
-        t === 'undefined' || t === 'bigint') {
-      return value;
-    }
-    if (t === 'symbol') {
-      return unclonableMarker('symbol', safeString(value.description));
-    }
-    if (t === 'function') {
-      var fnName = '(anonymous)';
-      try {
-        fnName = value.name || '(anonymous)';
-      } catch (_err) {
-        // A proxy-of-function with a throwing get trap.
-      }
-      return unclonableMarker('function', fnName);
-    }
-    // Objects: shared references and cycles map to the same copy.
-    if (seen.has(value)) return seen.get(value);
-    try {
-      if (value instanceof Promise) return unclonableMarker('promise');
-      if (value instanceof WeakMap) return unclonableMarker('weakmap');
-      if (value instanceof WeakSet) return unclonableMarker('weakset');
-      if (typeof WeakRef === 'function' && value instanceof WeakRef) {
-        return unclonableMarker('weakref');
-      }
-      if (value instanceof Date) return new Date(value.getTime());
-      if (value instanceof RegExp) return new RegExp(value.source, value.flags);
-      if (value instanceof ArrayBuffer) return value.slice(0);
-      if (ArrayBuffer.isView(value)) {
-        if (value instanceof DataView) {
-          return new DataView(value.buffer.slice(0), value.byteOffset, value.byteLength);
-        }
-        return value.slice(); // typed arrays: slice() copies
-      }
-      var shell;
-      if (value instanceof Error) {
-        shell = new Error(value.message);
-        shell.name = value.name;
-        if (typeof value.stack === 'string') shell.stack = value.stack;
-        seen.set(value, shell);
-        tasks.push({ kind: 'props', src: value, dst: shell });
-        return shell;
-      }
-      if (value instanceof Map) {
-        shell = new Map();
-        seen.set(value, shell);
-        tasks.push({ kind: 'map', src: value, dst: shell });
-        return shell;
-      }
-      if (value instanceof Set) {
-        shell = new Set();
-        seen.set(value, shell);
-        tasks.push({ kind: 'set', src: value, dst: shell });
-        return shell;
-      }
-      if (Array.isArray(value)) {
-        shell = new Array(value.length);
-        seen.set(value, shell);
-        tasks.push({ kind: 'array', src: value, dst: shell });
-        return shell;
-      }
-      // Anything else (plain objects, class instances, proxies): copy own
-      // enumerable string-keyed properties onto a plain object. Prototypes
-      // are not preserved — the same normalization structuredClone applies.
-      shell = {};
-      seen.set(value, shell);
-      tasks.push({ kind: 'props', src: value, dst: shell });
-      return shell;
-    } catch (err) {
-      // instanceof / brand probing threw (revoked or all-trap proxy).
-      return unclonableMarker('unfreezable', safeString(err));
-    }
-  }
-
-  function fillTask(task, tasks, seen) {
-    var src = task.src;
-    var dst = task.dst;
-    if (task.kind === 'map') {
-      src.forEach(function (v, k) {
-        dst.set(copyNode(k, tasks, seen), copyNode(v, tasks, seen));
-      });
-      return;
-    }
-    if (task.kind === 'set') {
-      src.forEach(function (v) {
-        dst.add(copyNode(v, tasks, seen));
-      });
-      return;
-    }
-    if (task.kind === 'array') {
-      for (var i = 0; i < src.length; i++) {
+      if (t === 'undefined') return 'undefined';
+      if (t === 'number') return value === 0 && 1 / value === -Infinity ? '-0' : String(value);
+      if (t === 'boolean') return value ? 'true' : 'false';
+      if (t === 'bigint') return String(value) + 'n';
+      if (t === 'symbol') return 'Symbol';
+      if (t === 'function') {
+        var fnName = '(anonymous)';
         try {
-          dst[i] = copyNode(src[i], tasks, seen);
-        } catch (err) {
-          dst[i] = unclonableMarker('thrown', safeString(err));
-        }
-      }
-      return;
-    }
-    // "props"
-    var keys;
-    try {
-      keys = Object.keys(src);
-    } catch (err) {
-      // A proxy's ownKeys trap threw — record the fact instead of failing.
-      dst.__unclonable__ = 'thrown';
-      dst.description = safeString(err);
-      return;
-    }
-    for (var j = 0; j < keys.length; j++) {
-      var k = keys[j];
-      try {
-        dst[k] = copyNode(src[k], tasks, seen);
-      } catch (err) {
-        // A getter (or proxy get trap) threw.
-        dst[k] = unclonableMarker('thrown', safeString(err));
-      }
-    }
-  }
-
-  function safeDeepCopy(root) {
-    var seen = new Map();
-    var tasks = [];
-    var result = copyNode(root, tasks, seen);
-    while (tasks.length) {
-      var task = tasks.pop();
-      try {
-        fillTask(task, tasks, seen);
-      } catch (err) {
-        // Container enumeration itself threw mid-fill (hostile iterator,
-        // fake Map/Set brand): record on the partial copy and move on.
-        try {
-          task.dst.__unclonable__ = 'thrown';
-          task.dst.description = safeString(err);
+          fnName = value.name || '(anonymous)';
         } catch (_err) {
-          // dst not expando-able — nothing more to record.
+          // A proxy-of-function with a throwing get trap.
         }
+        return 'ƒ ' + fnName + '()';
       }
-    }
-    return result;
-  }
-
-  /**
-   * Best-effort JSON-safe encoding of a (frozen) value for the console
-   * payload. This is a CONVENIENCE channel for hosts without a previewer —
-   * the authoritative channel is the '$N' refs, which the host previews via
-   * trap-free introspection. Strings/arrays/objects are capped (the full
-   * value always lives untruncated in $N); non-JSON values become tagged
-   * wrappers: { __undefined__ }, { __bigint__ }, { __nonfinite__ },
-   * { __date__ }, { __regexp__ }, { __error__ }, { __map__ }, { __set__ },
-   * { __binary__ }, { __cycle__ }, { __depth__ }.
-   */
-  function jsonSafe(value, depth, seen) {
-    if (value === null || typeof value === 'boolean') return value;
-    if (typeof value === 'string') {
-      if (value.length > PAYLOAD_STRING_LIMIT) {
-        return value.slice(0, PAYLOAD_STRING_LIMIT) +
-          '…[+' + (value.length - PAYLOAD_STRING_LIMIT) + ' chars; full value in $N]';
+      if (t !== 'object') return safeString(value);
+      // Objects/arrays below.
+      if (depth >= REPR_DEPTH_LIMIT) {
+        return Array.isArray(value) ? '[…]' : '{…}';
       }
-      return value;
-    }
-    if (typeof value === 'number') {
-      return Number.isFinite(value) ? value : { __nonfinite__: String(value) };
-    }
-    if (typeof value === 'bigint') return { __bigint__: value.toString() };
-    if (typeof value === 'undefined') return { __undefined__: true };
-    // DEFENSIVE ONLY — unreachable in practice: jsonSafe consumes freezeValue
-    // output, where symbols/functions/promises were already replaced by
-    // { __unclonable__ } markers. Kept so a future caller of jsonSafe on
-    // unfrozen values cannot make it throw.
-    if (typeof value === 'symbol') return { __symbol__: safeString(value.description) };
-    if (typeof value === 'function') return { __function__: value.name || '(anonymous)' };
-    // Objects.
-    if (seen.has(value)) return { __cycle__: true };
-    if (depth >= PAYLOAD_DEPTH_LIMIT) return { __depth__: true };
-    seen.add(value);
-    try {
-      if (value instanceof Date) return { __date__: value.toISOString() };
-      if (value instanceof RegExp) return { __regexp__: String(value) };
-      // DEFENSIVE ONLY — see the symbol/function note above.
-      if (value instanceof Promise) return { __promise__: true };
-      if (value instanceof Error) {
-        return {
-          __error__: true,
-          name: value.name,
-          message: jsonSafe(value.message, depth + 1, seen),
-        };
+      if (seen.has(value)) {
+        // A cycle (or a shared reference already rendered at a
+        // shallower depth): collapse instead of recursing forever.
+        return Array.isArray(value) ? '[…]' : '{…}';
       }
-      if (value instanceof ArrayBuffer) {
-        return { __binary__: 'ArrayBuffer', byteLength: value.byteLength };
-      }
-      if (ArrayBuffer.isView(value)) {
-        return {
-          __binary__: value.constructor && value.constructor.name ? value.constructor.name : 'TypedArray',
-          byteLength: value.byteLength,
-        };
-      }
-      if (value instanceof Map) {
-        var mapEntries = [];
-        var mTruncated = 0;
-        value.forEach(function (v, k) {
-          if (mapEntries.length < PAYLOAD_ENTRY_LIMIT) {
-            mapEntries.push([jsonSafe(k, depth + 1, seen), jsonSafe(v, depth + 1, seen)]);
-          } else {
-            mTruncated++;
+      seen.add(value);
+      try {
+        // Branded objects render as their brand word (the predictable
+        // leaf, like Python's '<class …>' — their content is reached
+        // by slicing a narrower expression).
+        if (value instanceof Error) {
+          var eName = typeof value.name === 'string' ? value.name : 'Error';
+          var eMessage = typeof value.message === 'string' ? value.message : '';
+          var errorBody = eMessage === '' ? eName : eName + ': ' + eMessage;
+          // The §4.6 attribution: an error that came from a subagent
+          // call names the call (the library stamps replCallId on every
+          // rejected registry call) and the resolved backend (the host
+          // stamps replBackend) — visible wherever the error renders.
+          if (typeof value.replCallId === 'string') {
+            errorBody += ' (call ' + value.replCallId;
+            if (typeof value.replBackend === 'string') errorBody += ' on backend ' + value.replBackend;
+            errorBody += ')';
           }
-        });
-        var mapOut = { __map__: mapEntries };
-        if (mTruncated) mapOut.__truncated__ = mTruncated;
-        return mapOut;
+          var errorChars = arrayFrom(errorBody);
+          return errorChars.length <= REPR_NESTED_STRING_CHARS
+            ? errorBody
+            : errorChars.slice(0, REPR_NESTED_STRING_CHARS).join('') + '…';
+        }
+        if (value instanceof Promise) return 'Promise';
+        if (value instanceof Date) return 'Date';
+        if (value instanceof RegExp) return 'RegExp';
+        if (value instanceof Map) return 'Map';
+        if (value instanceof Set) return 'Set';
+        if (value instanceof WeakMap) return 'WeakMap';
+        if (value instanceof WeakSet) return 'WeakSet';
+        if (value instanceof ArrayBuffer) return 'ArrayBuffer';
+        if (ArrayBuffer.isView(value)) return 'TypedArray';
+        if (Array.isArray(value)) {
+          var parts = [];
+          var n = Math.min(value.length, REPR_ENTRY_LIMIT);
+          for (var i = 0; i < n; i++) parts.push(reprValue(value[i], depth + 1, seen));
+          if (value.length > n) parts.push('… +' + (value.length - n) + ' more');
+          return '[' + parts.join(', ') + ']';
+        }
+        var keys;
+        try {
+          keys = Object.keys(value);
+        } catch (_err) {
+          return '{…}'; // a proxy's ownKeys trap threw — collapse
+        }
+        var objParts = [];
+        var kn = Math.min(keys.length, REPR_ENTRY_LIMIT);
+        for (var j = 0; j < kn; j++) {
+          objParts.push(keys[j] + ': ' + reprValue(value[keys[j]], depth + 1, seen));
+        }
+        if (keys.length > kn) objParts.push('… +' + (keys.length - kn) + ' more');
+        return '{' + objParts.join(', ') + '}';
+      } finally {
+        seen.delete(value);
       }
-      if (value instanceof Set) {
-        var setEntries = [];
-        var sTruncated = 0;
-        value.forEach(function (v) {
-          if (setEntries.length < PAYLOAD_ENTRY_LIMIT) {
-            setEntries.push(jsonSafe(v, depth + 1, seen));
-          } else {
-            sTruncated++;
-          }
-        });
-        var setOut = { __set__: setEntries };
-        if (sTruncated) setOut.__truncated__ = sTruncated;
-        return setOut;
-      }
-      if (Array.isArray(value)) {
-        var n = Math.min(value.length, PAYLOAD_ARRAY_LIMIT);
-        var arrOut = new Array(n);
-        for (var i = 0; i < n; i++) arrOut[i] = jsonSafe(value[i], depth + 1, seen);
-        if (value.length > n) arrOut.push({ __truncated__: value.length - n });
-        return arrOut;
-      }
-      var objOut = {};
-      var keys = Object.keys(value);
-      var kn = Math.min(keys.length, PAYLOAD_OBJECT_LIMIT);
-      for (var j = 0; j < kn; j++) objOut[keys[j]] = jsonSafe(value[keys[j]], depth + 1, seen);
-      if (keys.length > kn) objOut.__truncated_keys__ = keys.length - kn;
-      return objOut;
-    } finally {
-      seen.delete(value);
+    } catch (_err) {
+      return '[unstringifiable]';
     }
   }
 
   /**
-   * The guest half of the bridge. For every argument: freeze a copy, store
-   * it as the next real '$N' global, and forward
-   * { refs: ["$14", ...], args: [<json-safe best effort>, ...] } to
-   * __host_console as a JSON string. console.* NEVER throws — a broken
-   * value or a missing/failing host sink must not take down guest code.
+   * The guest half of the console bridge: ONE joined line per call —
+   * the arguments' reprs joined with a single space (the doc deletes the
+   * per-argument '$N' capture system). The line is forwarded to
+   * __host_console as the JSON payload { line }. console.* NEVER throws
+   * — a broken value or a missing/failing host sink must not take down
+   * guest code; every argument renders under its own guard.
    */
   function emitLog(level, args) {
     try {
-      var refs = [];
-      var payloadArgs = [];
-      // Every argument is processed under its OWN guard: one hostile value
-      // must never drop the whole log call, orphan sibling $N slots, or
-      // suppress the host event — it degrades to a typed marker instead.
+      var line = '';
+      var seen = new Set();
       for (var i = 0; i < args.length; i++) {
-        var frozen;
-        try {
-          frozen = freezeValue(args[i]);
-        } catch (_err) {
-          frozen = unclonableMarker('unfreezable', '[unstringifiable]');
-        }
-        var n = ++state.logSeq;
-        // Real realm globals, writable: the $N store is the agent's own
-        // workspace — it may slice, transform, or delete entries.
-        g['$' + n] = frozen;
-        refs.push('$' + n);
-        var encoded;
-        try {
-          encoded = jsonSafe(frozen, 0, new Set());
-        } catch (_err) {
-          encoded = unclonableMarker('unfreezable');
-        }
-        payloadArgs.push(encoded);
+        if (i > 0) line += ' ';
+        line += reprValue(args[i], 0, seen);
       }
       if (typeof g.__host_console === 'function') {
-        g.__host_console(level, JSON.stringify({ refs: refs, args: payloadArgs }));
+        g.__host_console(level, JSON.stringify({ line: line }));
       }
     } catch (_err) {
       // Deliberately swallowed: the bridge is best-effort by contract.
@@ -1760,7 +1694,8 @@ const GUEST_LIBRARY_SOURCE = `/*
       // bridge contract is console.* NEVER throws, and a guest that
       // replaces Array.prototype.slice (or Function.prototype.call) with
       // a throwing function must not be able to break it (review
-      // regression, pinned by test).
+      // regression, pinned by test). ONE joined line per call — the
+      // arguments' reprs joined with a single space (§4.4).
       emitLog(level, arraySlice(arguments));
     };
   });
@@ -2159,7 +2094,6 @@ const GUEST_LIBRARY_SOURCE = `/*
       return {
         version: VERSION,
         callSeq: state.callSeq,
-        logSeq: state.logSeq,
         pendingCalls: registrySize.call(state.registry),
       };
     },
@@ -2197,6 +2131,10 @@ const GUEST_LIBRARY_SOURCE = `/*
   Object.freeze(gate);
   Object.freeze(retry);
   Object.freeze(loopUntilDry);
+  Object.freeze(sleep);
+  Object.freeze(workspace);
+  Object.freeze(agents);
+  Object.freeze(reset);
   Object.freeze(replAwait);
   Object.freeze(replAwaitIterable);
 
@@ -2209,7 +2147,22 @@ const GUEST_LIBRARY_SOURCE = `/*
   installGlobal('gate', gate);
   installGlobal('retry', retry);
   installGlobal('loopUntilDry', loopUntilDry);
+  installGlobal('sleep', sleep);
+  installGlobal('workspace', workspace);
+  installGlobal('agents', agents);
+  installGlobal('reset', reset);
   installGlobal('console', consoleObject);
+  // The result-history global (§4.4): '_' holds the previous eval's
+  // completion value (IPython-style) — the HOST sets it after every eval
+  // that resolved with a value. Installed HERE (as an ordinary writable
+  // global initialized to undefined) so it sits in the fresh-realm
+  // baseline and never pollutes the workspace manifest as a user binding.
+  Object.defineProperty(g, '_', {
+    value: undefined,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
   // The host's top-level-await instrumenter inserts calls to this global
   // ('await x' → 'await __replAwait(x)'); a bare VM without the library
   // never has the instrumenter applied (the broker gates on

@@ -32,10 +32,7 @@ import {
   registerGuestHostCallbacks,
   readGuestSurface,
   readRealmSlot,
-  renderRefLine,
-  renderGlobalLine,
   inspectGlobal,
-  renderPreviewLine,
   renderCollapsed,
   formatByteSize,
   formatNumber,
@@ -44,9 +41,6 @@ import {
   shortString,
   headTailDescription,
   isCanonicalIndex,
-  applyOutputCaps,
-  OUTPUT_MAX_LINES,
-  OUTPUT_MAX_BYTES,
   GUEST_LIBRARY_VERSION,
   GUEST_SURFACE_KEY,
   GUEST_VERSION_GLOBAL,
@@ -143,9 +137,16 @@ async function exercisePhaseB(): Promise<void> {
     },
     console: (event: ConsoleEvent) => {
       event.level satisfies ConsoleLevel;
-      event.refs satisfies string[];
-      event.args satisfies unknown[];
+      event.line satisfies string;
     },
+    sleep: (call: GuestCall, ms: number) => {
+      ms satisfies number;
+      call.resolve(undefined);
+    },
+    workspace: () => '{}',
+    agents: () => '[]',
+    reset: () => undefined,
+    defaultBackend: () => undefined,
   };
   await installGuestBridge(bridgeVm, handlers);
   registerGuestHostCallbacks(bridgeVm, handlers);
@@ -159,12 +160,9 @@ async function exercisePhaseB(): Promise<void> {
     const stats = surface.stats();
     stats.pendingCalls satisfies number;
   }
-  const slot: RealmSlot = readRealmSlot(bridgeVm, '$1');
+  const slot: RealmSlot = readRealmSlot(bridgeVm, 'agent');
   slot satisfies RealmSlot;
-  const line: string = renderRefLine(bridgeVm, '$1', { fallback: true });
-  line satisfies string;
-  renderGlobalLine(bridgeVm, 'anything') satisfies string;
-  const meta = inspectGlobal(bridgeVm, '$1');
+  const meta = inspectGlobal(bridgeVm, 'agent');
   meta.kind satisfies 'data' | 'accessor' | 'absent';
   meta.label satisfies string;
   meta.sizeBytes satisfies number;
@@ -177,7 +175,6 @@ async function exercisePhaseB(): Promise<void> {
   };
   const t: PreviewType = preview.type;
   const st: PreviewSubtype | undefined = preview.subtype;
-  renderPreviewLine(7, 48000, preview) satisfies string;
   renderCollapsed(preview) satisfies string;
   formatByteSize(48000) satisfies string;
   formatNumber(-0) satisfies string;
@@ -195,11 +192,6 @@ async function exercisePhaseB(): Promise<void> {
   HOST_CHECKPOINT satisfies string;
   HOST_CONSOLE satisfies string;
   HOST_STEER satisfies string;
-  const capped = applyOutputCaps(['line 1', 'line 2']);
-  capped.lines satisfies string[];
-  capped.truncated satisfies boolean;
-  OUTPUT_MAX_LINES satisfies number;
-  OUTPUT_MAX_BYTES satisfies number;
   bridgeVm.dispose();
 }
 
@@ -250,8 +242,10 @@ function storeTyping(store: CallStore): void {
     sessionId: null,
     deliveredAtMs: null,
     droppedAtMs: null,
+    queuedAtMs: null,
   });
   store.recordReissued('c1', 2);
+  store.recordQueued('c1', 4);
   store.recordAttached('c1', 'backend-session-1', 5, 'pi');
   store.recordCompleted('c1', { outcome: 'resolve', value: { ok: true }, completedAtMs: 3 }) satisfies boolean;
   store.recordDelivery('c1', 'delivered', 4);
@@ -262,6 +256,12 @@ function storeTyping(store: CallStore): void {
 function brokerSurfaceTyping(ws: Workspace): void {
   const options: BrokerOptions = {
     runner: {
+      listBackends() {
+        return ['claude', 'pi'];
+      },
+      defaultBackendId() {
+        return 'claude';
+      },
       async openSession(_opts: BrokerOpenSessionOptions): Promise<BrokerSession> {
         return {
           sessionId: 's1',
@@ -330,7 +330,7 @@ function brokerSurfaceTyping(ws: Workspace): void {
   recordKind satisfies string;
   const outcomeKind: CallOutcomeKind = 'reject';
   outcomeKind satisfies string;
-  const summary: CheckpointSummary = { id: 'c1', question: '"What color?"' };
+  const summary: CheckpointSummary = { id: 'c1', question: 'What color?' };
   summary satisfies { id: string; question: string };
   const info: CheckpointInfo = { id: 'c1', question: 'x', optionsJson: null, raisedAtMs: 1 };
   const live: LiveAgentInfo = {
@@ -357,9 +357,10 @@ function brokerSurfaceTyping(ws: Workspace): void {
   fileStore.path() satisfies string;
   fileStore.close();
   const evalResult: ReplEvalResult = {
-    output: ['[$1 · number · 8B] 42'],
-    outputTruncated: false,
+    output: ['42'],
+    kind: 'value',
     result: '42',
+    evalToken: 'e1',
     pending: [],
     checkpoints: [],
     completed: [],

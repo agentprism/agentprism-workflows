@@ -2,7 +2,7 @@
 
 An **[MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, safe inspection, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tool surface is **two tools**: **`workflow`**, with run/resume/inspect/await/stop branches, and **`repl`** — a persistent QuickJS-in-WASM JavaScript REPL for live, stateful subagent orchestration (see [The `repl` tool](#the-repl-tool)) — plus an app-only `workflow-events` poller that feeds the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enters the model's tool loop. Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes (`resumeFromRunId`) after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
-This package is a **thin MCP adapter**. The `workflow` tool's real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, resume, token budgets — lives in **[`@automatalabs/workflows`](../workflows)**; the `repl` tool's real work — the persistent QuickJS-in-WASM VM, the subagent broker, the CDP-style previewer, and the enveloped-snapshot store — lives in **[`@automatalabs/repl-engine`](../repl-engine)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool over a per-project `WorkflowManager` and the `repl` tool over a per-project QuickJS VM, and serves them over stdin/stdout.
+This package is a **thin MCP adapter**. The `workflow` tool's real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, and resume — lives in **[`@automatalabs/workflows`](../workflows)**; the `repl` tool's real work — the persistent QuickJS-in-WASM VM, the subagent broker, the CDP-style previewer, and the enveloped-snapshot store — lives in **[`@automatalabs/repl-engine`](../repl-engine)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool over a per-project `WorkflowManager` and the `repl` tool over a per-project QuickJS VM, and serves them over stdin/stdout.
 
 > **Embedding in your own program?** Don't reach for this package — use **[`@automatalabs/workflows`](../workflows)** directly (`runDynamicWorkflow(script, …)`). This server exists to put that same engine behind the MCP protocol. See [Programmatic use](#programmatic-use) below.
 
@@ -185,7 +185,6 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `concurrency` | integer > 0 | no | engine default | Max concurrent agents. **Clamped to 16** (the runtime max) by the engine — never rejected. |
 | `agentRetries` | integer ≥ 0 | no | engine default | Retry attempts for recoverable agent failures. **Clamped to 3** (the runtime max). |
 | `agentTimeoutMs` | integer > 0 \| null | no | none | Total wall-clock ceiling in ms for each attempt. A per-call `timeoutMs` may tighten but cannot escape a finite ceiling. Omit/pass `null` for no host ceiling. Every retry re-arms the clock. |
-| `tokenBudget` | integer > 0 \| null | no | none | Hard total-token budget for the whole run. Omit or pass `null` for no limit. |
 | `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits compatible format/metadata/manifest/cwd state and replays only eligible calls; current-environment and Node/V8 drift are reported provenance. Pre-input-format-2 sources use the named positional bridge. If the source paused mid-agent on usage/auth, an unchanged, reopenable root occurrence continues from its recorded ACP session; every failed continuation gate runs fresh. |
 | `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format format/metadata/manifest/input checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. This works under the default policy and does not require `resumePolicy: "positional"`. The JSON decision is returned verbatim (`kind: "confirm"` normally uses a boolean). Wire keys must be canonical non-negative safe integers. |
@@ -210,8 +209,7 @@ Example call arguments:
 {
   "script": "export const meta = { name: 'review', description: 'review a diff' };\nconst r = await agent('Review this diff and summarize risks:\\n' + args.diff);\nreturn r;",
   "args": { "diff": "diff --git a/x b/x\n+console.log(1)" },
-  "concurrency": 4,
-  "tokenBudget": 200000
+  "concurrency": 4
 }
 ```
 
@@ -260,8 +258,7 @@ Background start and bounded collection:
   "script": "export const meta = { name: 'review', description: 'review a change' };\nconst report = await agent('Review ' + args.target, { label: 'review' });\nreturn report;",
   "args": { "target": "src/auth.ts" },
   "background": true,
-  "concurrency": 4,
-  "tokenBudget": 200000
+  "concurrency": 4
 }
 ```
 
@@ -271,7 +268,7 @@ Background start and bounded collection:
   "status": "running",
   "limits": {
     "maxAgents": 1000,
-    "tokenBudget": 200000,
+    "tokenBudget": null,
     "concurrency": 4,
     "agentRetries": 0,
     "agentTimeoutMs": null
@@ -431,8 +428,9 @@ Each call has its deterministic index, known agent/checkpoint attribution, a com
 `resultPreview`, and redaction/truncation flags. Agent rows also expose resolved `timeoutMs` and a
 terminal `errorCode`; timed-out and host-cancelled calls therefore remain visible as
 `AGENT_TIMEOUT` and `AGENT_CANCELLED`. `limits`
-contains `maxAgents`, `tokenBudget`, `concurrency`, `agentRetries`, and `agentTimeoutMs` as resolved
-for this run (legacy persisted rows may omit it). Inspection never returns script, args, prompts,
+contains `maxAgents`, `tokenBudget` (a persisted-shape compatibility field that is always `null`
+for new runs), `concurrency`, `agentRetries`, and `agentTimeoutMs` as resolved for
+this run (legacy persisted rows may omit it). Inspection never returns script, args, prompts,
 histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results. Sensitive
 keys and credential-shaped strings are redacted before results are structurally compacted; every
 text scalar and preview is at most 512 UTF-8 bytes. The inherited structured status is at most
@@ -451,7 +449,7 @@ No workflow run found for runId "<runId>" in this server's project-scoped run st
 Inspecting an existing failed/aborted run is still a successful read (`isError: false`); branch on
 the payload `status`.
 
-Await inherits that exact safe status projection. Its status fields retain the 24,576-byte budget,
+Await inherits that exact safe status projection. Its status fields retain the 24,576-byte bound,
 redaction, compaction, filtering, and truncation counters, and its text is capped at 8,192 bytes.
 Before terminal state, optional `tokenUsage` is the cumulative live work observed in this execution;
 replayed calls add zero. At terminal state, `outcome` is the foreground-equivalent execution result:
@@ -562,7 +560,7 @@ client `resources` capability to gate these server-offered primitives.
   redacted final-20 `logTail` even when empty. The text response renders `recent run log (last X of
   Y):` before resume guidance. The terminal text is capped at 12,288 UTF-8 bytes; completed results
   omit this extra tail and preserve the existing full `logs` field.
-- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Completed calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed or ambiguous calls run live. Filesystem/world state, read/write behavior, safety annotations, nested workflows, and earlier live calls do not gate a match or clear later candidates. Identity hits preserve logical budget control flow but cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `replayEligibility`; its background acknowledgement predicts the prefix, while run/await/inspect text names the observed prefix, first non-replay, runtime/environment provenance changes, and operational changes. Terminal results also return the full `resumeReport`. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentRetries`, and `concurrency` again when they matter. Those host knobs and per-call `timeoutMs`/`retries` enter neither identity nor the input fingerprint and may change without rejecting replay. Sources below input format 2 use the named `inputs-format-legacy` positional bridge; current-format crash snapshots use identity even without terminal-environment capture. ≤0.23 carried ancestor rows replay only while the ancestor record remains persisted. Workflow-engine, Node, V8, filesystem, and environment differences are diagnostics, never gates. Unsupported call-path/input/checkpoint formats remain named runtime mismatches.
+- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Completed calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed or ambiguous calls run live. Filesystem/world state, read/write behavior, safety annotations, nested workflows, and earlier live calls do not gate a match or clear later candidates. Identity hits cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `replayEligibility`; its background acknowledgement predicts the prefix, while run/await/inspect text names the observed prefix, first non-replay, runtime/environment provenance changes, and operational changes. Terminal results also return the full `resumeReport`. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentRetries`, and `concurrency` again when they matter. Those host knobs and per-call `timeoutMs`/`retries` enter neither identity nor the input fingerprint and may change without rejecting replay. Sources below input format 2 use the named `inputs-format-legacy` positional bridge; current-format crash snapshots use identity even without terminal-environment capture. ≤0.23 carried ancestor rows replay only while the ancestor record remains persisted. Workflow-engine, Node, V8, filesystem, and environment differences are diagnostics, never gates. Unsupported call-path/input/checkpoint formats remain named runtime mismatches.
 - **Authoritative stop.** `action:"stop"` without `callIndex` acts on `running` and `paused` runs live in this server
   process, cancels their agent/checkpoint work, persists `aborted`, appends the durable `stopped`
   event, releases the lease, and returns the final inspection projection inline. Resume is safe
@@ -613,282 +611,140 @@ client `resources` capability to gate these server-offered primitives.
 
 ## The `repl` tool
 
-The second model-facing tool is **`repl`**: one persistent **QuickJS-in-WASM JavaScript VM per project**, exposed as a live REPL. Where `workflow` runs a *deterministic script to completion*, `repl` is the *interactive* orchestration plane — the client's own agent writes JavaScript that spawns subagents, and workspace state (variables, pending subagent calls, raised checkpoints, logged values) **persists in the VM between tool calls**. A later `eval` in the same workspace sees the same bindings and awaits the same promises; nothing lives in the transcript. Subagents are ACP sessions run through [`acp-agents`](../acp-agents) — the same backends `workflow` drives — capped at **6 concurrent per workspace**.
+The second model-facing tool is **`repl`**: one persistent **QuickJS-in-WASM JavaScript VM per project**, exposed as a live REPL with **one verb — `eval`** (plus the out-of-band `interrupt`). Where `workflow` runs a *deterministic script to completion*, `repl` is the *interactive* orchestration plane: the client's own agent writes JavaScript that spawns subagents, and workspace state (bindings, pending subagent calls, raised checkpoints, logged values) **persists in the VM between tool calls** — a later `eval` sees the same bindings and awaits the same promises; nothing lives in the transcript. Subagents are ACP sessions run through [`acp-agents`](../acp-agents) — the same backends `workflow` drives — **6 concurrent per workspace**, with dispatches above the cap **queued** for the next free slot (never rejected).
 
-The VM is capability-free: no filesystem, no network, no timers beyond the job drain. Its entire effect surface is the host bridge — `agent(modelSpec, task, opts?)`, `checkpoint()` / `checkpoint.answer()`, `console`, and the agent-handle methods `followUp` / `steer` / `cancel`. Everything else this repo's workflow authors already know — `parallel`, `pipeline`, `verify`, `judgePanel`, `gate`, `retry`, `loopUntilDry` — is pure JavaScript layered on `agent()`, injected as the in-VM guest library. The full guest surface (and the engine internals) live in the engine package, [`@automatalabs/repl-engine`](../repl-engine#the-guest-library-and-the-bridge-phase-b).
+The VM is capability-free: no filesystem, no network, no timers beyond the `sleep(ms)` guest helper. Its entire effect surface is the host bridge — `agent(modelSpec, task, opts?)`, `checkpoint()` / `checkpoint.answer()`, `console`, and the agent-handle methods `followUp` / `steer` / `cancel`. Everything else this repo's workflow authors already know — `parallel`, `pipeline`, `verify`, `judgePanel`, `gate`, `retry`, `loopUntilDry` — is pure JavaScript layered on `agent()`, injected as the in-VM guest library. The full guest surface (and the engine internals) live in the engine package, [`@automatalabs/repl-engine`](../repl-engine#the-guest-library-and-the-bridge-phase-b).
 
-Every result carries a machine-readable `structuredContent` (the published `outputSchema`) alongside a bounded human-readable text block. Guest output (console lines, the previewed completion value) is kept in fields separate from the trusted orchestration metadata (pending call ids, checkpoints, the workspace manifest) — never one flat string.
+Every result carries a machine-readable `structuredContent` — the exact same shape as the published `outputSchema` — alongside a human-readable text block. Guest output is **one newline-joined string** with no byte ceiling, so an agent can flood its own context by printing something enormous. This is accepted and documented — the Python REPL posture.
 
 ### Input parameters
 
-The tool is an **action union**. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set: a missing required field, and an *irrelevant known* field (`reset` with `code`, `status` with `ids`), are both MCP Invalid Params (`-32602`).
+The tool is an **action union** of exactly two actions. The input schema is **strict**: the MCP SDK validates the primitive fields, then the discriminator enforces each action's exact field set, and every key outside that set is rejected as MCP Invalid Params (`-32602`).
 
 | Param | Type | Actions | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `action` | `"eval" \| "wait" \| "status" \| "interrupt" \| "reset"` | all | — | Required. Selects the operation. |
-| `projectDir` | absolute path string | all | daemon: **required** (except `status`); in-process: the server's own project | The workspace key — one VM per `projectDir`, resolved through the same validated, realpathed per-project context as the `workflow` tool. Workspace state survives MCP-session churn and daemon restarts. |
-| `code` | string | `eval` | — | The JavaScript to evaluate. Top-level `await` is accepted; top-level `return` is a syntax error; `console` output is captured. An empty string is valid and resolves with `undefined`. |
-| `ids` | string[] | `wait` | every pending call | Call ids to wait for. |
-| `timeoutMs` | integer 0–120,000 | `wait` | `30000` | Bounded server-side wait; `"still running"` on timeout. |
+| `action` | `"eval" \| "interrupt"` | all | — | Required. Selects the operation. |
+| `projectDir` | absolute path string | all | daemon: **required**; in-process: the server's own project | The workspace key — one VM per `projectDir`, resolved through the same validated, realpathed per-project context as the `workflow` tool. Workspace state survives MCP-session churn and daemon restarts. |
+| `code` | string | `eval` | — | The JavaScript to evaluate. Top-level `await` is accepted; top-level `return` is a syntax error; `console` output is captured. An empty string is valid — the documented idempotent poll (see below). |
+| `timeoutMs` | integer 0–120,000 | `eval` | `60000` | The soft bound the eval holds the call open for; values above 120 000 ms are rejected. |
 | `id` | string | `interrupt` | — | The call id to cancel. Omitted: break the running eval. |
-| `refs` | string[] | `eval` / `wait` / `status` | — | Continuation-ref ids from an earlier truncated result; their elided entries return under `referenced`. |
 
-`projectDir` is required on the shared daemon for every action **except `status`** (which may list every known workspace without naming one). On a single-project (`--in-process`) server it defaults to that server's own project.
+`projectDir` is required on the shared daemon for **both** actions. On a single-project (`--in-process`) server it defaults to that server's own project.
 
-### The five actions
+### The two actions
 
 The examples below run against one workspace, `/work/acme`, in sequence — the state each call leaves is what the next one sees.
 
-**`eval`** runs `code` in the workspace VM, drains microtasks/jobs, settles what it can, and returns. `result` is the previewed completion value **when the eval resolves to a value** — including the literal string `"undefined"` when that value is the guest `undefined` (a `const`/`let`/`class` declaration or a bare `console.log(...)` statement resolves with `undefined`, so those evals carry `result: "undefined"`, not a missing field). `result` is **absent whenever the eval does not resolve to a value**: when it **suspends** — on a subagent call, a `checkpoint()`, or any other unsettled promise — it returns *immediately with no fabricated value* and `pending` lists the call ids (the continuation resumes at settlement, exactly like a `.then`); and when it **throws, rejects, hits a syntax error, or is interrupted**, the error renders in `output` as a plain `Name: message` line — the error's own `name` and `message`, e.g. `TypeError: x is not a function`, **not** an `error:`-prefixed line — and there is no completion value. (The `error:` prefix is reserved for a *late uncaught* rejection of an already-suspended continuation, which the VM's rejection bridge routes through `console.error`.) The first `eval` in an untouched workspace creates (or restores) the VM.
+**`eval`** runs `code` in the workspace VM, then **holds the call open pumping settlements server-side** up to the soft bound. Exactly one of three shapes returns:
+
+- **The finished shape** — everything the code waits on settled within the bound:
+
+  ```json
+  { "output": "researched the auth flow", "result": "three findings…" }
+  ```
+
+  `output` is ONE newline-joined string: console lines (one joined line per `console.*` call, args' reprs joined with a space), raised checkpoint lines (`checkpoint c9: <question>`), uncaught-error renderings (§4.6 attribution), and the one-line durability notices (§6). `result` is the completion value's repr, present whenever the code finished — including the literal string `"undefined"` when the value is the guest `undefined` (a `const`/`let`/`class` declaration or a bare `console.log(...)` statement).
+
+- **The still-running shape** — the bound elapsed first; the eval *continues server-side*:
+
+  ```json
+  { "output": "…", "running": ["c1"] }
+  ```
+
+  `running` lists the in-flight call ids (the stable `c1, c2, …` vocabulary — what `interrupt` targets and `agents()` reports). **Any later eval drains what settled in the meantime**, and `eval` with `""` is the documented idempotent poll: a no-op script that only reports. A poll whose drained timed-out eval **settled** in the meantime reports that eval's completion repr as its own `result` (a poll with nothing new reports its own `"undefined"`). Re-sending the poll never re-executes work.
+
+- **The thrown-eval shape** — the code threw (or was broken mid-run by `interrupt`): `output` carries the §4.6 error rendering (name + message, the guest stack's top frames with **line numbers in the submitted code**, and — for a subagent-call error — the call id and resolved backend), with **no `result`**:
+
+  ```json
+  { "output": "TypeError: x is not a function\n    at <repl>:1:10" }
+  ```
 
 ```json
 { "action": "eval", "projectDir": "/work/acme",
-  "code": "const research = agent('claude/sonnet', 'Summarize the auth flow in src/auth')" }
+  "code": "const research = agent('claude/sonnet', 'Summarize the auth flow in src/auth'); 'started'" }
 ```
 ```json
-{ "action": "eval", "projectDir": "/work/acme", "output": [], "outputTruncated": false,
-  "result": "undefined", "pending": ["c1"], "checkpoints": [], "completed": [] }
+{ "output": "", "result": "started" }
 ```
 
-The eval **resolved** — a `const` declaration resolves with the guest value `undefined`, which previews as the string `"undefined"`, so `result` is `"undefined"`. The `agent(...)` call took id `c1` and keeps running server-side, listed in `pending`. (An eval carries no `result` field when it **suspends** — e.g. `const x = await agent(...)` or `await checkpoint(...)`, where `pending` lists the id and there is no completion value yet — or when it **throws, rejects, syntax-errors, or is interrupted**.)
+The `agent(...)` call took id `c1` and keeps running server-side — start-and-don't-await is idiomatic: `await research` in a later eval picks the answer up.
 
-**`wait`** blocks server-side until the target calls settle (or `timeoutMs` elapses), then returns the **same shape as `eval`** — including any console output drained by its pumps — plus `drained` and `timedOut` (`timedOut === !drained`). The one shape difference: `wait` **never carries `result`**. It renders settlement, drained output, pending, and checkpoints — not a completion value — so the inherited optional `result` field is never populated on a `wait` result, even though the type permits it. On timeout the text appends `(still running — wait timed out after N ms)`; call `wait` again to keep waiting. It absorbs client tool-call timeouts.
+**`interrupt`** is the one out-of-band verb (the only operation that cannot be expressed as code: a wedged VM cannot run the code that would unwedge it).
 
-```json
-{ "action": "wait", "projectDir": "/work/acme", "ids": ["c1"], "timeoutMs": 60000 }
-```
-```json
-{ "action": "wait", "projectDir": "/work/acme", "output": [], "outputTruncated": false,
-  "pending": [], "checkpoints": [], "completed": ["c1"], "drained": true, "timedOut": false }
-```
-
-`c1` settled during the wait, so its id is in `completed`; nothing awaited it yet, so there is no console output. A later `eval` that reads it — `console.log({ chars: (await research).length })` — resolves immediately and prints `$1`, with `completed: []` (c1 already settled).
-
-**`status`** is `ls` for the data plane. Per workspace it reports `state` (`not-opened` / `fresh` / `restored` / `refused`), the restore `reconcile` summary (restored only), the **workspace manifest** (`bindings` — top-level names with a structure-only `token`, `type`, `sizeBytes`, `provenance`/`task`/`provenanceAtMs`, and, for agent handles, `handleCallId` + `handleStatus`), the `$N` `logs` range, the `evalSeq` counter, `inFlight` calls, `checkpoints`, `liveAgents`, `pending` ops, `childrenClosed`, and any retained `drainError`. It is metadata, never content. **A named `status` is a first touch** — it creates or restores the workspace exactly like the stateful actions, so its manifest, reconcile summary, and any restore refusal are all surfaced on that first call. Only the **project-less** `status` (omit `projectDir`) is non-materializing: it lists every already-known workspace (an empty array when none have been opened) without opening one.
-
-```json
-{ "action": "status", "projectDir": "/work/acme" }
-```
-```json
-{ "action": "status", "projectDir": "/work/acme", "workspaces": [ {
-  "projectDir": "/work/acme", "state": "fresh",
-  "bindings": [ {
-    "name": "research", "token": "agent handle · settled · call c1 · 151B",
-    "type": "agent handle", "sizeBytes": 151,
-    "handleCallId": "c1", "handleStatus": "settled",
-    "provenance": "eval 1", "provenanceAtMs": 1754500000000,
-    "task": "Summarize the auth flow in src/auth" } ],
-  "logs": { "first": null, "last": null, "count": 0 }, "evalSeq": 1,
-  "inFlight": [], "checkpoints": [],
-  "liveAgents": [ {
-    "callId": "c1", "modelSpec": "claude/sonnet",
-    "task": "Summarize the auth flow in src/auth",
-    "state": "idle", "supportsSteering": true, "queuedSteers": 0 } ],
-  "pending": [], "childrenClosed": false } ] }
-```
-
-`research` was bound in the first eval, so its `provenance` is `eval 1` (the model spec lives on `liveAgents[].modelSpec`, not on the binding); `handleStatus` is `settled` because `c1` completed during the wait. The settled subagent's ACP session stays **registered and `idle`** — reusable for `followUp` until the client-presence drain closes it — so `c1` appears once in `liveAgents` with `state: "idle"` (a settled call is not removed from `liveAgents`). `evalSeq` is `1` (one eval so far), and no `console.log` has run yet, so `logs` is empty. The byte size in the token is `formatByteSize(sizeBytes)` (decimal units, no space — `151B`, `2.5kB`, `1MB`).
-
-**`interrupt`** has two paths.
-
-**With `id`** it cancels one subagent call — ACP `session/cancel` downward (a drained handle's session is re-attached lazily first). `interrupt.outcome` is `cancelled` (cancel sent to a running turn), `idle` (the session exists but has no turn to cancel), `failed` (the lazy re-attach could not reach the backend), or `none` (no live session for that id). Suppose a later eval started a second subagent — `const audit = agent('codex/gpt-5.6-sol', 'Cross-check the auth findings')` — still running as `c2` (the next id after `research`'s `c1`):
+**With `id`** it cancels one subagent call — ACP `session/cancel` downward (a drained handle's session is re-attached lazily first). `interrupt.outcome` is `cancelled` (cancel sent to a running turn), `idle` (the session exists but has no turn to cancel), `failed` (the lazy re-attach could not reach the backend), or `none` (no live session for that id):
 
 ```json
 { "action": "interrupt", "projectDir": "/work/acme", "id": "c2" }
 ```
 ```json
-{ "action": "interrupt", "projectDir": "/work/acme",
-  "interrupt": { "outcome": "cancelled", "callId": "c2" } }
+{ "interrupt": { "outcome": "cancelled", "callId": "c2" } }
 ```
 
-**Without `id`** it breaks the **running eval**. `outcome` is `targeted` when a break was armed against an in-flight eval (a suspended continuation, or a fully synchronous runaway the out-of-band relay broke mid-run), or `refused-idle` when nothing breakable is running — no eval is in flight, the in-flight eval awaits something no host call can key a resumption to (a never-settling local promise), or a restored older guest predates the continuation-lease seam:
+**Without `id`** it breaks the **running eval**. `outcome` is `targeted` when a break was armed against an in-flight eval (a suspended continuation, or a fully synchronous runaway the out-of-band relay broke mid-run), or `refused-idle` — the honest refusal — when nothing breakable is running:
 
 ```json
 { "action": "interrupt", "projectDir": "/work/acme" }
 ```
 ```json
-{ "action": "interrupt", "projectDir": "/work/acme",
-  "interrupt": { "outcome": "refused-idle" } }
+{ "interrupt": { "outcome": "refused-idle" } }
 ```
 
-**`reset`** tears the workspace down: cancels in-flight ACP sessions, drops the VM, clears the whole per-project `repl/` store, and drops the workspace's continuation refs. It is the escape hatch for a refused snapshot.
-
-```json
-{ "action": "reset", "projectDir": "/work/acme" }
-```
-```json
-{ "action": "reset", "projectDir": "/work/acme", "dropped": true }
-```
-
-A refused snapshot (see [Durability](#the-workspace-project-model-and-durability)) or a missing project context returns the **error variant** — `{ action, projectDir?, error }` flagged `isError: true`, where `action` is whichever action touched the refused/absent workspace. A **refused snapshot** returns the error variant on `eval`/`wait`/`interrupt`; a **named `status`** instead reports the same refusal *through its normal status variant* — `state: "refused"` with a `restoreError` message, **not** the `isError` error variant — and `reset` clears the store rather than surfacing a snapshot refusal at all. A **missing project context** (single-project mode with no adopted default) returns the error variant on the four **stateful** actions — `eval`, `wait`, `interrupt`, and `reset`. `status` never takes the error path: a project-less `status` lists every known workspace (an empty array when none have been opened) and a named `status` *creates* the context, so it can never find one missing. The published schema's error branch still enumerates all five `action` values for completeness, but no runtime path emits it with `action: "status"`.
+A missing project context (single-project mode with no adopted default) returns the **error variant** — `{ "error": "…" }` flagged `isError: true`.
 
 ### Output
 
-Every result carries the machine-readable `structuredContent` below — a `oneOf` over the six variants, published as the tool's `outputSchema` — alongside the bounded text. The interfaces below are the shapes the tool **emits at runtime**: its Zod refinement admits each variant with exactly the fields listed and no other. The published JSON-Schema `outputSchema` is a deliberately **looser** projection of the same union: its per-branch guard forbids only an enumerated vocabulary of variant fields, and that vocabulary omits `referenced`, so the schema permits `referenced` on *every* branch — `interrupt`/`reset`/`error` included — and it types `reset`'s `dropped` as `boolean`, not the literal `true`. No runtime path emits either looser shape; a host that validates against the published schema alone gets those two extra degrees of freedom the emitted results never use.
+Every result carries the machine-readable `structuredContent` below — a `oneOf` over the five variants, published as the tool's `outputSchema` — alongside the human text (the same output string, then a `result:` line or a `running:` line, then the interrupt outcome). The shapes are what the tool **emits at runtime**, and `result`/`running` are **mutually exclusive**: an eval result is exactly one of the finished, still-running, or thrown-eval variants.
 
 ```ts
 type ReplToolOutput =
-  | ReplEvalResult | ReplWaitResult | ReplStatusResult
-  | ReplInterruptResult | ReplResetResult | ReplErrorResult;
+  | ReplEvalResult | ReplEvalStillRunning | ReplEvalThrown
+  | ReplInterruptResult | ReplErrorResult;
 
-interface ReplEvalResult {
-  action: "eval";
-  projectDir: string;
-  output: string[];             // rendered console lines (already broker-capped)
-  outputTruncated: boolean;     // console lines dropped by the caps (still reachable via $N)
-  result?: string;              // previewed completion value; present when the eval RESOLVES to a value (a guest undefined renders as the string "undefined"); absent when the eval SUSPENDS, throws, rejects, syntax-errors, or is interrupted
-  pending: string[];            // pending call ids, registry order
-  checkpoints: CheckpointSummary[];
-  completed: string[];          // call ids settled into the guest by this op (checkpoint answers excluded)
-  truncated?: TruncatedRecord;  // present only when the 10 KB structured cap elided a field
-  referenced?: Record<string, unknown[]>;  // read-back for the `refs` parameter
+interface ReplEvalResult {          // the code finished within the soft bound
+  output: string;                   // ONE newline-joined string: console lines (one per call),
+                                    //   checkpoint lines, error renderings, §6 notices
+  result: string;                   // the completion value's §4.4 repr (a guest undefined renders "undefined")
 }
 
-interface ReplWaitResult extends Omit<ReplEvalResult, "action"> {
-  action: "wait";
-  // `result?` is inherited from ReplEvalResult, but Broker.renderWaitResult never sets it:
-  // a wait reports settlement + drained output, never a completion value. `result` is
-  // absent on every wait result (the field survives here only through the `extends`).
-  drained: boolean;             // the targets settled within the bound
-  timedOut: boolean;            // === !drained
+interface ReplEvalStillRunning {    // the bound elapsed first; the eval continues server-side
+  output: string;
+  running: string[];                // the in-flight call ids (c1, c2, … — what interrupt targets)
 }
 
-interface CheckpointSummary {
-  id: string;                   // the checkpoint's call id (shares the c1, c2, … sequence)
-  question: string;             // previewed via the top-level string rule (double-quoted, head+tail past 200 chars)
-}
-
-interface ReplStatusResult {
-  action: "status";
-  projectDir?: string;          // present only on a named status
-  workspaces: WorkspaceStatus[];
-  truncated?: TruncatedRecord;
-  referenced?: Record<string, unknown[]>;
-}
-
-interface WorkspaceStatus {
-  projectDir: string;
-  state: "not-opened" | "fresh" | "restored" | "refused";
-  restoreError?: string;        // refused only — the containment message
-  reconcile?: ReconcileReport;  // restored only
-  bindings: ManifestBinding[];
-  logs: { first: number | null; last: number | null; count: number };  // the $N range
-  evalSeq: number;              // snapshot-durable eval counter
-  inFlight: string[];           // in-flight host-call ids
-  checkpoints: CheckpointSummary[];
-  liveAgents: LiveAgent[];
-  pending: string[];            // pending call ids
-  childrenClosed: boolean;      // the client-presence drain closed idle children
-  drainError?: string;          // a retained last-drain failure
-}
-
-interface ReconcileReport {     // which arm each outstanding call took on restore
-  settledFromStore: string[];
-  reattached: string[];
-  reissued: string[];
-  failedLost: string[];
-  requeuedCheckpoints: string[];
-  leftPending: string[];
-  reQueuedUndelivered: string[];
-}
-
-interface ManifestBinding {     // metadata, never value content
-  name: string;
-  token: string;                // structure-only, e.g. "agent handle · settled · call c1 · 151B", "{3 keys} · 1.2kB", "string · 2.4kB"
-  type: string;                 // machine-readable type label: "string", "number", "object", "array", "agent handle", …
-  sizeBytes: number;            // trap-free byte-size estimate
-  handleCallId: string | null;  // set for agent-handle bindings
-  handleStatus: "pending" | "settled" | null;
-  provenance: string | null;    // "eval N", "worker c2" (or "worker c2+c3"), "session restore"
-  provenanceAtMs: number | null;
-  task: string | null;          // the founding call's task, ≤ 200 chars head+tail
-}
-
-interface LiveAgent {
-  callId: string;               // the founding call id (the steering address)
-  modelSpec: string;            // ≤ 200 chars head+tail
-  task: string;                 // ≤ 200 chars head+tail
-  state: "opening" | "running" | "delivering" | "idle";
-  supportsSteering: boolean;
-  queuedSteers: number;
+interface ReplEvalThrown {          // the code threw (or was broken mid-run)
+  output: string;                   // the §4.6 error rendering — no completion value exists
 }
 
 interface ReplInterruptResult {
-  action: "interrupt";
-  projectDir: string;
   interrupt: {
     outcome: "targeted" | "refused-idle" | "cancelled" | "idle" | "failed" | "none";
-    callId?: string;            // present on the id path
+    callId?: string;                // present on the id path
   };
 }
 
-interface ReplResetResult { action: "reset"; projectDir: string; dropped: true; }  // runtime always emits dropped: true; the published schema types this field boolean
-
-interface ReplErrorResult {     // isError: true — a refused snapshot (eval/wait/interrupt; a named status reports refusal via its status variant instead) or a missing project context (the stateful actions eval/wait/interrupt/reset; status never takes this path)
-  // The enum lists "status" for schema completeness only — no runtime path emits an error variant for it.
-  action: "eval" | "wait" | "status" | "interrupt" | "reset";
-  projectDir?: string;
+interface ReplErrorResult {         // isError: true — a missing project context
   error: string;
 }
 ```
 
-`TruncatedRecord` records what the structured cap elided. Each key is an elided field's path (`"pending"`, `"workspaces[0].reconcile.requeuedCheckpoints"`, …); its value is the elided entry count, or `{ elided, ref }` when the workspace captured a continuation ref for the dropped tail. The reserved key `strings` is a plain count of strings the string backstop head+tail-elided:
+### The guest API, printing, and checkpoints
 
-```ts
-type TruncatedRecord = Record<string, number | { elided: number; ref: string }>;
-```
+`agent(modelSpec, task, opts?)` spawns an ACP subagent on a registry built-in (currently **Claude, Codex, OpenCode, and pi**) or a registered custom agent. The spec is `"backend/model"` — a bare `"backend"` runs its default model — and an unknown backend segment rejects the call **synchronously**, naming the segment and enumerating the known backends (a spec with no known-backend prefix is an error, never a silent route to the default backend). The option keys are `schema` (a structured-output JSON schema, validated per call), `cwd`, `configOptions` (backend-specific knobs, validated at admission — a typo'd key fails in milliseconds naming the valid alternatives), and `mode` — e.g. `agent("pi/deepseek-v4-flash-max", "research X and report the top 3 findings", { cwd: "/repo", mode: "plan" })`. An unknown option key rejects synchronously too. The handle carries `followUp` (a settled session's new turn, resolved with its **answer**), `steer` (delivery outcome `injected`/`queued`/`failed`; on an idle session it aliases `followUp`), and `cancel` (the founding call rejects recoverable, `AGENT_CANCELLED` family).
 
-### Subagents, checkpoints, and call ids
+`checkpoint(question)` parks a promise for a human answer **inside the VM**. The raised checkpoint surfaces as an **output line** — `checkpoint c9: <question>` — and a later eval's `checkpoint.answer("c9", value)` resolves it. No side protocol: the question rides the ordinary output string and the answer rides the ordinary `eval` input.
 
-Every `agent(...)` call and every `checkpoint(...)` draws the **next id from one shared per-workspace sequence** — `c1`, `c2`, … — so in the timeline above `research` took `c1` and `audit` took `c2`; a `checkpoint()` in that workspace would take `c3`. (The `reset` above dropped `/work/acme`, so the counter below restarts at `c1` in the fresh VM.) `checkpoint("question")` parks a promise **inside the VM**; the previewed question appears in the result's `checkpoints` list as `{ id, question }`, the client's agent relays it to its human, and the answer returns in a later eval as `checkpoint.answer("c1", value)`. No side protocol — the question rides the ordinary tool result and the answer rides the ordinary `eval` input.
+Printing follows Python-ish conventions, **with no byte ceilings anywhere** (§4.4): strings passed **directly** to `console.log` — and a string **completion value** — print **whole** (they are the output the orchestrator asked for); objects/arrays render to **depth 2**, deeper levels as `{…}` / `[…]`; collections render their first **20 entries** per level, then `… +N more`; **nested** strings render head-limited at **200 chars**. Everything deeper/longer is reached by evaluating a narrower expression — the values are alive in the VM; slicing is the API. `_` holds the previous eval's completion value, IPython-style — bindings are the memory.
 
-```json
-{ "action": "eval", "projectDir": "/work/acme",
-  "code": "const ok = await checkpoint('Delete the staging DB?'); ok ? 'go' : 'stop'" }
-```
-```json
-{ "action": "eval", "projectDir": "/work/acme", "output": [], "outputTruncated": false,
-  "pending": ["c1"], "checkpoints": [ { "id": "c1", "question": "\"Delete the staging DB?\"" } ],
-  "completed": [] }
-```
-
-This eval **suspends** on `await checkpoint(...)`, so it carries no `result` — `pending` lists the checkpoint id `c1` and `checkpoints` previews the question. The question is rendered through the top-level string rule, so it crosses the wire double-quoted (`"\"Delete the staging DB?\""` as a JSON string). A later eval answers it; the answer resolves the parked promise during that eval's drain (the `'go'`/`'stop'` continuation runs, but its value is not re-surfaced unless logged), and `checkpoint.answer` itself completes with `true`, so `result` is `"true"`:
-
-```json
-{ "action": "eval", "projectDir": "/work/acme", "code": "checkpoint.answer('c1', true)" }
-```
-```json
-{ "action": "eval", "projectDir": "/work/acme", "output": [], "outputTruncated": false,
-  "result": "true", "pending": [], "checkpoints": [], "completed": [] }
-```
-
-An answered id leaves the `checkpoints` list — that is its visibility; checkpoint answers are deliberately **excluded** from `completed` (hence `completed: []` above even though the parked promise settled).
-
-### Output addressing and the caps
-
-Every `console.log` value is **captured inside the VM** as `$1`, `$2`, … via `structuredClone` (a stable snapshot — mutating the value after the log never changes `$N`), and the rendered line carries its address in the previewer's collapsed CDP syntax — property names unquoted, strings double-quoted, nested objects as brand tokens:
-
-```text
-[$14 · object · 48kB] {sections: Array(12), title: "Auth flow", …}
-```
-
-So the orchestrator slices deeper in a later eval — `console.log($14.sections.map(s => s.title))` — instead of re-running work. Cloneable data — plain objects, arrays, `Map`/`Set`/`Date`/`RegExp`/`Error`/`ArrayBuffer`/typed arrays — is preserved whole. What `structuredClone` cannot take is *not* dropped from the graph: an iterative marker-copy fallback substitutes a typed marker (`{ __unclonable__: "function" | "symbol" | "promise" | "weakmap" | "weakset" | "weakref" | "unfreezable" | "thrown", description? }`) for functions, symbols, promises, weak collections, hostile or otherwise unfreezable subgraphs, and any element, property, or enumeration whose read *throws* — a getter, a proxy `get`/`ownKeys` trap, or a hostile container iterator, recorded as `"thrown"` — so `$N` preserves the value's *shape* with those specific pieces stood in for by markers, rather than either failing or silently losing the surrounding structure. Nothing cloneable is lost by logging, and nothing floods the client's context by being logged.
-
-The two surfaces are capped **independently**:
-
-- **The text block** is capped at **256 physical lines or 10,000 UTF-8 bytes, whichever trips first** (line-granular — a line that would trip either limit is dropped whole and a truncation marker ships instead; embedded newlines count toward the line cap). Console values beyond the cap stay reachable through their `$N` refs.
-- **`structuredContent`** is capped only by a **10,000-byte serialized-JSON** bound (no line cap). When it trips, the largest arrays are elided head-first and each drop is recorded in the `truncated` record. An elided array carries a **continuation ref** (`{ elided, ref }`) *when the workspace captured one* — pass those ref ids back through the `refs` parameter of a later `eval`/`wait`/`status` call and the dropped entries return under `referenced`. That read-back is **itself subject to the same 10,000-byte cap**: `referenced` re-enters the structured cap, so a retrieved tail that is still over the bound is re-elided and a **fresh** continuation ref is issued for its remainder. A large tail therefore drains across **chained reads** — one ref read per round — rather than in a single call; each read costs only a read and loses no data. The guarantee is **not universal**, though: an array dropped when no ref store is available (a project-less `status` before any workspace has materialized) keeps a bare count, and the `strings` backstop head+tail-*shortens* an oversized string element in place — recorded as a bare `strings` count, never stored — so those two elisions do lose data.
-
-Continuation refs are **workspace-namespaced** (`<project-key>:t<seq>`) and held **in memory** per workspace: a ref from one project can never resolve in another, `reset` clears them, and a daemon restart loses them (the caller re-reads current state and gets fresh refs).
+Introspection is in-band guest data: `workspace()` returns `{ bindings: [{ name, type, sizeBytes, provenance, task, callId?, status? }], inFlight, checkpoints, diagnostics }` (with `diagnostics` carrying the §6 demotions — the last reconcile summary, a retained drain error, `childrenClosed`); `agents()` lists `{ callId, modelSpec, task, state, supportsSteering, queuedSteers }`; `reset()` tears the workspace down after the current eval completes. Subagent output passes through **unfiltered** — backend harness noise (e.g. codex's "Warning: Skill descriptions were shortened…") is forwarded verbatim, never curated away; expect it when the backend prints it.
 
 ### The workspace project model and durability
 
 Workspaces follow the daemon's project model exactly: **one VM per `projectDir`**, addressed by the same required-in-daemon-mode argument the `workflow` tool uses. MCP-session churn — client restarts, transport eviction — never touches the workspace; the daemon's lifetime plus disk snapshots carry it across everything else.
 
 - **Snapshots are implicit and boundary-durable.** There is no snapshot action. The workspace is written to the daemon's per-project `repl/` store (beside the workflow state, under the same project key) at **every state-changing boundary** — after each eval, and after each settlement drain that changed VM state — as a self-identifying envelope (the `quickjs.wasm` binary's SHA-256 + a format version + gzip compression). Because durability is boundary-based, a daemon kill loses at most the *in-flight* operation that had not yet reached a boundary; every committed boundary — and, through the append-only call store, every recorded subagent result — is durable and reconciled on the next touch.
-- **Restore is lazy, on first touch.** There is no daemon-startup restore sweep. The VM is restored the first time a `repl` call addresses the project (a named `status`, `eval`, `wait`, or `interrupt`): host callbacks are re-registered by name, and every outstanding subagent call is reconciled three ways — **settled from the store** if it completed while the daemon was down, **re-attached** to its still-running ACP session (all four built-in backends advertise `loadSession`), or **re-issued** if it was lost. The `reconcile` summary appears in `status`.
-- **A refused snapshot is contained, not fatal.** A snapshot that cannot be restored with the running engine — corrupt, a format upgrade, or a `quickjs.wasm` hash mismatch after a package bump — is surfaced loudly and points at `reset`: `eval`/`wait`/`interrupt` return the `isError` **error variant** (an `error` naming the cause), and a named `status` reports it through its **status variant** (`state: "refused"` with a `restoreError`). The daemon never crash-loops and never silently discards the data.
-- **Subagent processes are client-presence keyed.** Child ACP processes stay warm while any MCP client is connected to the project. On last-client disconnect the workspace **drains**: in-flight subagent turns run to completion (each settlement boundary snapshots, so "close the laptop while two researchers run" ends with the findings durable), bounded by the daemon's session-eviction TTL (`AGENTPRISM_SESSION_TTL_MS`, default 2 h) — a turn that overruns the bound is force-settled as the recoverable `AGENT_CANCELLED` — then idle children close (`childrenClosed: true`). A client that reconnects **mid-drain aborts it**, keeping the children warm. On the next connect the workspace is live (or restores), and `followUp` re-attaches a subagent session lazily. A drain that fails (a snapshot-flush error) is never silent: it surfaces as a `warn:`/`drainError` line on later results and retries on the next disconnect.
+- **Restore is lazy, on first touch.** There is no daemon-startup restore sweep. The VM is restored the first time a `repl` call addresses the project: host callbacks are re-registered by name, and every outstanding subagent call is reconciled three ways — **settled from the store** if it completed while the daemon was down, **re-attached** to its still-running ACP session (all four built-in backends advertise `loadSession`), or **re-issued** if it was lost. The reconcile summary demotes to `workspace().diagnostics.reconcile`; the next eval's output carries a one-line notice only when calls were **lost** (`failedLost` non-empty) — losses are never silent.
+- **A refused snapshot AUTO-RESETS.** A snapshot that cannot be restored with the running engine — corrupt, a format upgrade, or a `quickjs.wasm` hash mismatch after a package bump — no longer poisons every call until a manual reset. The workspace **auto-resets and starts fresh**, and the refused snapshot file is **renamed aside** (`.refused-<timestamp>`, never deleted — auto-reset must not be silent data destruction). The next eval's `output` **leads with a loud one-line notice** naming the file and the reason. The daemon never crash-loops and never silently discards the data.
+- **Subagent processes are client-presence keyed.** Child ACP processes stay warm while any MCP client is connected to the project. On last-client disconnect the workspace **drains**: in-flight subagent turns run to completion (each settlement boundary snapshots, so "close the laptop while two researchers run" ends with the findings durable), bounded by the daemon's session-eviction TTL (`AGENTPRISM_SESSION_TTL_MS`, default 2 h) — a turn that overruns the bound is force-settled as the recoverable `AGENT_CANCELLED` — then idle children close (`childrenClosed: true`). A client that reconnects **mid-drain aborts it**, keeping the children warm. On the next connect the workspace is live (or restores), and `followUp` re-attaches a subagent session lazily. A drain that fails (a snapshot-flush error) is never silent: the failure is retained under `workspace().diagnostics.drainError`, the next eval's output carries the one-line loss notice (the failed drain **lost state** — the workspace was not persisted), and the next disconnect retries the drain.
 
 **Interrupting a running eval is not universal.** An eval that **yields** (suspends on a subagent call or checkpoint) is broken by the QuickJS interrupt handler the next time its continuation runs. A **fully synchronous** runaway wedges the daemon's single thread, so the `interrupt` request cannot even be processed mid-run; it is broken **out of band** by a worker-thread relay that the stdio shim (or the `--in-process` relay transport) fires *before* forwarding the call — **a host connected directly over HTTP has no such relay**, and falls back to the per-eval wall-clock deadline. That deadline (`AGENTPRISM_REPL_EVAL_TIMEOUT_MS`, default 30 000 ms) is the last-resort bound in every mode. The no-id `interrupt` therefore honestly reports `refused-idle` for the cases it cannot break (a never-settling local promise, an older restored guest without the continuation-lease seam).
 
@@ -957,7 +813,7 @@ const run = await runDynamicWorkflow(
   `export const meta = { name: "demo", description: "one agent" };
    const r = await agent("Say hello in one word.");
    return r;`,
-  { exec: { concurrency: 4, tokenBudget: 100_000 } },
+  { exec: { concurrency: 4 } },
 );
 
 console.log(run.status, run.result);
@@ -979,7 +835,7 @@ installMcpServerLifecycle({ runner, server, transport });
 
 > **Synchronous-runaway interruption needs the relay transport.** A vanilla `StdioServerTransport` (above) serves every `repl` action, but its stdin reader runs on the main thread, so it cannot fire the out-of-band eval-break for a *fully synchronous* runaway — that eval only stops at the per-eval deadline. The bundled `main()` instead uses the internal relay stdio transport (a worker-thread stdin reader that fires `server.replBreakUrl()` before forwarding a no-id `interrupt`), so the documented no-id interrupt breaks a synchronous runaway mid-run. A yielding eval is interruptible on either transport.
 
-The REPL-specific exports are `replToolInputShape` / `replToolOutputShape` (the tool's Zod input/output schemas), `capStructuredResult` (the 10 KB structured cap), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). Other workflow-side exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
+The REPL-specific exports are `replToolInputShape` / `replToolOutputShape` (the tool's Zod input/output schemas), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). Other workflow-side exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
 `clampWorkflowInput` (primitive schema, action discriminator, execution clamp),
 `CreateWorkflowServerOptions`,
 `WorkflowExecuteToolInput`, `WorkflowInspectToolInput`, `WorkflowAwaitToolInput`, `WorkflowStopToolInput`,

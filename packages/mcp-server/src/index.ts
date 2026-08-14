@@ -51,13 +51,13 @@ export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
 export { replToolInputShape, replToolOutputShape } from "./repl-tool.js";
-export { capStructuredResult } from "./repl-tool.js";
 export type { ReplToolOptions } from "./repl-tool.js";
 export {
   createReplProjectState,
   ensureReplWorkspace,
   disposeReplProjectState,
   resetReplProjectState,
+  renameAsideNeverOverwriting,
 } from "./repl-project.js";
 export type { ReplProjectState } from "./repl-project.js";
 export { ReplPresenceLedger } from "./repl-presence.js";

@@ -1,20 +1,20 @@
 /**
- * Phase E of the REPL-orchestrator roadmap (docs/roadmap/repl-orchestrator.md):
- * the `repl` tool's DAEMON-BOUNDARY suite. The phase-D suites
- * (repl-tool.test.ts, repl-review2.test.ts) drive `createWorkflowServer`
- * over in-memory transports; this suite pins the phase-E deliverables
- * against a REAL daemon instance — `createDaemon` on an ephemeral
- * loopback port, driven by real SDK Clients over
+ * Phase E of the REPL-orchestrator roadmap, adapted to the eval-plane
+ * redesign surface: the `repl` tool's DAEMON-BOUNDARY suite. The
+ * phase-D suites (repl-tool.test.ts, repl-review2.test.ts) drive
+ * `createWorkflowServer` over in-memory transports; this suite pins the
+ * phase-E deliverables against a REAL daemon instance — `createDaemon`
+ * on an ephemeral loopback port, driven by real SDK Clients over
  * StreamableHTTPClientTransport (the `_http-harness` pattern):
  *
  * - the tool schema: `repl` registers alongside `workflow` with exactly
- *   the doc's action enum (`eval` / `wait` / `status` / `interrupt` /
- *   `reset`) and field set — snapshotting is implicit, there is no
- *   user-facing snapshot action,
+ *   the redesign's two-action enum (`eval` / `interrupt`) and field set
+ *   — snapshotting is implicit, there is no user-facing snapshot action,
  * - action behaviors on the daemon: projectDir is required in daemon
- *   mode, and eval / wait / status / interrupt / reset round-trip over
- *   HTTP (wait: bounded, "still running" on timeout, absorbs a
- *   mid-wait settlement),
+ *   mode, and eval / interrupt round-trip over HTTP (eval: the
+ *   soft-bound fused pump — the finished shape when the awaited call
+ *   settles within the bound, the honest still-running shape with the
+ *   running ids when it does not),
  * - project keying: two projectDirs are two ISOLATED workspaces on one
  *   daemon (separate VMs, separate per-project repl stores, a reset of
  *   one never touches the other),
@@ -24,43 +24,23 @@
  *   project presence on reconnect (the registry's connection-open
  *   signal re-adds it from the ledger's retained affinity), so the
  *   scheduled drain aborts and children stay warm,
- * - reset does NOT clear client presence (connection liveness, not
- *   workspace state): with a second client connected, the resetting
- *   client's disconnect never drains the post-reset workspace,
- * - the lifecycle drain driven by the daemon's session registry (the
- *   doc's client-presence policy): last-client disconnect drains the
- *   in-flight subagent turn to completion (mock runner), closes the
- *   idle child, and the next connect's followUp lazily re-attaches the
- *   recorded backend session,
- * - the eval-through-MCP round trip applies the doc's output caps
- *   (256 lines / 10 KB, whichever trips first) to the FINAL tool
- *   result — console lines, the result line, and the metadata sections
- *   alike, with the truncation marker shipping — and the `$N` refs the
- *   kept lines carry reach the truncated values (the cap costs reads,
- *   never data),
- * - interrupt without an id breaks a RUNNING eval: an eval that keeps
- *   EXECUTING across drains (a runaway loop over subagent calls) is in
- *   flight while a wait pumps it; the interrupt lands mid-wait (the
- *   wait releases the broker chain between its pumps) and the wait's
- *   very next pump breaks the loop's next iteration MID-RUN via the
- *   quickjs interrupt handler; the signal is consumed by that
- *   execution (a later eval is unaffected).
- * - the machine-readable output (phase-E review round 3): the tool
- *   publishes an outputSchema and every result carries the doc's
- *   shapes as structuredContent — eval/wait `{ output, result?,
- *   pending, checkpoints, completed }` (plus the wait-only
- *   drained/timedOut flags), the structured status workspaces surface
- *   (workspace state, reconcile summary, the workspace manifest, live
- *   agents, pending ops), the interrupt outcome, the reset
- *   acknowledgement, and the error variant — guest output and trusted
- *   orchestration metadata as separate fields, never one flat string;
- *   and the pending surface reports the WHOLE guest registry (the
- *   trap-free read cap that used to truncate it at 256 entries leaked
- *   an undefined hole into the structured array) — bounded on the wire
- *   by the aggregate structured-result cap (phase-E review round 8:
- *   the serialized structuredContent respects the doc's 10 KB bound
- *   with every elision flagged in the `truncated` record, so kept
- *   prefix + elided count always reconcile to the true totals).
+ * - reset() (the §4.5 guest function) does NOT clear client presence
+ *   (connection liveness, not workspace state): with a second client
+ *   connected, the resetting client's disconnect never drains the
+ *   post-reset workspace,
+ * - the lifecycle drain driven by the daemon's session registry: the
+ *   last-client disconnect drains the in-flight subagent turn to
+ *   completion (mock runner), closes the idle child, and the next
+ *   connect's followUp lazily re-attaches the recorded backend session,
+ * - interrupt without an id breaks a RUNNING eval: an eval held open by
+ *   the fused pump is in flight while the interrupt lands (the pump
+ *   releases the broker chain between iterations) and the armed signal
+ *   breaks the resumed continuation MID-RUN via the quickjs interrupt
+ *   handler,
+ * - the machine-readable output: the tool publishes an outputSchema and
+ *   every result carries the redesign's shapes as structuredContent —
+ *   eval `{ output, result?, running? }` (ONE newline-joined string,
+ *   nothing else), the interrupt outcome, and the error variant.
  */
 
 import assert from "node:assert/strict";
@@ -77,7 +57,6 @@ import type {
   BrokerSession,
   BrokerTurn,
 } from "@automatalabs/repl-engine";
-import { OUTPUT_MAX_BYTES, OUTPUT_MAX_LINES } from "@automatalabs/repl-engine";
 import { workflowProjectPaths } from "@automatalabs/workflows";
 import { z } from "zod";
 
@@ -167,6 +146,14 @@ class FakeRunner implements BrokerRunner {
   readonly openedWith: BrokerOpenSessionOptions[] = [];
   readonly loadedWith: BrokerLoadSessionOptions[] = [];
 
+  listBackends(): string[] {
+    return ["pi"];
+  }
+
+  defaultBackendId(): string {
+    return "pi";
+  }
+
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
     const session = new FakeSession(opts);
     this.sessions.push(session);
@@ -233,9 +220,23 @@ class DelayedOpenRunner extends FakeRunner {
 /** Call the repl tool over HTTP (typed over the raw input). */
 function repl(
   session: { client: Client },
-  input: { action: string; projectDir?: string; code?: string; ids?: string[]; timeoutMs?: number; id?: string; refs?: string[] },
+  input: { action: string; projectDir?: string; code?: string; timeoutMs?: number; id?: string },
 ): ReturnType<Client["callTool"]> {
   return session.client.callTool({ name: "repl", arguments: input as Record<string, unknown> });
+}
+
+function structuredOf(res: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
+  return (res as { structuredContent?: Record<string, unknown> }).structuredContent ?? {};
+}
+
+/** Evaluate an expression that returns JSON (the §4.5 sliceable-
+ *  introspection idiom). */
+async function evalJson(session: { client: Client }, projectDir: string, expression: string): Promise<unknown> {
+  const r = await repl(session, { action: "eval", projectDir, code: `JSON.stringify(${expression})` });
+  assert.ok(!isErrorResult(r), textOf(r));
+  const sc = structuredOf(r);
+  assert.ok(typeof sc.result === "string", `the eval resolved with a value: ${JSON.stringify(sc)}`);
+  return JSON.parse(sc.result as string);
 }
 
 function isErrorResult(res: Awaited<ReturnType<Client["callTool"]>>): boolean {
@@ -246,77 +247,43 @@ async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-test("the repl tool registers alongside workflow with the doc's exact action-enum schema; snapshotting is implicit (no snapshot action)", async () => {
+test("the repl tool registers alongside workflow with the redesign's two-action schema; snapshotting is implicit (no snapshot action)", async () => {
   const Schema = z.object(replToolInputShape);
-  // The field set is exactly the doc's surface.
-  assert.deepEqual(Object.keys(replToolInputShape).sort(), ["action", "code", "id", "ids", "projectDir", "refs", "timeoutMs"]);
-  // No user-facing snapshot action: snapshotting is implicit (the doc's
-  // "Snapshotting is implicit — there is no user-facing snapshot action").
+  // The field set is exactly the redesign's surface.
+  assert.deepEqual(Object.keys(replToolInputShape).sort(), ["action", "code", "id", "projectDir", "timeoutMs"]);
+  // No user-facing snapshot action: snapshotting is implicit.
   assert.ok(!("snapshot" in replToolInputShape), "snapshot must not be a tool action");
-  // The action enum is exactly eval / wait / status / interrupt / reset.
+  // The action enum is exactly eval / interrupt.
   assert.doesNotThrow(() => Schema.parse({ action: "eval" }));
-  assert.doesNotThrow(() => Schema.parse({ action: "wait" }));
-  assert.doesNotThrow(() => Schema.parse({ action: "status" }));
   assert.doesNotThrow(() => Schema.parse({ action: "interrupt" }));
-  assert.doesNotThrow(() => Schema.parse({ action: "reset" }));
   assert.throws(() => Schema.parse({ action: "snapshot" }), /Invalid option/);
+  assert.throws(() => Schema.parse({ action: "wait" }), /Invalid option/);
+  assert.throws(() => Schema.parse({ action: "status" }), /Invalid option/);
+  assert.throws(() => Schema.parse({ action: "reset" }), /Invalid option/);
   assert.throws(() => Schema.parse({ action: "nope" }), /Invalid option/);
-  // projectDir must be an absolute path (the doc's validated, realpathed
-  // project model; relative paths refuse at the schema).
+  // projectDir must be an absolute path.
   assert.throws(() => Schema.parse({ action: "eval", projectDir: "relative/path", code: "1" }), /absolute path/);
   assert.doesNotThrow(() => Schema.parse({ action: "eval", projectDir: "/abs/path", code: "1" }));
-  // timeoutMs: an integer in [0, 120_000] (the doc's bounded wait).
-  assert.throws(() => Schema.parse({ action: "wait", timeoutMs: -1 }));
-  assert.throws(() => Schema.parse({ action: "wait", timeoutMs: 120_001 }));
-  assert.throws(() => Schema.parse({ action: "wait", timeoutMs: 1.5 }));
-  assert.doesNotThrow(() => Schema.parse({ action: "wait", timeoutMs: 0 }));
-  assert.doesNotThrow(() => Schema.parse({ action: "wait", timeoutMs: 120_000 }));
-  // ids: an array of strings.
-  assert.doesNotThrow(() => Schema.parse({ action: "wait", ids: [] }));
-  assert.throws(() => Schema.parse({ action: "wait", ids: [7] }));
+  // timeoutMs: an integer in [0, 120_000] (the soft-bound eval's cap).
+  assert.throws(() => Schema.parse({ action: "eval", timeoutMs: -1 }));
+  assert.throws(() => Schema.parse({ action: "eval", timeoutMs: 120_001 }));
+  assert.throws(() => Schema.parse({ action: "eval", timeoutMs: 1.5 }));
+  assert.doesNotThrow(() => Schema.parse({ action: "eval", timeoutMs: 0 }));
+  assert.doesNotThrow(() => Schema.parse({ action: "eval", timeoutMs: 120_000 }));
 
-  // The OUTPUT schema (phase-E review round 3): the published
-  // machine-readable shape parses the doc's eval/wait variant and
-  // refuses a malformed one (the superRefine mirrors the oneOf
-  // branches at runtime — the workflow output shape's pattern).
+  // The OUTPUT schema: the published machine-readable shape parses the
+  // redesign's eval variant and refuses a malformed one.
   const OutputSchema = replToolOutputShape;
-  assert.doesNotThrow(() =>
-    OutputSchema.parse({
-      action: "eval",
-      projectDir: "/p",
-      output: [],
-      outputTruncated: false,
-      pending: [],
-      checkpoints: [],
-      completed: [],
-    }),
-  );
-  assert.doesNotThrow(() =>
-    OutputSchema.parse({
-      action: "wait",
-      projectDir: "/p",
-      output: [],
-      outputTruncated: false,
-      pending: ["c1"],
-      checkpoints: [],
-      completed: [],
-      drained: false,
-      timedOut: true,
-    }),
-  );
-  assert.doesNotThrow(() =>
-    OutputSchema.parse({ action: "status", projectDir: "/p", workspaces: [] }),
-  );
+  assert.doesNotThrow(() => OutputSchema.parse({ output: "", result: "42" }));
+  assert.doesNotThrow(() => OutputSchema.parse({ output: "", running: ["c1"] }));
+  assert.doesNotThrow(() => OutputSchema.parse({ interrupt: { outcome: "refused-idle" } }));
+  assert.doesNotThrow(() => OutputSchema.parse({ error: "nope" }));
   assert.throws(
-    () => OutputSchema.parse({ action: "eval", projectDir: "/p", output: [], pending: [] }),
+    () => OutputSchema.parse({ output: "", interrupt: { outcome: "refused-idle" } }),
     /output does not match a repl result variant/,
   );
   assert.throws(
-    () => OutputSchema.parse({ action: "wait", projectDir: "/p", output: [], outputTruncated: false, pending: [], checkpoints: [], completed: [] }),
-    /output does not match a repl result variant/,
-  );
-  assert.throws(
-    () => OutputSchema.parse({ action: "reset", projectDir: "/p" }),
+    () => OutputSchema.parse({ error: "x", interrupt: { outcome: "refused-idle" } }),
     /output does not match a repl result variant/,
   );
 
@@ -336,29 +303,36 @@ test("the repl tool registers alongside workflow with the doc's exact action-enu
       const schema = wire.inputSchema as { properties: Record<string, unknown>; required?: string[] };
       assert.deepEqual(
         Object.keys(schema.properties).sort(),
-        ["action", "code", "id", "ids", "projectDir", "refs", "timeoutMs"],
+        ["action", "code", "id", "projectDir", "timeoutMs"],
       );
       const action = schema.properties.action as { enum?: string[] };
-      assert.deepEqual(action.enum, ["eval", "wait", "status", "interrupt", "reset"]);
+      assert.deepEqual(action.enum, ["eval", "interrupt"]);
       assert.deepEqual(schema.required, ["action"], "action is the only required field");
-      // The OUTPUT schema is advertised on the wire too (phase-E review
-      // round 3: the tool used to register with no outputSchema at all):
-      // the doc's eval/wait fields plus the structured status, interrupt
-      // and reset surfaces, as six oneOf variants.
+      // The OUTPUT schema is advertised on the wire too: the redesign's
+      // eval shape plus the interrupt outcome and the error variant.
       const wireOutput = wire.outputSchema as { properties?: Record<string, unknown>; oneOf?: Array<{ title?: string; required?: string[] }> };
       assert.ok(wireOutput, "the output schema is published on the wire");
-      for (const field of ["action", "output", "outputTruncated", "result", "pending", "checkpoints", "completed", "drained", "timedOut", "workspaces", "interrupt", "dropped", "error"]) {
+      for (const field of ["output", "result", "running", "interrupt", "error"]) {
         assert.ok(field in (wireOutput.properties ?? {}), `output schema field ${field}`);
       }
-      assert.equal(wireOutput.oneOf?.length, 6, "the six output variants are published");
-      const evalBranch = wireOutput.oneOf?.find((b) => b.title === "eval");
-      assert.ok(
-        evalBranch?.required?.includes("output") &&
-          evalBranch.required.includes("pending") &&
-          evalBranch.required.includes("checkpoints") &&
-          evalBranch.required.includes("completed"),
-        "the eval branch requires the doc's shape",
+      for (const dead of ["pending", "completed", "checkpoints", "outputTruncated", "truncated", "referenced", "drained", "timedOut", "workspaces", "dropped", "action"]) {
+        assert.ok(!(dead in (wireOutput.properties ?? {})), `deleted output field ${dead}`);
+      }
+      assert.equal(wireOutput.oneOf?.length, 5, "the five output variants are published (finished / still-running / thrown eval, interrupt, error)");
+      const evalFinished = wireOutput.oneOf?.find((b) => b.title === "eval");
+      assert.deepEqual(
+        evalFinished?.required?.sort(),
+        ["output", "result"],
+        "the finished eval branch requires exactly output + result",
       );
+      const evalRunning = wireOutput.oneOf?.find((b) => b.title === "eval-still-running");
+      assert.deepEqual(
+        evalRunning?.required?.sort(),
+        ["output", "running"],
+        "the still-running eval branch requires exactly output + running",
+      );
+      const evalError = wireOutput.oneOf?.find((b) => b.title === "eval-error");
+      assert.deepEqual(evalError?.required, ["output"], "the thrown-eval branch requires the output string alone");
     } finally {
       await session.dispose();
     }
@@ -367,69 +341,75 @@ test("the repl tool registers alongside workflow with the doc's exact action-enu
   }
 });
 
-test("daemon mode: projectDir is required; eval/wait/status/interrupt/reset round-trip over the real HTTP daemon", async () => {
+test("daemon mode: projectDir is required; eval/interrupt round-trip over the real HTTP daemon (soft-bound shapes included); reset() is the guest function", async () => {
   const runner = new FakeRunner();
   const daemon = await startReplDaemon(runner);
   try {
     const session = await connectHttp(daemon.url);
     try {
       const PROJECT = makeProjectDir("repl-actions");
-      // Daemon mode REQUIRES projectDir for every stateful action (the
-      // same required-in-daemon-mode rule the workflow tool has).
+      // Daemon mode REQUIRES projectDir for both actions.
       const noDir = await repl(session, { action: "eval", code: "1 + 1" });
       assert.ok(isErrorResult(noDir), textOf(noDir));
       assert.ok(textOf(noDir).includes("projectDir is required on the shared workflow daemon"), textOf(noDir));
-      // status without projectDir lists every known project context; a
-      // daemon with NO contexts renders an empty listing — status never
-      // CREATES a context or a workspace.
-      const emptyStatus = await repl(session, { action: "status" });
-      assert.ok(!isErrorResult(emptyStatus), textOf(emptyStatus));
-      assert.equal(textOf(emptyStatus), "");
       // An unknown action is refused by the schema at the wire boundary.
       const badAction = await repl(session, { action: "snapshot", projectDir: PROJECT, code: "1" });
       assert.ok(isErrorResult(badAction), textOf(badAction));
       assert.ok(textOf(badAction).includes("Input validation error"), textOf(badAction));
-      // An empty script is VALID JavaScript (the doc's `eval { projectDir,
-      // code }` has no non-empty restriction — phase-E review round 5:
-      // the tool used to invent one): it resolves with `undefined` and
-      // returns the normal resolved eval shape.
+      // An empty script is VALID JavaScript and the documented poll idiom.
       const emptyCode = await repl(session, { action: "eval", projectDir: PROJECT, code: "" });
       assert.ok(!isErrorResult(emptyCode), textOf(emptyCode));
       assert.ok(textOf(emptyCode).includes("result: undefined"), textOf(emptyCode));
-      const structuredEmpty = (emptyCode as { structuredContent?: Record<string, unknown> }).structuredContent ?? {};
-      assert.deepEqual(structuredEmpty.output, []);
-      assert.deepEqual(structuredEmpty.pending, []);
+      const structuredEmpty = structuredOf(emptyCode);
+      assert.equal(structuredEmpty.output, "");
+      assert.equal(structuredEmpty.result, "undefined");
       // eval round trip.
       const evaled = await repl(session, { action: "eval", projectDir: PROJECT, code: "var answer = 40 + 2; answer" });
       assert.ok(!isErrorResult(evaled), textOf(evaled));
       assert.ok(textOf(evaled).includes("result: 42"), textOf(evaled));
-      // status: the workspace manifest — metadata (name/type token),
-      // never content. EVERY binding carries its byte size (phase-E
-      // review rejection: primitives used to render without size).
-      const status = await repl(session, { action: "status", projectDir: PROJECT });
-      assert.ok(textOf(status).includes(`workspace ${PROJECT}: fresh`), textOf(status));
-      assert.ok(textOf(status).includes("answer = number · 8B"), textOf(status));
-      assert.ok(!textOf(status).includes("40 + 2"), `content leaked: ${textOf(status)}`);
-      // A pending subagent call; wait is bounded ("still running" on
-      // timeout — absorbs client tool-call timeouts).
+      // The workspace manifest through workspace(): metadata (name/type
+      // token), never content. EVERY binding carries its byte size.
+      const ws = (await evalJson(session, PROJECT, "workspace()")) as {
+        bindings: Array<{ name: string; type: string; sizeBytes: number; token?: string }>;
+      };
+      assert.ok(ws.bindings.some((b) => b.name === "answer" && b.type === "number"), JSON.stringify(ws.bindings));
+      assert.ok(!JSON.stringify(ws).includes("40 + 2"), `content leaked: ${JSON.stringify(ws)}`);
+      // A pending subagent call; the soft-bound eval reports the honest
+      // still-running shape when the bound elapses (the call continues
+      // server-side).
       const started = await repl(session, { action: "eval", projectDir: PROJECT, code: 'const p = agent("pi/x", "task"); "started"' });
       assert.ok(!isErrorResult(started), textOf(started));
-      assert.ok(textOf(started).includes("pending: c1"), textOf(started));
+      assert.equal(structuredOf(started).result, "started", "start-and-don't-await finishes immediately");
       await tick();
-      const timedOut = await repl(session, { action: "wait", projectDir: PROJECT, ids: ["c1"], timeoutMs: 100 });
+      const timedOut = await repl(session, {
+        action: "eval",
+        projectDir: PROJECT,
+        code: "await p",
+        timeoutMs: 100,
+      });
       assert.ok(!isErrorResult(timedOut), textOf(timedOut));
-      assert.ok(textOf(timedOut).includes("still running"), textOf(timedOut));
-      // wait absorbs a MID-WAIT settlement: the server-side pump keeps
-      // waiting while the HTTP request is open, and the backend's
-      // settlement resolves it.
+      const scTimedOut = structuredOf(timedOut);
+      assert.deepEqual(Object.keys(scTimedOut).sort(), ["output", "running"], "the still-running shape");
+      assert.deepEqual(scTimedOut.running, ["c1"], "the in-flight call ids");
+      assert.ok(textOf(timedOut).includes("running: c1"), textOf(timedOut));
+      // The fused pump absorbs a MID-HOLD settlement: the eval call is
+      // held open while the HTTP request is open, and the backend's
+      // settlement resolves it in the SAME call (the finished shape).
       await repl(session, { action: "eval", projectDir: PROJECT, code: 'const q = agent("pi/x", "task2"); "started"' });
       await tick();
-      const waiting = repl(session, { action: "wait", projectDir: PROJECT, ids: ["c2"], timeoutMs: 5000 });
+      const waiting = repl(session, { action: "eval", projectDir: PROJECT, code: "await q", timeoutMs: 5000 });
       await tick();
       runner.last().completeTurn("waited result");
       const waited = await waiting;
       assert.ok(!isErrorResult(waited), textOf(waited));
-      assert.ok(textOf(waited).includes("completed: c2"), textOf(waited));
+      const scWaited = structuredOf(waited);
+      assert.deepEqual(Object.keys(scWaited).sort(), ["output", "result"], "the finished shape");
+      assert.equal(scWaited.result, "waited result");
+      // The earlier still-running eval's promise is still live: `await p`
+      // resolves once ITS turn completes.
+      runner.sessions[0].completeTurn("p result");
+      const picked = await repl(session, { action: "eval", projectDir: PROJECT, code: "await p" });
+      assert.equal(structuredOf(picked).result, "p result");
       // interrupt with an id cancels the subagent call (ACP
       // session/cancel downward).
       await repl(session, { action: "eval", projectDir: PROJECT, code: 'const r = agent("pi/x", "task3"); "started"' });
@@ -437,78 +417,66 @@ test("daemon mode: projectDir is required; eval/wait/status/interrupt/reset roun
       const interrupted = await repl(session, { action: "interrupt", projectDir: PROJECT, id: "c3" });
       assert.ok(!isErrorResult(interrupted), textOf(interrupted));
       assert.ok(textOf(interrupted).includes("session/cancel sent"), textOf(interrupted));
-      // interrupt without an id BREAKS THE RUNNING EVAL (phase-E review
-      // rejection round 2: the old test exercised a suspended
-      // continuation — the eval had never executed when the interrupt
-      // landed, and the old waitForCalls held the broker chain across
-      // its whole bounded poll, so an interrupt sent mid-wait could not
-      // even be PROCESSED until the wait finished or timed out). Here
-      // the eval is a runaway that KEEPS EXECUTING across drains (each
-      // iteration does real work, fires the next subagent call, and
-      // suspends — it is in flight the whole time, mid-run), a wait is
-      // pumping it, and the interrupt lands WHILE THE WAIT IS IN
-      // FLIGHT; the wait's very next pump resumes the loop's next
-      // iteration and the quickjs interrupt handler breaks it MID-RUN.
-      const inFlight = await repl(session, {
+      assert.deepEqual(structuredOf(interrupted), { interrupt: { outcome: "cancelled", callId: "c3" } });
+      // interrupt without an id BREAKS THE RUNNING EVAL: a runaway loop
+      // that keeps EXECUTING across drains (each iteration does real
+      // work, fires the next subagent call, and suspends) is held open
+      // by the fused pump; the interrupt lands while the eval call is IN
+      // FLIGHT; the pump's next iteration breaks the loop MID-RUN via
+      // the quickjs interrupt handler.
+      const inFlight = repl(session, {
         action: "eval",
         projectDir: PROJECT,
         code: 'const s = agent("pi/x", "task4"); await s; for (;;) { let x = 0; for (let i = 0; i < 200000; i++) x += i; await agent("pi/x", "again"); }',
-      });
-      assert.ok(!isErrorResult(inFlight), textOf(inFlight));
-      assert.ok(textOf(inFlight).includes("pending: c1, c4"), textOf(inFlight));
-      // The wait starts pumping the running eval; the interrupt must be
-      // PROCESSED while the wait is still in flight — the wait releases
-      // the broker chain between its pumps, so the interrupt call is
-      // served mid-wait (the old code held the chain: the interrupt
-      // queued behind the whole bounded wait and could not break the
-      // eval before the target completed).
-      let wait1Done = false;
-      const waiting1 = repl(session, { action: "wait", projectDir: PROJECT, ids: ["c4"], timeoutMs: 30000 }).then((r) => {
-        wait1Done = true;
-        return r;
+        timeoutMs: 30_000,
       });
       await tick();
       await tick();
       const armed = await repl(session, { action: "interrupt", projectDir: PROJECT });
       assert.ok(!isErrorResult(armed), textOf(armed));
       assert.ok(textOf(armed).includes("interrupting the running eval"), textOf(armed));
-      assert.ok(!wait1Done, "the interrupt was processed MID-WAIT (the wait was still pumping, its target unsettled)");
-      // The first settlement: the wait's very next pump resumes the
-      // loop's next iteration — and the armed signal breaks it MID-RUN
-      // (the break is the wait's own pump-drain error — honest output
-      // in the wait's result).
+      assert.deepEqual(structuredOf(armed), { interrupt: { outcome: "targeted" } });
+      // The first settlement: the pump resumes the loop's next iteration
+      // — and the armed signal breaks it MID-RUN. The broken eval can
+      // never settle: the held eval returns the finished-with-error
+      // shape promptly, and the interrupted drain is retained in
+      // workspace().diagnostics (§6.2).
       runner.last().completeTurn("resumed");
-      const waited1 = await waiting1;
-      assert.ok(!isErrorResult(waited1), textOf(waited1));
-      assert.ok(textOf(waited1).includes("completed: c4"), textOf(waited1));
-      assert.ok(textOf(waited1).includes("interrupted"), `the executing runaway was broken mid-run: ${textOf(waited1)}`);
+      const broken = await inFlight;
+      assert.ok(!isErrorResult(broken), textOf(broken));
+      const scBroken = structuredOf(broken);
+      assert.ok(!("running" in scBroken) && !("result" in scBroken), `the broken eval returned promptly: ${JSON.stringify(scBroken)}`);
+      const diag = (await evalJson(session, PROJECT, "workspace().diagnostics")) as { drainError: { message: string } | null };
+      assert.ok(
+        diag.drainError !== null && (diag.drainError.message.includes("interrupted") || diag.drainError.message.includes("Job execution error")),
+        `the interrupted drain is retained in diagnostics: ${JSON.stringify(diag.drainError)}`,
+      );
       // The signal was consumed by the running eval's execution: the
       // next eval is NOT broken, and the VM stays usable.
       const afterInterrupt = await repl(session, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
       assert.ok(textOf(afterInterrupt).includes("result: 42"), textOf(afterInterrupt));
-      // reset: teardown — the VM and its stored state are dropped; the
-      // next eval starts a fresh workspace.
-      const reset = await repl(session, { action: "reset", projectDir: PROJECT });
+      // reset() — the §4.5 guest function: the teardown runs after the
+      // eval completes; the next eval starts a fresh workspace.
+      const reset = await repl(session, { action: "eval", projectDir: PROJECT, code: "reset()" });
       assert.ok(!isErrorResult(reset), textOf(reset));
-      assert.ok(textOf(reset).includes("dropped"), textOf(reset));
       const gone = await repl(session, { action: "eval", projectDir: PROJECT, code: "typeof answer" });
       assert.ok(!isErrorResult(gone), textOf(gone));
-      assert.ok(textOf(gone).includes('"undefined"'), textOf(gone));
+      assert.ok(textOf(gone).includes("undefined"), textOf(gone));
       // A GLOBAL LEXICAL binding (top-level let/const/class — the
-      // roadmap's canonical `const research = agent(...)` state) is
-      // listed by status with its full provenance surface (phase-E
-      // review rejection: only global-object keys were enumerated, so
-      // lexical workspace state was invisible to status).
+      // canonical `const research = agent(...)` state) is listed by
+      // workspace() with its full provenance surface.
       const lexed = await repl(session, { action: "eval", projectDir: PROJECT, code: 'const research = agent("pi/x", "task"); "started"' });
       assert.ok(!isErrorResult(lexed), textOf(lexed));
-      assert.ok(textOf(lexed).includes("pending: c1"), textOf(lexed));
-      const statusLex = await repl(session, { action: "status", projectDir: PROJECT });
-      assert.ok(
-        textOf(statusLex).includes(
-          "research = agent handle · pending · call c1 · 151B · via eval 2 · task \"task\"",
-        ),
-        `lexical binding in status: ${textOf(statusLex)}`,
-      );
+      const wsLex = (await evalJson(session, PROJECT, "workspace()")) as {
+        bindings: Array<{ name: string; type: string; status?: string; callId?: string; provenance: string | null; task: string | null }>;
+      };
+      const binding = wsLex.bindings.find((b) => b.name === "research");
+      assert.ok(binding, JSON.stringify(wsLex.bindings));
+      assert.equal(binding.type, "agent handle");
+      assert.equal(binding.callId, "c1");
+      assert.equal(binding.status, "pending");
+      assert.equal(binding.provenance, "eval 2", "the provenance pass counts the fresh workspace's evals");
+      assert.equal(binding.task, "task");
     } finally {
       await session.dispose();
     }
@@ -529,13 +497,13 @@ test("workspaces are keyed by projectDir: two projects on one daemon are fully i
       // B does not see A's bindings...
       const probeB = await repl(session, { action: "eval", projectDir: projectB, code: "typeof secretA" });
       assert.ok(!isErrorResult(probeB), textOf(probeB));
-      assert.ok(textOf(probeB).includes('"undefined"'), textOf(probeB));
+      assert.ok(textOf(probeB).includes("undefined"), textOf(probeB));
       const b = await repl(session, { action: "eval", projectDir: projectB, code: 'const secretB = "beta"; "B"' });
       assert.ok(!isErrorResult(b), textOf(b));
       // ...and A does not see B's.
       const probeA = await repl(session, { action: "eval", projectDir: projectA, code: "typeof secretB" });
       assert.ok(!isErrorResult(probeA), textOf(probeA));
-      assert.ok(textOf(probeA).includes('"undefined"'), textOf(probeA));
+      assert.ok(textOf(probeA).includes("undefined"), textOf(probeA));
       // Each project persisted its OWN repl store (one enveloped snapshot
       // per project, under the daemon's per-project layout).
       const pathsA = workflowProjectPaths(projectA);
@@ -545,24 +513,16 @@ test("workspaces are keyed by projectDir: two projects on one daemon are fully i
       assert.notEqual(storeA, storeB);
       assert.ok(existsSync(join(storeA, "snapshot.bin")), "A's snapshot exists");
       assert.ok(existsSync(join(storeB, "snapshot.bin")), "B's snapshot exists");
-      // status without projectDir lists BOTH workspaces.
-      const status = await repl(session, { action: "status" });
-      assert.ok(textOf(status).includes(projectA), textOf(status));
-      assert.ok(textOf(status).includes(projectB), textOf(status));
       // resetting A never touches B: B's binding and store survive, and
-      // A's stored state is gone — the next touch (a named status is a
-      // first touch, exactly like every other stateful action) starts a
-      // FRESH workspace, never a restore, and the old binding is gone.
-      await repl(session, { action: "reset", projectDir: projectA });
+      // A's stored state is gone — the next touch starts a FRESH
+      // workspace, never a restore, and the old binding is gone.
+      await repl(session, { action: "eval", projectDir: projectA, code: "reset()" });
       const bAlive = await repl(session, { action: "eval", projectDir: projectB, code: "secretB" });
       assert.ok(!isErrorResult(bAlive), textOf(bAlive));
-      assert.ok(textOf(bAlive).includes('"beta"'), textOf(bAlive));
-      const aFresh = await repl(session, { action: "status", projectDir: projectA });
-      assert.ok(textOf(aFresh).includes("fresh"), textOf(aFresh));
-      assert.ok(!textOf(aFresh).includes("restored"), textOf(aFresh));
+      assert.ok(textOf(bAlive).includes("beta"), textOf(bAlive));
       const aGone = await repl(session, { action: "eval", projectDir: projectA, code: "typeof secretA" });
       assert.ok(!isErrorResult(aGone), textOf(aGone));
-      assert.ok(textOf(aGone).includes('"undefined"'), textOf(aGone));
+      assert.ok(textOf(aGone).includes("undefined"), textOf(aGone));
     } finally {
       await session.dispose();
     }
@@ -594,8 +554,10 @@ test("MCP-session churn never touches the workspace: bindings survive a client d
       const continued = await repl(session2, { action: "eval", projectDir: PROJECT, code: "x * 2" });
       assert.ok(!isErrorResult(continued), textOf(continued));
       assert.ok(textOf(continued).includes("result: 84"), textOf(continued));
-      const status = await repl(session2, { action: "status", projectDir: PROJECT });
-      assert.ok(textOf(status).includes("x = number"), textOf(status));
+      const ws = (await evalJson(session2, PROJECT, "workspace()")) as {
+        bindings: Array<{ name: string; type: string }>;
+      };
+      assert.ok(ws.bindings.some((b) => b.name === "x" && b.type === "number"), JSON.stringify(ws.bindings));
     } finally {
       await session2.dispose();
     }
@@ -613,7 +575,6 @@ test("the session registry drives the client-presence drain on the real daemon: 
     try {
       const started = await repl(session1, { action: "eval", projectDir: PROJECT, code: 'const p = agent("pi/x", "task"); "started"' });
       assert.ok(!isErrorResult(started), textOf(started));
-      assert.ok(textOf(started).includes("pending: c1"), textOf(started));
       await tick();
     } finally {
       // The client's last connection closes: the daemon's session
@@ -637,8 +598,10 @@ test("the session registry drives the client-presence drain on the real daemon: 
     // capability matrix (loadSession with the SAME session id).
     const session2 = await connectHttp(daemon.url);
     try {
-      const status = await repl(session2, { action: "status", projectDir: PROJECT });
-      assert.ok(textOf(status).includes("children: closed"), textOf(status));
+      const ws = (await evalJson(session2, PROJECT, "workspace()")) as {
+        diagnostics: { childrenClosed: boolean };
+      };
+      assert.equal(ws.diagnostics.childrenClosed, true, "children closed after the drain");
       const probe = await repl(session2, { action: "eval", projectDir: PROJECT, code: 'p.followUp("more"); "fired"' });
       assert.ok(!isErrorResult(probe), textOf(probe));
       await tick();
@@ -670,7 +633,6 @@ test("a transient connection drop of the SAME live session restores its project 
     try {
       const started = await repl(session, { action: "eval", projectDir: PROJECT, code: 'const p = agent("pi/x", "task"); "started"' });
       assert.ok(!isErrorResult(started), textOf(started));
-      assert.ok(textOf(started).includes("pending: c1"), textOf(started));
       await tick();
       const record = daemon.sessions.values()[0];
       assert.ok(record, "the session is registered");
@@ -685,10 +647,7 @@ test("a transient connection drop of the SAME live session restores its project 
       // The SAME live session reconnects (no new MCP session, no tool
       // call): the registry's connection-open signal re-adds the
       // session's project presence from its retained affinity, and the
-      // scheduled drain aborts — the child stays warm (phase-E review
-      // rejection: only disconnects were wired, so the reconnect used to
-      // leave the presence gone and the already-scheduled drain could
-      // close children while the client was connected).
+      // scheduled drain aborts — the child stays warm.
       daemon.sessions.connectionOpened(record.sessionId);
       await new Promise((resolve) => setTimeout(resolve, 20));
       assert.equal(child.releases, 0, "the reconnect aborted the drain — the child stays warm");
@@ -698,9 +657,11 @@ test("a transient connection drop of the SAME live session restores its project 
       child.completeTurn("warm after reconnect");
       const got = await repl(session, { action: "eval", projectDir: PROJECT, code: "await p" });
       assert.ok(!isErrorResult(got), textOf(got));
-      assert.ok(textOf(got).includes("warm after reconnect"), textOf(got));
-      const status = await repl(session, { action: "status", projectDir: PROJECT });
-      assert.ok(!textOf(status).includes("children: closed"), textOf(status));
+      assert.equal(structuredOf(got).result, "warm after reconnect");
+      const ws = (await evalJson(session, PROJECT, "workspace()")) as {
+        diagnostics: { childrenClosed: boolean };
+      };
+      assert.equal(ws.diagnostics.childrenClosed, false, "the workspace is warm");
     } finally {
       await session.dispose();
     }
@@ -709,7 +670,7 @@ test("a transient connection drop of the SAME live session restores its project 
   }
 });
 
-test("reset does not clear client presence: with a second client still connected, the resetting client's disconnect does NOT drain the post-reset workspace", async () => {
+test("reset() does not clear client presence: with a second client still connected, the resetting client's disconnect does NOT drain the post-reset workspace", async () => {
   const runner = new FakeRunner();
   const daemon = await startReplDaemon(runner);
   try {
@@ -720,22 +681,15 @@ test("reset does not clear client presence: with a second client still connected
       // Both clients are present on the project.
       const start = await repl(sessionA, { action: "eval", projectDir: PROJECT, code: 'const p = agent("pi/x", "task"); "started"' });
       assert.ok(!isErrorResult(start), textOf(start));
-      assert.ok(textOf(start).includes("pending: c1"), textOf(start));
       await repl(sessionB, { action: "eval", projectDir: PROJECT, code: '"b present"' });
       await tick();
       // A resets: the workspace is dropped, but the CONNECTIONS stay —
-      // presence is connection liveness, not workspace state (phase-E
-      // review rejection: reset used to clear state.clients while the
-      // presence ledger kept its maps, so the two desynced and a later
-      // disconnect of A could drain work started after the reset even
-      // though B was still connected).
-      const reset = await repl(sessionA, { action: "reset", projectDir: PROJECT });
+      // presence is connection liveness, not workspace state.
+      const reset = await repl(sessionA, { action: "eval", projectDir: PROJECT, code: "reset()" });
       assert.ok(!isErrorResult(reset), textOf(reset));
-      assert.ok(textOf(reset).includes("dropped"), textOf(reset));
       // A starts NEW work on the fresh workspace.
       const restarted = await repl(sessionA, { action: "eval", projectDir: PROJECT, code: 'const q = agent("pi/x", "task2"); "started2"' });
       assert.ok(!isErrorResult(restarted), textOf(restarted));
-      assert.ok(textOf(restarted).includes("pending: c1"), textOf(restarted));
       await tick();
       const child = runner.last();
       // A's connection drops while B is still connected: NO drain may
@@ -750,7 +704,7 @@ test("reset does not clear client presence: with a second client still connected
       child.completeTurn("post-reset result");
       const got = await repl(sessionB, { action: "eval", projectDir: PROJECT, code: "await q" });
       assert.ok(!isErrorResult(got), textOf(got));
-      assert.ok(textOf(got).includes("post-reset result"), textOf(got));
+      assert.equal(structuredOf(got).result, "post-reset result");
       // B's disconnect is the LAST client: NOW the drain runs and closes
       // the idle child.
       await sessionB.dispose();
@@ -783,10 +737,7 @@ test("workflow calls register project presence: a workflow-only client B keeps t
       // B addresses the SAME project through the WORKFLOW tool (a
       // trivial script — no agents, nothing repl-related). The workflow
       // handler resolves the same per-project context and registers the
-      // session's presence on it (phase-E review rejection round 2: only
-      // repl calls used to register presence, so B's connection was
-      // invisible to the drain and A's disconnect below would have
-      // drained/closed children while B was still connected).
+      // session's presence on it.
       const ran = await sessionB.client.callTool({
         name: "workflow",
         arguments: {
@@ -807,7 +758,7 @@ test("workflow calls register project presence: a workflow-only client B keeps t
       child.completeTurn("wf-presence result");
       const got = await repl(sessionB, { action: "eval", projectDir: PROJECT, code: "await p" });
       assert.ok(!isErrorResult(got), textOf(got));
-      assert.ok(textOf(got).includes("wf-presence result"), textOf(got));
+      assert.equal(structuredOf(got).result, "wf-presence result");
       // B's disconnect is the LAST client: NOW the drain runs and closes
       // the idle child.
       await sessionB.dispose();
@@ -824,117 +775,80 @@ test("workflow calls register project presence: a workflow-only client B keeps t
   }
 });
 
-test("every repl action returns the doc's machine-readable shape as structuredContent alongside the bounded text — eval/wait { output, result?, pending, checkpoints, completed } with the wait-only drained/timedOut flags, the structured status workspaces surface (state, reconcile, manifest, live agents, pending ops), the interrupt outcome, and the reset acknowledgement (phase-E review round 3: the text-only result mixed guest output and orchestration metadata into one flat string)", async () => {
+test("every repl action returns the redesign's machine-readable shape as structuredContent — eval { output, result?, running? }, the interrupt outcome, and the error variant (guest output and orchestration metadata were separate fields in v1; the redesign's output is ONE string)", async () => {
   const runner = new FakeRunner();
   const daemon = await startReplDaemon(runner);
   try {
     const session = await connectHttp(daemon.url);
     try {
       const PROJECT = makeProjectDir("repl-structured");
-      // eval: the doc's shape, guest output and trusted orchestration
-      // metadata as separate fields.
+      // eval: the redesign's shape — ONE newline-joined output string
+      // (console lines), the result repr, and nothing else.
       const evaled = await repl(session, {
         action: "eval",
         projectDir: PROJECT,
         code: 'const research = agent("pi/x", "investigate"); globalThis.answer = 42; console.log("hello"); answer',
       });
       assert.ok(!isErrorResult(evaled), textOf(evaled));
-      const sc = (evaled as { structuredContent?: Record<string, unknown> }).structuredContent;
-      assert.ok(sc !== undefined, "structured content present");
-      assert.equal(sc.action, "eval");
-      assert.equal(sc.projectDir, PROJECT);
-      assert.equal((sc.output as string[]).length, 1);
-      assert.ok((sc.output as string[])[0].includes('"hello"'), `output line: ${(sc.output as string[])[0]}`);
-      assert.equal(sc.outputTruncated, false);
+      const sc = structuredOf(evaled);
+      assert.deepEqual(Object.keys(sc).sort(), ["output", "result"]);
+      assert.equal(sc.output, "hello");
       assert.equal(sc.result, "42");
-      assert.deepEqual(sc.pending, ["c1"]);
-      assert.deepEqual(sc.checkpoints, []);
-      assert.deepEqual(sc.completed, []);
-      assert.equal((sc as Record<string, unknown>).drained, undefined, "no wait-only flags on eval");
-      assert.ok(textOf(evaled).includes("result: 42"), "the bounded text stays alongside");
+      assert.ok(textOf(evaled).includes("result: 42"), "the human text stays alongside");
 
-      // status: the structured workspaces surface — state, the manifest
-      // (bindings with size and provenance, never value content), the
-      // live agents, the pending ops.
-      const status = await repl(session, { action: "status", projectDir: PROJECT });
-      assert.ok(!isErrorResult(status), textOf(status));
-      const scStatus = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.equal(scStatus.action, "status");
-      assert.equal(scStatus.projectDir, PROJECT);
-      const workspaces = scStatus.workspaces as Array<Record<string, unknown>>;
-      assert.equal(workspaces.length, 1);
-      const w = workspaces[0];
-      assert.equal(w.projectDir, PROJECT);
-      assert.equal(w.state, "fresh");
-      const bindings = w.bindings as Array<Record<string, unknown>>;
-      assert.ok(bindings.some((b) => b.name === "answer" && b.sizeBytes === 8), "manifest binding with its byte size");
-      assert.ok(bindings.some((b) => b.name === "research" && (b.token as string).includes("agent handle")), "the agent handle binding");
-      assert.ok(bindings.some((b) => b.name === "research" && (b.task as string) === "investigate"), "the task provenance");
-      assert.ok((w.liveAgents as Array<Record<string, unknown>>).some((a) => a.callId === "c1" && a.state === "running"), "the live agent with its state");
-      assert.deepEqual(w.pending, ["c1"]);
-      assert.deepEqual(w.checkpoints, []);
-      assert.equal(w.childrenClosed, false);
-      assert.equal(w.drainError, undefined);
-
-      // wait: the SAME eval/wait shape plus drained/timedOut (the doc's
-      // "still running on timeout" as a machine-readable flag), with the
-      // mid-wait settlement absorbed.
+      // The still-running shape with the mid-hold settlement absorbed.
       await tick();
-      const waiting = repl(session, { action: "wait", projectDir: PROJECT, ids: ["c1"], timeoutMs: 5000 });
+      const waiting = repl(session, { action: "eval", projectDir: PROJECT, code: "await research", timeoutMs: 5000 });
       await tick();
       runner.last().completeTurn("waited result");
       const waited = await waiting;
       assert.ok(!isErrorResult(waited), textOf(waited));
-      const scWaited = (waited as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.equal(scWaited.action, "wait");
-      assert.equal(scWaited.drained, true);
-      assert.equal(scWaited.timedOut, false);
-      assert.deepEqual(scWaited.completed, ["c1"]);
-      assert.deepEqual(scWaited.pending, []);
-      assert.ok(textOf(waited).includes("completed: c1"), textOf(waited));
-      // The settled agent's RESULT text is worker content — it must not
-      // leak into the status manifest (metadata, never content).
-      const statusAfter = await repl(session, { action: "status", projectDir: PROJECT });
-      const scAfter = (statusAfter as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.ok(!JSON.stringify(scAfter).includes("waited result"), "worker content never enters the manifest");
+      const scWaited = structuredOf(waited);
+      assert.deepEqual(Object.keys(scWaited).sort(), ["output", "result"]);
+      assert.equal(scWaited.result, "waited result");
 
-      // A timed-out wait reports drained: false / timedOut: true.
+      // A timed-out hold reports the still-running shape with the ids.
       await repl(session, { action: "eval", projectDir: PROJECT, code: 'const q2 = agent("pi/x", "task2"); "started2"' });
-      const timedOut = await repl(session, { action: "wait", projectDir: PROJECT, ids: ["c2"], timeoutMs: 100 });
-      const scTimedOut = (timedOut as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.equal(scTimedOut.drained, false);
-      assert.equal(scTimedOut.timedOut, true);
-      assert.ok(textOf(timedOut).includes("still running"), textOf(timedOut));
+      const timedOut = await repl(session, { action: "eval", projectDir: PROJECT, code: "await q2", timeoutMs: 100 });
+      const scTimedOut = structuredOf(timedOut);
+      assert.deepEqual(scTimedOut, { output: "", running: ["c2"] });
+      assert.ok(textOf(timedOut).includes("running: c2"), textOf(timedOut));
 
       // interrupt with an id: the honest outcome + the call id.
       const interrupted = await repl(session, { action: "interrupt", projectDir: PROJECT, id: "c2" });
       assert.ok(!isErrorResult(interrupted), textOf(interrupted));
-      const scInterrupt = (interrupted as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.deepEqual(scInterrupt.interrupt, { outcome: "cancelled", callId: "c2" });
+      const scInterrupt = structuredOf(interrupted);
+      assert.deepEqual(scInterrupt, { interrupt: { outcome: "cancelled", callId: "c2" } });
       assert.ok(textOf(interrupted).includes("session/cancel sent"), textOf(interrupted));
-      // interrupt without an id on an idle workspace: the honest refusal.
-      const refused = await repl(session, { action: "interrupt", projectDir: PROJECT });
-      const scRefused = (refused as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.deepEqual(scRefused.interrupt, { outcome: "refused-idle" });
+      // interrupt without an id on an idle workspace: the honest refusal
+      // (a fresh project — nothing ever ran).
+      const idleProject = makeProjectDir("repl-structured-idle");
+      const refused = await repl(session, { action: "interrupt", projectDir: idleProject });
+      const scRefused = structuredOf(refused);
+      assert.deepEqual(scRefused, { interrupt: { outcome: "refused-idle" } });
       assert.ok(textOf(refused).includes("no running eval to interrupt"), textOf(refused));
       // interrupt without an id on a RUNNING eval: outcome "targeted".
-      await repl(session, { action: "eval", projectDir: PROJECT, code: 'const q3 = agent("pi/x", "task3"); await q3; while (true) {}' });
+      const running = repl(session, {
+        action: "eval",
+        projectDir: PROJECT,
+        code: 'const q3 = agent("pi/x", "task3"); await q3; while (true) {}',
+        timeoutMs: 30_000,
+      });
+      await tick();
       const targeted = await repl(session, { action: "interrupt", projectDir: PROJECT });
-      const scTargeted = (targeted as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.deepEqual(scTargeted.interrupt, { outcome: "targeted" });
+      const scTargeted = structuredOf(targeted);
+      assert.deepEqual(scTargeted, { interrupt: { outcome: "targeted" } });
       assert.ok(textOf(targeted).includes("interrupting the running eval"), textOf(targeted));
-      // The targeted runaway is broken at its next execution, then the
-      // reset acknowledgement.
+      // The targeted runaway is broken at its next execution — the held
+      // eval returns promptly (the finished-with-error shape).
       await tick();
       runner.last().completeTurn("resumed");
-      const broken = await repl(session, { action: "eval", projectDir: PROJECT, code: '"after"' });
-      assert.ok(textOf(broken).includes("interrupted"), `the armed target was broken: ${textOf(broken)}`);
-      const reset = await repl(session, { action: "reset", projectDir: PROJECT });
-      const scReset = (reset as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.equal(scReset.action, "reset");
-      assert.equal(scReset.projectDir, PROJECT);
-      assert.equal(scReset.dropped, true);
-      assert.ok(textOf(reset).includes("dropped"), textOf(reset));
+      const broken = await running;
+      assert.ok(!isErrorResult(broken), textOf(broken));
+      assert.ok(!("running" in structuredOf(broken)), "the broken eval returned");
+      // reset() via the guest function.
+      const reset = await repl(session, { action: "eval", projectDir: PROJECT, code: "reset()" });
+      assert.ok(!isErrorResult(reset), textOf(reset));
     } finally {
       await session.dispose();
     }
@@ -943,166 +857,9 @@ test("every repl action returns the doc's machine-readable shape as structuredCo
   }
 });
 
-test("eval-through-MCP round trip applies the output caps to the FINAL result (4000 lines / 50 KB, whichever trips first, marker included) and the $N refs reach the truncated values", async () => {
-  const daemon = await startReplDaemon(new FakeRunner());
-  try {
-    const session = await connectHttp(daemon.url);
-    try {
-      const PROJECT = makeProjectDir("repl-caps");
-      // The caps apply to the FINAL assembled tool result (phase-E review
-      // rejection: the completion line and the metadata sections used to
-      // be appended UNcapped). Large lines so the BYTE cap (50 KB) trips
-      // well before the 4000-line cap; a truncation marker ships instead
-      // of the dropped tail (its own budget is reserved inside the caps).
-      const big = await repl(session, {
-        action: "eval",
-        projectDir: PROJECT,
-        code: 'for (let i = 0; i < 60; i++) console.log("line-" + i + "-" + "y".repeat(1000));',
-      });
-      assert.ok(!isErrorResult(big), textOf(big));
-      const text = textOf(big);
-      const lines = text.split("\n");
-      assert.ok(lines.length <= OUTPUT_MAX_LINES, `the line cap holds on the wire: ${lines.length}`);
-      assert.ok(Buffer.byteLength(text) <= OUTPUT_MAX_BYTES, `the byte cap holds: ${Buffer.byteLength(text)} bytes`);
-      const bigSc = (big as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.equal(bigSc.outputTruncated, true, "the console output was truncated by the byte cap");
-      // The kept lines carry their $N addresses (the doc's "output is
-      // addressed, not just truncated").
-      assert.ok(text.startsWith("[$1 · string · "), text.slice(0, 80));
-      assert.ok(text.includes('"line-0-'), "the kept head lines are the earliest lines");
-      assert.ok(!text.includes("line-59-"), "the tail beyond the cap is never shipped");
-      // The truncated values stay reachable through the $N refs the kept
-      // lines carry (the cap costs reads, never data). $60 is the 60th log.
-      const sliced = await repl(session, { action: "eval", projectDir: PROJECT, code: 'console.log($60); "ok"' });
-      assert.ok(!isErrorResult(sliced), textOf(sliced));
-      assert.ok(textOf(sliced).includes("line-59-"), textOf(sliced));
-      // The BYTE cap: two-kilobyte strings trip the 50 KB cap long before
-      // the line cap; only the lines that fit are emitted.
-      const heavy = await repl(session, {
-        action: "eval",
-        projectDir: PROJECT,
-        code: 'for (let i = 0; i < 40; i++) console.log("B".repeat(2000) + i);',
-      });
-      assert.ok(!isErrorResult(heavy), textOf(heavy));
-      const heavyText = textOf(heavy);
-      assert.ok(heavyText.split("\n").length < 40, "the byte cap tripped before the line cap");
-      assert.ok(Buffer.byteLength(heavyText) <= OUTPUT_MAX_BYTES, `the byte cap: ${Buffer.byteLength(heavyText)} bytes`);
-      // (The broker already capped the console lines, so the final text
-      // fits without a marker; the marker-on-byte-cap path is pinned by
-      // capFinalText's unit tests.)
-      // The full value behind a capped line is one global: addressable by
-      // its ref in a later eval. The 60 prior logs created $1..$60, the
-      // sliced eval's log created $61, and the heavy loop created
-      // $62..$101 — the last one is "B" × 2000 + "39" (length 2002),
-      // intact.
-      const length = await repl(session, { action: "eval", projectDir: PROJECT, code: "$101.length" });
-      assert.ok(!isErrorResult(length), textOf(length));
-      assert.ok(textOf(length).includes("result: 2002"), textOf(length));
-      // METADATA-heavy results are capped too (phase-E review rejection:
-      // pending ids, checkpoints, completed ids, and timeout text were
-      // appended uncapped): 2500 parked checkpoints render 2500 checkpoint
-      // lines plus the result/pending sections — the final text is
-      // capped with the marker, head sections kept in order.
-      const CHECKPOINTS = 2500;
-      const meta = await repl(session, {
-        action: "eval",
-        projectDir: PROJECT,
-        code: `for (let i = 0; i < ${CHECKPOINTS}; i++) checkpoint("q-" + i); "asked"`,
-      });
-      assert.ok(!isErrorResult(meta), textOf(meta));
-      const metaText = textOf(meta);
-      const metaLines = metaText.split("\n");
-      assert.ok(metaLines.length <= OUTPUT_MAX_LINES, `metadata-heavy result capped: ${metaLines.length}`);
-      assert.ok(metaText.includes("tool result truncated"), "the metadata cap marker ships");
-      assert.ok(metaText.includes("pending:"), "the pending section is kept (head)");
-      assert.ok(metaText.includes("checkpoint"), "the checkpoint section is kept (head)");
-      assert.ok(!metaText.includes("completed:"), "the tail section is dropped");
-      // The STRUCTURED surface is bounded by the aggregate result cap
-      // too (phase-E review round 8: structuredContent used to cross
-      // the wire uncapped while only the text was capped) — every
-      // elision is FLAGGED with its elided count, so the kept head
-      // prefix plus the record always reconciles to the whole registry
-      // (phase-E review round 3: the trap-free surface read used to
-      // truncate at 256 entries and leak an undefined hole into the
-      // structured array — a silent hole stays impossible).
-      const scMeta = (meta as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.ok(
-        Buffer.byteLength(JSON.stringify(scMeta), "utf8") <= OUTPUT_MAX_BYTES,
-        `the structured surface respects the aggregate cap: ${Buffer.byteLength(JSON.stringify(scMeta), "utf8")} bytes`,
-      );
-      const truncated = (scMeta.truncated ?? {}) as Record<string, { elided: number; ref?: string }>;
-      const scPending = scMeta.pending as string[];
-      assert.equal(
-        scPending.length + (truncated.pending?.elided ?? 0),
-        CHECKPOINTS,
-        "the structured pending reconciles to the whole registry",
-      );
-      assert.ok(scPending.every((id, index) => id === `c${index + 1}`), "dense and in order — no holes");
-      if (truncated.pending !== undefined) {
-        assert.ok(typeof truncated.pending.ref === "string", "an elided pending tail carries its continuation ref");
-      }
-      const scCheckpoints = scMeta.checkpoints as unknown[];
-      assert.equal(
-        scCheckpoints.length + (truncated.checkpoints?.elided ?? 0),
-        CHECKPOINTS,
-        "the structured checkpoints reconcile to the whole registry",
-      );
-      assert.ok(typeof truncated.checkpoints?.ref === "string", "the elided checkpoint tail carries its continuation ref");
-      // Phase-F review round 2: the omitted values are ADDRESSABLE — a
-      // later read with the refs parameter recovers the elided tails
-      // (the cap costs reads, never data). A referenced read is itself
-      // capped: when the read-back crosses the aggregate bound again,
-      // the response's own truncated record carries a FRESH continuation
-      // ref for the referenced field — chain the refs until the whole
-      // registry is recovered.
-      const recovered = new Set<string>((scMeta.pending as string[]) ?? []);
-      const questions = new Set<string>((scMeta.checkpoints as Array<{ question?: string }>)?.map((c) => c.question ?? ""));
-      let queue = [
-        truncated.checkpoints!.ref!,
-        ...(truncated.pending !== undefined ? [truncated.pending.ref!] : []),
-      ];
-      let hops = 0;
-      while (queue.length > 0 && hops < 40) {
-        const refRead = await repl(session, {
-          action: "status",
-          projectDir: PROJECT,
-          refs: queue,
-        });
-        assert.ok(!isErrorResult(refRead), textOf(refRead));
-        const refSc = (refRead as { structuredContent?: Record<string, unknown> }).structuredContent!;
-        const referenced = (refSc.referenced ?? {}) as Record<string, unknown[]>;
-        for (const ref of queue) {
-          for (const value of referenced[ref] ?? []) {
-            if (typeof value === "string" && /^c\d+$/.test(value)) recovered.add(value);
-            else if (typeof value === "object" && value !== null) {
-              questions.add((value as { question?: string }).question ?? "");
-            }
-          }
-        }
-        // The read-back's own elisions chain onward (a referenced read
-        // is capped like any other result).
-        const chained = (refSc.truncated ?? {}) as Record<string, { elided: number; ref?: string }>;
-        queue = Object.values(chained)
-          .filter((entry) => typeof entry.ref === "string")
-          .map((entry) => entry.ref as string)
-          .filter((ref) => !queue.includes(ref));
-        hops++;
-      }
-      if (truncated.pending !== undefined) {
-        assert.equal(recovered.size, CHECKPOINTS, "every elided pending id was recovered through the ref chain");
-      }
-      assert.equal(questions.size, CHECKPOINTS, "every elided checkpoint question was recovered through the ref chain");
-    } finally {
-      await session.dispose();
-    }
-  } finally {
-    await daemon.close();
-  }
-});
+// ── Round 4: exact action shapes, manifest fields, bounded surface ────
 
-// ── Round 4: exact action shapes, manifest fields, bounded status ─────
-
-test("review round 4: the input is action-discriminated — every action's EXACT field set is enforced at the boundary (eval without code, reset with code, status with ids, interrupt with timeoutMs, wait with code, eval with ids: all rejected with 'cannot include'/'requires'; irrelevant known fields are never silently accepted)", async () => {
+test("review round 4: the input is action-discriminated — every action's EXACT field set is enforced at the boundary (eval without code, interrupt with code/timeoutMs, eval with id: all rejected with 'cannot include'/'requires'; irrelevant known fields are never silently accepted)", async () => {
   const runner = new FakeRunner();
   const daemon = await startReplDaemon(runner);
   try {
@@ -1115,38 +872,21 @@ test("review round 4: the input is action-discriminated — every action's EXACT
       const noCode = await repl(session, { action: "eval", projectDir: PROJECT });
       assert.ok(isErrorResult(noCode), textOf(noCode));
       assert.ok(textOf(noCode).includes("eval requires a code string"), textOf(noCode));
-      // Extraneous known fields per action (the carried defect: the
-      // flat optional-field bag silently accepted them and deferred the
-      // semantics to late handler checks).
-      const resetWithCode = await repl(session, { action: "reset", projectDir: PROJECT, code: "1 + 1" });
-      assert.ok(isErrorResult(resetWithCode), textOf(resetWithCode));
-      assert.ok(textOf(resetWithCode).includes('cannot include code'), textOf(resetWithCode));
-      const statusWithIds = await repl(session, { action: "status", projectDir: PROJECT, ids: ["c1"] });
-      assert.ok(isErrorResult(statusWithIds), textOf(statusWithIds));
-      assert.ok(textOf(statusWithIds).includes('cannot include ids'), textOf(statusWithIds));
+      // Extraneous known fields per action.
       const interruptWithTimeout = await repl(session, { action: "interrupt", projectDir: PROJECT, timeoutMs: 100 });
       assert.ok(isErrorResult(interruptWithTimeout), textOf(interruptWithTimeout));
       assert.ok(textOf(interruptWithTimeout).includes('cannot include timeoutMs'), textOf(interruptWithTimeout));
-      const waitWithCode = await repl(session, { action: "wait", projectDir: PROJECT, code: "1 + 1" });
-      assert.ok(isErrorResult(waitWithCode), textOf(waitWithCode));
-      assert.ok(textOf(waitWithCode).includes('cannot include code'), textOf(waitWithCode));
-      const evalWithIds = await repl(session, { action: "eval", projectDir: PROJECT, code: "1 + 1", ids: ["c1"] });
-      assert.ok(isErrorResult(evalWithIds), textOf(evalWithIds));
-      assert.ok(textOf(evalWithIds).includes('cannot include ids'), textOf(evalWithIds));
-      const resetWithId = await repl(session, { action: "reset", projectDir: PROJECT, id: "c1" });
-      assert.ok(isErrorResult(resetWithId), textOf(resetWithId));
-      assert.ok(textOf(resetWithId).includes('cannot include id'), textOf(resetWithId));
-      // The workspace was never created by the rejected calls (nothing
-      // ran): a status still reports the project as not opened... (the
-      // named status IS a first touch — assert the workspace is still
-      // usable and fresh).
+      const interruptWithCode = await repl(session, { action: "interrupt", projectDir: PROJECT, code: "1 + 1" });
+      assert.ok(isErrorResult(interruptWithCode), textOf(interruptWithCode));
+      assert.ok(textOf(interruptWithCode).includes('cannot include code'), textOf(interruptWithCode));
+      const evalWithId = await repl(session, { action: "eval", projectDir: PROJECT, code: "1 + 1", id: "c1" });
+      assert.ok(isErrorResult(evalWithId), textOf(evalWithId));
+      assert.ok(textOf(evalWithId).includes('cannot include id'), textOf(evalWithId));
+      // The workspace was never created by the rejected calls: a well-
+      // formed eval works.
       const ok = await repl(session, { action: "eval", projectDir: PROJECT, code: "6 * 7" });
       assert.ok(!isErrorResult(ok), textOf(ok));
       assert.ok(textOf(ok).includes("result: 42"), textOf(ok));
-      // A well-formed reset (no extraneous fields) works.
-      const reset = await repl(session, { action: "reset", projectDir: PROJECT });
-      assert.ok(!isErrorResult(reset), textOf(reset));
-      assert.ok(textOf(reset).includes("dropped"), textOf(reset));
     } finally {
       await session.dispose();
     }
@@ -1155,7 +895,7 @@ test("review round 4: the input is action-discriminated — every action's EXACT
   }
 });
 
-test("review round 4: the structured manifest carries the machine-readable type and live-handle status fields — `agent handle` type, the call id, and pending→settled status transitions as their own fields (phase-E review round 4: the manifest exposed only the human token with the status and call id embedded in the string)", async () => {
+test("review round 4: workspace() carries the machine-readable type and live-handle status fields — `agent handle` type, the call id, and pending→settled status transitions as their own fields", async () => {
   const runner = new FakeRunner();
   const daemon = await startReplDaemon(runner);
   try {
@@ -1169,34 +909,30 @@ test("review round 4: the structured manifest carries the machine-readable type 
       });
       assert.ok(!isErrorResult(evaled), textOf(evaled));
       await tick();
-      const status = await repl(session, { action: "status", projectDir: PROJECT });
-      assert.ok(!isErrorResult(status), textOf(status));
-      const sc = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      const w = (sc.workspaces as Array<Record<string, unknown>>)[0];
-      const bindings = w.bindings as Array<Record<string, unknown>>;
-      const handle = bindings.find((b) => b.name === "research");
+      const ws = (await evalJson(session, PROJECT, "workspace()")) as {
+        bindings: Array<{ name: string; type: string; callId?: string; status?: string }>;
+      };
+      const handle = ws.bindings.find((b) => b.name === "research");
       assert.ok(handle, "the agent handle binding");
       assert.equal(handle.type, "agent handle", "the machine-readable type");
-      assert.equal(handle.handleCallId, "c1", "the call id is its own field, not just token text");
-      assert.equal(handle.handleStatus, "pending", "the live-handle status is its own field");
-      assert.ok((handle.token as string).includes("agent handle · pending · call c1"), `the token still carries the human form: ${handle.token}`);
-      const plain = bindings.find((b) => b.name === "answer");
+      assert.equal(handle.callId, "c1", "the call id is its own field");
+      assert.equal(handle.status, "pending", "the live-handle status is its own field");
+      const plain = ws.bindings.find((b) => b.name === "answer");
       assert.ok(plain, "the plain binding");
       assert.equal(plain.type, "number", "the plain binding's machine-readable type");
-      assert.equal(plain.handleCallId, null);
-      assert.equal(plain.handleStatus, null);
-      // The handle settles: the structured status transitions to
-      // `settled` (the call store is the authority).
+      assert.equal(plain.callId, undefined);
+      assert.equal(plain.status, undefined);
+      // The handle settles: the status transitions to `settled` (the
+      // call store is the authority).
       runner.last().completeTurn("done");
       await tick();
-      const after = await repl(session, { action: "wait", projectDir: PROJECT, ids: ["c1"], timeoutMs: 5000 });
-      assert.ok(!isErrorResult(after), textOf(after));
-      const statusAfter = await repl(session, { action: "status", projectDir: PROJECT });
-      const scAfter = (statusAfter as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      const wAfter = (scAfter.workspaces as Array<Record<string, unknown>>)[0];
-      const handleAfter = (wAfter.bindings as Array<Record<string, unknown>>).find((b) => b.name === "research");
-      assert.equal(handleAfter?.handleStatus, "settled", "the handle status transitioned");
-      assert.equal(handleAfter?.handleCallId, "c1");
+      const picked = await repl(session, { action: "eval", projectDir: PROJECT, code: "await research" });
+      assert.equal(structuredOf(picked).result, "done");
+      const wsAfter = (await evalJson(session, PROJECT, "workspace()")) as {
+        bindings: Array<{ name: string; status?: string }>;
+      };
+      const handleAfter = wsAfter.bindings.find((b) => b.name === "research");
+      assert.equal(handleAfter?.status, "settled", "the handle status transitioned");
     } finally {
       await session.dispose();
     }
@@ -1205,69 +941,27 @@ test("review round 4: the structured manifest carries the machine-readable type 
   }
 });
 
-test("review round 4: the structured status respects the output limits for guest-derived fields — a huge agent task is head+tail elided at the ENGINE seam, so the wire's structuredContent carries at most the documented 200-char bound (the carried defect: structured status copied the raw task, so a guest could push an unbounded string through structuredContent while only the text was capped)", async () => {
+test("review round 8 (flipped by the redesign): agents() ships the modelSpec VERBATIM — the old 200-char status cap is deleted with the structured-status surface (§7 kept the 200-char bound only for manifest tokens and task previews)", async () => {
   const runner = new FakeRunner();
   const daemon = await startReplDaemon(runner);
   try {
     const session = await connectHttp(daemon.url);
     try {
-      const PROJECT = makeProjectDir("repl-bounded-status");
-      const hugeTask = "T".repeat(10_000);
-      const evaled = await repl(session, { action: "eval", projectDir: PROJECT, code: `const big = agent("pi/x", ${JSON.stringify(hugeTask)}); "started"` });
-      assert.ok(!isErrorResult(evaled), textOf(evaled));
-      await tick();
-      const status = await repl(session, { action: "status", projectDir: PROJECT });
-      assert.ok(!isErrorResult(status), textOf(status));
-      const sc = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      const w = (sc.workspaces as Array<Record<string, unknown>>)[0];
-      const agent = (w.liveAgents as Array<Record<string, unknown>>)[0];
-      assert.equal(agent.callId, "c1");
-      assert.ok(typeof agent.task === "string", "the task is a string");
-      assert.ok(agent.task.length <= 200, `the wire task respects the 200-char cap: ${agent.task.length}`);
-      assert.ok(agent.task.startsWith("T".repeat(99)) && agent.task.endsWith("T".repeat(100)), "head+tail elision keeps both ends");
-      assert.ok(agent.task.includes("…"), "the elision marker is present");
-      // The raw task never reaches the wire in ANY structured field.
-      assert.ok(!JSON.stringify(sc).includes(hugeTask), "the unbounded task never crosses the wire");
-      // The bounded text rendering carries the same elided form.
-      assert.ok(!textOf(status).includes(hugeTask), "the text rendering is bounded too");
-    } finally {
-      await session.dispose();
-    }
-  } finally {
-    await daemon.close();
-  }
-});
-
-test("review round 8: the structured status bounds the modelSpec at the ENGINE seam like the task — a 20,000-character model spec produces a head+tail-elided live-agent entry, never a >20KB structured field (the phase-E review rejection: modelSpec crossed status uncapped while only the text was capped), and the serialized structuredContent respects the aggregate 10 KB cap", async () => {
-  const runner = new FakeRunner();
-  const daemon = await startReplDaemon(runner);
-  try {
-    const session = await connectHttp(daemon.url);
-    try {
-      const PROJECT = makeProjectDir("repl-bounded-modelspec");
-      const hugeSpec = "model-" + "X".repeat(20_000);
+      const PROJECT = makeProjectDir("repl-modelspec-verbatim");
+      const hugeSpec = "pi/" + "X".repeat(500);
       const evaled = await repl(session, { action: "eval", projectDir: PROJECT, code: `const big = agent(${JSON.stringify(hugeSpec)}, "task"); "started"` });
       assert.ok(!isErrorResult(evaled), textOf(evaled));
       await tick();
-      const status = await repl(session, { action: "status", projectDir: PROJECT });
-      assert.ok(!isErrorResult(status), textOf(status));
-      const sc = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      const w = (sc.workspaces as Array<Record<string, unknown>>)[0];
-      const agent = (w.liveAgents as Array<Record<string, unknown>>)[0];
-      assert.equal(agent.callId, "c1");
-      assert.ok(typeof agent.modelSpec === "string", "the modelSpec is a string");
-      assert.ok(agent.modelSpec.length <= 200, `the wire modelSpec respects the engine-seam cap: ${agent.modelSpec.length}`);
-      assert.ok(agent.modelSpec.startsWith("model-XXXX"), "head+tail elision keeps the head");
-      assert.ok(agent.modelSpec.includes("…"), "the elision marker is present");
-      // The raw spec never reaches the wire in ANY structured field or
-      // the text, and the WHOLE serialized structured result respects
-      // the aggregate cap.
-      assert.ok(!JSON.stringify(sc).includes(hugeSpec), "the unbounded modelSpec never crosses the wire");
-      assert.ok(!textOf(status).includes(hugeSpec), "the text rendering is bounded too");
-      assert.ok(
-        Buffer.byteLength(JSON.stringify(sc), "utf8") <= OUTPUT_MAX_BYTES,
-        `the serialized structured result respects the aggregate cap: ${Buffer.byteLength(JSON.stringify(sc), "utf8")} bytes`,
-      );
+      const agents = (await evalJson(session, PROJECT, "agents()")) as Array<{ callId: string; modelSpec: string }>;
+      assert.equal(agents.length, 1);
+      assert.equal(agents[0].callId, "c1");
+      assert.equal(agents[0].modelSpec, hugeSpec, "the full model spec, verbatim");
+      // The workspace manifest's task preview keeps its 200-char metadata
+      // bound (a retained §7 preview — metadata formatting, not a cap).
+      const ws = (await evalJson(session, PROJECT, "workspace()")) as {
+        bindings: Array<{ name: string; task: string | null }>;
+      };
+      assert.equal(ws.bindings.find((b) => b.name === "big")?.task, "task");
     } finally {
       await session.dispose();
     }
@@ -1276,7 +970,7 @@ test("review round 8: the structured status bounds the modelSpec at the ENGINE s
   }
 });
 
-test("review round 8: interrupt { id } cancels a call whose openSession is still pending — the call settles durably as the recoverable AGENT_CANCELLED (the guest promise rejects now, a later wait reports it completed, and a daemon RESTART settles it from the store), and the LATE child is closed without ever prompting (the phase-E review rejection: cancelCall ignored openingCalls and returned 'none', and the eventual open resolved into a prompted, supposedly-interrupted call)", async () => {
+test("review round 8: interrupt { id } cancels a call whose openSession is still pending — the call settles durably as the recoverable AGENT_CANCELLED, and the LATE child is closed without ever prompting", async () => {
   const runner = new DelayedOpenRunner();
   runner.parkOpens();
   const PROJECT = makeProjectDir("repl-interrupt-opening");
@@ -1286,8 +980,6 @@ test("review round 8: interrupt { id } cancels a call whose openSession is still
     try {
       const evaled = await repl(session, { action: "eval", projectDir: PROJECT, code: `const p = agent("pi/x", "task"); "started"` });
       assert.ok(!isErrorResult(evaled), textOf(evaled));
-      const sc0 = (evaled as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.ok((sc0.pending as string[]).includes("c1"), `the opening call is pending: ${JSON.stringify(sc0.pending)}`);
       await tick();
       // The interrupt lands while openSession is STILL parked: the
       // old decision returned 'none' (no live session, no lazy
@@ -1295,26 +987,17 @@ test("review round 8: interrupt { id } cancels a call whose openSession is still
       // supposedly-interrupted call.
       const interrupted = await repl(session, { action: "interrupt", projectDir: PROJECT, id: "c1" });
       assert.ok(!isErrorResult(interrupted), textOf(interrupted));
-      const si = (interrupted as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const si = structuredOf(interrupted);
       assert.equal((si.interrupt as { outcome: string }).outcome, "cancelled", `honest outcome: ${JSON.stringify(si.interrupt)}`);
       // The guest promise settled NOW with the recoverable error — not
       // when the open eventually lands.
       const read = await repl(session, { action: "eval", projectDir: PROJECT, code: `await p.catch((e) => "ERR:" + e.message)` });
       assert.ok(!isErrorResult(read), textOf(read));
-      const sc1 = (read as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const sc1 = structuredOf(read);
       assert.ok(
         String(sc1.result).includes("was cancelled by interrupt while its session was still opening"),
         `guest-visible settlement: ${sc1.result}`,
       );
-      // A later wait sees the cancelled call as no longer pending (the
-      // settled call is gone from the pending registry — the wait
-      // drains at its first pump; it observed nothing settle, so
-      // `completed` stays empty and `pending` no longer lists c1).
-      const waited = await repl(session, { action: "wait", projectDir: PROJECT, ids: ["c1"], timeoutMs: 5000 });
-      assert.ok(!isErrorResult(waited), textOf(waited));
-      const sw = (waited as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      assert.equal(sw.drained, true, `the cancelled call drains the wait: ${JSON.stringify(sw)}`);
-      assert.ok(!(sw.pending as string[]).includes("c1"), `no longer pending: ${JSON.stringify(sw.pending)}`);
     } finally {
       await session.dispose();
     }
@@ -1332,7 +1015,7 @@ test("review round 8: interrupt { id } cancels a call whose openSession is still
     try {
       const read = await repl(session, { action: "eval", projectDir: PROJECT, code: `await p.catch((e) => "ERR:" + e.message)` });
       assert.ok(!isErrorResult(read), textOf(read));
-      const sc = (read as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const sc = structuredOf(read);
       assert.ok(
         String(sc.result).includes("was cancelled by interrupt"),
         `the restart settles the durable cancellation: ${sc.result}`,
@@ -1353,7 +1036,7 @@ test("review round 8: interrupt { id } cancels a call whose openSession is still
   assert.equal(runner.sessions[0].releases, 1, "the late child was closed without prompting");
 });
 
-test("review round 9: interrupt { id } on a still-OPENING call is IMMEDIATELY durable — the daemon can be killed right after the interrupt (NO eval or wait in between) and the restart restores the SETTLED workspace: the manifest provenance attributes the settlement's continuation to the cancelled worker, the registry is settled (nothing left for the store arm), and the guest promise rejects with the cancellation (the phase-E review rejection: the opening-cancel skipped the settlement boundary, so the daemon's snapshot writer never marked the workspace dirty and the kill restored the PRE-settlement snapshot with the call still pending — the round-8 regression masked it by performing another eval and wait before the restart)", async () => {
+test("review round 9: interrupt { id } on a still-OPENING call is IMMEDIATELY durable — the daemon can be killed right after the interrupt (NO eval in between) and the restart restores the SETTLED workspace: the reconcile's store arm has nothing to settle and the continuation binding carries the settlement provenance", async () => {
   const runner = new DelayedOpenRunner();
   runner.parkOpens();
   const PROJECT = makeProjectDir("repl-interrupt-opening-immediate");
@@ -1368,7 +1051,7 @@ test("review round 9: interrupt { id } on a still-OPENING call is IMMEDIATELY du
       await tick();
       const interrupted = await repl(session, { action: "interrupt", projectDir: PROJECT, id: "c1" });
       assert.ok(!isErrorResult(interrupted), textOf(interrupted));
-      const si = (interrupted as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const si = structuredOf(interrupted);
       assert.equal((si.interrupt as { outcome: string }).outcome, "cancelled", `honest outcome: ${JSON.stringify(si.interrupt)}`);
       // NO further repl calls — the daemon dies immediately. The
       // interrupt's own settlement boundary must already have persisted
@@ -1380,38 +1063,32 @@ test("review round 9: interrupt { id } on a still-OPENING call is IMMEDIATELY du
   } finally {
     await daemon.close();
   }
-  // The restart over the same home: the FIRST read is a status, and it
+  // The restart over the same home: the FIRST read is an eval, and it
   // must already see the settlement — the restored registry is settled
   // (c1 not pending) and the continuation binding carries the
-  // settlement's provenance FROM THE SNAPSHOT (without the fix, the
-  // restored pre-settlement VM's continuation runs only at reconcile,
-  // with no provenance pass before the read — the manifest would show
-  // null provenance).
+  // settlement's provenance FROM THE SNAPSHOT.
   const daemon2 = await startReplDaemon(runner);
   try {
     const session = await connectHttp(daemon2.url);
     try {
-      const status = await repl(session, { action: "status", projectDir: PROJECT });
-      assert.ok(!isErrorResult(status), textOf(status));
-      const sc = (status as { structuredContent?: Record<string, unknown> }).structuredContent!;
-      const w0 = (sc.workspaces as Array<Record<string, unknown>>)[0];
-      assert.ok(w0 !== undefined, `a workspace is reported: ${JSON.stringify(sc)}`);
-      assert.ok(!(w0.pending as string[]).includes("c1"), `the restored registry is settled: ${JSON.stringify(w0.pending)}`);
+      const ws = (await evalJson(session, PROJECT, "workspace()")) as {
+        inFlight: string[];
+        bindings: Array<{ name: string; provenance: string | null }>;
+        diagnostics: { reconcile: { settledFromStore: string[] } | null };
+      };
+      assert.ok(!ws.inFlight.includes("c1"), `the restored registry is settled: ${JSON.stringify(ws.inFlight)}`);
       // The discriminator: the interrupt's OWN snapshot carried the
       // settlement, so the restart's reconcile has NOTHING for the
-      // store arm (without the fix, the restore reconciles the
-      // pre-settlement snapshot and settles c1 from the store here).
-      const reconcile = w0.reconcile as { settledFromStore: string[] } | undefined;
-      assert.ok(reconcile !== undefined, "the restored workspace carries its reconcile summary");
-      assert.deepEqual(reconcile.settledFromStore, [], "the store arm had nothing to settle — the snapshot already carried the settlement");
-      const bindings = w0.bindings as Array<Record<string, unknown>>;
-      const wasCancelled = bindings.find((b) => b.name === "wasCancelled");
-      assert.ok(wasCancelled !== undefined, `the continuation binding survived the restart: ${JSON.stringify(bindings)}`);
+      // store arm.
+      assert.ok(ws.diagnostics.reconcile !== null, "the restored workspace carries its reconcile summary");
+      assert.deepEqual(ws.diagnostics.reconcile!.settledFromStore, [], "the store arm had nothing to settle — the snapshot already carried the settlement");
+      const wasCancelled = ws.bindings.find((b) => b.name === "wasCancelled");
+      assert.ok(wasCancelled !== undefined, `the continuation binding survived the restart: ${JSON.stringify(ws.bindings)}`);
       assert.equal(wasCancelled.provenance, "worker c1", "the settlement provenance traveled inside the interrupt's snapshot");
       // The guest promise rejects with the durable cancellation.
       const read = await repl(session, { action: "eval", projectDir: PROJECT, code: `await p.catch((e) => "ERR:" + e.message)` });
       assert.ok(!isErrorResult(read), textOf(read));
-      const sc1 = (read as { structuredContent?: Record<string, unknown> }).structuredContent!;
+      const sc1 = structuredOf(read);
       assert.ok(
         String(sc1.result).includes("was cancelled by interrupt"),
         `the restart settles the durable cancellation: ${sc1.result}`,
@@ -1430,96 +1107,4 @@ test("review round 9: interrupt { id } on a still-OPENING call is IMMEDIATELY du
   assert.equal(runner.sessions.length, 1, "exactly one session ever opened");
   assert.equal(runner.sessions[0].prompts.length, 0, "the stopped call never ran a turn");
   assert.equal(runner.sessions[0].releases, 1, "the late child was closed without prompting");
-});
-
-test("review round 8: the aggregate structured-result cap bounds the eval/wait/status wire — 16 500 parked checkpoints cross the wire as an EXPLICITLY-FLAGGED head prefix (kept ids well-formed, never a silent undefined hole), the elided counts reconcile to the true totals, and the serialized structuredContent respects the doc's 10 KB cap; a daemon RESTART restores and reconciles the FULL registry in the VM while the wire stays bounded (the phase-E review rejection: 16 500 pending ids crossed the wire as an ~80 KB array — structuredContent was uncapped while only the text was)", async () => {
-  const runner = new FakeRunner();
-  const daemon = await startReplDaemon(runner);
-  const PROJECT = makeProjectDir("repl-whole-registry");
-  const CHECKPOINTS = 16_500;
-  const boundedSc = (res: unknown): Record<string, unknown> => {
-    const sc = (res as { structuredContent?: Record<string, unknown> }).structuredContent!;
-    assert.ok(
-      Buffer.byteLength(JSON.stringify(sc), "utf8") <= OUTPUT_MAX_BYTES,
-      `the serialized structuredContent respects the aggregate cap: ${Buffer.byteLength(JSON.stringify(sc), "utf8")} bytes`,
-    );
-    return sc;
-  };
-  try {
-    const session = await connectHttp(daemon.url);
-    try {
-      const evaled = await repl(session, {
-        action: "eval",
-        projectDir: PROJECT,
-        code: `for (let i = 0; i < ${CHECKPOINTS}; i++) checkpoint("q" + i); "raised"`,
-      });
-      assert.ok(!isErrorResult(evaled), textOf(evaled));
-      const sc = boundedSc(evaled);
-      const pending = sc.pending as string[];
-      const truncated = (sc.truncated ?? {}) as Record<string, { elided: number; ref?: string }>;
-      assert.ok(pending.length > 0, "the head prefix is non-empty");
-      assert.ok(pending.length < CHECKPOINTS, "the wire is bounded, not the whole registry");
-      assert.equal(pending[0], "c1", "the kept prefix starts at the head");
-      assert.equal(truncated.pending?.elided, CHECKPOINTS - pending.length, "the elided pending count reconciles");
-      assert.ok(typeof truncated.pending?.ref === "string", "the elided pending tail carries its continuation ref");
-      for (const id of pending) {
-        assert.ok(typeof id === "string" && /^c\d+$/.test(id), `no truncation/undefined hole: ${JSON.stringify(id)}`);
-      }
-      const checkpoints = sc.checkpoints as Array<{ id: string }>;
-      assert.equal(checkpoints.length + (truncated.checkpoints?.elided ?? 0), CHECKPOINTS, "the elided checkpoint count reconciles");
-      assert.ok(typeof truncated.checkpoints?.ref === "string", "the elided checkpoint tail carries its continuation ref");
-      for (const checkpoint of checkpoints) {
-        assert.ok(/^c\d+$/.test(checkpoint.id), `no checkpoint hole: ${JSON.stringify(checkpoint.id)}`);
-      }
-    } finally {
-      await session.dispose();
-    }
-  } finally {
-    await daemon.close();
-  }
-  // A daemon RESTART over the same store: the first touch restores the
-  // snapshot and reconciles the in-VM pending-call registry — the FULL
-  // registry survives in the VM (the same complete read serves the
-  // restore path) while the wire stays bounded and flagged.
-  const daemon2 = await startReplDaemon(runner);
-  try {
-    const session = await connectHttp(daemon2.url);
-    try {
-      const status = await repl(session, { action: "status", projectDir: PROJECT });
-      assert.ok(!isErrorResult(status), textOf(status));
-      const sc = boundedSc(status);
-      const w = (sc.workspaces as Array<Record<string, unknown>>)[0];
-      assert.equal(w.state, "restored", "the workspace restored from the snapshot");
-      const truncated = (sc.truncated ?? {}) as Record<string, { elided: number; ref?: string }>;
-      assert.ok(Object.keys(truncated).length > 0, "the wire elision is flagged");
-      const pending = w.pending as string[];
-      assert.ok(pending.length < CHECKPOINTS, "the status pending surface is bounded");
-      assert.equal(
-        pending.length + (truncated["workspaces[0].pending"]?.elided ?? 0),
-        CHECKPOINTS,
-        "the status pending counts reconcile",
-      );
-      assert.ok(typeof truncated["workspaces[0].pending"]?.ref === "string", "the status elision carries its continuation ref");
-      for (const id of pending) {
-        assert.ok(typeof id === "string" && /^c\d+$/.test(id), `no hole after restore: ${JSON.stringify(id)}`);
-      }
-      const checkpoints = w.checkpoints as Array<{ id: string }>;
-      assert.equal(
-        checkpoints.length + (truncated["workspaces[0].checkpoints"]?.elided ?? 0),
-        CHECKPOINTS,
-        "every checkpoint re-surfaced in the VM, wire-bounded",
-      );
-      // The restore's reconcile report rides the same cap (the
-      // re-surfaced checkpoint ids are an id list like any other).
-      const requeued = truncated["workspaces[0].reconcile.requeuedCheckpoints"];
-      if (requeued !== undefined) {
-        const kept = ((w.reconcile as Record<string, unknown>).requeuedCheckpoints as string[]).length;
-        assert.equal(kept + (requeued as { elided: number }).elided, CHECKPOINTS, "the reconcile id list reconciles too");
-      }
-    } finally {
-      await session.dispose();
-    }
-  } finally {
-    await daemon2.close();
-  }
 });

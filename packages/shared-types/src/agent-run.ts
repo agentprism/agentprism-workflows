@@ -142,9 +142,6 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
   /** Out-of-band result provenance for the current attempt. The last report received
    *  before the attempt settles wins; late reports are dropped by the engine. */
   onResultProvenance?: (provenance: AgentResultProvenance) => void;
-  /** Reports the recorded settlement ordinal bound to this attempt for budget-
-   *  trajectory replay. The engine seals this callback with the attempt. */
-  onBudgetReplay?: (r: { settlementOrdinal: number }) => void;
   /** The actually-resolved concrete model id (display/telemetry). */
   onModelResolved?: (modelId: string) => void;
   /** A requested model/tier/phase spec that wasn't found (fell back to the session default). */

@@ -10,7 +10,7 @@
 // Flags:
 //   --target <dir>             repo to triage (default: nearest enclosing git repo)
 //   --workflow <name>          which saved workflow to run (default: repo-triage)
-//   --budget <tokens>          optional hard token budget for the run (default: unbounded)
+//
 //   --max-areas <n>            areas the map step may pick (default: 4)
 //   --findings-per-area <n>    per-area findings cap (default: 3)
 //   --hunt-rounds <n>          quick-wins rounds; 0 disables the Hunt stage (default: 3)
@@ -61,10 +61,8 @@ function defaultTarget(): string {
 }
 const target = resolve(flags.get("target") || defaultTarget());
 const workflowName = flags.get("workflow") || "repo-triage";
-// Unbounded by default — an autonomous triage should finish, not die at an arbitrary
-// cap. Passing --budget turns on the hard cap AND the script's budget-aware guards.
-const budgetFlag = Number(flags.get("budget"));
-const tokenBudget = Number.isFinite(budgetFlag) && budgetFlag > 0 ? Math.floor(budgetFlag) : undefined;
+// The token budget is deleted (§7): an autonomous triage should finish, not die at
+// an arbitrary cap.
 const outFile = resolve(flags.get("out") || resolve(exampleDir, "triage-report.md"));
 
 // The SDK's workflow loader: a fresh-per-call view over ./workflows/*.workflow.js
@@ -78,9 +76,7 @@ if (!available.includes(workflowName)) {
   process.exit(1);
 }
 
-console.error(
-  `running "${workflowName}" against ${target} (budget: ${tokenBudget ? `${tokenBudget.toLocaleString()} tokens` : "unbounded"})`,
-);
+console.error(`running "${workflowName}" against ${target}`);
 
 // ── the run ──
 let lastLine = "";
@@ -97,7 +93,6 @@ const run = await runDynamicWorkflow(workflowName, {
     rounds: num("hunt-rounds", 3), // quick-wins' round cap, when run standalone
   },
   exec: {
-    tokenBudget, // undefined = unbounded; set = hard cap the script sees via budget.*
     agentTimeoutMs: 600_000, // no single agent may run longer than 10 minutes
     agentRetries: 1, // default retry for recoverable failures (timeouts, empty output)
     onProgress: (s: WorkflowSnapshot) => {
@@ -113,7 +108,7 @@ console.log(`\nstatus:  ${run.status}${run.reason ? ` (${run.reason})` : ""}`);
 console.log(`phases:  ${run.phases.join(" → ")}`);
 console.log(`agents:  ${run.agentCount} calls in ${Math.round(run.durationMs / 1000)}s`);
 if (run.tokenUsage)
-  console.log(`tokens:  ${run.tokenUsage.total.toLocaleString()}${tokenBudget ? ` of ${tokenBudget.toLocaleString()} budgeted` : ""}`);
+  console.log(`tokens:  ${run.tokenUsage.total.toLocaleString()}`);
 if (run.logs.length > 0) console.log(`log:\n  ${run.logs.join("\n  ")}`);
 
 if (run.status !== "completed") {

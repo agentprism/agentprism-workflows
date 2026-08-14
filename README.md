@@ -10,7 +10,7 @@
   <a href="https://deepwiki.com/agentprism/agentprism-workflows"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
 </p>
 
-Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipeline()` — over real coding agents (Claude Code, OpenAI Codex, OpenCode, and pi), with deterministic journaling, resume, token budgets, and git-worktree isolation.
+Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipeline()` — over real coding agents (Claude Code, OpenAI Codex, OpenCode, and pi), with deterministic journaling, resume, and git-worktree isolation.
 
 **Your agent authors** a small JavaScript *script* (`export const meta`, then call `agent()` / `parallel()` / `pipeline()`); the engine runs it in a sandboxed realm, fanning each `agent()` call out to an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) backend. It's available two ways:
 
@@ -55,7 +55,7 @@ Scripts run in a deterministic realm and every `agent()` call is journaled under
 
 > **Resume rule:** replay is content-addressed and fail-to-live on correspondence: a completed call replays when its identity and input fingerprint match uniquely. Filesystem or world state never gates replay.
 >
-> `args` is not itself part of an `agent()` identity. New args can raise an orchestration-only loop cap while earlier calls keep replaying; when args change a prompt or another hashed/runner-visible input, only corresponding calls miss. New-format reuse requires exact cwd, compatible format/metadata/manifest admission, and unambiguous identity/input correspondence—not a purity annotation. Identity hits preserve logical budget debit but spend zero current provider tokens. See the [incremental resume API](docs/api.md#content-addressed-incremental-resume) for matching, reports, legacy fallback, and checkpoints.
+> `args` is not itself part of an `agent()` identity. New args can raise an orchestration-only loop cap while earlier calls keep replaying; when args change a prompt or another hashed/runner-visible input, only corresponding calls miss. New-format reuse requires exact cwd, compatible format/metadata/manifest admission, and unambiguous identity/input correspondence—not a purity annotation. Identity hits spend zero current provider tokens. See the [incremental resume API](docs/api.md#content-addressed-incremental-resume) for matching, reports, legacy fallback, and checkpoints.
 
 Compact reader/experiment fan-out:
 
@@ -83,7 +83,7 @@ Every client-side ACP method is served (`fs/*`, `terminal/*`, permission request
 
 ### Controls for unattended runs
 
-Hard token budgets (run-level caps, `budget.remaining()` in-script), per-call git **worktree isolation**, per-call timeouts and retries, and `checkpoint()` — a deterministic, journaled human gate with three modes. A live SDK `confirm` callback or MCP elicitation collects the reply immediately; without a live channel, the default mode takes `default ?? true` (or `headless: "abort"` aborts), so detached runs never hang by default. Authors can opt into a durable pause with `headless: "pause"`: the run returns `status: "paused"` plus `checkpointContext`, the host resumes with `checkpointReplies`, and the decision is journaled and replayed without re-asking. For watching those runs from the outside, `@automatalabs/agentprism-otel` attaches to any `WorkflowManager` and exports OpenTelemetry traces (run → agent → tool call) plus token, cost, and duration metrics.
+Per-run agent and concurrency limits, per-call git **worktree isolation**, per-call timeouts and retries, and `checkpoint()` — a deterministic, journaled human gate with three modes. A live SDK `confirm` callback or MCP elicitation collects the reply immediately; without a live channel, the default mode takes `default ?? true` (or `headless: "abort"` aborts), so detached runs never hang by default. Authors can opt into a durable pause with `headless: "pause"`: the run returns `status: "paused"` plus `checkpointContext`, the host resumes with `checkpointReplies`, and the decision is journaled and replayed without re-asking. For watching those runs from the outside, `@automatalabs/agentprism-otel` attaches to any `WorkflowManager` and exports OpenTelemetry traces (run → agent → tool call) plus token, cost, and duration metrics.
 
 ---
 
@@ -106,7 +106,7 @@ One process plays **two protocol roles at once**: it's an **MCP server** (or a l
         │  → real agents; paused occurrences may reopen their recorded session
 ```
 
-The deterministic engine (sandboxed `vm` realm, `parallel`/`pipeline`, journal/resume, token budget, worktree isolation) is independent of *how* a single agent runs and of *how* the tool is exposed. See [`docs/design-notes.md`](docs/design-notes.md) for the full protocol-level design.
+The deterministic engine (sandboxed `vm` realm, `parallel`/`pipeline`, journal/resume, worktree isolation) is independent of *how* a single agent runs and of *how* the tool is exposed. See [`docs/design-notes.md`](docs/design-notes.md) for the full protocol-level design.
 
 The MCP server also exposes a second, **interactive** route: the `repl` tool. Instead of running a deterministic script to completion, it holds a persistent **QuickJS-in-WASM VM per project** (the [`@automatalabs/repl-engine`](packages/repl-engine) tier), and the client's own agent writes live JavaScript that spawns subagents over the same ACP path — workspace state (bindings, pending calls, checkpoints, logged values) persisting between tool calls and across daemon restarts. Workflows is the batch orchestrator; `repl` is the live steering plane. See [The `repl` tool](packages/mcp-server/README.md#the-repl-tool).
 
@@ -167,7 +167,7 @@ The five packages below are **internal building blocks**. Most are composed by t
 | Package | What it is |
 |---|---|
 | **`@automatalabs/acp-agents`** | The ACP client + Claude/Codex/OpenCode/pi/custom backends (the `AgentRunner` implementation, connection pooling, auth/session lifecycle, structured output, permissions, usage). Internal — public entry is `@automatalabs/workflows`. |
-| **`@automatalabs/workflow-engine`** | The deterministic engine: the script realm, `parallel`/`pipeline`, journal/resume, budgets, worktree isolation. Internal — public entry is `@automatalabs/workflows`. |
+| **`@automatalabs/workflow-engine`** | The deterministic engine: the script realm, `parallel`/`pipeline`, journal/resume, and worktree isolation. Internal — public entry is `@automatalabs/workflows`. |
 | **`@automatalabs/repl-engine`** | The REPL orchestrator engine: a persistent JavaScript REPL in a capability-free QuickJS-in-WASM VM (workspace lifecycle, eval + job drain, per-VM memory limits, per-eval interrupts, trap-free completion reads, the append-only call store and enveloped snapshots). Its `repl` MCP tool is registered in `mcp-server` (the roadmap's `repl-orchestrator`, phase E — implemented; the package itself is unreleased at `0.0.0`); it depends on `workflows`, `acp-agents` (subagents are ACP sessions), and `shared-types`. |
 | **`@automatalabs/codex-acp`** | The workspace fork of `agentclientprotocol/codex-acp` (imported with full history) — the ACP server the Codex backend spawns, baking turn-level `outputSchema` forwarding into its shipped dist. Consumed by `@automatalabs/acp-agents` as `workspace:*`; you never depend on it directly. |
 | **`@automatalabs/shared-types`** | The `AgentRunner` seam + shared types the others compose against. Internal — public entry is `@automatalabs/workflows`. |
@@ -322,7 +322,6 @@ locally against the ext-apps reference host, run
 | `concurrency` | number | **Clamped** to 16 (not rejected). |
 | `agentRetries` | number | **Clamped** to 3. |
 | `agentTimeoutMs` | number \| null | Per-agent timeout; omit for none. |
-| `tokenBudget` | number \| null | Hard total-token cap for the run; omit for none. |
 | `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
 | `resumePolicy` | `"auto" \| "positional"` | Default `"auto"`; positional requests index/prefix matching but cannot bypass new-format format, metadata, manifest, input, or safety checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to its decision. Keys must be canonical non-negative integer strings on the JSON wire. |
@@ -443,7 +442,6 @@ A script is plain JavaScript whose **first statement** is the `meta` literal. In
 - `parallel([fn, …])` — run thunks concurrently; **barrier** (awaits all).
 - `pipeline(items, stage1, stage2, …)` — stream each item through stages independently (no inter-stage barrier).
 - `phase(title)`, `log(msg)` — progress grouping + narration.
-- `budget` — the run's token budget (`budget.total`, `budget.remaining()`, `budget.spent()`).
 - `gate(produce, validate, opts?)` — returns `{ ok, value, verdict, attempts }`: `value` is the final producer result and `verdict` is the exact last validator return.
 - `checkpoint()`, `verify()`, `judgePanel()`, `loopUntilDry()`, `completenessCheck()`, `retry()`, `workflow()`, `args`.
 
@@ -458,7 +456,7 @@ Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in t
 > npx skills add agentprism/agentprism-workflows
 > ```
 >
-> It teaches the full DSL: per-call backend routing, structured outputs, checkpoints, budgets, isolation,
+> It teaches the full DSL: per-call backend routing, structured outputs, checkpoints, isolation,
 > and the determinism rules.
 
 Validate a script **without spending tokens**: `npx @automatalabs/workflows validate <file> --args '<json>'`.

@@ -35,8 +35,8 @@ and asks the ACP session to cancel. A session that keeps running after the cance
 closed where supported and its pooled child is recycled.
 
 Every new run, including one admitted with `resumeFromRunId`, resolves host limits from that run's
-request. It does not inherit `agentTimeoutMs`, retries, concurrency, agent-count, or token-budget
-values from its source, so pass every operational bound the resumed execution should use.
+request. It does not inherit `agentTimeoutMs`, retries, concurrency, or agent-count values from
+its source, so pass every operational bound the resumed execution should use.
 
 ## Model specs & routing
 
@@ -84,14 +84,13 @@ verify(item, { reviewers = 2, threshold = 0.5, lens? })
 judgePanel(attempts, { judges = 3, rubric = "overall quality and correctness" })
     → { index, attempt, score, judgments }  // mean 0–1 score per candidate; stable tie-break by index
 loopUntilDry({ round, key = JSON.stringify, consecutiveEmpty = 2, maxRounds = 50 })
-    → unique items[]   // round(i) returns items; stops after N dry rounds; budget exhaustion returns the partial result
+    → unique items[]   // round(i) returns items; stops after N dry rounds; agent-limit exhaustion returns the partial result
 completenessCheck(taskArgs, results)       → { complete, missing?: string[] }
 checkpoint(promptText, options?)           → Promise<reply>       // journaled human gate; zero tokens
-phase(title, { budget? })                  → void                 // soft per-phase token sub-budget
+phase(title)                               → void                 // open a named phase
 log(message)                               → void                 // console.log/info/warn/error route here too
 args                                       // the host-provided input value, verbatim
 cwd                                        // the run's base working directory (string); process.cwd() returns it too
-budget.total | budget.spent() | budget.remaining()
 ```
 
 For `gate()`, `value` is the final producer result and `verdict` is the exact last completed
@@ -127,7 +126,6 @@ The host supplies the live human channel (elicitation in the MCP server; `ExecOp
 | `AGENT_EXECUTION_ERROR` | yes* | Generic agent failure (*refusal/truncation variants are non-recoverable). |
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the re-prompt ladder. Halts the run (catchable in-script). |
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall — the run **pauses** (journaled, resumable), with the provider's reset hint. |
-| `TOKEN_BUDGET_EXHAUSTED` | no | Run (or phase) token cap hit; further `agent()` calls throw. |
 | `AGENT_LIMIT_EXCEEDED` | no | `maxAgents` cap hit. |
 | `AUTH_REQUIRED` | no | Backend needs authentication. `WorkflowManager` returns a resumable pause with `reason: "auth_required"` and redacted `authContext`; a direct runner throws. The host completes auth before resuming/retrying. |
 | `CHECKPOINT_REQUIRED` | no | `headless: "pause"` reached without a live channel. `WorkflowManager` returns `reason: "checkpoint_required"` plus non-secret `checkpointContext`; resume with `checkpointReplies` or live confirm. |
@@ -135,7 +133,7 @@ The host supplies the live human channel (elicitation in the MCP server; `ExecOp
 | `SCRIPT_ERROR` | no | The script itself crashed (uncaught throw, floated rejection). |
 | `WORKFLOW_ABORTED` | — | Real cancellation (pause/stop/host signal) — never used for crashes. |
 
-`loopUntilDry` absorbs `TOKEN_BUDGET_EXHAUSTED` / `AGENT_LIMIT_EXCEEDED` from its rounds and returns the partial result; everywhere else those propagate.
+`loopUntilDry` absorbs `AGENT_LIMIT_EXCEEDED` from its rounds and returns the partial result; everywhere else it propagates.
 
 ## Determinism & the resume journal
 
@@ -221,8 +219,8 @@ overrides. Pi uses `AGENTPRISM_PI_ACP_CMD` with optional `AGENTPRISM_PI_ACP_ARGS
 installed exact-pinned package bin is used before the `npx -y @automatalabs/pi-acp` fallback.
 
 Embedding hosts drive the same contract directly through the SDK — `runDynamicWorkflow` /
-`WorkflowManager` from `@automatalabs/workflows`, with `exec` limits (`tokenBudget`, `maxAgents`,
-`concurrency`, `agentTimeoutMs`, `agentRetries`), a live `confirm` checkpoint channel, and
+`WorkflowManager` from `@automatalabs/workflows`, with `exec` limits (`maxAgents`, `concurrency`,
+`agentTimeoutMs`, `agentRetries`), a live `confirm` checkpoint channel, and
 `exec.resumeFromRunId` for edited-script resume. See `docs/api.md` in the repository. The shapes
 below are the `workflow` tool's MCP surface, which is what script authors interact with.
 
@@ -236,7 +234,6 @@ interface WorkflowExecuteToolInputBase {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number | null;
-  tokenBudget?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
@@ -428,7 +425,7 @@ interface WorkflowRunStatus {
 
 interface WorkflowRunLimits {
   maxAgents: number;
-  tokenBudget: number | null;
+  tokenBudget: null; // persisted-shape compatibility field; new runs always report null
   concurrency: number;
   agentRetries: number;
   agentTimeoutMs: number | null;
@@ -465,7 +462,6 @@ tables and grammar below are the exhaustive contract.
 | `--workflows-dir <dir>` | repeatable; a folder of workflow scripts (name = filename stem). Lets the positional be a NAME and resolves nested `workflow("<name>")` calls |
 | `--parse-only` | static parse only |
 | `--cwd <dir>` | dry-run base cwd (default: throwaway temp dir, so `isolation: "worktree"` no-ops; a real repo cwd creates and cleans up real worktrees) |
-| `--token-budget <n>` | sets `budget.total`; the mock reports 1000 tokens per agent call |
 | `--max-agents <n>` | cap on dry-run agent calls |
 | `--timeout-ms <n>` | dry-run wall-clock limit (default 30000) |
 | `--json` | machine-readable `ValidateWorkflowReport` on stdout |
@@ -501,11 +497,11 @@ A single answer is reusable. `{ "$sequence": [...] }` is finite and only the win
 
 For schema calls, each answer deep-merges over a **fresh** fabricated base: JSON objects merge recursively; arrays, `null`, falsy primitives, and other scalars replace. The merged value is TypeBox-checked without coercion. Any answer-caused violation fails non-recoverably with `SCHEMA_NONCOMPLIANCE`; a failure already present at the identical untouched path/message in the simple fabricated base may be accepted with a grouped inherited-fabrication warning. A valid override can repair such a base limitation. Schema-less answers must be nonblank strings. Fixture failure messages, attribution, and warnings contain only labels, globs, positions, paths, and counts—not answer values.
 
-Limits: 256 KiB raw UTF-8 for either CLI source and canonical JSON for programmatic input; 256 rules; 1–256 UTF-16 code units per glob; 256 entries per sequence; answer depth 32. Inputs must be plain JSON data. Mock-enabled validation serves agent calls serially for deterministic FIFO sequence allocation; it is not a concurrency/load simulation, and the soft token gate may admit work differently than an unscripted concurrent dry run. Fixture values still flow into the script like real agent results, so author code can expose them via `log()` or its returned result—never store credentials or production data in fixtures.
+Limits: 256 KiB raw UTF-8 for either CLI source and canonical JSON for programmatic input; 256 rules; 1–256 UTF-16 code units per glob; 256 entries per sequence; answer depth 32. Inputs must be plain JSON data. Mock-enabled validation serves agent calls serially for deterministic FIFO sequence allocation; it is not a concurrency/load simulation. Fixture values still flow into the script like real agent results, so author code can expose them via `log()` or its returned result—never store credentials or production data in fixtures.
 
 Exit codes: `0` valid · `1` parse/static failure · `2` dry-run failure · `3` usage error. The report also lists every checkpoint with the mock reply (`default ?? true`) and warnings for backend approval, phase mismatch, `headless: "abort"`, and agent-less scripts. `headless: "pause"` dry-runs cleanly. A saved nested workflow still needs `--workflows-dir`.
 
-Programmatic: `validateWorkflowScript(script, { args, workflows, dryRun, cwd, tokenBudget, maxAgents, timeoutMs, mockAnswers })` from `@automatalabs/workflows` returns the same report. Invalid workflow scripts resolve to reports; invalid `mockAnswers` supplied from untyped JavaScript throws `TypeError` before parsing.
+Programmatic: `validateWorkflowScript(script, { args, workflows, dryRun, cwd, maxAgents, timeoutMs, mockAnswers })` from `@automatalabs/workflows` returns the same report. Invalid workflow scripts resolve to reports; invalid `mockAnswers` supplied from untyped JavaScript throws `TypeError` before parsing.
 
 ## Harness config discovery — `agentprism-workflows config`
 

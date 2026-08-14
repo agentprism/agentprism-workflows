@@ -6,7 +6,8 @@ JavaScript REPL in a capability-free QuickJS-in-WASM VM. One VM per workspace; t
 object owns the VM lifecycle (`create` → `eval` → `drainJobs` → `dispose`). The `repl` MCP
 tool that registers in `mcp-server` (the daemon wiring below) is built directly on this
 engine's `Broker` + `Workspace` + per-project `ReplWorkspaceStore` — with its own tool-level
-input/output schemas, an action discriminator, output caps, and the client-presence drain —
+input/output schemas, an action discriminator (TWO actions: `eval` + `interrupt`), the
+soft-bound fused eval pump, and the client-presence drain —
 **not** a thin [`WorkspaceRegistry`](#workspace-registry) wrapper; this package is the engine
 tier it sits on.
 
@@ -46,7 +47,7 @@ snapshots restorable.
   eval **and its drain**, and `drainJobs({ interruptHandler })` arms for the duration of a
   standalone settlement drain, then restores. Handlers never leak across operations. Returning
   `true` aborts with `InternalError: interrupted` (`EvalErrorInfo.interrupted === true`). Note the
-  interrupt budget is instruction-based (quickjs's built-in check interval), so against a
+  interrupt check is instruction-based (quickjs's built-in check interval), so against a
   tiny loop body the handler fires comparatively rarely — that is the shim's native behavior.
   **Why the drain takes its own handler:** a suspended eval's handler is removed when the eval
   returns, and a settlement drain that later resumes a runaway continuation (a continuation left
@@ -116,8 +117,7 @@ result). This package follows the rule from its first line of engine code, and i
   pins guest memory**; review measured a 1 MiB VM exhausting after ~3,128 accessor-valued
   completions), proxies and branded objects (`[Promise]`, `[Date]`, `[Map]`, …) rendered as
   markers, depth ≤ 4, ≤ 256 properties per level, cycle-guarded. This shallow read is the
-  conservative seed of the ObjectPreview rendering a later phase owns; the tool-result caps
-  live there.
+  conservative seed of the ObjectPreview rendering a later phase owns.
 - Error names come from the error prototype's own `name` data property when instances carry
   none (quickjs-ng stores `name` on the prototype) — still trap-free; a guest-installed
   accessor or proxy prototype is skipped and the name falls back to `'Error'`.
@@ -165,22 +165,22 @@ roadmap doc's DSL split: only a sliver needs host effects, everything else is pu
   resolving with **what actually happened** (the host settles with the steering outcome,
   live injection vs queued delivery, mirroring the outcome values `acp-agents` surfaces
   in its steering events) — plus `id` (the stable call id `"c1"`, … used by
-  `status`/`interrupt`).
+  `interrupt` and reported by `agents()`).
 - `checkpoint(question, options?) → Promise` and `checkpoint.answer(callId, value) → boolean`
   — the data plane interrupting the intent plane. The answer enters the data plane only
   through `checkpoint.answer` (the `__host_checkpoint` trailing-argument answer mode); it
   returns whether a pending checkpoint with that id was answered.
-- `console.{log,info,warn,error,debug}` — the bridge: every argument is frozen (structuredClone
-  via the shipped quickjs-wasi extension, with an iterative marker-copy fallback) into a real
-  `$N` global, then forwarded as `{ refs, args }` to `__host_console`.
+- `console.{log,info,warn,error,debug}` — the bridge: ONE joined line per call — the
+  arguments' §4.4 reprs joined with a single space (strings passed directly print whole;
+  objects/arrays render to depth 2, 20 entries per level, nested strings head-limited at
+  200 chars). The line itself is forwarded as `{ line }` to `__host_console` without a
+  byte ceiling.
 - `parallel` / `pipeline` / `verify` / `judgePanel` / `gate` / `retry` / `loopUntilDry` —
   pure JavaScript layered on `agent()`, following `packages/workflows/src/dsl.d.ts` semantics.
   A rejection with `recoverable: false` halts the surrounding orchestration; any other
   rejection is recoverable (a `null` slot in `parallel`/`pipeline`, reported via
-  `console.warn`). **There is no budget surface**: no `budget()` global, no ledger, no caps
-  vocabulary — resource limits are server configuration, invisible to the guest (the host's
-  non-recoverable signal is exclusively `recoverable: false`). `phase()` is deleted per the
-  doc.
+  `console.warn`). Resource limits are server configuration, invisible to the guest; the
+  host's non-recoverable signal is exclusively `recoverable: false`.
 
 ### Guest library ⇄ host contract
 
@@ -189,7 +189,7 @@ roadmap doc's DSL split: only a sliver needs host effects, everything else is pu
 | `__host_agent(callId, modelSpec, task, optionsJson)` | Kick off one worker run against the backend routed by `modelSpec`. May return a thenable (the bridge's `GuestCall` promise) — the guest chains onto it — or `undefined` (settle later via the surface). |
 | `__host_checkpoint(callId, question, optionsJson, answerJson?)` | Question mode: three arguments, like `__host_agent`. Answer mode: a PRESENT fourth argument (the JSON-encoded answer) — the host settles the pending checkpoint and returns a boolean synchronously; nothing new pends. |
 | `__host_agent_steer(callId, sessionId, action, payloadJson)` | Steering: `callId` is the operation's OWN registry id (the settlement key), `sessionId` the FOUNDING call id of the session being steered (the dispatch and post-restore re-issue target); `action` is `"followUp"` \| `"steer"` \| `"cancel"` and `payloadJson` is `{ prompt, options }` or `null` for cancel. The host settles with the steering outcome. |
-| `__host_console(level, payloadJson)` | The console bridge, called synchronously after the guest froze each argument into `$N`. |
+| `__host_console(level, payloadJson)` | The console bridge, called synchronously with the rendered `{ line }` payload (one joined line per call). |
 
 Settlement is first-wins idempotent by call id, through two always-valid routes: the live
 `GuestCall` (a promise created via the raw `qjs_new_promise` export whose parts the call
@@ -284,54 +284,38 @@ workspace, not the host — a host must serve any snapshot whose resident librar
 an older version, the host-call surface is append-only (new optional trailing arguments =
 minor; new `__host_*` names = major), and the host discovers the resident version through the
 surface rather than assuming. `ReplVm.restore` exists so the evolution discipline is testable
-now: state, `$N` store, registry and marker survive a snapshot/restore round trip.
+now: state, the pending-call registry and the version marker survive a snapshot/restore round trip.
 
-### The console bridge and the previewer
+### The console bridge and the §4.4 repr
 
-Every `console.log` is truncated in the tool result but **captured inside the VM** as
-`$1`, `$2`, … (what-you-saw-is-what-you-have: mutation after the log never changes `$N`), and
-the rendered line carries the address, type and size — `[$14 · object · 48kB] {sections:
-Array(12), title: "Auth flow", …}` — so the orchestrator slices deeper in a later eval
-(`console.log($14.sections.map(s => s.title))`) instead of re-running work. The capture is a
-`structuredClone` with an iterative marker-copy fallback: cloneable data (objects, arrays,
-`Map`/`Set`/`Date`/`RegExp`/`Error`/`ArrayBuffer`/typed arrays) is preserved whole, while
-functions, symbols, promises, weak collections, and hostile or otherwise unfreezable subgraphs are
-stood in for by a typed marker (`{ __unclonable__: <kind>, description? }`) — so `$N` keeps the
-value's *shape* rather than failing or losing the surrounding structure. Nothing cloneable is lost
-by logging it; nothing floods the client's context by being logged.
+Every `console.*` call renders **ONE joined output line**: the arguments' reprs joined
+with a single space (§4.4 [D]). The repr is depth-limited and predictable, with no byte
+ceiling on the rendered stream (the Python posture: an agent can flood its own context by
+printing something enormous; accepted and documented):
 
-The truncation format is the Chrome DevTools Protocol's `ObjectPreview` model, adopted as a
-spec; the harness's `previewer/FORMAT.md` is the normative reference and this package imitates
-its rules: one collapsed level, ≤ 8 properties / 8 leading array entries, 40-char property
-strings (24+8 head/tail), 200-char top-level strings (120+40 head/tail), 120-char error
-descriptions (72+24), a 400-char collapsed backstop, the `overflow` flag, head+tail elision
-everywhere (errors live at the end), positional canonical-index rendering, and the byte-size
-format with decimal units and the ≥ 999.95 promotion rule. Preview generation is
-**side-effect-free by construction**: engine brand checks only, own-property-descriptor reads
-only, proxies detected first and previewed *as* proxies (`Proxy(Array)`, `Proxy(revoked)`),
-typed-array elements via the language-guaranteed integer-indexed reads, and the key
-materialization read back through descriptors with honest degradation on a corrupted
-enumeration (FORMAT.md §6 — a corrupted typed-array key count degrades with `overflow: true`,
-never a fabricated "no expandos"). The forbidden seams stay unwired: symbol descriptions are
-never read (`qjs_get_symbol_description` invokes guest `Symbol.keyFor` — FORMAT.md §1.1), so
-symbols render as the bare brand `Symbol` everywhere, including thrown-symbol error messages,
-and `qjs_get_array_buffer`'s raw data pointer is never passed to `qjs_is_exception` (a
-guest-controlled buffer must not be able to forge a failed read). Every raw export that
-returns heap-allocated JSValues (`qjs_get_typed_array_buffer`'s backing buffer,
-`qjs_get_proxy_target`'s exception box) is disposed on every path. A `$N` slot rebound to an
-accessor renders an explicit sabotage marker — the getter is never invoked.
+- strings passed **directly** to `console.log`, and a string **completion value**, print
+  **whole** — they are the output the orchestrator asked for;
+- objects/arrays render to **depth 2**; deeper levels render as `{…}` / `[…]`;
+- collections render their first **20 entries** per level, then `… +N more`;
+- **nested** strings (inside a collection) render head-limited at **200 chars**;
+- everything deeper/longer is reached by evaluating a narrower expression — the values are
+  alive in the VM; slicing is the API. The sole result-history global is `_` (the previous
+  eval's completion value, IPython-style); bindings are the memory.
 
-### Output caps
+The repr is generated **side-effect-free by construction** (engine brand checks only,
+own-property-descriptor reads only, proxies detected first and previewed *as* proxies,
+cycle-guarded via a per-render `seen` set, every argument rendered under its own guard —
+`console.*` NEVER throws by contract). The forbidden seams stay unwired: symbol descriptions
+are never read (`qjs_get_symbol_description` invokes guest `Symbol.keyFor` — FORMAT.md §1.1),
+so symbols render as the bare brand `Symbol` everywhere, including thrown-symbol error
+messages, and `qjs_get_array_buffer`'s raw data pointer is never passed to
+`qjs_is_exception` (a guest-controlled buffer must not be able to forge a failed read).
 
-`applyOutputCaps` enforces the doc's limits — **256 lines or 10 KB per tool result, whichever
-trips first** — line-granular (a line that would trip either cap is not emitted at all) and
-byte-counted in UTF-8 with `\n` separators (the canonical serialization). The 256-line cap
-counts **physical lines**, not rendered entries: the previewer renders property names verbatim
-(FORMAT.md §5.18), so a name carrying 300 line feeds reaches the tool result as 301 physical
-lines inside ONE rendered line — both caps account for embedded newlines (the byte cap via
-`Buffer.byteLength`, the line cap by splitting on `\n`; review regression, pinned by test).
-Over-cap content remains reachable through the `$N` refs the capped lines carry: the cap
-costs reads, never data.
+### Unbounded guest output
+
+Console lines and completion reprs ship verbatim. The previewer is also used internally for
+bounded metadata tokens such as manifest entries and checkpoint/task previews; those 200-character
+metadata renderings do not alter guest output.
 
 ## The workspace (phase B)
 
@@ -369,10 +353,10 @@ the doc's broker contract against real ACP sessions through `@automatalabs/acp-a
   live-handle contract) and are opened with `keepSession: true`, so the ACP session persists on the
   backend for the restore path's lazy re-attach.
 - **Six concurrent subagents per workspace** (doc-settled; `maxConcurrentAgents` configurable —
-  server configuration, invisible to the guest). The cap counts live work: unsettled agent calls
-  plus sessions running a queued-steer delivery turn. An over-cap dispatch is refused at dispatch
-  time — recorded in the store (a refused call is never re-issued after a restore) and rejected
-  with a recoverable `ConcurrencyLimitError`; nothing queues and nothing is hidden.
+  server configuration, invisible to the guest). The limit counts live work: unsettled agent calls
+  plus sessions running a queued-steer delivery turn. Additional dispatches **QUEUE for the
+  next free slot in dispatch order** (§4.1 [D]) — never a rejection, matching the workflow
+  engine's semantics (`parallel(items.map(...))` never loses work).
 - **Steering resolves with what actually happened** (the doc's "nothing is hidden, nothing
   hard-errors"): `followUp`/`steer` settle with acp-agents' steering-outcome vocabulary where the
   backend advertises `_session/steering`, with the broker's honest `queued` marker where it does
@@ -391,14 +375,17 @@ the doc's broker contract against real ACP sessions through `@automatalabs/acp-a
   consume, with both sides first-wins idempotent — a crash between the store write and the guest
   settlement is healed by the next delivery, exactly once (pinned by the simulated-crash tests,
   including the snapshot/restore + `reconcile()` path).
-- **The eval tool-result shape** (`Broker.eval` → `{ output, outputTruncated, result?, pending,
-  checkpoints, completed }`): output lines (console events rendered through the previewer — one
-  line per logged argument, non-log levels prefixed `warn:`/`error:`/… — capped at 256 lines /
-  10 KB), the previewed completion value when the eval resolved (trap-free, from the live
-  completion handle), the pending call ids when it suspended (no fabricated value), the raised
-  checkpoints (previewed questions), and the call ids this operation settled (checkpoint answers
-  deliberately excluded — an answered id leaves the `checkpoints` list). Eval errors render as
-  plain `Name: message` lines in `output`.
+- **The eval tool-result seam** (`Broker.eval` → `{ output, kind, result?, evalToken?, pending,
+  checkpoints, completed }`): output lines (console events rendered through the previewer — ONE
+  joined line per console call, non-log levels prefixed `warn:`/`error:`/… — never capped), the
+  previewed completion value when the eval resolved (trap-free, from the live completion
+  handle), the pending call ids when it suspended (no fabricated value), the raised
+  checkpoints (previewed questions), the call ids this operation settled (checkpoint answers
+  deliberately excluded — an answered id leaves the `checkpoints` list), and `kind` naming the
+  outcome (`value`/`error`/`pending`) with the continuation `evalToken` the fused-eval pump
+  attributes swept settlements with. The §3.1 wire shape `{ output, result?, running? }` is
+  assembled by the tool phase over this seam. Eval errors render as
+  `Name: message` lines in `output`.
 - **Suspended-eval semantics** (transfer lesson 3): top-level `await` accepted; an eval whose
   completion resolves within its drain reports the previewed value; a suspension returns
   immediately with the pending call ids; the continuation resumes at settlement like a `.then`
@@ -478,30 +465,31 @@ Phase C decisions (the broker, the call store, the eval tool-result semantics):
   structured output, else the generic parse-final-JSON dialect) — the one divergence from
   `run()`: the client-hosted StructuredOutput MCP capture tool is not injected on the
   interactive path.
-- **The concurrency cap counts live work** — unsettled agent calls plus sessions running a
-  queued-steer delivery turn (a follow-up turn is a subagent working). Over-cap dispatches are
-  refused AT DISPATCH TIME (nothing queues): recorded in the store (dispatched + rejected, so a
-  restore never re-issues them) and rejected with a recoverable `ConcurrencyLimitError` with NO
-  code — the doc deletes the budget vocabulary (`AGENT_LIMIT_EXCEEDED`/`BUDGET_EXHAUSTED` have
-  no counterpart here), and `recoverable: true` is the one signal the guest needs.
+- **The concurrency limit counts live work** — unsettled agent calls plus sessions running a
+  queued-steer delivery turn (a follow-up turn is a subagent working). Additional dispatches
+  QUEUE in dispatch order for the next free slot (§4.1 [D]).
+  `recoverable: true` remains the one signal the guest needs.
 - **The steering mechanism table** (the doc's spec-owed decision): extension backend + turn in
-  flight → live `_session/steering` wire call, resolving with the backend's verbatim outcome
-  (`injected`/`startedNewTurn`/`failed`); extension backend + idle session → a new turn
-  (`startedNewTurn`); no-extension backend + turn in flight → queued for next-turn delivery,
+  flight → live `_session/steering` wire call, resolving with the §4.2 delivery-outcome
+  vocabulary (`injected` for live injection; a backend `startedNewTurn` — the injection raced
+  the turn's end — maps to `queued`, accepted for next-turn delivery; `failed`); extension
+  backend + idle session → a new turn (the §4.2 [D] turn minted with its own call id; its
+  promise resolves with the turn's ANSWER); no-extension backend + turn in flight → queued
+  for next-turn delivery,
   resolving `queued` IMMEDIATELY (the delivery happens at the next turn boundary; a delivery
   turn's failure surfaces as a warn-level line in the next tool result; a cancelled call drops
-  its queue — both documented); no-extension backend + idle session → a new turn
-  (`startedNewTurn`). Any wire failure resolves `failed` — steering never hard-errors. `cancel`
+  its queue — both documented); no-extension backend + idle session → a new turn, same as the
+  idle extension case (the §4.2 [C] alias: idle-session `steer` = `followUp`, and both carry
+  the followUp answer semantics — no path runs a turn and discards its result). Any wire
+  failure resolves `failed` — steering never hard-errors. `cancel`
   resolves `cancelled` (a turn was in flight and ACP `session/cancel` completed; the cancelled
   call itself rejects with the recoverable `AGENT_CANCELLED` — never a halt signal for the
   orchestration owning it), `idle` (nothing was running), or `failed`. The
-  outcome surface is acp-agents' `SteeringOutcome` plus the honest `queued`/`cancelled`/`idle`
-  additions — urgency delivery (`injected`) is always distinguishable from next-turn delivery
-  (`queued`/`startedNewTurn`).
+  outcome surface is the honest `injected`/`queued`/`failed` plus `cancelled`/`idle` —
+  urgency delivery (`injected`) is always distinguishable from next-turn delivery
+  (`queued`); the v1 bare `startedNewTurn` token never reaches the guest.
 - **The store records refused calls too** (dispatched + rejected with the refusal error):
-  without the record, a restore would re-issue a call that was deliberately refused. `admitted`
-  is deliberately absent from the record shape — it was the budget ledger's bookkeeping, and
-  the ledger is deleted vocabulary.
+  without the record, a restore would re-issue a call that was deliberately refused.
 - **`completed` excludes checkpoint answers** (the harness's pump convention): an answered id
   leaves the `checkpoints` list — that is its visibility; `completed` reports delegated work
   (pump deliveries + dispatch-time refusals).
@@ -687,26 +675,27 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   reads only, sanitized at render), and live-handle status (`agent handle ·
   pending|settled · call cN` — the call id maps to the task and timestamps in the
   store) and the doc's full provenance surface — `task` (the founding `agent()` call's
-  task text for `worker cN` and handle bindings, capped at 200 chars) and
+  task text for `worker cN` and handle bindings, limited to 200 chars) and
   `provenanceAtMs` (the attribution wall clock; phase-D review round 3: bindings used
-  to carry only the label and an internal timestamp). The `$N` log-ref globals render
-  as a range (`logs: $1…$4 (4 values)`).
+  to carry only the label and an internal timestamp). The sole result-history global is `_`
+  (the previous eval's completion value, §4.4).
 - **Pending steers whose wire call died with the process resolve `failed`** (recorded +
-  settled + warned): their outcome is unknowable and re-injecting would duplicate; the one
+  settled; the reason demotes to workspace().diagnostics.reconcileNotes, §6.2): their outcome
+  is unknowable and re-injecting would duplicate; the one
   exception is queued-but-undelivered steers, whose payload is in the store (the phase-C
   queue rebuild). Pending checkpoints re-surface into the broker's checkpoint table
   (`PendingCheckpoint.call` is null on that path; answers settle through the reconciliation
   surface). Reconcile is idempotent (an `isTracked` guard never re-attaches/re-issues twice)
   and adopts store-unknown entries (foreign snapshot / wiped store) so the replay ledger
-  stays complete. Re-issues respect the concurrency cap (over-cap re-issues refuse with the
-  recoverable `ConcurrencyLimitError`).
+  stays complete. Re-issues respect the concurrency limit (additional re-issues QUEUE for the
+  next free slot — never a rejection).
 
 Phase E review round 3 decisions (the carried review's three defects, as re-verified in
 round 5):
 
 - **The eval-break signal is keyed to the armed target's CONTINUATION, not to whichever drain runs next.** The carried defect: the drain-phase interrupt handler was installed on every later eval's drain without checking whether that drain resumed an armed target — an unrelated finite eval B (or an unrelated settlement drain) consumed the signal and the interrupted-drain release cleared the target's tracking while its checkpoint stayed pending and uninterruptible. The armed identity is the target's CONTINUATION TOKEN (round 5): the guest library's `__replAwait(value, token)` wrap sets the continuation lease to the eval's token in the job immediately before the eval's continuation segment, the drain loop mirrors the lease per job, and the signal fires only while the executing JOB holds an armed token — the executing job IS the target's continuation. An unrelated drain — and an unrelated JOB inside a drain that settled a target's call (an unawaited sibling `.then` registered before the target's await runs first, before the lease-setting reaction: it can neither fire nor consume the signal) — leaves the armed state intact; an indirect wait (`await Promise.all([q])`) is targetable through the promise graph (round 5's regressions). The interrupted-drain release (`releaseInterruptedEval`) is exact the same way: the interrupted job's lease names the eval whose continuation was actually executing — exactly that eval is released (a deadline-broken resumed runaway releases its tracked eval even when no signal was armed — a stale target would make a later arm target a dead eval); an unrelated interrupted drain leaves the armed state and every tracked eval intact. A no-id interrupt with NOTHING BREAKABLE — no eval in flight, or every in-flight eval suspended with NO pending host call (a never-settling local promise — no execution can ever resume it; a suspended eval's continuation is always queued by a pending call's settlement, directly or through any promise chain) — REFUSES and arms nothing.
-- **The bounded wait sleeps only for the REMAINING budget**: `waitForCalls`'s inter-pump sleep is `min(50, deadline - now)` (the carried defect: the unconditional 50 ms sleep made every sub-50 ms `timeoutMs` take ~51 ms, violating the bounded-wait contract). The disconnect drain's pumps already did this; the wait now matches. A zero `timeoutMs` still performs ONE immediately available state read (round 5's regression: the chain acquisition used to return unacquired with the deadline already past, so an idle workspace reported `drained: false` and a pending call's surface read as empty).
-- **The pending surface reports the WHOLE guest registry**: the trap-free reader's generic 256-element array cap silently truncated the guest surface's `pending()` list, and its `[ArrayTruncated]` marker mapped to `undefined` in the broker's id lists (a hole in the tool's structured `pending`). `readValue` still bounds the general preview read (default 256); the host-owned metadata surfaces (`readValueComplete` — the pending registry, the await log, the provenance registry's `read()` result) read with NO array-length or object-key cap: they are the frozen guest library's own metadata, bounded by the VM's memory like the metadata itself.
+- **The bounded wait sleeps only for the remaining time**: `waitForCalls`'s inter-pump sleep is `min(50, deadline - now)` (the carried defect: the unconditional 50 ms sleep made every sub-50 ms `timeoutMs` take ~51 ms, violating the bounded-wait contract). The disconnect drain's pumps already did this; the wait now matches. A zero `timeoutMs` still performs ONE immediately available state read (round 5's regression: the chain acquisition used to return unacquired with the deadline already past, so an idle workspace reported `drained: false` and a pending call's surface read as empty).
+- **The pending surface reports the WHOLE guest registry**: the trap-free reader's generic 256-element array limit once shortened the guest surface's `pending()` list, and its marker mapped to `undefined` in the broker's id list. `readValue` still bounds general preview reads (default 256); host-owned metadata surfaces (`readValueComplete` — the pending registry, the await log, and the provenance registry's `read()` result) read the complete arrays/objects because they are the frozen guest library's own metadata, bounded by VM memory like the metadata itself.
 
 Phase E review round 6 decisions (the carried review's three defects):
 
@@ -719,9 +708,8 @@ Phase B decisions (the guest library, bridge, previewer):
 - **`repl.guest` as the surface key** (`Symbol.for("repl.guest")`, marker global
   `__REPL_GUEST_VERSION`) — a fresh namespace for this product's own library (the harness's
   `agentprism.guest`/`__AGENTPRISM_GUEST_VERSION` are its sibling project's).
-- **Four host callbacks, no budget function**: `__host_agent`, `__host_checkpoint`,
-  `__host_console`, `__host_agent_steer`. The harness's `__host_budget` is deleted with the
-  budget surface; `__host_agent_steer` carries the doc's handle methods
+- **Four host callbacks**: `__host_agent`, `__host_checkpoint`, `__host_console`, and
+  `__host_agent_steer`. The steering callback carries the handle methods
   (`followUp`/`steer`/`cancel`) as a new host-callback name in the initial major.
 - **`agent(modelSpec, task, opts?)` carries the model spec as a first-class argument** — the
   roadmap doc's own signature (`agent("pi/deepseek-v4-flash-max", "research X")`). The spec
@@ -746,8 +734,7 @@ Phase B decisions (the guest library, bridge, previewer):
   await, per the doc (`const research = agent(...)`; end the eval; check in next call). No
   `agent.start`/`agent.continue` variants (the doc does not carry them; `followUp` is the
   continuation vector).
-- **Non-recoverable = `recoverable: false` exclusively** — the harness's reserved
-  `BUDGET_EXHAUSTED`/`AGENT_LIMIT_EXCEEDED` codes are budget vocabulary, deleted per the doc.
+- **Non-recoverable = `recoverable: false` exclusively.**
 - **`retry` mirrors the workflow engine exactly**: without `until`, the FIRST attempt's
   result is returned (`workflow.ts`: `if (!opts.until || opts.until(last)) return last` —
   "stopping early once `until(result)` holds" holds trivially when there is no predicate);
@@ -757,15 +744,11 @@ Phase B decisions (the guest library, bridge, previewer):
 - **`loopUntilDry` dedupes within rounds too** (the harness dedupes across rounds only) —
   "collecting fresh (deduped by `key`) items" is honored completely; the default key degrades
   to a safe string for non-serializable items instead of throwing.
-- **Weak collections keep typed markers in `$N` — nested ones too**: the structured-clone
-  extension silently clones `WeakMap`/`WeakSet`/`WeakRef` to empty plain objects, at ANY
-  depth of the logged graph, so `freezeValue` runs an iterative pre-flight over the whole
-  reachable graph — depth bound AND nested-uncloneable detection — before attempting
-  `structuredClone`; every weak collection (and function/symbol/promise) at any depth
-  becomes a typed marker instead of an empty `{}`. An orchestrator must be able to tell a
-  WeakMap from a deleted property even inside an object, array, or Map/Set. Review
-  regression: the uncloneable check used to test only the logged root, so nested weak
-  collections were silently normalized. (Pinned by the nested-weak-collections test.)
+- **The repr handles hostile values without ever throwing** (the §4.4 repr renders each
+  console argument under its own guard): proxies render
+  *as* proxies, cycles are preserved by a per-render `seen` set, and an unstringifiable
+  value degrades to the `[unstringifiable]` marker — `console.*` NEVER throws by contract,
+  so a hostile value cannot take down guest code. (Pinned by the repr tests.)
 - **`GuestCall` owns and disposes every handle it touches** (the Rust broker's Deferred
   discipline): the marshalled value is disposed after settling, both resolving functions are
   disposed at settlement (raw `qjs_new_promise` parts — the shim's `newPromise()` pins the
@@ -782,12 +765,9 @@ Phase B decisions (the guest library, bridge, previewer):
   normal agent call failed with `Error: null`; pinned by the 30,000-refusals
   bounded-memory test, which then re-registers working handlers and proves the VM is
   healthy). Answer mode mints no `GuestCall`, so a throw there has nothing to dispose.
-- **The $N freeze path and the argument gatherers use captured intrinsics.** The library is
+- **The console path and the argument gatherers use captured intrinsics.** The library is
   evaluated exactly once at VM creation, before any guest code can run, so it captures what
-  it needs then: the structured-clone extension's native function (a guest that replaces
-  `globalThis.structuredClone` with an aliasing function must not make `$N` hold LIVE
-  references — mutation after a log must never change the frozen store; review regression,
-  pinned by test) and a bound copy of `Array.prototype.slice` (created via
+  it needs then: a bound copy of `Array.prototype.slice` (created via
   `Function.prototype.call.bind` at installation — no property lookups at call time, so
   replacing either prototype method with a throwing function cannot make `console.*` or
   `pipeline()` throw; `console.*` NEVER throws by contract; review regression, pinned by
@@ -795,16 +775,8 @@ Phase B decisions (the guest library, bridge, previewer):
 - **`readGuestSurface` returns a surface that pins no guest memory**: every handle is
   acquired per call and disposed on the spot (review regression: the surface used to capture
   three owned function handles in closures with no disposal contract).
-- **The console payload keeps the harness's `{ refs, args }` shape** — `args` is the
-  best-effort JSON-safe encoding (capped, tagged wrappers) for hosts without a previewer;
-  `$N` refs are the authoritative channel and are never truncated.
-- **Output caps are decimal KB (10 × 1000 bytes)** — consistent with the preview format's
-  byte-size convention (×1000 units), and line-granular with `\n` separators counted. The
-  256-line cap counts PHYSICAL lines (embedded `\n`s inside a rendered line included —
-  property names render verbatim per FORMAT.md §5.18, so a name can carry line feeds), so
-  the cap matches what the client agent actually receives, line for line (review
-  regression: an entry with 300 embedded LFs used to be retained whole with
-  `truncated: false`, silently shipping 301 serialized lines).
+- **The console payload is `{ line }`** — the guest renders ONE joined line per call
+  (§4.4) and forwards it verbatim.
 - **`ReplSnapshot` is a self-contained structural stand-in** for the shim's `Snapshot` type,
   so the public `ReplVm.restore` declaration stays checkable by a non-DOM `skipLibCheck:
   false` consumer; snapshots produced through the shim satisfy it without conversion.
@@ -826,7 +798,7 @@ restarts — the property that makes a "persistent REPL" trustworthy. Three coop
 
 - **The identity envelope** (`src/snapshot-envelope.ts`, transfer lesson 5): the shim's own
   `serializeSnapshot()` output wrapped in a JSON header line + gzip — the header carries the
-  format name (`repl-snapshot`), the envelope format version (`SNAPSHOT_FORMAT_VERSION = 1`),
+  format name (`repl-snapshot`), the envelope format version (`SNAPSHOT_FORMAT_VERSION = 2`),
   the **wasm-binary sha256** (`wasmSha256Of` — raw bytes hash directly; a compiled module
   hashes through the registry `loadShippedWasm` populates) and the creation time. A restore
   whose recorded hash mismatches the running binary REFUSES LOUDLY naming both hashes
@@ -894,53 +866,28 @@ in-flight promise — one VM and broker per project, the single-writer persisten
 the broker's state-changing-boundary sink is attached so every eval and every settlement
 drain that changed VM state persists. A stored snapshot that REFUSES on first touch
 (corrupt/truncated, format-version bump, or a wasm-hash mismatch naming both hashes) is
-CONTAINED and surfaced per action: `eval`/`wait`/`interrupt` return the `isError` error
-variant, a named `status` reports it through its status variant (`state: "refused"` with a
-`restoreError`), and `reset` clears the store outright (dropping the refused snapshot, so it
-surfaces no refusal at all) — the daemon never crash-loops and never silently discards the
-data. The workspace
-therefore survives daemon restarts: this is the production wiring the phase-D review
-demanded (`ReplWorkspaceStore` used to be exported/tested only).
+CONTAINED and AUTO-RESET (§6.1): the refused file is renamed aside
+(`snapshot.bin.refused-<ts>` — NEVER deleted, auto-reset must not be silent data
+destruction) and a fresh workspace starts; the next eval's `output` leads with a loud
+one-line notice naming the file and the reason. The daemon never crash-loops. The
+workspace therefore survives daemon restarts: this is the production wiring the phase-D
+review demanded (`ReplWorkspaceStore` used to be exported/tested only).
 
 Every `repl` result also carries the doc's MACHINE-READABLE shape as
-`structuredContent` (phase-E review round 3 — the tool used to flatten
-everything into text): the published `outputSchema` (the workflow tool's
-oneOf-branch pattern) mirrors eval/wait as `{ output, result?, pending,
-checkpoints, completed }` plus the wait-only `drained`/`timedOut` flags,
-status as structured workspaces (state, the reconcile summary, the
-workspace manifest with name/token/size/provenance/task per binding, the
-live agents, the pending ops), interrupt as its honest outcome, and reset
-as the dropped acknowledgement. The error variant replaces the
-result and is flagged `isError` — a **refused snapshot**
-on `eval`/`wait`/`interrupt`, or a **missing project context** on the four
-stateful actions `eval`/`wait`/`interrupt`/`reset`.
-A **named `status`** instead reports a refused snapshot through its normal
-status variant (`state: "refused"` with a `restoreError`), not the error
-variant, and `status` never takes the missing-context path at all: a
-project-less `status` lists every known workspace (an empty array when none
-exist) and a named `status` *creates* the context, so it can never find one
-missing. `reset` never refuses a *snapshot* — it clears the store — but it
-still returns the error variant when there is **no project context** to reset
-(single-project mode with no adopted default). The published schema's error
-branch enumerates all five actions, but no runtime path emits it with
-`action: "status"`.
-Guest output (the capped console lines, the previewed result) stays in
-separate fields from the trusted orchestration metadata — never one
-flat string — and every structured field is bounded metadata (output
-capped by the broker, checkpoint questions previewed, manifest tokens
-structure-only). The whole `structuredContent` is bounded AGAIN at the
-tool seam by a **10 000-byte serialized-JSON cap** (distinct from the
-text's 256-line / 10 000-byte cap — the structured surface has no line
-cap): the largest arrays are elided head-first, and each drop is recorded
-in a `truncated` record (field path → elided count, or `{ elided, ref }`
-when a continuation ref was captured; the reserved `strings` key is a
-plain count). A captured ref reads the dropped tail back through a later
-call's `refs` parameter (returned under `referenced`) — and that read-back
-re-enters the same 10 000-byte cap, so a still-oversized tail is re-elided
-under a *fresh* ref and a large tail drains across chained reads rather than
-one call. Refs are
-workspace-namespaced, held in memory, cleared by `reset`, and lost on a
-daemon restart. The bounded text stays alongside for human reading.
+`structuredContent`: the published `outputSchema` (the workflow tool's
+oneOf-branch pattern) mirrors the TWO actions exactly — eval as
+`{ output, result? }` (finished), `{ output, running: [ids] }`
+(bound elapsed), or the bare `{ output }` of a thrown eval (the §4.6
+rendering — `result` and `running` are mutually exclusive), interrupt
+as its honest outcome (`targeted` / `refused-idle` /
+`cancelled` / `idle` / `failed`), and the error variant carrying a
+bare structured error string (`{ error }` — exactly one key, mirroring
+the runtime validator). `output` is one unbounded, newline-joined string: console lines
+(one per call), raised checkpoint lines (`checkpoint c9: <question>`),
+uncaught-error renderings (§4.6), and the §6.1/§6.2 one-line notices
+(auto-reset; a restore that lost calls or a drain failure that lost
+state). Reconcile summaries and retained drain errors leave the result
+surface entirely — they live under `workspace().diagnostics` (§6.2).
 
 ## Client presence and the drain (phase D, in `mcp-server`)
 
@@ -1009,7 +956,7 @@ consumer compiles the published declarations — including `@ts-expect-error` ne
 pinning the opaque `WasmModule` boundary.
 
 Phase B pins the guest library and bridge: install/version-marker/idempotence (re-eval and
-re-install are no-ops), the deleted vocabulary (`phase`, the whole budget surface), agent
+re-install are no-ops), agent
 round trips with the model-spec signature and JSON options, rejections normalizing to Errors
 carrying `code`/`recoverable`, the live handle (`id`/`followUp`/`steer`/`cancel`,
 non-enumerable, steering addressed to the founding session id), synchronous host-refusal
@@ -1029,16 +976,15 @@ hygiene (5,000 resolved agent calls leave a 2 MiB VM healthy; 5,000 parked agent
 footprint fills a 2 MiB limit to 99.9%, a knife-edge where any library evolution tips it; the
 3 MiB limit keeps ~70% headroom while a per-call leak still cannot hide; 30,000 synchronous
 host refusals — agent, steer and checkpoint — leave a 2 MiB VM healthy, with a normal agent
-call still completing afterwards), the captured-intrinsic regressions ($N freezing is immune
-to `structuredClone` aliasing pollution; `console.*`/`pipeline` keep working when
+call still completing afterwards), the captured-intrinsic regressions (`console.*`/
+`pipeline` keep working when
 `Array.prototype.slice` and `Function.prototype.call` are replaced by throwing functions),
 host-serving-an-older-library (a workspace whose resident library is v0.0.1 installs, works,
 and keeps its resident version under the current host's install path), snapshot
-travel (state, `$N` store, registry and marker survive; callbacks re-register by name; new
-calls mint fresh ids), `$N` freezing (mutation after log never changes the store; the store
-is the agent's writable workspace; hostile values including revoked proxies degrade to typed
-markers without throwing; 2000-deep nesting freezes without crashing the VM; cycles are
-preserved), and the console payload shapes. The workspace suite pins the phase-B injection:
+travel (state, the pending-call registry and version marker survive; callbacks re-register
+by name; new
+calls mint fresh ids), and the console payload shapes (the `{ line }` payload — one joined
+line per call). The workspace suite pins the phase-B injection:
 a created workspace exposes the DSL, accumulates console events, parks calls, and serves the
 surface/render/manifest seams. Phase C adds the store and broker suites: the call-store
 semantics (in-memory first-wins dispatch/completion idempotence and unknown-id refusal; the
@@ -1059,11 +1005,13 @@ the answer recorded before settlement), steering outcome visibility (extension b
 injection with the backend's verbatim outcome and wire failures resolving `failed`;
 no-extension backend: `queued` at enqueue and next-turn delivery, delivery-failure warn
 lines; idle sessions start new turns with and without the extension; cancel → `cancelled` +
-the call's `AGENT_CANCELLED` rejection, idle cancel → `idle`), the concurrency cap
-(dispatch-time refusal recorded in the store, slot release on settlement), trap-free result
+the call's `AGENT_CANCELLED` rejection, idle cancel → `idle`), the concurrency limit
+(additional dispatches QUEUE in dispatch order — never a rejection; slot release on
+settlement), the §3.1 fused pump (the eval-token settlement short-circuits the target set —
+an unrelated pending call never holds the finished shape to the bound), trap-free result
 rendering (accessor completions render `(...)` and never fire; the `Object.prototype.value`
-pollution cannot hijack the result line), and the output caps (preview lines one-per-argument
-with level prefixes; truncation at 256 lines with `outputTruncated`). The consumer fixture
+pollution cannot hijack the result line), and the console rendering (one joined line per
+`console.*` call with level prefixes). The consumer fixture
 exercises the whole phase-C public surface (`Broker`, the store classes, the self-contained
 `BrokerRunner`/`BrokerSession` stand-ins, the eval-result types) under the non-DOM
 `skipLibCheck: false` configuration. The previewer suite pins the FORMAT.md rules (primitives incl.
@@ -1071,17 +1019,16 @@ exercises the whole phase-C public surface (`Broker`, the store classes, the sel
 own-data-only names, promise states, arrays with holes/named props/overflow, plain objects
 with positional indices and accessor `(...)`, branded objects and typed arrays with expando
 overflow, proxies incl. revoked, property-level shorthand tokens, the 400-char backstop,
-byte-size formatting with the promotion rule, the `$N` line format), the trap-freedom
+byte-size formatting with the promotion rule) and the §4.4 repr rules (depth 2, 20 entries
+per level, nested strings head-limited at 200 chars, direct strings whole — the completion
+and console reprs), the trap-freedom
 guarantees (hostile getters on `Object.prototype`/`Array.prototype` never fire — including
-the `Object.prototype.value` pollution case; proxy traps never fire; an accessor-rebound
-`$N` slot renders the sabotage marker; a guest that replaces `Symbol.keyFor` cannot forge
+the `Object.prototype.value` pollution case; proxy traps never fire; a guest that replaces
+`Symbol.keyFor` cannot forge
 thrown-symbol rendering; the byte-size estimate is bounded and cycle-safe), the FORMAT.md §6
 degradation (a corrupted key materialization lists nothing and flags overflow — typed arrays
 included), and bounded-memory previews (3,000 revoked-proxy and typed-array previews leave a
-2 MiB VM healthy). `caps.test.ts` pins 256 lines / 10 KB (whichever trips first),
-line-granular truncation and UTF-8 byte counting — with physical-line accounting for
-embedded newlines (a rendered line whose property name carries line feeds counts as that
-many lines; exact at the 256 boundary; embedded-LF bytes count toward the 10 KB cap).
+2 MiB VM healthy).
 
 Phase D adds the snapshot + restore suites: `snapshot-envelope.test.ts` (the envelope round
 trip — serialize → deserialize → restore with state intact, gzip actually compressing —
@@ -1098,12 +1045,14 @@ and removing the tmp, the boundary-in/burst-out debounce (one atomic write per d
 from the store / re-attach via `loadSession` with the capability gate / re-issue under the
 same call id with the reissues counter bumped and the guest promise settling exactly once —
 the custom-backend-without-the-capability degradation surfaced guest-visibly, the lost-
-session degradation, reconcile idempotence, over-cap re-issue refusal with the recoverable
-`ConcurrencyLimitError`, checkpoint re-surfacing + answering across a restore, in-flight
+session degradation, reconcile idempotence, over-cap re-issue QUEUED in dispatch order
+(never a `ConcurrencyLimitError` rejection), checkpoint re-surfacing + answering across a
+restore, in-flight
 steers resolving the honest `failed`, the state-changing-boundary cadence (after each eval
 and each settlement drain that changed VM state; nothing for an empty drain; the
-reconcile-time refusal branches — invalid options and the over-cap re-issue — settle the
-guest and fire the boundary too, and a changed-VM drain that FAILS still fires its
+reconcile-time refusal branches — the invalid-options refusal settles the guest and fires
+the boundary too (the over-cap re-issue QUEUES instead, settling nothing), and a changed-VM
+drain that FAILS still fires its
 boundary, on the reconcile and pump paths alike), the end-to-end debounce through the
 per-project store, and the re-attach arm through the REAL acp-agents adapter (a real
 `AcpAgentRunner` + `InteractiveSession` over the fake ACP agent, driven by the
@@ -1125,9 +1074,11 @@ drain to completion with settlement boundaries, the bound cancels an over-bound 
 the recoverable `AGENT_CANCELLED`, queued-but-undelivered steers survive durably; the
 workspace manifest — structure-only tokens, provenance labels, live-handle status,
 metadata-never-content asserted hard; the per-eval wall-clock deadline breaking a
-currently-running runaway eval with the VM usable after; the provenance passes) and the
-mcp-server `repl-review2.test.ts` (the wait action's same-shape output, the status
-manifest, the single-flight first touch, the last-client-disconnect drain + lazy
+currently-running runaway eval with the VM usable after; the provenance passes; the §6.2
+demotion — reconcile surfacing lines retained under `workspace().diagnostics.reconcileNotes`,
+never the eval output) and the
+mcp-server `repl-review2.test.ts` (the soft-bound eval's finished/still-running shapes, the
+empty-eval poll, the single-flight first touch, the last-client-disconnect drain + lazy
 re-attach, the eval-timeout env knob). The consumer fixture exercises the whole
 phase-D public surface (envelope functions, `ReplWorkspaceStore`, the snapshot sink, the
 manifest/provenance/drain surfaces, the extended report/seam types) under the non-DOM

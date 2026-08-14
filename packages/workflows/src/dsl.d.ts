@@ -51,7 +51,7 @@ declare function pipeline(
 
 /**
  * Run a saved workflow (by name) or a raw script inline, sharing this run's
- * limiter/counters/budget. Nests at most one level deep.
+ * limiter/counters. Nests at most one level deep.
  */
 declare function workflow(nameOrScript: string, args?: unknown): Promise<unknown>;
 
@@ -132,18 +132,8 @@ declare function checkpoint(
 /** Append a line to the run log. */
 declare function log(message: string): void;
 
-/** Open a named phase (optionally with a soft token sub-budget) for subsequent agents. */
-declare function phase(title: string, options?: { budget?: number }): void;
+/** Open a named phase for subsequent agents. */
+declare function phase(title: string): void;
 
 /** The arguments passed into this run (the host-provided input bag). */
 declare const args: unknown;
-
-/** Live token-budget view for the run. */
-declare const budget: {
-  /** The total token budget, or `null` when unbounded. */
-  readonly total: number | null;
-  /** Tokens spent so far. */
-  spent(): number;
-  /** Tokens remaining (`Infinity` when unbounded). */
-  remaining(): number;
-};

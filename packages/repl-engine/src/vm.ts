@@ -92,6 +92,7 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
+import { parse } from 'acorn';
 import { EvalFlags, JSValueHandle, QuickJS } from 'quickjs-wasi';
 
 import { classifyError, type EvalErrorInfo } from './errors.js';
@@ -279,11 +280,11 @@ type EvalResult =
 let shippedModule: Promise<WasmModule> | null = null;
 
 // The structured-clone extension (.so) is loaded once per process and
-// attached to every VM: the guest library's $N freezing uses
-// `structuredClone` (the roadmap doc pins the mechanism), and the
-// extension travels in snapshots, so the restore path must attach the same
-// byte-identical artifact it was snapshotted with (quickjs-wasi restores
-// extension memory against the descriptors it was created with).
+// attached to every VM: older guest libraries used it for the $N
+// freezing path (deleted in 0.4.0), and the extension travels in
+// snapshots, so the restore path must attach the same byte-identical
+// artifact it was snapshotted with (quickjs-wasi restores extension
+// memory against the descriptors it was created with).
 let structuredCloneExtension: Promise<Uint8Array> | null = null;
 
 async function loadStructuredCloneExtension(): Promise<Uint8Array> {
@@ -341,6 +342,8 @@ export class ReplVm {
   private readonly vm: QuickJS;
   private readonly memoryLimitBytes: number;
   private readonly interruptSlot: { current: (() => boolean) | null };
+  /** Engine-owned throw-site capture helpers installed in the realm. */
+  private readonly throwCaptureAvailable: boolean;
   /** Active-operation depth; > 0 means a VM operation is running. */
   private opDepth = 0;
   private disposed = false;
@@ -359,6 +362,7 @@ export class ReplVm {
     // and `skipLibCheck: false` type-checks the published declarations
     // cleanly — quickjs-wasi's own declarations need DOM globals.
     vmShims.set(this, vm);
+    this.throwCaptureAvailable = this.installThrowCapture();
   }
 
   /**
@@ -380,10 +384,10 @@ export class ReplVm {
       wasm,
       memoryLimit: memoryLimitBytes,
       // The structured-clone extension ships with the quickjs-wasi package
-      // and is attached to every VM: the guest library's console bridge
-      // freezes logged values into the $N store via `structuredClone` (the
-      // roadmap doc's pinned mechanism). The extension also travels inside
-      // snapshots, so `restore()` attaches the same artifact.
+      // and is attached to every VM (older guest libraries used it for the
+      // deleted $N freezing path). The extension travels inside snapshots,
+      // so `restore()` attaches the same artifact — a restored pre-0.4.0
+      // workspace still carries the extension.
       extensions: [{ name: 'structured-clone', wasm: await loadStructuredCloneExtension() }],
       interruptHandler: () => interruptSlot.current?.() ?? false,
     });
@@ -502,7 +506,17 @@ export class ReplVm {
     this.opDepth++;
     let handle: JSValueHandle | undefined;
     try {
-      const evaluated = this.evalTrapFree(code, options.filename ?? '<repl>', EvalFlags.ASYNC);
+      // A capture belongs to exactly one submitted eval. The generation
+      // lives inside the realm so it survives snapshot/restore; beginning
+      // an eval also invalidates any handled throw left by an older eval.
+      const throwGeneration = this.throwCaptureAvailable
+        ? this.beginThrowCaptureGeneration()
+        : undefined;
+      const evaluated = this.evalTrapFree(
+        throwGeneration === undefined ? code : instrumentThrownValues(code, throwGeneration),
+        options.filename ?? '<repl>',
+        EvalFlags.ASYNC,
+      );
       if (evaluated.kind === 'error') {
         return { outcome: { kind: 'error', error: evaluated.error } };
       }
@@ -542,7 +556,7 @@ export class ReplVm {
         }
         throw e; // host-side failure, not a guest outcome — fail loudly
       }
-      return this.readCompletion(handle, true, attachBridge);
+      return this.readCompletion(handle, true, attachBridge, throwGeneration);
     } finally {
       // The wrapper is disposed here on every arm except the retained-
       // pending one: `readCompletion` returns a DUP for the retained
@@ -581,6 +595,10 @@ export class ReplVm {
     this.interruptSlot.current = options.interruptHandler ?? null;
     this.opDepth++;
     try {
+      // A standalone drain is a new execution boundary. If its first job
+      // throws an uninstrumented primitive, it must not inherit a capture
+      // left by a handled throw in an earlier eval.
+      this.clearThrowCapture();
       return this.runDrain(options.jobLease);
     } finally {
       this.interruptSlot.current = previousInterrupt;
@@ -596,9 +614,193 @@ export class ReplVm {
     this.vm.dispose();
   }
 
+  /**
+   * Write a live guest value into a realm GLOBAL slot by name — the
+   * engine's seam for `_` (the §4.4 result-history global: the previous
+   * eval's completion value, IPython-style; the broker sets it after
+   * every eval that resolved with a value). The value handle is
+   * BORROWED (the raw set dups it — the caller keeps ownership). Trap-
+   * free by construction: a plain `JS_SetProperty` on the global object
+   * runs no guest code. Called BETWEEN VM operations (never re-entrant
+   * — like every host-side VM read).
+   */
+  setGlobal(name: string, value: unknown): void {
+    // `value` is typed `unknown` for the published declaration graph (see
+    // `evalCodeWithCompletion`'s completion — the public surface must stay
+    // free of quickjs-wasi types); the caller passes the live completion
+    // handle, borrowed (the raw set dups it).
+    this.assertAlive();
+    const shim = getVmShim(this) as QuickJS;
+    shim.setProp(shim.global, name, value as JSValueHandle);
+  }
+
   /** Support for `using` declarations (Explicit Resource Management). */
   [Symbol.dispose](): void {
     this.dispose();
+  }
+
+  /**
+   * Read a RETAINED suspended-eval completion wrapper after it settled
+   * (the broker's active-eval sweep calls this on a wrapper whose
+   * `promiseState` left 0 — the `_` result-history seam: a suspended
+   * eval that completed during a previous drain is the PREVIOUS eval,
+   * and its completion value becomes `_`). Fully synchronous and
+   * trap-free, like `readCompletion`: for a FULFILLED completion the
+   * unwrapped value handle (the raw `qjs_promise_result` ref's
+   * `{ value }` own-data property — never a `[[Get]]`) is returned
+   * OWNED BY THE CALLER; a REJECTED completion (the eval errored late
+   * — `_` stays unchanged, the error already rendered through the
+   * rejection bridge), a still-pending wrapper, or the pollution quirk
+   * (the wrapper with no own `value` — the wrapper itself is returned,
+   * so the caller always sees *a* value) never leaves the caller
+   * owning anything unexpected. Must be called between VM operations.
+   * Both the parameter and the result are typed `unknown` (the caller
+   * casts to the shim's handle type internally) so the published
+   * declaration graph stays free of quickjs-wasi types.
+   */
+  readRetainedCompletion(handle: unknown): unknown {
+    this.assertAlive();
+    const wrapper = handle as JSValueHandle;
+    const state = wrapper.promiseState;
+    if (state === 0) return undefined; // still pending — nothing to read
+    const e = this.vm._getExports();
+    const resultPtr = e.qjs_promise_result(wrapper.ptr);
+    const result = new JSValueHandle(this.vm, resultPtr);
+    try {
+      if (state === 2) return undefined; // rejected — `_` stays unchanged
+      const valueHandle = readOwnDataProperty(result, 'value');
+      if (valueHandle !== undefined) return valueHandle;
+      // The unexpected wrapper shape (the pollution quirk the README
+      // pins): return the wrapper itself — the caller sees *a* value.
+      return result.dup();
+    } finally {
+      result.dispose();
+    }
+  }
+
+  /** Install immutable engine helpers that capture the stack at each
+   *  instrumented `throw` while returning the exact thrown value. The
+   *  identity-preserving return keeps guest catch semantics unchanged,
+   *  including for primitives and proxies. */
+  private installThrowCapture(): boolean {
+    const source =
+      '(() => {' +
+      'var g = this;' +
+      `if (typeof g[${JSON.stringify(THROW_CAPTURE_GLOBAL)}] === "function" && ` +
+      `typeof g[${JSON.stringify(THROW_STACK_GLOBAL)}] === "function" && ` +
+      `typeof g[${JSON.stringify(THROW_BOUNDARY_GLOBAL)}] === "function") return true;` +
+      'var same = Object.is; var generation = 0; var lastGeneration = -1; var lastValue; var lastStack;' +
+      `Object.defineProperty(g, ${JSON.stringify(THROW_CAPTURE_GLOBAL)}, {` +
+      'value: function (value, captureGeneration) {' +
+      'lastValue = value; lastStack = new Error().stack; lastGeneration = captureGeneration; return value; },' +
+      'writable: false, enumerable: false, configurable: false });' +
+      `Object.defineProperty(g, ${JSON.stringify(THROW_STACK_GLOBAL)}, {` +
+      'value: function (value, expectedGeneration) {' +
+      'return same(lastValue, value) && ' +
+      '(expectedGeneration === undefined || lastGeneration === expectedGeneration) ? lastStack : undefined; },' +
+      'writable: false, enumerable: false, configurable: false });' +
+      `Object.defineProperty(g, ${JSON.stringify(THROW_BOUNDARY_GLOBAL)}, {` +
+      'value: function (beginEval, expectedGeneration) {' +
+      'if (beginEval === true || expectedGeneration === undefined || lastGeneration === expectedGeneration) {' +
+      'lastValue = undefined; lastStack = undefined; lastGeneration = -1;' +
+      '}' +
+      'if (beginEval === true) generation++; return generation; },' +
+      'writable: false, enumerable: false, configurable: false });' +
+      'return true;' +
+      '})()';
+    const installed = this.evalTrapFree(source, '<repl-throw-capture>', 0);
+    if (installed.kind === 'error') return false;
+    installed.handle.dispose();
+    return true;
+  }
+
+  /** Start one realm-persistent throw-capture generation. The helper
+   *  clears the previous slot before returning the generation id, so a
+   *  primitive handled by an older eval cannot match this eval's error. */
+  private beginThrowCaptureGeneration(): number | undefined {
+    const begun = this.evalTrapFree(
+      `this[${JSON.stringify(THROW_BOUNDARY_GLOBAL)}](true)`,
+      '<repl-throw-boundary>',
+      0,
+    );
+    if (begun.kind === 'error') return undefined;
+    try {
+      return begun.handle.isNumber ? begun.handle.toNumber() : undefined;
+    } finally {
+      begun.handle.dispose();
+    }
+  }
+
+  /** Clear a capture at a host execution boundary without minting a new
+   *  eval generation. Best-effort: capture is supplemental metadata. */
+  private clearThrowCapture(): void {
+    if (!this.throwCaptureAvailable) return;
+    const cleared = this.evalTrapFree(
+      `this[${JSON.stringify(THROW_BOUNDARY_GLOBAL)}](false)`,
+      '<repl-throw-boundary>',
+      0,
+    );
+    if (cleared.kind === 'ok') cleared.handle.dispose();
+  }
+
+  /** Classify one thrown value trap-free, supplementing stackless values
+   *  with the engine-captured throw-site stack. */
+  private readErrorInfoWithCapturedStack(
+    handle: JSValueHandle,
+    expectedGeneration?: number,
+  ): EvalErrorInfo {
+    const info = readErrorInfo(handle);
+    if (info.stack === undefined) {
+      const captured = this.capturedThrowStack(handle, expectedGeneration);
+      if (captured !== undefined) info.stack = captured;
+    }
+    return info;
+  }
+
+  /** Call the immutable engine helper with the thrown value BORROWED.
+   *  Its captured `Object.is` performs identity comparison without any
+   *  proxy traps or guest property reads. */
+  private capturedThrowStack(
+    handle: JSValueHandle,
+    expectedGeneration?: number,
+  ): string | undefined {
+    if (!this.throwCaptureAvailable) return undefined;
+    const key = this.vm.newString(THROW_STACK_GLOBAL);
+    const fn = this.vm.getProp(this.vm.global, key);
+    const generation = expectedGeneration === undefined
+      ? undefined
+      : this.vm.newNumber(expectedGeneration);
+    try {
+      if (!fn.isFunction) return undefined;
+      const e = this.vm._getExports();
+      const argv = e.wasm_malloc(8);
+      let resultPtr: number;
+      try {
+        new DataView(e.memory.buffer).setUint32(argv, handle.ptr, true);
+        new DataView(e.memory.buffer).setUint32(
+          argv + 4,
+          generation?.ptr ?? this.vm.undefined.ptr,
+          true,
+        );
+        resultPtr = e.qjs_call(fn.ptr, this.vm.undefined.ptr, 2, argv);
+      } finally {
+        e.wasm_free(argv);
+      }
+      const result = new JSValueHandle(this.vm, resultPtr);
+      try {
+        if (e.qjs_is_exception(result.ptr) !== 0) {
+          takeAndFreeException(e, this.vm);
+          return undefined;
+        }
+        return result.isString ? result.toString() : undefined;
+      } finally {
+        result.dispose();
+      }
+    } finally {
+      generation?.dispose();
+      fn.dispose();
+      key.dispose();
+    }
   }
 
   private assertAlive(): void {
@@ -682,13 +884,14 @@ export class ReplVm {
     handle: JSValueHandle,
     keepCompletion: boolean,
     attachBridge: boolean,
+    throwGeneration?: number,
   ): { outcome: ReplEvalOutcome; completion?: unknown } {
     try {
       // 0 pending, 1 fulfilled, 2 rejected (quickjs-wasi built-in
       // `promiseState`).
       const state = handle.promiseState;
       if (state === 0) {
-        if (attachBridge) this.attachRejectionBridge(handle);
+        if (attachBridge) this.attachRejectionBridge(handle, throwGeneration);
         if (keepCompletion) {
           // Retained-pending arm: the caller owns a DUP of the wrapper
           // promise handle (the completion stays pending — the eval
@@ -711,7 +914,12 @@ export class ReplVm {
       let callerOwnsWrapper = false;
       try {
         if (state === 2) {
-          return { outcome: { kind: 'error', error: readErrorInfo(result) } };
+          return {
+            outcome: {
+              kind: 'error',
+              error: this.readErrorInfoWithCapturedStack(result, throwGeneration),
+            },
+          };
         }
         // Trap-free unwrap of the engine-created `{ value }` wrapper — an
         // own-data-property descriptor read, never `[[Get]]` (R69: a guest
@@ -744,25 +952,73 @@ export class ReplVm {
 
   /**
    * The uncaught-rejection bridge for a suspended eval completion (the
-   * doc's transfer lesson 3): attach `p.then(undefined, err =>
-   * console.error(err))` so a late rejection of the completion promise
-   * travels the ordinary console bridge — frozen into a `$N`, previewed
-   * under the existing rules, delivered at the settlement drain's natural
-   * point — never a new intent-plane surface. Best-effort: the bridge
-   * script is evaluated with the engine's own trap-free eval, the call's
-   * result (including an exception result, whose runtime exception is
-   * taken out and freed) is disposed, and any failure leaves the pending
-   * outcome unchanged.
+   * doc's transfer lesson 3): attach `p.then(undefined, renderer)` so a
+   * late rejection of the completion promise travels the ordinary
+   * console bridge — rendered as an error-level console line, delivered
+   * at the settlement drain's natural point — never a new intent-plane
+   * surface. The renderer produces the §4.6 uncaught-error line (the
+   * same shape the broker's `errorLine` renders for an in-eval error):
+   * the error name and message, the call-id/resolved-backend attribution
+   * when the error came from a subagent call, and the guest stack's top
+   * frames with line numbers in the submitted code (`at <repl>:line:
+   * col` — the guest library augments rejected registry calls with the
+   * CALL-SITE stack, see `settleCall` in guest-library.ts; a thrown
+   * Error's own stack carries the frames natively). Best-effort: the
+   * bridge script is evaluated with the engine's own trap-free eval, the
+   * call's result (including an exception result, whose runtime
+   * exception is taken out and freed) is disposed, and any failure
+   * leaves the pending outcome unchanged. The renderer never throws
+   * (its own guard swallows a hostile error value — a proxy's traps
+   * fire inside the renderer, never in the host's error path).
    */
-  private attachRejectionBridge(handle: JSValueHandle): void {
+  private attachRejectionBridge(
+    handle: JSValueHandle,
+    throwGeneration?: number,
+  ): void {
     const e = this.vm._getExports();
     let bridge: JSValueHandle | undefined;
     try {
-      const evaluated = this.evalTrapFree(
-        '(p) => { p.then(undefined, (err) => { console.error(err); }); }',
-        '<repl-rejection-bridge>',
-        0,
-      );
+      // Plain string concatenation (no template literal — the source
+      // must be exactly what the VM evaluates; every `\` below is an
+      // escaped backslash so the guest code receives the literal escape
+      // sequences).
+      const source =
+        '(p) => { p.then(undefined, (err) => { try {' +
+        'var e = err;' +
+        'var name = "Error";' +
+        'var message = "undefined";' +
+        'if (e !== null && e !== undefined) {' +
+        'if (typeof e === "string") { message = e; }' +
+        'else if (typeof e === "number" || typeof e === "boolean" || typeof e === "bigint") { message = String(e); }' +
+        'else {' +
+        'if (typeof e.name === "string") { name = e.name; }' +
+        'if (typeof e.message === "string") { message = e.message; }' +
+        'else if (typeof e.toString === "function") { try { message = e.toString(); } catch (_x) { message = "unreadable error"; } }' +
+        '} }' +
+        'var line = name + ": " + message;' +
+        'if (e !== null && e !== undefined && (typeof e === "object" || typeof e === "function")) {' +
+        'var attrib = "";' +
+        'if (typeof e.replCallId === "string") { attrib = "(call " + e.replCallId;' +
+        'if (typeof e.replBackend === "string") { attrib += " on backend " + e.replBackend; } attrib += ")"; }' +
+        'else if (typeof e.replBackend === "string") { attrib = "(on backend " + e.replBackend + ")"; }' +
+        'if (attrib !== "") { line += " " + attrib; }' +
+        '}' +
+        'var frames = [];' +
+        'var stack = e !== null && e !== undefined && typeof e.stack === "string" ? e.stack : undefined;' +
+        `if (typeof stack !== "string" && typeof this[${JSON.stringify(THROW_STACK_GLOBAL)}] === "function") {` +
+        `stack = this[${JSON.stringify(THROW_STACK_GLOBAL)}](e, ${throwGeneration === undefined ? 'undefined' : String(throwGeneration)});` +
+        '}' +
+        'if (typeof stack === "string") {' +
+        'var parts = stack.split("\\n");' +
+        'for (var i = 0; i < parts.length && frames.length < 8; i++) {' +
+        'var m = /^\\s*at\\s+(?:(.+?)\\s+\\()?<repl>:(\\d+):(\\d+)\\)?\\s*$/.exec(parts[i]);' +
+        'if (m !== null) {' +
+        'frames.push(m[1] !== undefined ? "    at " + m[1] + " (<repl>:" + m[2] + ":" + m[3] + ")" : "    at <repl>:" + m[2] + ":" + m[3]);' +
+        '} } }' +
+        'if (frames.length > 0) { line += "\\n" + frames.join("\\n"); }' +
+        'console.error(line);' +
+        '} catch (_bridge) {} }); }';
+      const evaluated = this.evalTrapFree(source, '<repl-rejection-bridge>', 0);
       if (evaluated.kind === 'error') return;
       bridge = evaluated.handle;
       // Raw `qjs_call` with one borrowed argument (the completion promise);
@@ -828,9 +1084,8 @@ export class ReplVm {
       const result = e.qjs_execute_pending_job();
       // The lease-carrying job ended: clear the guest lease so a later
       // job (or a later drain) never starts under a stale lease. The
-      // mirror keeps the value until the next job's read — the only
-      // reader (the interrupted-drain release) runs right after the
-      // drain throws.
+      // mirror keeps the value until the next job's read; when this job
+      // fails, the interrupted-drain release reads it after the throw.
       if (jobLease !== undefined) lease?.clear();
       if (result < 0) {
         // The failed job's exception is the runtime's current exception.
@@ -839,18 +1094,180 @@ export class ReplVm {
         // the only reference; the VM stays usable after it is disposed.
         const exc = new JSValueHandle(this.vm, e.qjs_get_exception());
         try {
-          throw new DrainJobError(readErrorInfo(exc));
+          throw new DrainJobError(this.readErrorInfoWithCapturedStack(exc));
         } finally {
           exc.dispose();
         }
       }
       count++;
     }
+    // No job is executing after a successful drain. In particular, a
+    // later eval's synchronous code must never observe the last job's
+    // continuation token. The error arm above intentionally bypasses
+    // this clear so interrupted-drain attribution can read the token.
+    if (lease !== undefined) lease.cell.current = undefined;
     return count;
   }
 }
 
-/**
+const THROW_CAPTURE_GLOBAL = '__replCaptureThrownValueV2';
+const THROW_STACK_GLOBAL = '__replCapturedThrowStackV2';
+const THROW_BOUNDARY_GLOBAL = '__replThrowCaptureBoundaryV2';
+const THROW_INSTRUMENT_CACHE_MAX = 256;
+const throwInstrumentCache = new Map<string, ThrowInstrumentation | null>();
+const THROW_FUNCTION_NODES = new Set([
+  'FunctionDeclaration',
+  'FunctionExpression',
+  'ArrowFunctionExpression',
+  'StaticBlock',
+]);
+
+/** Wrap each throw argument in an identity-preserving capture call. Point
+ *  insertions add no newlines, so captured stacks retain submitted-code
+ *  line numbers. Parse failures stay untouched for the VM to report. */
+function instrumentThrownValues(code: string, generation: number): string {
+  let instrumentation = throwInstrumentCache.get(code);
+  if (instrumentation === undefined) {
+    try {
+      const ast = parse(code, {
+        ecmaVersion: 'latest',
+        sourceType: 'script',
+        allowAwaitOutsideFunction: true,
+      }) as unknown as ThrowNode;
+      const sites: ThrowSite[] = [];
+      const catchSites: CatchSite[] = [];
+      collectThrowSites(ast, false, sites, catchSites);
+      instrumentation = {
+        sites,
+        catchSites,
+        nestedCaptureSafe: !containsPotentialCaptureShadow(ast),
+      };
+    } catch {
+      instrumentation = null;
+    }
+    if (throwInstrumentCache.size >= THROW_INSTRUMENT_CACHE_MAX) throwInstrumentCache.clear();
+    throwInstrumentCache.set(code, instrumentation);
+  }
+  if (instrumentation === null || instrumentation.sites.length === 0) return code;
+  const insertions: Array<{ pos: number; text: string }> = [];
+  for (const site of instrumentation.sites) {
+    if (site.inFunction && !instrumentation.nestedCaptureSafe) continue;
+    const capture = site.inFunction
+      ? THROW_CAPTURE_GLOBAL
+      : `this[${JSON.stringify(THROW_CAPTURE_GLOBAL)}]`;
+    insertions.push({
+      pos: site.start,
+      text: `${capture}(`,
+    });
+    insertions.push({ pos: site.end, text: `,${generation})` });
+  }
+  // A catch means the throw was handled and can no longer be the
+  // uncaught value classified at this eval boundary. Clear only this
+  // eval's generation so concurrent suspended evals cannot erase each
+  // other's supplemental stack metadata.
+  for (const site of instrumentation.catchSites) {
+    if (site.inFunction && !instrumentation.nestedCaptureSafe) continue;
+    const boundary = site.inFunction
+      ? THROW_BOUNDARY_GLOBAL
+      : `this[${JSON.stringify(THROW_BOUNDARY_GLOBAL)}]`;
+    insertions.push({
+      pos: site.start,
+      text: `${boundary}(false,${generation});`,
+    });
+  }
+  insertions.sort((a, b) => b.pos - a.pos);
+  let instrumented = code;
+  for (const insertion of insertions) {
+    instrumented =
+      instrumented.slice(0, insertion.pos) + insertion.text + instrumented.slice(insertion.pos);
+  }
+  return instrumented;
+}
+
+/** Nested code cannot use `this` as the realm object: methods, strict
+ *  functions, and arrows all give it user-controlled semantics. Instead
+ *  it resolves the immutable engine helper installed on the global object.
+ *  If the submitted program mentions that reserved identifier, uses
+ *  `with`, or can inject a local binding through direct eval, leave nested
+ *  throws untouched rather than risk changing the value being thrown. */
+function containsPotentialCaptureShadow(node: ThrowNode | null | undefined): boolean {
+  if (node === null || node === undefined || typeof node !== 'object' || typeof node.type !== 'string') return false;
+  const record = node as unknown as Record<string, unknown>;
+  if (
+    node.type === 'Identifier' &&
+    (record.name === THROW_CAPTURE_GLOBAL || record.name === THROW_BOUNDARY_GLOBAL)
+  ) return true;
+  if (node.type === 'WithStatement') return true;
+  if (node.type === 'CallExpression') {
+    const callee = record.callee as Record<string, unknown> | null | undefined;
+    if (callee?.type === 'Identifier' && callee.name === 'eval') return true;
+  }
+  for (const key of Object.keys(node)) {
+    if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+    const child = record[key];
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        if (containsPotentialCaptureShadow(item as ThrowNode)) return true;
+      }
+    } else if (child !== null && typeof child === 'object') {
+      if (containsPotentialCaptureShadow(child as ThrowNode)) return true;
+    }
+  }
+  return false;
+}
+
+function collectThrowSites(
+  node: ThrowNode | null | undefined,
+  inFunction: boolean,
+  sites: ThrowSite[],
+  catchSites: CatchSite[],
+): void {
+  if (node === null || node === undefined || typeof node !== 'object' || typeof node.type !== 'string') return;
+  if (node.type === 'ThrowStatement' && node.argument !== null && node.argument !== undefined) {
+    sites.push({ start: node.argument.start, end: node.argument.end, inFunction });
+  }
+  if (node.type === 'CatchClause' && node.body !== null && node.body !== undefined) {
+    catchSites.push({ start: node.body.start + 1, inFunction });
+  }
+  const childInFunction = inFunction || THROW_FUNCTION_NODES.has(node.type);
+  for (const key of Object.keys(node)) {
+    if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+    const child = (node as unknown as Record<string, unknown>)[key];
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        collectThrowSites(item as ThrowNode, childInFunction, sites, catchSites);
+      }
+    } else if (child !== null && typeof child === 'object') {
+      collectThrowSites(child as ThrowNode, childInFunction, sites, catchSites);
+    }
+  }
+}
+
+interface ThrowSite {
+  start: number;
+  end: number;
+  inFunction: boolean;
+}
+
+interface CatchSite {
+  start: number;
+  inFunction: boolean;
+}
+
+interface ThrowInstrumentation {
+  sites: ThrowSite[];
+  catchSites: CatchSite[];
+  nestedCaptureSafe: boolean;
+}
+
+interface ThrowNode {
+  type: string;
+  start: number;
+  end: number;
+  argument?: ThrowNode | null;
+  body?: ThrowNode | null;
+}
+
 /**
  * Trap-free error info: name/message/stack are read as own data
  * properties; primitives thrown as values convert natively (strings and
@@ -902,11 +1319,19 @@ function readErrorInfo(handle: JSValueHandle): EvalErrorInfo {
   let nameHandle: JSValueHandle | undefined;
   let messageHandle: JSValueHandle | undefined;
   let stackHandle: JSValueHandle | undefined;
+  let replCallIdHandle: JSValueHandle | undefined;
+  let replBackendHandle: JSValueHandle | undefined;
   let protoHandle: JSValueHandle | undefined;
   try {
     nameHandle = readOwnDataProperty(handle, 'name');
     messageHandle = readOwnDataProperty(handle, 'message');
     stackHandle = readOwnDataProperty(handle, 'stack');
+    // The §4.6 error attribution (see `EvalErrorInfo`): the guest
+    // library stamps 'replCallId' onto every rejected registry call's
+    // Error and the host stamps 'replBackend' onto the rejection value
+    // it settles — both read here as own data strings, trap-free.
+    replCallIdHandle = readOwnDataProperty(handle, 'replCallId');
+    replBackendHandle = readOwnDataProperty(handle, 'replBackend');
     let name = nameHandle && nameHandle.typeof === 'string' ? nameHandle.toString() : undefined;
     if (name === undefined && handle.isError) {
       // Error constructor names live on the error prototype (`name` is not
@@ -938,11 +1363,21 @@ function readErrorInfo(handle: JSValueHandle): EvalErrorInfo {
       messageHandle && messageHandle.typeof === 'string' ? messageHandle.toString() : '';
     const stack =
       stackHandle && stackHandle.typeof === 'string' ? stackHandle.toString() : undefined;
-    return classifyError(name ?? 'Error', message, stack);
+    const replCallId =
+      replCallIdHandle && replCallIdHandle.typeof === 'string'
+        ? replCallIdHandle.toString()
+        : undefined;
+    const replBackend =
+      replBackendHandle && replBackendHandle.typeof === 'string'
+        ? replBackendHandle.toString()
+        : undefined;
+    return classifyError(name ?? 'Error', message, stack, replCallId, replBackend);
   } finally {
     nameHandle?.dispose();
     messageHandle?.dispose();
     stackHandle?.dispose();
+    replCallIdHandle?.dispose();
+    replBackendHandle?.dispose();
     protoHandle?.dispose();
   }
 }

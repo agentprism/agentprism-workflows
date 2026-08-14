@@ -34,7 +34,7 @@ export function registerAuthoringPrompt(mcp: McpServer): void {
       title: "Author an AgentPrism workflow script",
       description:
         "Load the complete AgentPrism workflow-authoring guide — the agent()/parallel()/pipeline() " +
-        "DSL, per-call backend routing, structured outputs, checkpoints, token budgets, determinism " +
+        "DSL, per-call backend routing, structured outputs, checkpoints, determinism " +
         "rules, and the exhaustive option reference — so the assistant can write a correct workflow " +
         "script and run it with the `workflow` tool. Optional `task`: what the workflow should accomplish.",
       argsSchema: {

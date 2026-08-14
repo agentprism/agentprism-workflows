@@ -101,13 +101,12 @@ export interface WorkflowAgentOptions {
 
 /**
  * Global resources shared across a run and any workflow() nested inside it, so
- * the 16-concurrent / 1000-total caps and the token budget hold across nesting
- * instead of each level getting its own limiter and counters.
+ * the 16-concurrent / 1000-total caps hold across nesting instead of each
+ * level getting its own limiter and counters.
  */
 export interface SharedRuntime {
   limiter: <T>(fn: () => Promise<T>) => Promise<T>;
   agentCount: number;
-  spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
   depth: number;
   /** Root-run-wide workflow() invocation ordinal. Monotonic and never decremented. */
@@ -160,10 +159,6 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   concurrency?: number;
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
-  tokenBudget?: number | null;
-  /** Recorded budget debits, replayed in settlement-ordinal order before a bound
-   *  call's settlement is exposed to workflow code. Isolation-only. */
-  budgetReplay?: { trajectory: Array<{ ordinal: number; debit: number }> };
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
@@ -413,14 +408,6 @@ export interface CheckpointCallContext {
 
 interface RuntimeState {
   currentPhase?: string;
-  /**
-   * Per-phase soft sub-budgets carved from the run total: phase title -> the
-   * ceiling and the run-wide spent at the moment the budget was declared. A phase
-   * exceeding its ceiling throws TOKEN_BUDGET_EXHAUSTED while the run's overall
-   * budget is untouched. Soft gate (like the global one): spent accrues after each
-   * agent, so an in-flight wave may overshoot slightly.
-   */
-  phaseBudgets: Map<string, { budget: number; startSpent: number; warned: boolean }>;
   logs: string[];
   phases: string[];
   /** Monotonic, assigned at lexical agent() call time — the stable resume key. */
@@ -499,17 +486,18 @@ export const CHECKPOINT_INPUTS_FORMAT = 1;
 
 export interface WorkflowRunLimitOptions {
   maxAgents?: number;
-  tokenBudget?: number | null;
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number | null;
 }
 
-/** Resolve the run limits once so admission, persistence, and execution report the same values. */
+/** Resolve the run limits once so admission, persistence, and execution report the same values.
+ *  `tokenBudget` stays in the persisted record, ALWAYS null — the budget is deleted (§7); the
+ *  field survives only so old persisted runs and isolation recordings keep their shape. */
 export function resolveWorkflowRunLimits(options: WorkflowRunLimitOptions): WorkflowRunLimits {
   return {
     maxAgents: options.maxAgents ?? MAX_AGENTS_PER_RUN,
-    tokenBudget: options.tokenBudget ?? null,
+    tokenBudget: null,
     concurrency: normalizeConcurrency(
       options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
     ),
@@ -600,7 +588,6 @@ export async function runWorkflow<T = unknown>(
     // explicit phase() (or agent({ phase })) overrides this.
     phases: meta.phases?.[0]?.title ? [meta.phases[0].title] : [],
     currentPhase: meta.phases?.[0]?.title,
-    phaseBudgets: new Map(),
     callSeq: 0,
     firstMiss: options.preparedResume?.strategy === "positional-v1"
       ? initialPositionalFirstMiss(options.preparedResume.eligibility)
@@ -613,11 +600,10 @@ export async function runWorkflow<T = unknown>(
   };
 
   const agentRunner = options.agent;
-  // Global caps + budget are shared with any nested workflow() so they hold across nesting.
+  // Global caps are shared with any nested workflow() so they hold across nesting.
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
     agentCount: 0,
-    spent: 0,
     tokenUsage: { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
     depth: 0,
     nestedSeq: 0,
@@ -689,34 +675,21 @@ export async function runWorkflow<T = unknown>(
     );
   }
 
-  const phase = (title: string, phaseOptions?: { budget?: number }) => {
+  const phase = (title: string, ...deletedOptions: unknown[]) => {
+    if (deletedOptions.length > 0) {
+      // §7: the per-phase budget option is deleted — phase takes NO
+      // options. An unknown second argument (the budget surface's
+      // `{ budget }` included) is a script error naming the deleted
+      // surface, exactly like an unknown agent option key.
+      throw new WorkflowError(
+        "phase() takes no options — the per-phase budget option was deleted with the budget surface (§7); call phase(title) with only the title",
+        WorkflowErrorCode.SCRIPT_ERROR,
+        { recoverable: false },
+      );
+    }
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
-    // Carve a soft sub-budget from the run total for work done under this phase.
-    // Re-declaring re-bases from the current spent (idempotent across resume: the
-    // script re-runs phase() and the ceiling is recomputed from live spent).
-    if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
-      state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
-    }
     options.onPhase?.(title, callbackContext);
-  };
-
-  const budget = Object.freeze({
-    total: options.tokenBudget ?? null,
-    spent: () => shared.spent,
-    remaining: () => (options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - shared.spent)),
-  });
-  const replayTrajectory = options.budgetReplay?.trajectory ?? [];
-  let replayCursor = 0;
-  const applyBudgetReplay = (settlementOrdinal: number | undefined) => {
-    if (!options.budgetReplay || settlementOrdinal === undefined) return;
-    while (
-      replayCursor < replayTrajectory.length &&
-      replayTrajectory[replayCursor].ordinal <= settlementOrdinal
-    ) {
-      shared.spent += replayTrajectory[replayCursor].debit;
-      replayCursor++;
-    }
   };
 
   // Run-scoped fault channel: when the rejection tripwire fires (a promise the SCRIPT
@@ -1004,35 +977,7 @@ export async function runWorkflow<T = unknown>(
       );
     }
 
-    if (budget.total !== null && budget.remaining() <= 0) {
-      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
-        recoverable: false,
-      });
-    }
-
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
-
-    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
-    // without touching the run's overall budget. Soft (spent accrues post-agent),
-    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
-    // work so subsequent phases still proceed.
-    if (assignedPhase) {
-      const pb = state.phaseBudgets.get(assignedPhase);
-      if (pb) {
-        const phaseSpent = shared.spent - pb.startSpent;
-        if (phaseSpent >= pb.budget) {
-          throw new WorkflowError(
-            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
-            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
-            { recoverable: false },
-          );
-        }
-        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
-          pb.warned = true;
-          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
-        }
-      }
-    }
 
     const requestedLabel = agentOptions.label?.trim();
     const pendingLabel = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
@@ -1147,11 +1092,9 @@ export async function runWorkflow<T = unknown>(
       guardTerminal("onAgentEnd", () => options.onAgentEnd?.(terminalEvent));
     };
 
-    // Reserve the agent slot synchronously — atomic with the limit/budget gate
-    // above (no await in between) — so a parallel() fan-out can't all observe the
-    // same agentCount and overshoot maxAgents. (Token budget stays a soft gate:
-    // spent accrues after each agent, matching Claude Code; in-flight agents may
-    // push slightly past total, then further agent() calls throw.)
+    // Reserve the agent slot synchronously — atomic with the limit gate above
+    // (no await in between) — so a parallel() fan-out can't all observe the
+    // same agentCount and overshoot maxAgents.
     shared.agentCount++;
 
     let precreatedWorktree: Worktree | undefined;
@@ -1238,7 +1181,6 @@ export async function runWorkflow<T = unknown>(
         modelResolved?: string;
         modelFallbacks: string[];
         provenance?: AgentResultProvenance;
-        budgetReplay?: { settlementOrdinal: number };
         history?: AgentHistoryEntry[];
       }
 
@@ -1252,7 +1194,6 @@ export async function runWorkflow<T = unknown>(
           shared.tokenUsage.cacheWrite += usage.cacheWrite;
         }
         shared.tokenUsage.total += tokens;
-        if (!options.budgetReplay) shared.spent += tokens;
         budgetDebit += tokens;
         options.onTokenUsage?.({ ...shared.tokenUsage }, callbackContext);
         return tokens;
@@ -1309,7 +1250,6 @@ export async function runWorkflow<T = unknown>(
         aborted: boolean,
       ) => {
         if (settled) return;
-        applyBudgetReplay(slot?.budgetReplay?.settlementOrdinal);
         const errorRecord = projectRecordedError(thrown);
         const workflowError = wrapError(thrown, { agentLabel: label });
         const usage = terminalUsage();
@@ -1518,11 +1458,6 @@ export async function runWorkflow<T = unknown>(
                     const copied = cloneTelemetry(reported);
                     if (copied) slot.provenance = copied;
                   },
-                  onBudgetReplay: (reported: { settlementOrdinal: number }) => {
-                    if (slot.sealed) return;
-                    const copied = cloneTelemetry(reported);
-                    if (copied) slot.budgetReplay = copied;
-                  },
                   onHistory: (history: AgentHistoryEntry[]) => {
                     if (slot.sealed) return;
                     const copied = cloneTelemetry(history);
@@ -1588,7 +1523,6 @@ export async function runWorkflow<T = unknown>(
             }
             const resultSnapshot = strictSnapshot(result, `agent "${label}" result`, label);
             recordTokens(result, slot.usage);
-            applyBudgetReplay(slot.budgetReplay?.settlementOrdinal);
             const usage = terminalUsage();
             const session = sessionRecord(slot, agentOptions.keepSession === true);
             if (session) state.agentSessions.push(session);
@@ -1725,8 +1659,6 @@ export async function runWorkflow<T = unknown>(
     }): Promise<unknown> => {
       await Promise.resolve();
       throwIfAborted();
-      if (input.rebindSession) shared.spent += input.logicalBudgetDebit as number;
-
       emitAgentStart();
       const recordedSession = input.entry.session ? cloneTelemetry(input.entry.session) : undefined;
       let cachedSession: AgentSessionRecord | undefined;
@@ -2068,9 +2000,9 @@ export async function runWorkflow<T = unknown>(
         } catch (error) {
           if (signal.aborted) throw error;
           const workflowError = wrapError(error);
-          // Non-recoverable failures (token budget / agent limit exhausted) must
-          // halt the whole run, exactly like a directly-awaited agent() — not be
-          // swallowed into a null in the result array.
+          // Non-recoverable failures (agent limit exhausted) must halt the whole
+          // run, exactly like a directly-awaited agent() — not be swallowed into a
+          // null in the result array.
           if (!workflowError.recoverable) throw workflowError;
           log(`parallel[${index}] failed: ${workflowError.message}`);
           return null;
@@ -2111,7 +2043,7 @@ export async function runWorkflow<T = unknown>(
   };
 
   // Nested workflow(): run a saved workflow (or a raw script) inline, sharing this
-  // run's limiter/counters/budget so the global caps hold. One level deep only.
+  // run's limiter/counters so the global caps hold. One level deep only.
   const workflowImplementation = async (
     nameOrScript: string,
     childArgs: unknown,
@@ -2270,9 +2202,9 @@ export async function runWorkflow<T = unknown>(
       try {
         items = (await opts.round(r)) ?? [];
       } catch (error) {
-        // Budget / agent-limit exhaustion: return the partial result, don't abort.
+        // Agent-limit exhaustion: return the partial result, don't abort.
         const code = (error as { code?: string })?.code;
-        if (code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED || code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) break;
+        if (code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) break;
         throw error;
       }
       const fresh = (Array.isArray(items) ? items : []).filter((x) => x != null && !seen.has(key(x)));
@@ -2342,8 +2274,8 @@ export async function runWorkflow<T = unknown>(
     return { ok: false, value: last, verdict: lastVerdict ?? null, attempts };
   };
 
-  // Deterministic, journaled, replayable human checkpoint. Spends no tokens, so it
-  // is gated on the agent counter + abort (not budget). On resume the human's reply
+  // Deterministic, journaled, replayable human checkpoint. Gated on the agent
+  // counter + abort. On resume the human's reply
   // replays by callIndex exactly like a cached agent() — the genuine edge over CC,
   // whose steering is in-session only. Headless defaults remain non-blocking; authors
   // can opt into a persisted pause with headless:"pause".
@@ -2815,7 +2747,6 @@ export async function runWorkflow<T = unknown>(
     args: options.args,
     cwd: options.cwd ?? process.cwd(),
     process: Object.freeze({ cwd: () => options.cwd ?? process.cwd() }),
-    budget,
     console: {
       log,
       info: log,
@@ -2850,7 +2781,7 @@ export async function runWorkflow<T = unknown>(
     await tripwire.drain();
   } catch (error) {
     scriptFailed = true;
-    // A WorkflowError crossing the script boundary keeps its classification (abort, budget,
+    // A WorkflowError crossing the script boundary keeps its classification (abort,
     // usage limit, tripwire). Anything else IS the script crashing — label it SCRIPT_ERROR,
     // never WORKFLOW_ABORTED (nobody cancelled anything).
     if (error instanceof WorkflowError) throw error;

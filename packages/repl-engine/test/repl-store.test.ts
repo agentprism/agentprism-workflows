@@ -18,7 +18,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -28,6 +28,7 @@ import {
   CALL_STORE_FILENAME,
   REPL_STORE_SUBDIR,
   SNAPSHOT_FILENAME,
+  SNAPSHOT_FORMAT_VERSION,
   ReplWorkspaceStore,
   SnapshotEnvelopeError,
   Workspace,
@@ -116,7 +117,7 @@ test('write/load round trip: the enveloped snapshot restores the workspace; the 
   assert.equal(reopened.callStore().lookup('c1')!.completion!.value, 'done');
   const loaded = reopened.loadSnapshot(module);
   assert.equal(loaded.wasmSha256, wasmSha256Of(module));
-  assert.equal(loaded.formatVersion, 1);
+  assert.equal(loaded.formatVersion, SNAPSHOT_FORMAT_VERSION);
   const ws2 = await Workspace.restore(PROJECT, loaded.snapshot, { wasm: module });
   const outcome = await ws2.eval('durable.n + 1 + "/" + tag');
   assert.equal(outcome.kind, 'value');
@@ -173,7 +174,7 @@ test('hash-mismatch refusal PRECEDES payload interpretation: a foreign-binary pa
   const header = Buffer.from(
     JSON.stringify({
       format: 'repl-snapshot',
-      formatVersion: 1,
+      formatVersion: SNAPSHOT_FORMAT_VERSION,
       wasmSha256: foreignHash,
       createdAtMs: Date.now(),
     }) + '\n',
@@ -202,14 +203,14 @@ test('version-bump refusal through the store: an upgraded format version refuses
   const nl = raw.indexOf(0x0a);
   const header = JSON.parse(raw.subarray(0, nl).toString('utf8'));
   writeFileSync(store.snapshotPath, Buffer.concat([
-    Buffer.from(JSON.stringify({ ...header, formatVersion: 2 }) + '\n'),
+    Buffer.from(JSON.stringify({ ...header, formatVersion: SNAPSHOT_FORMAT_VERSION + 1 }) + '\n'),
     raw.subarray(nl + 1),
   ]));
   const error = captureThrows(() => store.loadSnapshot(module));
   assert.ok(error instanceof SnapshotEnvelopeError, error.message);
   assert.equal((error as SnapshotEnvelopeError).code, 'VERSION_MISMATCH');
-  assert.ok(error.message.includes('2'), error.message);
-  assert.ok(error.message.includes('1'), error.message);
+  assert.ok(error.message.includes(String(SNAPSHOT_FORMAT_VERSION + 1)), error.message);
+  assert.ok(error.message.includes(String(SNAPSHOT_FORMAT_VERSION)), error.message);
   assert.ok(error.message.includes(store.snapshotPath), error.message);
   teardown(dir);
 });
@@ -364,7 +365,7 @@ test('THE REVIEW REGRESSION: a failed flush RETAINS the dirty boundary — the n
   teardown(dir);
 });
 
-test('reset tears the repl/ directory down (the reset tool\'s engine-side)', async () => {
+test('reset tears the repl/ directory down (the reset() guest function\'s engine-side) — §6.1 [C]13: a renamed-aside refused snapshot is NEVER deleted', async () => {
   const { dir, module, store } = await setup();
   const ws = await Workspace.create(PROJECT, { wasm: module });
   store.writeSnapshot(ws.snapshot(), module);
@@ -381,15 +382,24 @@ test('reset tears the repl/ directory down (the reset tool\'s engine-side)', asy
     droppedAtMs: null,
   });
   assert.equal(store.hasSnapshot(), true);
+  // A refused snapshot that auto-reset renamed aside survives the wipe
+  // (the §6.1 data-safety guarantee — auto-reset is never silent data
+  // destruction, and neither is a later reset()).
+  const refusedAside = `${store.snapshotPath}.refused-1720000000000`;
+  writeFileSync(refusedAside, 'refused bytes');
   store.reset();
   assert.equal(store.hasSnapshot(), false, 'the snapshot is gone');
   assert.equal(store.stats().snapshotWrites, 0, 'the counters reset');
-  const { existsSync } = await import('node:fs');
-  assert.equal(existsSync(store.replDir), false, 'the whole repl/ directory is gone');
+  assert.equal(existsSync(store.replDir), true, 'the repl/ directory itself stays');
+  assert.deepEqual(
+    [...readdirSync(store.replDir)],
+    ['snapshot.bin.refused-1720000000000'],
+    'every store file was dropped — EXCEPT the renamed-aside refused snapshot',
+  );
   // The store is usable again from scratch.
   store.writeSnapshot(ws.snapshot(), module);
   assert.equal(store.hasSnapshot(), true);
-  assert.equal(store.callStore().lookup('c1'), undefined, 'the call log was dropped with the directory');
+  assert.equal(store.callStore().lookup('c1'), undefined, 'the call log was dropped with the directory contents');
   ws.dispose();
   teardown(dir);
 });

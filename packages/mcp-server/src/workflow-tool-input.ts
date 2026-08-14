@@ -86,13 +86,6 @@ export const workflowToolInputShape = {
     .nullable()
     .optional()
     .describe("Per-agent timeout in ms. Omit/null for no hard timeout (the engine owns the timeout)."),
-  tokenBudget: z
-    .number()
-    .int()
-    .positive()
-    .nullable()
-    .optional()
-    .describe("Hard total-token budget for the whole run. Omit/null for no limit."),
   resumeFromRunId: z
     .string()
     .min(1)
@@ -153,7 +146,6 @@ interface WorkflowExecuteToolInputBase {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number | null;
-  tokenBudget?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
@@ -233,7 +225,6 @@ interface RawWorkflowToolInput {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number | null;
-  tokenBudget?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
@@ -256,7 +247,6 @@ function hasExecutionFields(raw: RawWorkflowToolInput): boolean {
     raw.concurrency !== undefined ||
     raw.agentRetries !== undefined ||
     raw.agentTimeoutMs !== undefined ||
-    raw.tokenBudget !== undefined ||
     raw.resumeFromRunId !== undefined ||
     raw.resumePolicy !== undefined ||
     raw.checkpointReplies !== undefined ||
@@ -358,7 +348,6 @@ export function parseWorkflowToolInput(
     concurrency: raw.concurrency,
     agentRetries: raw.agentRetries,
     agentTimeoutMs: raw.agentTimeoutMs,
-    tokenBudget: raw.tokenBudget,
     resumeFromRunId: raw.resumeFromRunId,
     resumePolicy: raw.resumePolicy,
     checkpointReplies: raw.checkpointReplies,

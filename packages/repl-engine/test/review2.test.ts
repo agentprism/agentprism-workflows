@@ -153,6 +153,14 @@ class FakeRunner implements BrokerRunner {
   /** When set, loadSession rejects (the capability gate / lost session). */
   loadError: Error | null = null;
 
+  listBackends(): string[] {
+    return ['claude', 'codex', 'opencode', 'pi'];
+  }
+
+  defaultBackendId(): string {
+    return 'claude';
+  }
+
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
     const session = new FakeSession(opts);
     session.backendId = 'pi';
@@ -223,7 +231,7 @@ test('review 2/1: after the client-presence drain, followUp/steer/cancel on a se
   loaded.completeTurn('follow-up answer');
   await tick();
   await broker.pump();
-  assert.equal(broker.store().lookup('c2')!.completion!.value, 'startedNewTurn', 'the followUp settled with what happened');
+  assert.equal(broker.store().lookup('c2')!.completion!.value, 'follow-up answer', 'the followUp settled with the TURN\'S ANSWER (§4.2)');
   // The lazy re-attach info line surfaces guest-visibly in the next tool
   // result.
   let sawReattachLine = false;
@@ -243,7 +251,7 @@ test('review 2/1: after the client-presence drain, followUp/steer/cancel on a se
   runner.sessions[1].completeTurn('steered answer');
   await tick();
   await broker.pump();
-  assert.equal(broker.store().lookup('c3')!.completion!.value, 'startedNewTurn');
+  assert.equal(broker.store().lookup('c3')!.completion!.value, 'steered answer', 'the re-attached followUp settles with the TURN\'S ANSWER');
   // cancelCall (the interrupt tool's engine path) reports the honest idle
   // no-op for the now-warm re-attached session (no second load — the
   // session entry is live again).
@@ -312,7 +320,7 @@ test('review 2/1c: a settled handle whose session never opened (no recorded back
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.equal(outcome, '"failed"');
+  assert.equal(outcome, 'failed');
   assert.equal(runner.loadedWith.length, 0, 'nothing to load — the session never opened');
   void got;
   await broker.dispose();
@@ -327,13 +335,15 @@ test('review 2/2: the resolved backend id is recorded at session open and pins t
   try {
     const runner = new FakeRunner();
     const { ws, broker } = await setup({ runner, store: JsonlCallStore.open(storePath) });
-    // The guest's reserved "default" sentinel routes to the configured
-    // default backend; the RESOLVED backend id ("pi") is what the store
-    // records.
-    await broker.eval('const p = agent("default", "task"); "started"');
+    // The guest's verbatim spec rides admission validation; the RESOLVED
+    // backend id ("pi" — the fake's own backend) is what the store
+    // records, distinct from the spec's segment (the deleted 'default'
+    // sentinel used to be the only way to route off-segment — a real
+    // registered spec covers the same pin now).
+    await broker.eval('const p = agent("claude/some-model", "task"); "started"');
     await tick();
     const record = broker.store().lookup('c1')!;
-    assert.equal(record.modelSpec, 'default', 'the verbatim spec is persisted');
+    assert.equal(record.modelSpec, 'claude/some-model', 'the verbatim spec is persisted');
     assert.equal(record.backendId, 'pi', 'the resolved backend id is persisted');
     const snapshot = ws.snapshot();
     await broker.dispose();
@@ -425,7 +435,7 @@ test('review 2/3: drainForDisconnect drains in-flight turns to completion (settl
   assert.ok(sink.boundaries.includes('settlement'), sink.boundaries.join(','));
   // Both results settled into the VM (the continuation can read them).
   const got = await broker.eval('await a + "|" + await b');
-  assert.equal(got.result, '"A done|B done"');
+  assert.equal(got.result, 'A done|B done');
   await broker.dispose();
   ws.dispose();
 });
@@ -544,6 +554,7 @@ test('review 2/3c-2: a parked open that outlives the drain bound is STOPPED — 
   assert.equal(boundRecord.completion!.outcome, 'reject');
   assert.equal((boundRecord.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
   assert.equal((boundRecord.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal((boundRecord.completion!.value as { replBackend?: string }).replBackend, 'pi');
   // The parked open lands LATER: the child is closed immediately — it
   // never prompts (nothing runs after the last client disconnected) —
   // and the late reject is a first-wins no-op against the bound's
@@ -603,6 +614,7 @@ test('review 7/3c-3: an openSession that NEVER resolves is settled DURABLY at th
   assert.equal(record.completion!.outcome, 'reject');
   assert.equal((record.completion!.value as { code?: string }).code, 'AGENT_CANCELLED');
   assert.equal((record.completion!.value as { recoverable?: boolean }).recoverable, true);
+  assert.equal((record.completion!.value as { replBackend?: string }).replBackend, 'pi');
   assert.deepEqual(
     broker.pendingCalls().map((e) => e.id),
     [],
@@ -647,8 +659,8 @@ test('review 2/4: the workspace manifest lists top-level bindings with structure
   assert.equal(byName.get('count')!.sizeBytes, 8, 'the size is exposed as its own field');
   assert.equal(byName.get('research')!.token, 'agent handle \u00b7 pending \u00b7 call c1 \u00b7 151B');
   assert.equal(byName.get('research')!.provenance, 'eval 1');
-  assert.equal(manifest.logs.count, 1);
-  assert.equal(manifest.logs.first, 1);
+  assert.equal(manifest.logs.count, 0, 'the $N capture system is deleted — the logs range is always empty');
+  assert.equal(manifest.logs.first, null);
   assert.ok(manifest.inFlight.includes('c1'), manifest.inFlight.join(','));
   // The intent-plane hygiene rule: NO fragment of any bound value at ANY
   // length appears in the manifest.
