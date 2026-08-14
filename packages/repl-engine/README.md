@@ -321,17 +321,15 @@ returns heap-allocated JSValues (`qjs_get_typed_array_buffer`'s backing buffer,
 `qjs_get_proxy_target`'s exception box) is disposed on every path. A `$N` slot rebound to an
 accessor renders an explicit sabotage marker — the getter is never invoked.
 
-### Output caps
+### Output caps — deleted (§7)
 
-`applyOutputCaps` enforces the doc's limits — **256 lines or 10 KB per tool result, whichever
-trips first** — line-granular (a line that would trip either cap is not emitted at all) and
-byte-counted in UTF-8 with `\n` separators (the canonical serialization). The 256-line cap
-counts **physical lines**, not rendered entries: the previewer renders property names verbatim
-(FORMAT.md §5.18), so a name carrying 300 line feeds reaches the tool result as 301 physical
-lines inside ONE rendered line — both caps account for embedded newlines (the byte cap via
-`Buffer.byteLength`, the line cap by splitting on `\n`; review regression, pinned by test).
-Over-cap content remains reachable through the `$N` refs the capped lines carry: the cap
-costs reads, never data.
+The output-cap apparatus (`applyOutputCaps` / `capFinalText`, the 256-line / 10 KB wire
+enforcement) is **deleted** with the eval-plane redesign's §7 budget sweep. The engine applies
+**no caps to guest output** — console lines and completion reprs ship verbatim (the Python
+posture: an agent CAN flood its own context by printing something enormous; accepted and
+documented). The CDP-style previewer is retained *internally* where the engine needs a bounded
+token — manifest tokens, checkpoint-question previews, task previews at the engine seam — as
+metadata formatting, never caller-facing budget machinery.
 
 ## The workspace (phase B)
 
@@ -391,14 +389,17 @@ the doc's broker contract against real ACP sessions through `@automatalabs/acp-a
   consume, with both sides first-wins idempotent — a crash between the store write and the guest
   settlement is healed by the next delivery, exactly once (pinned by the simulated-crash tests,
   including the snapshot/restore + `reconcile()` path).
-- **The eval tool-result shape** (`Broker.eval` → `{ output, outputTruncated, result?, pending,
-  checkpoints, completed }`): output lines (console events rendered through the previewer — one
-  line per logged argument, non-log levels prefixed `warn:`/`error:`/… — capped at 256 lines /
-  10 KB), the previewed completion value when the eval resolved (trap-free, from the live
-  completion handle), the pending call ids when it suspended (no fabricated value), the raised
-  checkpoints (previewed questions), and the call ids this operation settled (checkpoint answers
-  deliberately excluded — an answered id leaves the `checkpoints` list). Eval errors render as
-  plain `Name: message` lines in `output`.
+- **The eval tool-result seam** (`Broker.eval` → `{ output, kind, result?, evalToken?, pending,
+  checkpoints, completed }`): output lines (console events rendered through the previewer — ONE
+  joined line per console call, non-log levels prefixed `warn:`/`error:`/… — never capped), the
+  previewed completion value when the eval resolved (trap-free, from the live completion
+  handle), the pending call ids when it suspended (no fabricated value), the raised
+  checkpoints (previewed questions), the call ids this operation settled (checkpoint answers
+  deliberately excluded — an answered id leaves the `checkpoints` list), and `kind` naming the
+  outcome (`value`/`error`/`pending`) with the continuation `evalToken` the fused-eval pump
+  attributes swept settlements with. The §3.1 wire shape `{ output, result?, running? }` is
+  assembled by the tool phase over this seam. Eval errors render as
+  `Name: message` lines in `output`.
 - **Suspended-eval semantics** (transfer lesson 3): top-level `await` accepted; an eval whose
   completion resolves within its drain reports the previewed value; a suspension returns
   immediately with the pending call ids; the continuation resumes at settlement like a `.then`
@@ -1062,8 +1063,8 @@ lines; idle sessions start new turns with and without the extension; cancel → 
 the call's `AGENT_CANCELLED` rejection, idle cancel → `idle`), the concurrency cap
 (dispatch-time refusal recorded in the store, slot release on settlement), trap-free result
 rendering (accessor completions render `(...)` and never fire; the `Object.prototype.value`
-pollution cannot hijack the result line), and the output caps (preview lines one-per-argument
-with level prefixes; truncation at 256 lines with `outputTruncated`). The consumer fixture
+pollution cannot hijack the result line), and the console rendering (one joined line per
+`console.*` call with level prefixes; no output caps). The consumer fixture
 exercises the whole phase-C public surface (`Broker`, the store classes, the self-contained
 `BrokerRunner`/`BrokerSession` stand-ins, the eval-result types) under the non-DOM
 `skipLibCheck: false` configuration. The previewer suite pins the FORMAT.md rules (primitives incl.

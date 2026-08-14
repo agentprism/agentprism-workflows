@@ -3880,6 +3880,44 @@ this.evalBreakArmed = false;
    *  its outcome and `result` carries the completion's §4.4 repr (the
    *  entry is consumed on read).
    */
+  /**
+   * The §3.1 empty-eval poll seam: claim the OLDEST swept settlement
+   * whose owning eval's held call has ENDED — its continuation token
+   * is in `timedOutTokens`, the tool layer's record of the evals IT
+   * returned as still-running. Settlements of evals whose held calls
+   * are still pumping are NEVER claimable here: the token-keyed wait
+   * read (`renderWaitResult`) owns them, so a concurrent client's
+   * in-flight wait can never lose its eval's attribution. Consumed on
+   * claim — one settlement, one poll — so repeated polls drain the
+   * settled timed-out evals in settlement order (the §3.1 drain:
+   * "any later eval reports what settled in the meantime").
+   */
+  claimSweptEvalSettlement(
+    timedOutTokens: ReadonlySet<string>,
+  ): { token: string; kind: 'value' | 'error'; result?: string } | undefined {
+    for (const [token, settlement] of this.sweptEvalSettlements) {
+      if (timedOutTokens.has(token)) {
+        this.sweptEvalSettlements.delete(token);
+        return { token, ...settlement };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * §6.2: retain a client-presence drain failure observed OUTSIDE the
+   * broker under `workspace().diagnostics.drainError` — the demoted
+   * diagnostics home. The tool layer calls this when its own drain
+   * (`drainForDisconnect` + the snapshot flush) rethrew a failure the
+   * broker's internal drain paths did not classify (a store write
+   * error, for example): the loss notice leads the next eval's output
+   * (never silent), and this record keeps the failure visible where
+   * §4.5 says drain errors live.
+   */
+  retainDrainError(name: string, message: string): void {
+    this.retainedDrainError = { name, message, atMs: now() };
+  }
+
   private renderWaitResult(completed: string[], pending: string[], evalToken?: string): ReplEvalResult {
     const lines: string[] = [];
     for (const event of this.consoleBuffer.splice(0)) {

@@ -153,7 +153,7 @@ export type ParsedReplToolInput =
   | { action: "interrupt"; projectDir?: string; id?: string };
 
 /** Which fields belong to which action (the discriminator's exact-shape
- *  vocabulary). */
+ *  vocabulary — every other key is rejected at the boundary). */
 const replInputFields = ["action", "projectDir", "code", "timeoutMs", "id"] as const;
 type ReplInputField = (typeof replInputFields)[number];
 
@@ -167,19 +167,22 @@ function invalidReplInput(message: string): never {
 }
 
 /** Apply the action discriminator after the MCP SDK has validated the
- *  primitive fields: every action's EXACT field set is enforced here
- *  (missing required fields and extraneous known fields are both
- *  rejected). `requireProjectDir` mirrors the workflow tool's
- *  daemon-mode rule: projectDir is required for both actions there. */
+ *  primitive fields: every action's EXACT field set is enforced here.
+ *  EVERY key outside the action's set is rejected — deleted surface
+ *  like the v1 `refs` parameter (and the wait/status/reset fields)
+ *  fails at the boundary instead of being silently discarded, and
+ *  missing required fields are rejected too. `requireProjectDir`
+ *  mirrors the workflow tool's daemon-mode rule: projectDir is
+ *  required for both actions there. */
 export function parseReplToolInput(
   raw: Record<string, unknown>,
   options: { requireProjectDir: boolean },
 ): ParsedReplToolInput {
   const action = replToolInputShape.action.parse(raw.action);
   const allowed = REPL_ACTION_FIELDS[action];
-  const present = replInputFields.filter((field) => field !== "action" && raw[field] !== undefined);
-  for (const field of present) {
-    if (!allowed.has(field)) {
+  for (const field of Object.keys(raw)) {
+    if (field === "action") continue;
+    if (!allowed.has(field as ReplInputField)) {
       invalidReplInput(`action "${action}" cannot include ${field}`);
     }
   }
@@ -257,6 +260,7 @@ function syncReplStateAfterOp(state: ReplProjectState): boolean {
     state.lossNotices = [];
     state.drained = false;
     state.drainError = null;
+    state.timedOutEvalTokens.clear();
     return true;
   }
   return false;
@@ -270,13 +274,17 @@ const interruptOutcomeShape = z.object({
 
 /** The machine-readable output of the `repl` tool (published as the
  *  tool's `outputSchema`, mirrored by every result's
- *  `structuredContent`): the bible's §3.1 eval shape
- *  `{ output, result?, running? }` — ONE newline-joined string of the
- *  printed stream (console lines, checkpoint lines, error renderings,
- *  and the §6 notices), the completion value's repr when the code
- *  finished, the in-flight call ids when the bound elapsed. The
- *  interrupt variant carries the honest outcome; the error variant a
- *  structured error string. NOTHING else — the v1
+ *  `structuredContent`): the bible's §3.1 eval shape — ONE
+ *  newline-joined string of the printed stream (console lines,
+ *  checkpoint lines, error renderings, and the §6 notices), the
+ *  completion value's repr when the code finished, the in-flight call
+ *  ids when the bound elapsed. `result` and `running` are MUTUALLY
+ *  EXCLUSIVE — an eval result is exactly one of the finished shape
+ *  `{ output, result }`, the still-running shape `{ output, running }`,
+ *  or the bare `{ output }` of an eval whose code threw (the §4.6
+ *  rendering, no completion value). The interrupt variant carries the
+ *  honest outcome; the error variant a structured error string.
+ *  NOTHING else — the v1
  *  pending/completed/checkpoints/outputTruncated/truncated/referenced
  *  fields are deleted with the cap apparatus (§7). */
 export const replToolOutputShape = z
@@ -297,7 +305,10 @@ export const replToolOutputShape = z
     } else if (has("interrupt")) {
       valid = only("interrupt");
     } else {
-      valid = has("output") && only("output", "result", "running");
+      // The eval variant: the output string is required, `result` and
+      // `running` are mutually exclusive (the finished shape vs the
+      // bound-elapsed shape), and nothing else rides along.
+      valid = has("output") && only("output", "result", "running") && !(has("result") && has("running"));
     }
     if (!valid) {
       context.addIssue({ code: "custom", message: "output does not match a repl result variant" });
@@ -307,9 +318,21 @@ export const replToolOutputShape = z
     oneOf: [
       {
         title: "eval",
+        required: ["output", "result"],
+        properties: { output: { type: "string" }, result: { type: "string" } },
+        not: { anyOf: [{ required: ["running"] }, { required: ["interrupt"] }, { required: ["error"] }] },
+      },
+      {
+        title: "eval-still-running",
+        required: ["output", "running"],
+        properties: { output: { type: "string" }, running: { type: "array", items: { type: "string" } } },
+        not: { anyOf: [{ required: ["result"] }, { required: ["interrupt"] }, { required: ["error"] }] },
+      },
+      {
+        title: "eval-error",
         required: ["output"],
         properties: { output: { type: "string" } },
-        not: { anyOf: [{ required: ["interrupt"] }, { required: ["error"] }] },
+        not: { anyOf: [{ required: ["result"] }, { required: ["running"] }, { required: ["interrupt"] }, { required: ["error"] }] },
       },
       {
         title: "interrupt",
@@ -400,7 +423,12 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         "output passes through UNFILTERED — backend harness noise (e.g. codex's \"Warning: Skill descriptions " +
         "were shortened…\") is forwarded verbatim, never curated away. Every result carries the machine-readable " +
         "shape (see the output schema) as structuredContent alongside the human text.",
-      inputSchema: replToolInputShape,
+      // STRICT at the wire too: the MCP SDK strips unknown keys from a
+      // non-strict object schema before the handler runs, so a deleted
+      // surface like `refs` would be silently discarded instead of
+      // rejected. The strict schema makes the wire fail on EVERY key
+      // outside the two actions' exact sets (§3.3 [C]4 / §7).
+      inputSchema: z.object(replToolInputShape).strict(),
       outputSchema: replToolOutputShape,
     },
     async (rawArgs) => {
@@ -468,7 +496,26 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         // Finished in-eval: a value (its repr in `result`) or an error
         // (the §4.6 rendering in `output`). Nothing the code waits on
         // remains — the finished shape ships immediately.
-        return evalResult(outputLines, evalOutcome.result, undefined, takeNotices(state));
+        let result = evalOutcome.result;
+        if (input.code === "") {
+          // The empty eval IS the documented idempotent poll (§3.1
+          // [C]3): its own completion is the guest `undefined` (repr
+          // "undefined") — and a previous eval that timed out may have
+          // settled in the meantime, its completion value swept under
+          // that eval's token. Claim the oldest such settlement: the
+          // poll reports the drained late value instead of its own
+          // empty-script undefined. A claimed `error` settlement's
+          // rendering already drained into `output` — the poll keeps
+          // its own undefined result then.
+          const swept = broker.claimSweptEvalSettlement(state.timedOutEvalTokens);
+          if (swept !== undefined) {
+            state.timedOutEvalTokens.delete(swept.token);
+            if (swept.kind === "value" && swept.result !== undefined) {
+              result = swept.result;
+            }
+          }
+        }
+        return evalResult(outputLines, result, undefined, takeNotices(state));
       }
       // Suspended: hold the call open pumping settlements up to the
       // bound. Each wait targets the calls pending at ITS entry, so a
@@ -519,7 +566,13 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
       }
       // The bound elapsed first: the honest still-running shape. The
       // eval continues server-side; any later eval (including `""`)
-      // drains what settled.
+      // drains what settled. Its continuation token joins the poll
+      // seam: when the eval settles later, a subsequent empty eval
+      // claims the swept settlement under this token and reports the
+      // late completion value as ITS `result` (§3.1 [C]3).
+      if (evalOutcome.evalToken !== undefined) {
+        state.timedOutEvalTokens.add(evalOutcome.evalToken);
+      }
       return evalResult(outputLines, undefined, lastRunning, takeNotices(state));
     },
   );

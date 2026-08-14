@@ -129,7 +129,7 @@ test("(4) no-schema completion returns the final assistant text; onHistory fires
     cwd,
     onHistory: (h) => history.push(h),
   });
-  assert.equal(out, "Hello, world!"); // chunks concatenated, then trimmed
+  assert.equal(out, "Hello, \n\nworld!"); // every chunk joins with \n\n (§5 [C]12), then trimmed
   assert.equal(history.length, 1);
   assert.ok(history[0].length >= 1, "history captured assistant chunks");
 });
@@ -276,9 +276,9 @@ test("(2b) schema result is the FINAL assistant message — a schema-shaped prog
   assert.deepEqual(out, { city: "LA", hot: true });
 });
 
-// ---- (2c) the §5 result fold: assistant MESSAGE chunks join with "\n\n" ---------------
+// ---- (2c) the §5 result fold: assistant message chunks join with "\n\n" ---------------
 
-test("(2c) the §5 result fold joins assistant MESSAGE chunks with \"\\n\\n\" — narration stays apart from the answer, while consecutive chunks of ONE message join with \"\" (mid-sentence fragments never gain separators)", async () => {
+test("(2c) the §5 result fold joins EVERY assistant message chunk with \"\\n\\n\" — narration chunks stay apart from the answer, and consecutive chunks of one message gain the separator too (the bible's literal rule, never the v1 glue)", async () => {
   const { cwd } = configure({
     turns: [
       {
@@ -288,7 +288,10 @@ test("(2c) the §5 result fold joins assistant MESSAGE chunks with \"\\n\\n\" �
           // A tool call ends the narration and starts the answer message.
           { sessionUpdate: "tool_call", toolCallId: "tc-fold-1", title: "search the codebase", kind: "search", status: "in_progress" },
           { sessionUpdate: "tool_call_update", toolCallId: "tc-fold-1", status: "completed" },
-          // The answer message streams in two consecutive chunks — one message, joined with "".
+          // The answer message streams in two consecutive chunks — the
+          // two chunks of one message join with "\n\n" exactly like
+          // separate messages ([C]12: assistant message chunks join
+          // with "\n\n", no segmentation exception).
           { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "TypeScript" } },
           { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " files under src stay untouched." } },
         ],
@@ -299,13 +302,14 @@ test("(2c) the §5 result fold joins assistant MESSAGE chunks with \"\\n\\n\" �
   const out = await makeRunner().run("check", { model: "pi", cwd });
   assert.equal(
     out,
-    "won't modify any files.\n\nTypeScript files under src stay untouched.",
-    "separate messages join with \\n\\n; consecutive chunks of one message join with \"\"",
+    "won't modify any files.\n\nTypeScript\n\n files under src stay untouched.",
+    "every assistant message chunk joins with \\n\\n",
   );
-  // A single multi-chunk message gains NO separators (mid-sentence fragments).
+  // A single multi-chunk message gains the same separators (the fold is
+  // the chunk stream itself — no mid-message exemption).
   const single = configure({ turns: [{ text: ["hello", " world"] }] });
   const singleOut = await makeRunner().run("hi", { model: "pi", cwd: single.cwd });
-  assert.equal(singleOut, "hello world");
+  assert.equal(singleOut, "hello\n\n world");
 });
 
 // ---- (3b) Claude schema channel + structured_output read ----------------------------

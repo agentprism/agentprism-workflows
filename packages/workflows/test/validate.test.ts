@@ -694,7 +694,7 @@ test("script-declared backends: dry run treats them as approved, attributes call
   assert.match(report.warnings.join("\n"), /custom backends \(browser\)/);
 });
 
-test("§7: the budget surface is deleted — a script referencing `budget` fails the dry run with the undefined-global error, and `phase(title, { budget })` is a script error", async () => {
+test("§7: the budget surface is deleted — a script referencing `budget` fails the dry run with the undefined-global error", async () => {
   const script = [
     'export const meta = { name: "v", description: "d" };',
     "const out = [];",
@@ -706,6 +706,17 @@ test("§7: the budget surface is deleted — a script referencing `budget` fails
   const report = await validateWorkflowScript(script);
   assert.equal(report.ok, false);
   assert.match(report.dryRun?.reason ?? "", /budget/);
+});
+
+test("§7: the per-phase budget option is deleted — phase('p', { budget: 0 }) fails the dry run as a script error", async () => {
+  const script = [
+    'export const meta = { name: "v", description: "d" };',
+    'phase("p", { budget: 0 });',
+    "return 1;",
+  ].join("\n");
+  const report = await validateWorkflowScript(script);
+  assert.equal(report.ok, false);
+  assert.match(report.dryRun?.reason ?? "", /phase\(\) takes no options/);
 });
 
 test("phase mismatches and agent-less scripts produce warnings, not failures", async () => {

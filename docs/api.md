@@ -28,7 +28,7 @@ import { runDynamicWorkflow } from "@automatalabs/workflows";
 const run = await runDynamicWorkflow(script, {
   cwd: "/abs/path/to/project",   // every agent session runs here
   args: { target: "src/" },      // exposed as the script's `args` global
-  exec: { tokenBudget: 500_000 },
+  exec: { concurrency: 4 },
 });
 // Never throws for ordinary outcomes — read run.status: "completed" | "paused" | "failed" | "aborted"
 ```
@@ -39,15 +39,15 @@ Options (`RunDynamicWorkflowOptions`): `runner?` (custom `AgentRunner`; defaults
 
 `openWorkflowDir(dir | dirs, { cwd? })` binds a read-only view over folders of versioned workflow scripts. Construction does **no I/O** (nothing created, scanned, or cached); every method reads the filesystem at call time so the view always reflects the current working tree, and missing dirs contribute nothing. The filename stem is the name (`review-pr.workflow.js` / `review-pr.js` ⇒ `review-pr`; across dirs first hit wins, within a dir `.workflow.js` beats `.js`; also `.mjs` variants). Surface: `dirs` (absolute, precedence order), `list()` (`[{ name, file, meta?, error? }]`, meta parsed per call, sorted), `read(name)` (script text; throws with searched dirs + closest matches), and `resolve(name)` — `(name) => string | undefined`, deliberately the exact `loadSavedWorkflow` contract, with strict name-shape validation (one flat path segment) so inline nested scripts fall through and path traversal is impossible. Exported by both `@automatalabs/workflow-engine` and the facade.
 
-**Script validation (token-free):** `validateWorkflowScript(script, opts?)` runs a static parse (meta literal, syntax, and direct nondeterministic call expressions) plus a dry run over an in-process mock `AgentRunner`, then opens one no-prompt session for every distinct routed `{ backend, model }` pair. An authored model is selected verbatim before the echoed, model-specific config options are read; a call without a model reads its harness/session default. The probe spends no tokens. `dryRun.harnessOptions` reports each routed catalog with optional `model` attribution on every run, even when the script authors no `configOptions`; the human formatter prints the same tables. Authored exact ids and values are checked for unknown ids, invalid select values, non-boolean boolean values, and the reserved `"model"` id. A select option may add `_meta["@automatalabs/agentprism"].recognizedValues`: supported values pass unchanged, recognized unsupported values pass with an ordered clamp warning, and unrecognized values fail. Pi derives this domain from its SDK and advertises a per-model `thinkingLevel` subset. Ordered built-ins without that metadata (Claude and Codex) derive it client-side by enumerating the advertised model picker through the existing per-model probe cache and merging consistent per-model orders. Claude's absent `effort` option means unsupported, while `default` is recognized but excluded from ordered ceiling comparisons. `ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT` is 32; a larger picker or inconsistent orders warn and fall back to exact advertised-value validation. OpenCode and custom/unknown backends are exact-set and reject unadvertised thought-level values without clamping. A routed probe spawn/auth/model-selection/session failure adds one warning, sets that pair to `probed:false`, and skips its checks without invalidating the report. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` warns because a truly unattended run would abort. Script-declared backends are treated as approved (with a warning). Invalid scripts resolve to a report; read `report.ok` / `report.exitCode` (`0` valid, `1` parse failure, `2` dry-run or config-option failure). `ValidateWorkflowOptions` is `{ args?, workflows?, dryRun?, cwd?, tokenBudget?, maxAgents?, timeoutMs?, mockAnswers? }`; `workflows` accepts a `WorkflowDir` or dir path(s), the mock reports `MOCK_TOKENS_PER_AGENT` = 1000 per call, and timeout defaults to 30 000 ms.
+**Script validation (token-free):** `validateWorkflowScript(script, opts?)` runs a static parse (meta literal, syntax, and direct nondeterministic call expressions) plus a dry run over an in-process mock `AgentRunner`, then opens one no-prompt session for every distinct routed `{ backend, model }` pair. An authored model is selected verbatim before the echoed, model-specific config options are read; a call without a model reads its harness/session default. The probe spends no tokens. `dryRun.harnessOptions` reports each routed catalog with optional `model` attribution on every run, even when the script authors no `configOptions`; the human formatter prints the same tables. Authored exact ids and values are checked for unknown ids, invalid select values, non-boolean boolean values, and the reserved `"model"` id. A select option may add `_meta["@automatalabs/agentprism"].recognizedValues`: supported values pass unchanged, recognized unsupported values pass with an ordered clamp warning, and unrecognized values fail. Pi derives this domain from its SDK and advertises a per-model `thinkingLevel` subset. Ordered built-ins without that metadata (Claude and Codex) derive it client-side by enumerating the advertised model picker through the existing per-model probe cache and merging consistent per-model orders. Claude's absent `effort` option means unsupported, while `default` is recognized but excluded from ordered ceiling comparisons. `ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT` is 32; a larger picker or inconsistent orders warn and fall back to exact advertised-value validation. OpenCode and custom/unknown backends are exact-set and reject unadvertised thought-level values without clamping. A routed probe spawn/auth/model-selection/session failure adds one warning, sets that pair to `probed:false`, and skips its checks without invalidating the report. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` warns because a truly unattended run would abort. Script-declared backends are treated as approved (with a warning). Invalid scripts resolve to a report; read `report.ok` / `report.exitCode` (`0` valid, `1` parse failure, `2` dry-run or config-option failure). `ValidateWorkflowOptions` is `{ args?, workflows?, dryRun?, cwd?, maxAgents?, timeoutMs?, mockAnswers? }`; `workflows` accepts a `WorkflowDir` or dir path(s), the mock reports `MOCK_TOKENS_PER_AGENT` = 1000 per call, and timeout defaults to 30 000 ms.
 
 `MockAnswers` is a read-only record from label glob to JSON answer or `{ $sequence: readonly MockAnswerJson[] }`. Matching uses the final resolved label, is case-sensitive and whole-label, and supports `*`, `?`, and backslash escaping. Normalization captures property order once and the last matching rule wins. Raw canonical array-index keys `"0"` through `"4294967294"` are reserved because ECMAScript reorders them; spell an exact numeric-label rule with an escape, such as JSON key `"\\10"` for label `10`. `"01"` and `"4294967295"` are not reserved. A raw array is one answer, while `$sequence` is finite and consumes only when its rule wins.
 
 For schema calls the validator creates a fresh fabricated base per invocation and recursively deep-merges JSON objects; arrays, `null`, falsy primitives, and other scalars replace. It then runs TypeBox `Check` without `Convert`. Any answer-caused error is non-recoverable `SCHEMA_NONCOMPLIANCE`; identical failures inherited from untouched fabricator limitations are accepted with grouped, value-free warnings. Schema-less scripted answers must be nonblank strings. Sequence exhaustion fails rather than repeating or falling back. `ValidatedAgentCall.mockAnswer` records the winning glob and zero-based sequence position; `dryRun.mockAnswers` reports captured-order rule match/consumption counters and item-level `no-match`, `shadowed`, or `not-reached` unused entries. Human positions are one-based. Unused entries only warn.
 
-Inputs are limited to 256 KiB raw CLI UTF-8 and canonical programmatic JSON, 256 rules, 256 UTF-16 code units per glob, 256 sequence items, and answer depth 32; only ordinary JSON data is accepted. Supplying invalid programmatic `mockAnswers` throws `TypeError` before parsing. Mock-enabled validation serializes agent service at concurrency one for deterministic FIFO sequence use, so it is not a load simulator and soft token-budget admission can differ from an unscripted dry run. Attribution, warnings, and validation errors never echo answers, but workflow code receives the fixture normally and may expose it in `log()` or the returned result; fixtures must not contain credentials or production data.
+Inputs are limited to 256 KiB raw CLI UTF-8 and canonical programmatic JSON, 256 rules, 256 UTF-16 code units per glob, 256 sequence items, and answer depth 32; only ordinary JSON data is accepted. Supplying invalid programmatic `mockAnswers` throws `TypeError` before parsing. Mock-enabled validation serializes agent service at concurrency one for deterministic FIFO sequence use, so it is not a load simulator. Attribution, warnings, and validation errors never echo answers, but workflow code receives the fixture normally and may expose it in `log()` or the returned result; fixtures must not contain credentials or production data.
 
-The CLI adds mutually exclusive `--mock-answers <json>` and `--mock-answers-file <path>` to the existing `npx @automatalabs/workflows validate <file-or-name> [--args <json> | --args-file <path>] [--workflows-dir <dir>]… [--parse-only] [--cwd <dir>] [--token-budget <n>] [--max-agents <n>] [--timeout-ms <n>] [--json]` surface (`3` = usage error). With `--workflows-dir` the positional may be a workflow name and nested `workflow("<name>")` calls resolve. The package exports `MockAnswerJson`, `MockAnswerSequence`, `MockAnswerRule`, `MockAnswers`, `ValidatedMockAnswerUse`, `ValidatedMockAnswerRule`, `UnusedMockAnswer`, and `ValidatedMockAnswers`, along with the existing validation types and `fabricateFromSchema()` / `formatValidateReport()` helpers.
+The CLI adds mutually exclusive `--mock-answers <json>` and `--mock-answers-file <path>` to the existing `npx @automatalabs/workflows validate <file-or-name> [--args <json> | --args-file <path>] [--workflows-dir <dir>]… [--parse-only] [--cwd <dir>] [--max-agents <n>] [--timeout-ms <n>] [--json]` surface (`3` = usage error). With `--workflows-dir` the positional may be a workflow name and nested `workflow("<name>")` calls resolve. The package exports `MockAnswerJson`, `MockAnswerSequence`, `MockAnswerRule`, `MockAnswers`, `ValidatedMockAnswerUse`, `ValidatedMockAnswerRule`, `UnusedMockAnswer`, and `ValidatedMockAnswers`, along with the existing validation types and `fabricateFromSchema()` / `formatValidateReport()` helpers.
 
 **Harness config discovery (token-free):** `probeHarnessConfig({ harnesses?, backends?, cwd?, timeoutMs? })` runs validate's no-prompt config probe standalone — no script — and resolves to a `HarnessConfigReport` (`{ ok, exitCode, harnessOptions }`, per-harness entries in the same `ValidateHarnessOptions` shape). Default targets are the built-in harnesses plus every registered custom backend; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner`. A per-harness spawn/auth/session failure or timeout (default 60 000 ms) reports `probed:false` without throwing; only a malformed registry or invalid options throw. `formatHarnessConfigReport(report)` renders the CLI's human table. CLI: `npx @automatalabs/workflows config [harness ...] [--cwd <dir>] [--timeout-ms <n>] [--json]` — exit `0` all probed, `1` at least one probe failed, `3` usage error.
 
@@ -106,7 +106,6 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `signal` / `externalSignal` | Host `AbortSignal` that aborts this run (aliases). |
 | `journaling` | Per-run journaling override. |
 | `environmentKey` | Host-supplied non-git environment label used for replay provenance diagnostics. It never gates journal replay; git workspaces report measured HEAD + dirty digest instead. |
-| `tokenBudget` | Hard cap; once spent, `agent()` throws `TOKEN_BUDGET_EXHAUSTED`. |
 | `maxAgents` | Cap on total agent calls for the run. |
 | `agentTimeoutMs` | Host total-wall-clock ceiling for each agent attempt (`null` = no host ceiling). |
 | `concurrency`, `agentRetries` | Per-run overrides of the manager defaults. |
@@ -126,7 +125,7 @@ An exhausted timeout settles the call to `null` with recoverable `AGENT_TIMEOUT`
 concurrency slot. The runner cancels the ACP turn; after a five-second grace, an uncooperative turn
 is closed where supported and its pooled child is quarantined and recycled after sibling sessions
 drain. A new resume execution does not inherit operational limits from its source; pass the desired
-timeout, retry, concurrency, agent-count, and token-budget values again.
+timeout, retry, concurrency, and agent-count values again.
 
 ### `CheckpointOptions` — in-script human gates
 
@@ -410,9 +409,10 @@ the other side of a nested workflow can still replay. This remains true when a w
 a live host checkpoint callback runs. The engine never uses ambient/world effects as an implicit
 dependency graph.
 
-Identity replays add the preserved source logical debit once to script-visible
-`budget.spent()`/`remaining()` and phase/run gates, but current `tokenUsage`, provider cost, and the
-current physical `WorkflowCallRecord.budgetDebit` remain zero. Replayed agent sessions open no new
+Identity replays preserve the source logical debit on the record, but current `tokenUsage`,
+provider cost, and the current physical `WorkflowCallRecord.budgetDebit` remain zero (the script-visible
+budget surface — the `budget` global and per-phase sub-budgets — was deleted with the §7 budget
+removal; the persisted debit fields stay for record-shape stability). Replayed agent sessions open no new
 session: their record keeps source session/backend/cwd/reopen fields and rebinds only the current
 call index, label, and phase. Completed checkpoint decisions use the same identity rules plus an
 equal fingerprint of `default`, `headless`, and `timeoutMs`, regardless of host/headless origin.
@@ -1324,7 +1324,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `providerUsageLimitContext` and a synthesized `resetHint` when a reset instant is available. |
 | `AUTH_REQUIRED` | no | Agent demanded auth (`-32000`) → the run **pauses** (`reason: "auth_required"`, journaled, resumable), carries the non-secret `authContext`; `resume()` re-arms via `runner.auth.canResume`. |
 | `CHECKPOINT_REQUIRED` | no | `checkpoint(..., { headless: "pause" })` has no live channel → the run **pauses** with non-secret `checkpointContext`; resume with `checkpointReplies` or a live `confirm`. |
-| `TOKEN_BUDGET_EXHAUSTED` / `AGENT_LIMIT_EXCEEDED` | no | Run caps hit. |
+| `AGENT_LIMIT_EXCEEDED` | no | Run caps hit. (`TOKEN_BUDGET_EXHAUSTED` is deleted with the token budget — the §7 budget removal.) |
 | `AGENT_EXECUTION_ERROR` | yes | Other agent-level failure (refusal/truncation are non-recoverable variants). |
 | `PERSISTENCE_ERROR`, `UNKNOWN` | no | Storage / unexpected host-level failure. |
 
@@ -1348,7 +1348,6 @@ interface WorkflowExecuteToolInput {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number | null;
-  tokenBudget?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
@@ -1487,73 +1486,22 @@ The server also registers a second model-facing tool, **`repl`** — a persisten
 
 ```ts
 type ReplToolInput =
-  | { action: "eval"; projectDir?: string; code: string; refs?: string[] }
-  | { action: "wait"; projectDir?: string; ids?: string[]; timeoutMs?: number; refs?: string[] } // timeoutMs default 30_000, max 120_000
-  | { action: "status"; projectDir?: string; refs?: string[] }
-  | { action: "interrupt"; projectDir?: string; id?: string }
-  | { action: "reset"; projectDir?: string };
+  | { action: "eval"; projectDir?: string; code: string; timeoutMs?: number } // timeoutMs default 60_000, hard cap 120_000
+  | { action: "interrupt"; projectDir?: string; id?: string };
 ```
 
-`projectDir` is required on the shared daemon for every action **except `status`**, and defaults to the server's own project on `--in-process`. A discriminator rejects a missing required field or an irrelevant known one (`reset` with `code`, `status` with `ids`) as Invalid Params (`-32602`). Every result carries both `structuredContent` and bounded text. The union below is the shape the tool **emits** at runtime (its Zod refinement admits exactly these per-variant fields); the published `outputSchema` JSON Schema is a looser projection — it permits `referenced` on every branch (not only eval/wait/status) and types `reset`'s `dropped` as `boolean` rather than the literal `true`, though no runtime path emits either of those looser shapes:
+`projectDir` is required on the shared daemon for **both** actions, and defaults to the server's own project on `--in-process`. The input schema is **strict**: a missing required field and **every key outside the action's exact set** — the deleted v1 `wait`/`status`/`reset` actions, `ids`, `refs`, … included — are rejected as Invalid Params (`-32602`), never silently discarded. Every result carries `structuredContent` (the exact same shape as the published `outputSchema`) alongside the human text. `eval` holds the call open pumping settlements up to the soft bound: the **finished** shape `{ output, result }` when everything the code waits on settles within the bound, the **still-running** shape `{ output, running: [call ids] }` when the bound elapses (the eval continues server-side; any later eval — including `""`, the documented idempotent poll — drains what settled, and a poll picks a drained timed-out eval's completion repr up as its own `result`), or the **thrown** shape `{ output }` (the §4.6 error rendering, no completion value). `output` is ONE newline-joined string — console lines, raised checkpoint lines, error renderings, and the one-line durability notices — with **no caps anywhere** (the v1 `pending`/`completed`/`checkpoints`/`outputTruncated`/`truncated`/`referenced` fields and the whole cap/ref apparatus are deleted with the §7 budget sweep):
 
 ```ts
 type ReplToolOutput =
-  | { action: "eval"; projectDir: string; output: string[]; outputTruncated: boolean;
-      result?: string; pending: string[]; checkpoints: CheckpointSummary[]; completed: string[];
-      truncated?: TruncatedRecord; referenced?: Record<string, unknown[]> }
-  | { action: "wait"; projectDir: string; output: string[]; outputTruncated: boolean;
-      result?: string; pending: string[]; checkpoints: CheckpointSummary[]; completed: string[];
-      truncated?: TruncatedRecord; referenced?: Record<string, unknown[]>;
-      drained: boolean; timedOut: boolean } // timedOut === !drained; wait itself never sets `result`
-  | { action: "status"; projectDir?: string; workspaces: WorkspaceStatus[];
-      truncated?: TruncatedRecord; referenced?: Record<string, unknown[]> }
-  | { action: "interrupt"; projectDir: string;
-      interrupt: { outcome: "targeted" | "refused-idle" | "cancelled" | "idle" | "failed" | "none"; callId?: string } }
-  | { action: "reset"; projectDir: string; dropped: true } // runtime always dropped: true; published schema types it boolean
-  | { action: "eval" | "wait" | "status" | "interrupt" | "reset"; projectDir?: string; error: string }; // isError: true
-
-interface CheckpointSummary { id: string; question: string } // question previewed (double-quoted, head+tail past 200 chars)
-
-interface WorkspaceStatus {
-  projectDir: string;
-  state: "not-opened" | "fresh" | "restored" | "refused";
-  restoreError?: string;                 // refused only
-  reconcile?: ReconcileReport;           // restored only
-  bindings: ManifestBinding[];
-  logs: { first: number | null; last: number | null; count: number }; // the $N range
-  evalSeq: number;
-  inFlight: string[];
-  checkpoints: CheckpointSummary[];
-  liveAgents: LiveAgent[];
-  pending: string[];
-  childrenClosed: boolean;
-  drainError?: string;
-}
-interface ReconcileReport {
-  settledFromStore: string[]; reattached: string[]; reissued: string[];
-  failedLost: string[]; requeuedCheckpoints: string[]; leftPending: string[]; reQueuedUndelivered: string[];
-}
-interface ManifestBinding {              // metadata, never value content
-  name: string; token: string; type: string; sizeBytes: number;
-  handleCallId: string | null; handleStatus: "pending" | "settled" | null;
-  provenance: string | null;             // "eval N", "worker c2", "session restore"
-  provenanceAtMs: number | null;
-  task: string | null;                   // the founding call's task, ≤ 200 chars head+tail
-}
-interface LiveAgent {
-  callId: string;
-  modelSpec: string;                     // ≤ 200 chars head+tail
-  task: string;                          // ≤ 200 chars head+tail
-  state: "opening" | "running" | "delivering" | "idle"; supportsSteering: boolean; queuedSteers: number;
-}
-// truncated: field-path → elided count, or { elided, ref } when a continuation ref was captured;
-// reserved key `strings` is a plain count from the string backstop.
-type TruncatedRecord = Record<string, number | { elided: number; ref: string }>;
+  | { output: string; result: string }                                  // eval finished (a guest undefined renders "undefined")
+  | { output: string; running: string[] }                               // eval still running (the in-flight c1, c2, … ids)
+  | { output: string }                                                  // eval threw / was broken mid-run
+  | { interrupt: { outcome: "targeted" | "refused-idle" | "cancelled" | "idle" | "failed" | "none"; callId?: string } }
+  | { error: string };                                                  // isError: true — a missing project context
 ```
 
-`result` is the previewed completion value, present **when the eval resolves to a value** — a guest `undefined` (a declaration or a bare `console.log(...)`) renders as the string `"undefined"`, so it is a real value, not a missing field. `result` is absent when the eval **suspends** (on a subagent call, a `checkpoint()`, or any other unsettled promise — the eval returns immediately with the pending ids and no `result`) **or when it throws, rejects, hits a syntax error, or is interrupted** (the error renders in `output` as a plain `Name: message` line — the error's own `name` and `message`, e.g. `TypeError: x is not a function` — **not** an `error:`-prefixed line, which is reserved for a late uncaught rejection bridged through `console.error`). (A `wait` never sets `result` — it has no completion value of its own.) The error variant carries the optional `projectDir` (omitted when the call omitted it) and is flagged `isError: true`; a **refused snapshot** returns the error variant on `eval`/`wait`/`interrupt`, while a **named `status`** reports the same refusal through its status variant (`state: "refused"`, `restoreError`) rather than `isError`, and `reset` clears the store rather than refusing. A **missing project context** (single-project mode with no adopted default) returns the error variant only on the four stateful actions `eval`/`wait`/`interrupt`/`reset`. `status` never takes the error path: a project-less `status` lists every known workspace (an empty array when none exist), and a **named** `status` is a first touch that *creates*/restores the workspace, so it can never find one missing. The published schema's error branch still enumerates all five `action` values, but no runtime path emits it with `action: "status"`.
-
-Subagent `agent()` calls and `checkpoint()` draw from **one shared per-workspace id sequence** — `c1`, `c2`, … — so a `checkpoint()` after a single `agent()` call is `c2`, answered by `checkpoint.answer("c2", value)` in a later eval (checkpoint answers are excluded from `completed`). The two output surfaces are capped **independently**: the **text** at 256 physical lines *or* 10,000 UTF-8 bytes (whichever trips first), and **`structuredContent`** at a 10,000-byte serialized-JSON bound *only* (no line cap). Elided console values stay reachable through their `$N` refs; elided structured arrays are recorded in `truncated` and — when a ref was captured — read back through the `refs` parameter (returned under `referenced`). That read-back is **itself subject to the same 10,000-byte cap**, so a retrieved tail that is still oversized is re-elided and yields a **fresh** continuation ref; a large tail drains across **chained reads** rather than in one call. Continuation refs are **workspace-namespaced**, held **in memory**: `reset` clears them and a daemon restart loses them (the caller re-reads current state). Subagents are [`acp-agents`](#acpagentrunner-createacprunner) sessions, 6 concurrent per workspace; the workspace snapshots to the per-project store at every state-changing boundary and restores **lazily on first touch** with a three-way call reconcile (settle / re-attach / re-issue). `repl` shares the `workflow` tool's project model and daemon lifetime.
+`interrupt` keeps v1's semantics: with `id` it cancels that subagent call (the guest promise rejects recoverable, `AGENT_CANCELLED` family); without `id` it breaks the running eval, honestly `refused-idle` when nothing is running. Introspection went in-band as guest functions returning ordinary values: `workspace()` (`{ bindings, inFlight, checkpoints, diagnostics }` — `diagnostics` carries the §6.2 demotions: the last reconcile summary, a retained drain error, `childrenClosed`), `agents()` (the live-agent entries), and `reset()` (teardown after the current eval). A stored snapshot that **refuses** (corrupt, format bump, wasm-hash mismatch) now **auto-resets**: the refused file is renamed aside (`.refused-<ts>`, never deleted) and the next eval's output leads with a one-line notice; a restore that **lost calls** or a drain failure that **lost state** gets the same one-line-notice treatment (losses are never silent). Printing follows the §4.4 repr rules (direct strings whole; depth 2; 20 entries per level; nested strings 200 chars head+tail) with no byte ceilings — the Python posture. Subagent `agent()` calls and `checkpoint()` draw from **one shared per-workspace id sequence** — `c1`, `c2`, … — answered by `checkpoint.answer("c2", value)` in a later eval; raised checkpoints surface as output lines. Subagents are [`acp-agents`](#acpagentrunner-createacprunner) sessions, 6 concurrent per workspace (dispatches above the cap queue); the workspace snapshots to the per-project store at every state-changing boundary and restores **lazily on first touch** with a three-way call reconcile (settle / re-attach / re-issue). `repl` shares the `workflow` tool's project model and daemon lifetime.
 
 ## `@automatalabs/repl-engine`
 
@@ -1562,7 +1510,7 @@ The engine tier the `repl` tool registers over (unreleased at `0.0.0`; imported 
 - **`Workspace`** / **`WorkspaceRegistry`** (`WorkspaceOptions`, `WorkspaceRegistryOptions`, `WorkspaceManifest`, `WorkspaceBinding`) — one VM per workspace, owning the lifecycle (`create` → `eval` → `drainJobs` → `dispose`) and the manifest surface. `ReplVm` (`loadShippedWasm`, `ReplVmOptions`, `ReplEvalOptions`, `ReplDrainOptions`, `ReplEvalOutcome`, `DrainJobError`) is the raw quickjs-wasi shim tier.
 - **`Broker`** (`DEFAULT_MAX_CONCURRENT_AGENTS`, `DEFAULT_EVAL_TIMEOUT_MS`, `DEFAULT_DISPOSE_BOUND_MS`, `BrokerOptions`, `BrokerRunner`, `ReplEvalResult`, `CheckpointSummary`, `LiveAgentInfo`, `ReconcileReport`, `WorkspaceManifestReport`, …) — drives subagents as ACP sessions, records results by call id, and reconciles on restore. The call store is `InMemoryCallStore` / `JsonlCallStore` (`CallStore`, `CallRecord`, `CallOutcome`, …).
 - **Snapshots and durability** — `serializeSnapshot` / `deserializeSnapshot` / `wasmSha256Of`, `SNAPSHOT_FORMAT` / `SNAPSHOT_FORMAT_VERSION`, `SnapshotEnvelopeError` / `SnapshotRestoreError`, and the per-project `ReplWorkspaceStore` (`REPL_STORE_SUBDIR`, `SNAPSHOT_FILENAME`, `CALL_STORE_FILENAME`).
-- **The previewer and caps** — `renderPreviewLine` / `renderCollapsed` / `renderGlobalLine` / `manifestBinding` / `formatByteSize` and the CDP preview types (`ObjectPreview`, `PropertyPreview`, …); `applyOutputCaps` / `capFinalText` with `OUTPUT_MAX_LINES` (256) and `OUTPUT_MAX_BYTES` (10 000).
+- **The previewer** — `renderPreviewLine` / `renderCollapsed` / `renderGlobalLine` / `manifestBinding` / `formatByteSize` and the CDP preview types (`ObjectPreview`, `PropertyPreview`, …). The output-cap apparatus (`applyOutputCaps` / `capFinalText`, `OUTPUT_MAX_LINES` / `OUTPUT_MAX_BYTES`) is deleted with the §7 budget sweep — the engine applies no caps to guest output; the previewer stays for internal metadata bounds (manifest tokens, checkpoint/task previews).
 - **The guest bridge and provenance** — `installGuestBridge`, `GUEST_LIBRARY_VERSION`, the `HOST_*` callback names; `provenanceRecord` / `provenanceView` (`eval N` / `worker cN` / `session restore` labels).
 - **The out-of-band eval-break channel** — `createEvalBreakChannel` / `EvalBreakChannel` (the worker-thread relay the MCP shim fires to break a synchronous runaway).
 
@@ -1570,13 +1518,13 @@ The full engine contract (guest library, host-call surface, FORMAT.md preview ru
 
 ### The `repl` adapter exports from `@automatalabs/mcp-server`
 
-`@automatalabs/mcp-server` re-exports the REPL adapter surface for hosts mounting the tool themselves: `replToolInputShape` / `replToolOutputShape` (the Zod input/output schemas), `capStructuredResult` (the 10 KB structured cap), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). `createWorkflowServer` registers both `workflow` and `repl`; `CreateWorkflowServerOptions` exposes `replRunner` / `replPresence` / `replClientId` / `replEvalBreakChannel` / `replDrainBoundMs`. Breaking a *fully synchronous* runaway requires the relay stdio transport `main()` installs; a vanilla `StdioServerTransport` bounds it only by the per-eval deadline (`AGENTPRISM_REPL_EVAL_TIMEOUT_MS`, default 30 000 ms).
+`@automatalabs/mcp-server` re-exports the REPL adapter surface for hosts mounting the tool themselves: `replToolInputShape` / `replToolOutputShape` (the Zod input/output schemas), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). `createWorkflowServer` registers both `workflow` and `repl`; `CreateWorkflowServerOptions` exposes `replRunner` / `replPresence` / `replClientId` / `replEvalBreakChannel` / `replDrainBoundMs`. Breaking a *fully synchronous* runaway requires the relay stdio transport `main()` installs; a vanilla `StdioServerTransport` bounds it only by the per-eval deadline (`AGENTPRISM_REPL_EVAL_TIMEOUT_MS`, default 30 000 ms).
 
 ## Workflow script DSL
 
 Scripts run in a deterministic `vm` realm (`Date.now`/`Math.random`/argless `new Date()` throw — the journal/resume identity depends on it; the realm is a determinism boundary, **not** a security boundary). Realm globals:
 
-`agent(prompt, { label?, schema?, model?, mode?, configOptions?, tier?, phase?, isolation?, resume?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title, { budget? })` · `log(msg)` · `budget.{total,spent(),remaining()}` · `args` · `cwd`.
+`agent(prompt, { label?, schema?, model?, mode?, configOptions?, tier?, phase?, isolation?, resume?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title)` · `log(msg)` · `args` · `cwd`. (`budget` and the per-phase budget option are deleted with the §7 budget removal; `phase(title, { budget })` is a script error.)
 
 `gate()` validators may return `{ ok: boolean, feedback?: string, ... }`, a bare boolean, or
 `null`. A fulfilled gate returns exactly `{ ok, value, verdict, attempts }`: `value` is the final

@@ -45,7 +45,7 @@ import {
 } from "@automatalabs/repl-engine";
 import { workflowProjectPaths } from "@automatalabs/workflows";
 
-import { createWorkflowServer } from "../src/index.js";
+import { createWorkflowServer, replToolOutputShape } from "../src/index.js";
 import { okRunner, textOf, type Connected } from "./_harness.js";
 
 /** The fake held-open ACP session (the broker's structural seam). */
@@ -261,6 +261,21 @@ test("an empty eval resolves with result \"undefined\" — the documented poll i
   }
 });
 
+test("the output shape models finished and still-running EXACTLY: result and running are mutually exclusive — { output, result } finished, { output, running } bound-elapsed, { output } a thrown eval, and the v1 fields are gone", () => {
+  const finished = replToolOutputShape.safeParse({ output: "printed", result: "42" });
+  assert.equal(finished.success, true, JSON.stringify(finished));
+  const running = replToolOutputShape.safeParse({ output: "printed", running: ["c1"] });
+  assert.equal(running.success, true, JSON.stringify(running));
+  const thrown = replToolOutputShape.safeParse({ output: "Error: boom\n  at <repl>:1" });
+  assert.equal(thrown.success, true, "a thrown eval ships { output } alone");
+  const both = replToolOutputShape.safeParse({ output: "", result: "x", running: ["c1"] });
+  assert.equal(both.success, false, "result and running together are never a valid eval result");
+  const resultOnlyNoOutput = replToolOutputShape.safeParse({ result: "x" });
+  assert.equal(resultOnlyNoOutput.success, false, "the output string is required on every eval variant");
+  const runningWithInterrupt = replToolOutputShape.safeParse({ output: "", running: ["c1"], interrupt: { outcome: "idle" } });
+  assert.equal(runningWithInterrupt.success, false, "an eval variant never carries the interrupt outcome");
+});
+
 test("the soft-bound eval: everything the code waits on settles within the bound → the FINISHED shape in ONE call (the v1 eval→wait→eval loop fused)", async () => {
   const PROJECT = freshProject();
   const runner = new FakeRunner();
@@ -323,6 +338,44 @@ test("the soft-bound eval: the bound elapses first → the STILL-RUNNING shape {
     assert.equal(structuredOf(picked).result, "slow answer");
     // `_` holds the late completion too.
     assert.equal(structuredOf(await repl(connected, { action: "eval", projectDir: PROJECT, code: "_" })).result, "slow answer");
+  } finally {
+    await connected.dispose();
+  }
+});
+
+test("the empty-eval poll picks up the LATE COMPLETION VALUE of an eval that exceeded its soft bound — result carries the drained repr, never the poll's own undefined", async () => {
+  const PROJECT = freshProject();
+  const runner = new FakeRunner();
+  const connected = await connectWithRepl(runner);
+  try {
+    const held = repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: 'const p = agent("pi/x", "slow task"); const v = await p; console.log("late:", v); "late-value-" + v',
+      timeoutMs: 300,
+    });
+    await tick();
+    const r = await held;
+    assert.ok(!isErrorResult(r), textOf(r));
+    const sc = structuredOf(r);
+    assert.deepEqual(Object.keys(sc).sort(), ["output", "running"], "the held call returned the still-running shape");
+    assert.deepEqual(sc.running, ["c1"]);
+    // The turn settles AFTER the bound elapsed — the held call is gone
+    // and its token-keyed settlement has no reader. The empty eval
+    // drains the settled continuation AND picks the timed-out eval's
+    // completion value up as ITS result (§3.1 [C]3).
+    runner.last().completeTurn("slow answer");
+    await tick();
+    const poll = await repl(connected, { action: "eval", projectDir: PROJECT, code: "" });
+    assert.ok(!isErrorResult(poll), textOf(poll));
+    const pollSc = structuredOf(poll);
+    assert.equal(pollSc.output, "late: slow answer", "the poll drained the late console output");
+    assert.equal(pollSc.result, "late-value-slow answer", "the poll picked up the timed-out eval's completion repr");
+    // Idempotent: the settlement was claimed once — the next empty eval
+    // drains nothing new and reports its own undefined.
+    const again = await repl(connected, { action: "eval", projectDir: PROJECT, code: "" });
+    assert.equal(structuredOf(again).output, "", "the second poll drains nothing new");
+    assert.equal(structuredOf(again).result, "undefined", "no late settlement left — the poll's own undefined");
   } finally {
     await connected.dispose();
   }
@@ -714,6 +767,33 @@ test("the input is action-discriminated: eval requires code; interrupt rejects c
     const evalWithId = await repl(connected, { action: "eval", projectDir: PROJECT, code: "1 + 1", id: "c1" });
     assert.ok(isErrorResult(evalWithId), textOf(evalWithId));
     assert.ok(textOf(evalWithId).includes('cannot include id'), textOf(evalWithId));
+    // EVERY key outside the action's exact set is rejected at the wire
+    // (the strict input schema) and at the discriminator — the deleted
+    // v1 `refs` parameter and any unknown field fail instead of being
+    // silently discarded (§3.3 [C]4 / §7).
+    const evalWithRefs = await repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: "",
+      refs: ["r1"],
+    } as unknown as { action: string; projectDir: string; code: string });
+    assert.ok(isErrorResult(evalWithRefs), textOf(evalWithRefs));
+    assert.ok(textOf(evalWithRefs).includes("refs"), `the deleted refs parameter is rejected: ${textOf(evalWithRefs)}`);
+    const evalWithMystery = await repl(connected, {
+      action: "eval",
+      projectDir: PROJECT,
+      code: "",
+      mysteryField: 1,
+    } as unknown as { action: string; projectDir: string; code: string });
+    assert.ok(isErrorResult(evalWithMystery), textOf(evalWithMystery));
+    assert.ok(textOf(evalWithMystery).includes("mysteryField"), `unknown keys are rejected: ${textOf(evalWithMystery)}`);
+    const interruptWithRefs = await repl(connected, {
+      action: "interrupt",
+      projectDir: PROJECT,
+      refs: ["r1"],
+    } as unknown as { action: string; projectDir: string });
+    assert.ok(isErrorResult(interruptWithRefs), textOf(interruptWithRefs));
+    assert.ok(textOf(interruptWithRefs).includes("refs"), `the interrupt branch rejects refs too: ${textOf(interruptWithRefs)}`);
     // The deleted v1 actions refuse at the schema (the wire enum).
     for (const dead of ["wait", "status", "reset"]) {
       const r = await repl(connected, { action: dead, projectDir: PROJECT });

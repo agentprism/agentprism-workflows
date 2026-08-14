@@ -542,6 +542,18 @@ test("review6: a failed client-presence drain gets the §6.2 [C]14 one-line noti
       `the drain failure is surfaced as the one-line notice: ${String(sc.output)}`,
     );
     assert.ok(String(sc.output).includes("not persisted"), `the notice names the lost state: ${String(sc.output)}`);
+    // §6.2: the retained drain error lives under
+    // workspace().diagnostics.drainError — the demoted diagnostics home
+    // (the broker's own internal drain failures are retained there, and
+    // the tool layer pushes ITS observation of the rethrown flush
+    // failure into the same record).
+    const diag = (await evalJson(connected, PROJECT, "workspace().diagnostics")) as {
+      drainError: { message: string } | null;
+    };
+    assert.ok(
+      diag.drainError !== null && diag.drainError.message.includes("EISDIR"),
+      `the failed drain is retained in workspace().diagnostics: ${JSON.stringify(diag.drainError)}`,
+    );
     // The notice is consumed exactly once: a further eval is clean.
     const clean = await repl(connected, { action: "eval", projectDir: PROJECT, code: '"clean"' });
     assert.equal(structuredOf(clean).output, "", "the notice was rendered once");

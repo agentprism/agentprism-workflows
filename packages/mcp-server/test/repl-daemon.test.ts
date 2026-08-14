@@ -318,12 +318,21 @@ test("the repl tool registers alongside workflow with the redesign's two-action 
       for (const dead of ["pending", "completed", "checkpoints", "outputTruncated", "truncated", "referenced", "drained", "timedOut", "workspaces", "dropped", "action"]) {
         assert.ok(!(dead in (wireOutput.properties ?? {})), `deleted output field ${dead}`);
       }
-      assert.equal(wireOutput.oneOf?.length, 3, "the three output variants are published");
-      const evalBranch = wireOutput.oneOf?.find((b) => b.title === "eval");
-      assert.ok(
-        evalBranch?.required?.includes("output") && evalBranch.required.length === 1,
-        "the eval branch requires exactly the output string",
+      assert.equal(wireOutput.oneOf?.length, 5, "the five output variants are published (finished / still-running / thrown eval, interrupt, error)");
+      const evalFinished = wireOutput.oneOf?.find((b) => b.title === "eval");
+      assert.deepEqual(
+        evalFinished?.required?.sort(),
+        ["output", "result"],
+        "the finished eval branch requires exactly output + result",
       );
+      const evalRunning = wireOutput.oneOf?.find((b) => b.title === "eval-still-running");
+      assert.deepEqual(
+        evalRunning?.required?.sort(),
+        ["output", "running"],
+        "the still-running eval branch requires exactly output + running",
+      );
+      const evalError = wireOutput.oneOf?.find((b) => b.title === "eval-error");
+      assert.deepEqual(evalError?.required, ["output"], "the thrown-eval branch requires the output string alone");
     } finally {
       await session.dispose();
     }

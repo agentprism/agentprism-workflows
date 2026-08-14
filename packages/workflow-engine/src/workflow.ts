@@ -675,7 +675,18 @@ export async function runWorkflow<T = unknown>(
     );
   }
 
-  const phase = (title: string) => {
+  const phase = (title: string, ...deletedOptions: unknown[]) => {
+    if (deletedOptions.length > 0) {
+      // §7: the per-phase budget option is deleted — phase takes NO
+      // options. An unknown second argument (the budget surface's
+      // `{ budget }` included) is a script error naming the deleted
+      // surface, exactly like an unknown agent option key.
+      throw new WorkflowError(
+        "phase() takes no options — the per-phase budget option was deleted with the budget surface (§7); call phase(title) with only the title",
+        WorkflowErrorCode.SCRIPT_ERROR,
+        { recoverable: false },
+      );
+    }
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
     options.onPhase?.(title, callbackContext);

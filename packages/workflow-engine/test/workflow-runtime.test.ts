@@ -912,7 +912,7 @@ return { cwd: process.cwd() }`;
   assert.ok(result.result.cwd.length > 0, "result.cwd should not be empty");
 });
 
-test("§7: the budget surface is deleted — `budget` is undefined in the script realm and phase() takes no budget option", async () => {
+test("§7: the budget surface is deleted — `budget` is undefined in the script realm and phase(title, { budget }) is a script error", async () => {
   const script = `export const meta = { name: 'no_budget', description: 'the deleted budget surface' }
 const seen = typeof budget
 phase('noisy')
@@ -925,6 +925,21 @@ return { seen }`;
   });
 
   assert.equal(result.result.seen, "undefined", "the budget global is deleted from the script realm");
+
+  // The per-phase budget option is deleted too: phase takes NO options
+  // anymore, so a second argument is a SCRIPT_ERROR naming the deleted
+  // surface (not a silently ignored options bag).
+  const budgetPhase = `export const meta = { name: 'no_phase_budget', description: 'the deleted per-phase budget' }
+phase('p', { budget: 0 })
+return 1`;
+  await assert.rejects(
+    runWorkflow(budgetPhase, { agent: fakeAgent({ total: 10 }), persistLogs: false }),
+    (error: unknown) =>
+      error instanceof WorkflowError &&
+      error.code === WorkflowErrorCode.SCRIPT_ERROR &&
+      /phase\(\) takes no options/.test(error.message),
+    "phase(title, { budget }) fails the script with the deleted-option error",
+  );
 });
 
 test("runWorkflow returns empty logs array when nothing logged", async () => {

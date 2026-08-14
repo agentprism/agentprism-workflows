@@ -165,6 +165,14 @@ export interface ReplProjectState {
    *  that lost state. Each surfaces ONCE, in the next eval's output
    *  (losses are never silent); consumed on render. */
   lossNotices: string[];
+  /** The §3.1 empty-eval poll seam: the continuation tokens of evals
+   *  THIS tool returned as still-running (their held calls ended with
+   *  the bound elapsed, so no wait will ever read their token-keyed
+   *  settlement). The engine's `claimSweptEvalSettlement` reads an
+   *  entry only when its token is in this set — a concurrent client's
+   *  still-pumping wait can never lose its attribution — and the
+   *  claimed token leaves the set (its settlement was reported). */
+  timedOutEvalTokens: Set<string>;
 }
 
 /** Open (and create, on first touch) the project's repl state. */
@@ -186,6 +194,7 @@ export function createReplProjectState(
     drainError: null,
     autoResetNotice: null,
     lossNotices: [],
+    timedOutEvalTokens: new Set(),
   };
 }
 
@@ -425,6 +434,12 @@ export async function drainReplProject(state: ReplProjectState, boundMs: number)
       name: error instanceof Error ? error.name : 'Error',
       message: error instanceof Error ? error.message : String(error),
     };
+    // §6.2: the retained drain error lives under
+    // workspace().diagnostics.drainError (the demoted diagnostics
+    // home) — the broker's own drain paths retain their internal
+    // failures there, and the tool layer pushes ITS observation of a
+    // rethrown failure into the same record.
+    state.broker?.retainDrainError(state.drainError.name, state.drainError.message);
     // §6.2 [C]14: the failed drain LOST STATE (the workspace was not
     // persisted — the store's dirty boundary is retained for retry) and
     // losses are never silent: a one-line notice leads the next eval's

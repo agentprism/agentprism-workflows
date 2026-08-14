@@ -211,9 +211,9 @@ export class InteractiveSession {
     return this.session.finalMessageText();
   }
 
-  /** The latest turn's assistant text with the §5 chunk joiner (separate
-   *  assistant MESSAGES join with "\n\n") — the no-schema result fold.
-   *  Additive passthrough to `SessionHandle`. */
+  /** The latest turn's assistant text with the §5 chunk joiner (every
+   *  assistant message chunk joins with "\n\n") — the no-schema
+   *  result fold. Additive passthrough to `SessionHandle`. */
   foldedTurnText(): string {
     return this.session.foldedTurnText();
   }
