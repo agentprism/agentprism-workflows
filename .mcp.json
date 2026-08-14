@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "agentprism-workflows": {
-      "command": "npx",
-      "args": ["-y", "@automatalabs/workflows", "mcp"]
-    }
-  }
-}
