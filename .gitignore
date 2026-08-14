@@ -9,3 +9,7 @@ nanobanana-output/
 # committed — generation is automatic so it can't go stale. (The sibling authoring-prompt-content.ts
 # IS committed; it has a different provenance and a drift test.)
 packages/mcp-server/src/generated/run-monitor-html.ts
+
+# Local-only files (never commit)
+CLAUDE.local.md
+.mcp.json
