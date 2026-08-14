@@ -400,9 +400,10 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         "A persistent QuickJS-in-WASM JavaScript VM you drive interactively to orchestrate subagents — one VM per " +
         "projectDir, addressed by the same project model as the workflow tool. Two actions: eval runs code and " +
         "holds the call open pumping settlements; interrupt cancels one subagent call (by id) or breaks the " +
-        "running eval (no id). Every binding, pending subagent call, raised checkpoint, and logged value PERSISTS " +
-        "in the VM between calls — a later eval sees the same variables and awaits the same promises; nothing " +
-        "lives in the transcript. " +
+        "running eval (no id). Named bindings, pending subagent calls, raised checkpoints, and `_` (the previous " +
+        "eval's completion value) PERSIST in the VM between calls — a later eval sees the same variables and awaits " +
+        "the same promises. Console logging produces output text only and creates no persistent value; nothing lives " +
+        "in the transcript. " +
         // The guest API.
         "Inside code (JavaScript; top-level await is allowed, top-level return is a syntax error; console output " +
         "is captured) the host bridge provides agent(modelSpec, task, opts?) → Promise: spawn an ACP subagent on " +
