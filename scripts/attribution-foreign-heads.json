@@ -60,6 +60,11 @@
       "sha": "c4a9311f60a638e3a4b03a475afff1d7678e594f",
       "imported": "2026-08-14",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (feat: add versioned context compaction metadata (#396))"
+    },
+    {
+      "sha": "47b57da5641a04df9aeeedc254a3aef53a9497da",
+      "imported": "2026-08-17",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (v1.3.0 + v1.4.0 — AIR typed-session-failure reshape #393, native provider-state restore after overrides #400, changed-files AIR extension #403, provider switch for loaded Codex sessions #404)"
     }
   ]
 }
