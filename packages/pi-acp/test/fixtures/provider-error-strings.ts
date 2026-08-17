@@ -1,4 +1,12 @@
-export const FIXTURE_PI_PIN = "0.84.1";
+export const FIXTURE_PI_PIN = "0.84.2";
+// 2026-08-17 bump 0.84.1 -> 0.84.2: a no-breaking-changes patch (fullscreen transcript search,
+// configurable default tools, a native Mistral Chat Completions transport, plus TUI /
+// provider-stream and JSON/RPC usage-streaming fixes) that touches no classified surface. E1
+// re-verified against the installed pi v0.84.2 dists: auth-guidance.js still emits `No API key
+// found for ${providerDisplay}.` over `getProviderLoginHelp()`, and agent-session.js still carries
+// the "Authentication failed for" / "Run '/login" / "to re-authenticate" prose the classifier keys
+// on; pi-ai's retry/overflow/error-body/provider-retry util dists are unchanged, so the
+// provider-error fixtures below classify byte-identically. Only the pin moves.
 // 2026-08-07 bump 0.84.0 -> 0.84.1: a no-breaking-changes patch (additive Qwen provider,
 // `pi auth check`, fullscreen mouse/scroll, extension tool_call `terminate`, plus TUI/Bun/LaTeX
 // fixes) that touches no classified surface. E1 re-verified against the installed pi v0.84.1
