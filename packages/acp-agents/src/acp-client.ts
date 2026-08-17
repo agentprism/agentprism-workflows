@@ -367,10 +367,11 @@ class SessionState {
   providerErrorMetadata: ProviderErrorMetadata | undefined;
   modes: SessionModeState | null | undefined;
   /** The latched typed session failure (codex-acp's negotiated extension — see typed-failures.ts):
-   *  the newest failure record the server has published for THIS session over the asynchronous
-   *  `session_info_update` channel, or undefined when it never published one. Kept in the
-   *  server's own vocabulary (including the `cleared` phase) rather than collapsed to a boolean,
-   *  because the revision/identity rules are what make a duplicated or reordered frame harmless. */
+   *  the newest ERROR record the server has published for THIS session over the asynchronous
+   *  `session_info_update` channel, or undefined when it never published one. Advisory `warning`
+   *  records never enter it. Kept in the server's own vocabulary rather than collapsed to a
+   *  boolean, because the revision/identity rules are what make a duplicated or reordered frame
+   *  harmless. */
   private typedSessionFailure: TypedSessionFailure | undefined;
   /** The latch as it stood when the current turn began. The server keeps the same snapshot for the
    *  same reason (`recoverableSessionFailure` in its prompt path): it is what distinguishes a
@@ -612,8 +613,8 @@ class SessionState {
       case "session_info_update": {
         // The ASYNCHRONOUS half of codex-acp's negotiated typed-failure channel: failures the
         // server could not attribute to a running turn (late/idle terminal errors, and errors
-        // buffered before a turn had an identity), plus the `cleared` frame it publishes once a
-        // later turn recovers. Parsed unconditionally like the Claude `_meta` readers above — the
+        // buffered before a turn had an identity), plus advisory `warning` records (retry hints,
+        // deprecation notices). Parsed unconditionally like the Claude `_meta` readers above — the
         // namespace is vendor-unique, so this is inert for every other agent and for every
         // codex-acp that did not accept our advertisement.
         this.applyTypedSessionFailure(update._meta);
@@ -639,10 +640,13 @@ class SessionState {
    * carries none — every other backend's, every older codex-acp's — leaves the latch untouched.
    *
    * SUPERSESSION. A frame for the same `id` at a revision we have already seen is stale and is
-   * dropped, so a duplicate or a reordered delivery can neither re-raise a cleared failure nor
-   * roll one back to an older category. A `cleared` frame that DOES supersede drops the latch
-   * outright rather than latching a cleared record: nothing downstream should ever have to ask
-   * "is the latched failure still in force?".
+   * dropped, so a duplicate or a reordered delivery can neither re-raise a superseded failure nor
+   * roll one back to an older category. Only an `error` record enters the latch: a
+   * `severity: "warning"` frame (a retry hint or deprecation notice) is advisory and must never
+   * fail a turn, so it is read (and returned) but not latched. The server no longer publishes an
+   * explicit "cleared" frame — it retires a failure by simply not re-publishing it, and the
+   * per-turn baseline comparison (`turnTypedSessionFailure`) is what keeps a stale latch off a
+   * later turn.
    *
    * Returns the frame that was READ (whether or not it superseded the latch), so a caller holding
    * an authoritative frame — a turn's own terminal failure, which is authoritative for that turn
@@ -650,8 +654,12 @@ class SessionState {
    */
   applyTypedSessionFailure(meta: unknown): TypedSessionFailure | undefined {
     const failure = readTypedSessionFailure(meta);
-    if (failure && supersedesTypedSessionFailure(this.typedSessionFailure, failure)) {
-      this.typedSessionFailure = failure.phase === "cleared" ? undefined : failure;
+    if (
+      failure &&
+      failure.severity === "error" &&
+      supersedesTypedSessionFailure(this.typedSessionFailure, failure)
+    ) {
+      this.typedSessionFailure = failure;
     }
     return failure;
   }
@@ -2894,10 +2902,11 @@ export class SessionHandle implements StructuredSource {
    * Usage is recorded before this runs, so a walled turn still reports the tokens it burned.
    */
   private terminalTypedSessionFailure(response: PromptResponse): TypedSessionFailure | undefined {
-    // Fold the terminal record into the latch as well: it is the newest state of the same
-    // failure, and a later turn's `cleared` frame is written against its (id, revision).
+    // Fold the terminal record into the latch as well: it is the newest state of the same failure.
     const terminal = this.state.applyTypedSessionFailure(response._meta);
-    if (terminal?.phase === "active") return terminal;
+    // A record on the terminal response is the turn's own authoritative failure — raise it when it
+    // is a real (`error`) failure, exactly as the server only puts one there for a walled turn.
+    if (terminal?.severity === "error") return terminal;
     if (this.state.currentTurnText().trim().length > 0) return undefined;
     return this.state.turnTypedSessionFailure();
   }
