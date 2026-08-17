@@ -104,7 +104,13 @@ export function createBaseTestFixture(config: ConnectionConfig): TestFixture {
 
     const codexAppServerClient = new CodexAppServerClient(config.connection);
     const codexAcpClient = new CodexAcpClient(codexAppServerClient);
-    const codexAcpAgent = new CodexAcpServer(acpConnection, codexAcpClient, undefined, config.getExitCode);
+    const codexAcpAgent = new CodexAcpServer(
+        acpConnection,
+        codexAcpClient,
+        undefined,
+        config.getExitCode,
+        undefined,
+    );
 
     const transportEvents: CodexConnectionEvent[] = [];
     const codexEventHandlers: ((event: CodexConnectionEvent) => void)[] = [];
@@ -269,7 +275,10 @@ export interface CodexMockTestFixtureOptions {
  * Provides `sendServerRequest()` to simulate server-initiated requests (e.g., approval requests).
  * Provides `setPermissionResponse()` to control ACP permission dialog responses.
  */
-export function createCodexMockTestFixture(options?: CodexMockTestFixtureOptions): CodexMockTestFixture {
+export function createCodexMockTestFixture(
+    restartCodexClient?: () => Promise<CodexAcpClient>,
+    options?: CodexMockTestFixtureOptions,
+): CodexMockTestFixture {
     let unhandledNotificationHandler: ((notification: any) => void) | null = null;
     const requestHandlers = new Map<string, (params: unknown) => Promise<unknown>>();
 
@@ -327,6 +336,10 @@ export function createCodexMockTestFixture(options?: CodexMockTestFixtureOptions
             eventHandlers: acpEventHandlers,
         }
     });
+    if (restartCodexClient) {
+        vi.spyOn(baseFixture.getCodexAcpAgent() as any, "restartCodexClient")
+            .mockImplementation(restartCodexClient);
+    }
 
     return {
         ...baseFixture,

@@ -13,52 +13,54 @@
 // classification lives with every other ACP failure mapping in errors-map.ts.
 import { CODEX_AIR_EXTENSION_VERSION, CODEX_AIR_META_KEYS } from "@automatalabs/shared-types";
 
-/** The failure categories codex-acp emits today (`SESSION_FAILURE_PRESENTATION` in its
- *  CodexEventHandler). A newer server could add one: an unrecognized category is carried through
- *  verbatim and classified by `retryable` alone, never dropped. */
+/** The failure categories codex-acp emits today (`SESSION_FAILURE_POLICY` in its
+ *  CodexEventHandler). The vocabulary is coarse — the finer per-error distinctions the server used
+ *  to expose as categories now ride `actions` (see the mapper). A newer server could add a
+ *  category: an unrecognized one is carried through verbatim and classified by its `actions`
+ *  alone, never dropped. */
 export type TypedSessionFailureCategory =
-  | "transport_lost"
-  | "auth_required"
-  | "rate_limited"
-  | "quota_exhausted"
-  | "overloaded"
-  | "context_exhausted"
-  | "budget_exhausted"
-  | "policy_denied"
-  | "bad_request"
-  | "provider_error"
-  | "internal_error";
+  | "connection"
+  | "access"
+  | "limit"
+  | "request"
+  | "service"
+  | "unknown";
 
-/** The recovery actions the server suggests for a failure. Advisory: they ride the mapped
- *  WorkflowError's `details` (and its message) so a host can act, but the seam classification is
- *  driven by `category` + `retryable`. */
-export type TypedSessionFailureAction = "retry" | "reconnect" | "login" | "new_turn" | "new_session";
+/** How loudly the client should render the record. Absent on the wire means `error`, so a build
+ *  that predates warning support keeps treating every record it receives as a failure. `warning`
+ *  records are advisory (retry hints, deprecation notices) and never fail a turn. */
+export type TypedSessionFailureSeverity = "error" | "warning";
+
+/** The recovery actions the server suggests for a failure. Advisory to a host — they ride the
+ *  mapped WorkflowError's `details` (and its message) — but they are ALSO the finest recoverability
+ *  signal the wire still carries now that `retryable` is gone: the mapper reads `retry` (this
+ *  category is worth re-running) and `new_session` (a ceiling that a resume cannot clear). */
+export type TypedSessionFailureAction = "retry" | "login" | "new_session";
 
 /** One typed session failure, exactly as codex-acp puts it on the wire.
  *
  *  IDENTITY + REVISION. `id` is restart-safe: it is derived from the owning turn
  *  (`<turnId>:error`) or, for an unattributed failure, from the session plus the server's process
  *  epoch — so a restarted server never reuses an id. `revision` counts monotonically WITHIN one
- *  `id`; the server bumps it every time it re-records the same failure and once more when it
- *  clears it. A frame for the same `id` at a revision we have already seen is stale and must not
- *  overwrite newer state. */
+ *  `id`; records sharing an id form one logical banner whose revision increases each time the
+ *  server re-records the same failure. A frame for the same `id` at a revision we have already seen
+ *  is stale and must not overwrite newer state. There is no explicit "cleared" record anymore: the
+ *  server retires a failure by simply not re-publishing it, and a later successful turn is what
+ *  proves recovery. */
 export interface TypedSessionFailure {
   readonly id: string;
   readonly revision: number;
-  /** `active` = the session is in this failed state; `cleared` = the server recovered from it
-   *  (a later turn succeeded) and the client must drop the latch. */
-  readonly phase: "active" | "cleared";
   readonly category: TypedSessionFailureCategory | (string & {});
-  /** The failure's origin as the server names it (`codex` today). */
-  readonly source: string;
-  /** Server-sanitized, display-safe text. Raw provider prose, stderr, and stack detail are
+  /** Render loudness. `error` is a real failure; `warning` is advisory and never fails a turn.
+   *  Absent on the wire is normalized to `error` per the server's forward-compatibility rule. */
+  readonly severity: TypedSessionFailureSeverity;
+  /** Server-sanitized, display-safe summary. Raw provider prose, stderr, and stack detail are
    *  deliberately withheld from this channel — never expect them here. */
-  readonly safeMessage: string;
-  /** Whether re-running is meaningful at all. The PRIMARY recoverability signal. */
-  readonly retryable: boolean;
+  readonly title: string;
+  /** Optional supplementary display-safe text (present on advisory notices that split a long
+   *  summary into a title plus details). */
+  readonly details?: string;
   readonly actions: readonly TypedSessionFailureAction[];
-  /** The turn this failure belongs to, when the server could attribute it. */
-  readonly turnId?: string;
 }
 
 /** The `initialize.clientCapabilities._meta` block that turns the extension on. Its shape is
@@ -73,7 +75,7 @@ export const TYPED_SESSION_FAILURE_CLIENT_CAPABILITY: Readonly<Record<string, un
   }),
 });
 
-const KNOWN_ACTIONS: readonly string[] = ["retry", "reconnect", "login", "new_turn", "new_session"];
+const KNOWN_ACTIONS: readonly string[] = ["retry", "login", "new_session"];
 
 /**
  * Read a typed session failure out of any ACP `_meta` (a PromptResponse's or a session update's).
@@ -101,39 +103,37 @@ export function readTypedSessionFailure(meta: unknown): TypedSessionFailure | un
   }
   const failure = record(block[CODEX_AIR_META_KEYS.sessionFailure]);
   if (!failure) return undefined;
-  const { id, revision, phase, category, source, safeMessage, retryable, actions, turnId } = failure;
+  const { id, revision, category, severity, title, details, actions } = failure;
   if (typeof id !== "string" || id.length === 0) return undefined;
   if (typeof revision !== "number" || !Number.isInteger(revision)) return undefined;
-  if (phase !== "active" && phase !== "cleared") return undefined;
   if (typeof category !== "string" || category.length === 0) return undefined;
-  if (typeof source !== "string") return undefined;
-  if (typeof safeMessage !== "string") return undefined;
-  if (typeof retryable !== "boolean") return undefined;
+  if (typeof title !== "string") return undefined;
   if (!Array.isArray(actions)) return undefined;
+  if (details !== undefined && typeof details !== "string") return undefined;
   return Object.freeze({
     id,
     revision,
-    phase,
     category,
-    source,
-    safeMessage,
-    retryable,
+    // `warning` is the only non-error severity; anything else — absent, "error", or a value we do
+    // not recognize — normalizes to "error" so a real failure is never silently downgraded.
+    severity: severity === "warning" ? "warning" : "error",
+    title,
+    ...(typeof details === "string" ? { details } : {}),
     // Unknown actions are dropped rather than surfaced as suggestions this client cannot describe.
     actions: Object.freeze(
       actions.filter((action): action is TypedSessionFailureAction =>
         typeof action === "string" && KNOWN_ACTIONS.includes(action),
       ),
     ),
-    ...(typeof turnId === "string" ? { turnId } : {}),
   });
 }
 
 /**
  * Whether `incoming` is newer than the currently latched `latched` (see the revision/identity notes
  * on TypedSessionFailure). Same id => strictly greater revision wins, so a duplicated or reordered
- * frame can never resurrect a stale state — including a stale `cleared` frame over a newer `active`
- * one. A DIFFERENT id is always newer: the server holds exactly one session failure at a time and
- * only ever mints a fresh id when it replaces the previous record.
+ * frame can never resurrect a stale state or roll a record back to an older category. A DIFFERENT
+ * id is always newer: the server holds exactly one active failure at a time and only ever mints a
+ * fresh id when it replaces the previous record.
  */
 export function supersedesTypedSessionFailure(
   latched: TypedSessionFailure | undefined,

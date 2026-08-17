@@ -49,11 +49,9 @@ function failure(overrides: Partial<TypedSessionFailure> = {}): TypedSessionFail
   return {
     id: "turn-1:error",
     revision: 1,
-    phase: "active",
-    category: "internal_error",
-    source: "codex",
-    safeMessage: "Codex encountered an internal error.",
-    retryable: true,
+    category: "service",
+    severity: "error",
+    title: "Codex encountered an internal error.",
     actions: ["retry"],
     ...overrides,
   } as TypedSessionFailure;
@@ -158,26 +156,36 @@ test("readTypedSessionFailure reads a well-formed payload and drops unknown acti
     meta({
       id: "turn-7:error",
       revision: 3,
-      phase: "active",
-      category: "rate_limited",
-      source: "codex",
-      safeMessage: "The Codex rate limit was reached.",
-      retryable: true,
+      category: "limit",
+      severity: "error",
+      title: "The Codex rate limit was reached.",
       actions: ["retry", "teleport"],
-      turnId: "turn-7",
     }),
   );
   assert.deepEqual(parsed, {
     id: "turn-7:error",
     revision: 3,
-    phase: "active",
-    category: "rate_limited",
-    source: "codex",
-    safeMessage: "The Codex rate limit was reached.",
-    retryable: true,
+    category: "limit",
+    severity: "error",
+    title: "The Codex rate limit was reached.",
     actions: ["retry"],
-    turnId: "turn-7",
   });
+});
+
+test("readTypedSessionFailure defaults an absent severity to error and carries details", () => {
+  // The wire treats an absent `severity` as `error` so a pre-warning build never downgrades a
+  // failure; `details` is the optional supplementary text advisory notices split off from `title`.
+  const noSeverity = readTypedSessionFailure(
+    meta({ id: "n:error", revision: 1, category: "service", title: "Boom", details: "stack-ish", actions: [] }),
+  );
+  assert.equal(noSeverity?.severity, "error");
+  assert.equal(noSeverity?.details, "stack-ish");
+
+  const warning = readTypedSessionFailure(
+    meta({ id: "w:notice", revision: 1, category: "unknown", severity: "warning", title: "Heads up", actions: [] }),
+  );
+  assert.equal(warning?.severity, "warning");
+  assert.equal(warning?.details, undefined);
 });
 
 test("readTypedSessionFailure returns undefined for every _meta that carries no typed failure", () => {
@@ -212,12 +220,12 @@ test("readTypedSessionFailure rejects a malformed failure record rather than hal
     { ...failure(), id: 7 },
     { ...failure(), revision: "3" },
     { ...failure(), revision: 1.5 },
-    { ...failure(), phase: "pending" },
     { ...failure(), category: "" },
-    { ...failure(), source: 1 },
-    { ...failure(), safeMessage: null },
-    { ...failure(), retryable: "yes" },
+    { ...failure(), category: 5 },
+    { ...failure(), title: null },
+    { ...failure(), title: 7 },
     { ...failure(), actions: "retry" },
+    { ...failure(), details: 5 },
   ];
   for (const payload of malformed) {
     assert.equal(readTypedSessionFailure(meta(payload)), undefined, JSON.stringify(payload));
@@ -225,9 +233,9 @@ test("readTypedSessionFailure rejects a malformed failure record rather than hal
 });
 
 test("readTypedSessionFailure carries an unrecognized category through verbatim", () => {
-  const parsed = readTypedSessionFailure(meta(failure({ category: "sandbox_revoked", retryable: false })));
+  const parsed = readTypedSessionFailure(meta(failure({ category: "sandbox_revoked", actions: [] })));
   assert.equal(parsed?.category, "sandbox_revoked");
-  assert.equal(parsed?.retryable, false);
+  assert.deepEqual(parsed?.actions, []);
 });
 
 // ---- supersession --------------------------------------------------------------------
@@ -239,18 +247,13 @@ test("supersession: same id needs a strictly greater revision; a different id al
   assert.equal(supersedesTypedSessionFailure(latched, failure({ id: "a", revision: 2 })), false);
   assert.equal(supersedesTypedSessionFailure(latched, failure({ id: "a", revision: 1 })), false);
   assert.equal(supersedesTypedSessionFailure(latched, failure({ id: "b", revision: 1 })), true);
-  // A stale `cleared` frame cannot retire a newer active record.
-  assert.equal(
-    supersedesTypedSessionFailure(latched, failure({ id: "a", revision: 1, phase: "cleared" })),
-    false,
-  );
 });
 
 // ---- category -> seam error ----------------------------------------------------------
 
-test("auth_required maps to AUTH_REQUIRED with the advertised-method auth context", () => {
+test("access maps to AUTH_REQUIRED with the advertised-method auth context", () => {
   const mapped = mapTypedSessionFailure(
-    failure({ category: "auth_required", retryable: false, actions: ["login"], safeMessage: "Sign in to continue using Codex." }),
+    failure({ category: "access", actions: ["login"], title: "Sign in to continue using Codex." }),
     {
       label: "codex-agent",
       backendId: "codex",
@@ -271,70 +274,74 @@ test("auth_required maps to AUTH_REQUIRED with the advertised-method auth contex
   assert.match(mapped.message, /run authenticate\(\) with one of: api-key, chat-gpt/);
 });
 
-test("quota_exhausted and rate_limited map to a resumable PROVIDER_USAGE_LIMIT", () => {
-  for (const category of ["quota_exhausted", "rate_limited"] as const) {
-    const mapped = mapTypedSessionFailure(failure({ category, retryable: category === "rate_limited" }), {
+test("a rate/quota limit maps to a resumable PROVIDER_USAGE_LIMIT", () => {
+  // rate = ["retry"], quota = []: neither carries `new_session`, so both resume.
+  for (const actions of [["retry"], []] as const) {
+    const mapped = mapTypedSessionFailure(failure({ category: "limit", actions: [...actions] }), {
       backendId: "codex",
       providerErrorMetadata: { resetAt: "2026-07-15T08:00:00.000Z" },
     });
     assert.equal(mapped.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
     // Non-recoverable even for the retryable rate limit: the code's contract is "pause + resume",
     // which beats retrying straight back into the same wall.
-    assert.equal(mapped.recoverable, false, category);
+    assert.equal(mapped.recoverable, false, JSON.stringify(actions));
     assert.equal(mapped.resetHint, "Resets at 2026-07-15T08:00:00.000Z");
     assert.deepEqual(mapped.providerUsageLimitContext, {
       backendId: "codex",
       source: "provider",
-      providerCode: category,
+      providerCode: "limit",
       resetAt: "2026-07-15T08:00:00.000Z",
     });
   }
 });
 
+test("a context/budget limit (flagged new_session) fails fast instead of pausing", () => {
+  const mapped = mapTypedSessionFailure(failure({ category: "limit", actions: ["new_session"] }), { backendId: "codex" });
+  assert.equal(mapped.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+  assert.equal(mapped.recoverable, false, "a ceiling a resume cannot clear must not pause into a loop");
+});
+
 test("PROVIDER_USAGE_LIMIT omits reset metadata the agent never supplied", () => {
-  const mapped = mapTypedSessionFailure(failure({ category: "quota_exhausted" }), { backendId: "codex" });
+  const mapped = mapTypedSessionFailure(failure({ category: "limit", actions: [] }), { backendId: "codex" });
   assert.equal(mapped.resetHint, undefined);
   assert.deepEqual(mapped.providerUsageLimitContext, {
     backendId: "codex",
     source: "provider",
-    providerCode: "quota_exhausted",
+    providerCode: "limit",
   });
 });
 
-test("every remaining category becomes AGENT_EXECUTION_ERROR with recoverable = retryable", () => {
-  const expectations: Array<[string, boolean]> = [
-    ["transport_lost", true],
-    ["overloaded", true],
-    ["provider_error", true],
-    ["internal_error", true],
-    ["context_exhausted", false],
-    ["budget_exhausted", false],
-    ["policy_denied", false],
-    ["bad_request", false],
-    // An unrecognized category from a newer server is classified by `retryable` alone.
-    ["sandbox_revoked", false],
+test("remaining categories become AGENT_EXECUTION_ERROR recoverable only when the server suggests retry", () => {
+  const expectations: Array<[string, string[], boolean]> = [
+    ["connection", ["retry", "new_session"], true],
+    ["service", ["retry"], true],
+    ["service", [], false],
+    ["request", [], false],
+    ["request", ["retry"], false],
+    // An unrecognized category from a newer server is classified by `actions` alone.
+    ["sandbox_revoked", ["retry"], true],
+    ["sandbox_revoked", [], false],
   ];
-  for (const [category, retryable] of expectations) {
-    const mapped = mapTypedSessionFailure(failure({ category, retryable }), { backendId: "codex" });
-    assert.equal(mapped.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR, category);
-    assert.equal(mapped.recoverable, retryable, category);
+  for (const [category, actions, recoverable] of expectations) {
+    const mapped = mapTypedSessionFailure(failure({ category, actions: actions as never }), { backendId: "codex" });
+    assert.equal(mapped.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR, `${category} ${actions.join(",")}`);
+    assert.equal(mapped.recoverable, recoverable, `${category} ${actions.join(",")}`);
   }
 });
 
-test("the mapped message and details carry the sanitized text, category, and suggested actions", () => {
+test("the mapped message and details carry the sanitized title, category, and suggested actions", () => {
   const raised = failure({
-    category: "transport_lost",
-    safeMessage: "Connection to Codex was lost.",
-    retryable: true,
-    actions: ["reconnect", "retry"],
+    category: "connection",
+    title: "Connection to Codex was lost.",
+    actions: ["retry", "new_session"],
   });
   const mapped = mapTypedSessionFailure(raised, { backendId: "codex" });
   assert.equal(
     mapped.message,
-    "Connection to Codex was lost. (codex typed failure: transport_lost; suggested: reconnect, retry)",
+    "Connection to Codex was lost. (codex typed failure: connection; suggested: retry, new_session)",
   );
   assert.deepEqual(mapped.details, raised);
 
-  const actionless = mapTypedSessionFailure(failure({ category: "policy_denied", retryable: false, actions: [] }), {});
-  assert.match(actionless.message, /\(codex typed failure: policy_denied\)$/);
+  const actionless = mapTypedSessionFailure(failure({ category: "request", actions: [] }), {});
+  assert.match(actionless.message, /\(codex typed failure: request\)$/);
 });

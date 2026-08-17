@@ -127,28 +127,28 @@ export function mapThrownError(error: unknown, labelOrContext?: string | ErrorMa
 /**
  * Map a NEGOTIATED codex-acp typed session failure (see typed-failures.ts) onto the same seam
  * contract `mapThrownError` produces for the legacy channel. The typed payload is the PRIMARY
- * signal: `category` selects the code and `retryable` decides recoverability, so nothing here reads
- * provider prose. `actions` are advisory — they ride `details` (machine-readable) and the message
- * suffix (human-readable), never the classification.
+ * signal: `category` (plus `actions`, the finest recoverability signal now that `retryable` is
+ * gone) selects the code and recoverability, so nothing here reads provider prose. `actions` still
+ * ride `details` (machine-readable) and the message suffix (human-readable) as well.
  *
- * The three codes and why:
- *   • auth_required                 -> AUTH_REQUIRED. Byte-equivalent to the legacy path, where the
- *     server raised `RequestError.authRequired` (-32000) for the same condition. The machine
- *     surface (`authContext`) and message shape are built by the same helpers as that path.
- *   • rate_limited | quota_exhausted -> PROVIDER_USAGE_LIMIT. These are the typed forms of exactly
- *     the two conditions CodexBackend.classifyProviderError already walls on (`usageLimitExceeded`
- *     and an HTTP 429 from the app-server). The code's contract is "non-recoverable => the engine
- *     PAUSES and resumes", so `recoverable` is false here regardless of `retryable`: a rate limit
- *     IS retryable, but retrying it immediately walks back into the same wall — pausing is the
- *     stronger, resumable behavior, and it is what the legacy path already did.
+ * The codes and why (categories per the server's `SESSION_FAILURE_POLICY`):
+ *   • access                 -> AUTH_REQUIRED. Auth / sign-in (the former `auth_required`).
+ *     Byte-equivalent to the legacy path, where the server raised `RequestError.authRequired`
+ *     (-32000); the machine surface (`authContext`) and message shape use the same helpers.
+ *   • limit                  -> PROVIDER_USAGE_LIMIT, EXCEPT a context/budget ceiling. `limit`
+ *     collapses rate/quota (the two conditions CodexBackend.classifyProviderError already walls on,
+ *     `usageLimitExceeded` and an HTTP 429) with context/budget exhaustion. The former resume
+ *     ("non-recoverable => the engine PAUSES and resumes", stronger than retrying back into the
+ *     same wall); the latter cannot clear on resume, and the server flags exactly those with a
+ *     `new_session` action, so they fail fast instead of pausing into an unwinnable loop.
  *     `providerCode` carries the typed category; the raw `codexErrorInfo` discriminant the legacy
  *     path reported is deliberately withheld from this sanitized channel.
- *   • everything else                -> AGENT_EXECUTION_ERROR with `recoverable = retryable`. That
- *     splits the categories the legacy path could only stream as prose: transport_lost / overloaded
- *     / provider_error / internal_error retry, while context_exhausted / budget_exhausted /
- *     policy_denied / bad_request fail fast instead of burning the engine's retry budget on a wall
- *     the server has already said is not retryable. An UNRECOGNIZED category from a newer server
- *     lands here too and is classified by `retryable` alone.
+ *   • request                -> AGENT_EXECUTION_ERROR non-recoverable. The request itself was
+ *     rejected (the former policy_denied / bad_request): re-running it changes nothing.
+ *   • connection | service | anything else -> AGENT_EXECUTION_ERROR with
+ *     `recoverable = actions.includes("retry")`. Transport loss and provider/overload/internal
+ *     faults the server still marks `retry` are retried; anything it does not is a hard stop. An
+ *     UNRECOGNIZED category from a newer server lands here too and is classified by `actions` alone.
  */
 export function mapTypedSessionFailure(
   failure: TypedSessionFailure,
@@ -156,9 +156,9 @@ export function mapTypedSessionFailure(
 ): WorkflowError {
   const message = typedFailureMessage(failure);
   switch (failure.category) {
-    case "auth_required":
+    case "access":
       return new WorkflowError(
-        authRequiredMessage(failure.safeMessage, context),
+        authRequiredMessage(failure.title, context),
         WorkflowErrorCode.AUTH_REQUIRED,
         {
           recoverable: false,
@@ -167,15 +167,23 @@ export function mapTypedSessionFailure(
           details: failure,
         },
       );
-    case "rate_limited":
-    case "quota_exhausted": {
+    case "limit": {
+      // A context/budget ceiling (flagged `new_session`) does not clear on resume — fail fast
+      // rather than pause into an unwinnable loop. Rate/quota walls resume.
+      if (failure.actions.includes("new_session")) {
+        return new WorkflowError(message, WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+          recoverable: false,
+          agentLabel: context.label,
+          details: failure,
+        });
+      }
       const resetAt = context.providerErrorMetadata?.resetAt;
       return new WorkflowError(message, WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
         recoverable: false,
         agentLabel: context.label,
         ...(resetAt ? { resetHint: `Resets at ${resetAt}` } : {}),
         providerUsageLimitContext: {
-          backendId: context.backendId ?? failure.source,
+          backendId: context.backendId ?? "codex",
           source: "provider",
           providerCode: failure.category,
           ...(resetAt ? { resetAt } : {}),
@@ -183,22 +191,28 @@ export function mapTypedSessionFailure(
         details: failure,
       });
     }
+    case "request":
+      return new WorkflowError(message, WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+        recoverable: false,
+        agentLabel: context.label,
+        details: failure,
+      });
     default:
       return new WorkflowError(message, WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
-        recoverable: failure.retryable,
+        recoverable: failure.actions.includes("retry"),
         agentLabel: context.label,
         details: failure,
       });
   }
 }
 
-/** `<sanitized server text> (codex typed failure: <category>; suggested: …)`. The category and
- *  actions are appended because the sanitized text alone ("Codex is temporarily overloaded.")
+/** `<sanitized server title> (codex typed failure: <category>; suggested: …)`. The category and
+ *  actions are appended because the sanitized title alone ("Codex is temporarily overloaded.")
  *  carries neither the discriminant a log reader needs nor the recovery the server proposed. */
 function typedFailureMessage(failure: TypedSessionFailure): string {
   const suggested = failure.actions.length > 0 ? `; suggested: ${failure.actions.join(", ")}` : "";
-  const detail = `(${failure.source} typed failure: ${failure.category}${suggested})`;
-  return failure.safeMessage ? `${failure.safeMessage} ${detail}` : detail;
+  const detail = `(codex typed failure: ${failure.category}${suggested})`;
+  return failure.title ? `${failure.title} ${detail}` : detail;
 }
 
 /** The machine-readable AUTH_REQUIRED surface. Sources ONLY agent-advertised AuthMethod fields

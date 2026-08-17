@@ -300,4 +300,5 @@ export type {
   TypedSessionFailure,
   TypedSessionFailureAction,
   TypedSessionFailureCategory,
+  TypedSessionFailureSeverity,
 } from "./typed-failures.js";

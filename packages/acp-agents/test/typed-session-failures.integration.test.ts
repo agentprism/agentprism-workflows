@@ -42,11 +42,9 @@ function failure(overrides: Partial<TypedSessionFailure> = {}): Record<string, u
   return {
     id: "turn-1:error",
     revision: 1,
-    phase: "active",
-    category: "internal_error",
-    source: "codex",
-    safeMessage: "Codex encountered an internal error.",
-    retryable: true,
+    category: "service",
+    severity: "error",
+    title: "Codex encountered an internal error.",
     actions: ["retry"],
     ...overrides,
   };
@@ -97,11 +95,10 @@ test("a terminal typed failure fails the turn instead of resolving it as empty o
   const { cwd } = configure({
     turns: [{
       responseMeta: failureMeta(failure({
-        category: "transport_lost",
-        safeMessage: "Connection to Codex was lost.",
-        retryable: true,
-        actions: ["reconnect", "retry"],
-        turnId: "turn-1",
+        id: "turn-1:error",
+        category: "connection",
+        title: "Connection to Codex was lost.",
+        actions: ["retry", "new_session"],
       })),
     }],
   });
@@ -111,24 +108,23 @@ test("a terminal typed failure fails the turn instead of resolving it as empty o
     (err: unknown) => {
       assert.ok(isWorkflowError(err));
       assert.equal(err.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
-      assert.equal(err.recoverable, true, "retryable: true => the engine may retry");
+      assert.equal(err.recoverable, true, "a retry action => the engine may retry");
       assert.equal(err.agentLabel, "typed-terminal");
       assert.match(err.message, /Connection to Codex was lost\./);
-      assert.match(err.message, /transport_lost; suggested: reconnect, retry/);
-      assert.equal((err.details as TypedSessionFailure).turnId, "turn-1");
+      assert.match(err.message, /connection; suggested: retry, new_session/);
+      assert.equal((err.details as TypedSessionFailure).id, "turn-1:error");
       return true;
     },
   );
 });
 
-test("a terminal auth_required failure becomes AUTH_REQUIRED with the advertised methods", async () => {
+test("a terminal access failure becomes AUTH_REQUIRED with the advertised methods", async () => {
   const { cwd } = configure({
     authMethods: [{ id: "api-key", name: "API Key" }, { id: "chat-gpt", name: "ChatGPT" }],
     turns: [{
       responseMeta: failureMeta(failure({
-        category: "auth_required",
-        safeMessage: "Sign in to continue using Codex.",
-        retryable: false,
+        category: "access",
+        title: "Sign in to continue using Codex.",
         actions: ["login"],
       })),
     }],
@@ -152,14 +148,13 @@ test("a terminal auth_required failure becomes AUTH_REQUIRED with the advertised
   );
 });
 
-test("a terminal quota_exhausted failure becomes the resumable PROVIDER_USAGE_LIMIT", async () => {
+test("a terminal rate/quota limit becomes the resumable PROVIDER_USAGE_LIMIT", async () => {
   const { cwd } = configure({
     turns: [{
       responseMeta: failureMeta(failure({
-        category: "quota_exhausted",
-        safeMessage: "The Codex usage quota is exhausted.",
-        retryable: false,
-        actions: ["new_session"],
+        category: "limit",
+        title: "The Codex usage quota is exhausted.",
+        actions: [],
       })),
     }],
   });
@@ -173,21 +168,20 @@ test("a terminal quota_exhausted failure becomes the resumable PROVIDER_USAGE_LI
       assert.deepEqual(err.providerUsageLimitContext, {
         backendId: "codex",
         source: "provider",
-        providerCode: "quota_exhausted",
+        providerCode: "limit",
       });
       return true;
     },
   );
 });
 
-test("a non-retryable terminal failure fails fast instead of burning the retry budget", async () => {
+test("a context/budget limit (flagged new_session) fails fast instead of burning the retry budget", async () => {
   const { cwd } = configure({
     turns: [{
       responseMeta: failureMeta(failure({
-        category: "context_exhausted",
-        safeMessage: "This conversation has reached its context limit.",
-        retryable: false,
-        actions: ["new_turn"],
+        category: "limit",
+        title: "This conversation has reached its context limit.",
+        actions: ["new_session"],
       })),
     }],
   });
@@ -206,7 +200,7 @@ test("a non-retryable terminal failure fails fast instead of burning the retry b
 test("a terminal failure pre-empts the schema-repair ladder", async () => {
   const { cwd, readLog } = configure({
     turns: [{
-      responseMeta: failureMeta(failure({ category: "overloaded", safeMessage: "Codex is temporarily overloaded." })),
+      responseMeta: failureMeta(failure({ category: "service", title: "Codex is temporarily overloaded.", actions: ["retry"] })),
     }],
   });
 
@@ -222,7 +216,7 @@ test("a terminal failure still reports the tokens the walled turn burned", async
   const { cwd } = configure({
     turns: [{
       usage: { inputTokens: 11, outputTokens: 3, totalTokens: 14 },
-      responseMeta: failureMeta(failure({ category: "internal_error" })),
+      responseMeta: failureMeta(failure({ category: "service" })),
     }],
   });
   const usages: AgentUsage[] = [];
@@ -246,9 +240,8 @@ test("an asynchronous typed failure explains a turn that produced nothing", asyn
     turns: [{
       updates: [failureUpdate(failure({
         id: "fake-session:error:epoch-1",
-        category: "policy_denied",
-        safeMessage: "The request was blocked by provider policy.",
-        retryable: false,
+        category: "request",
+        title: "The request was blocked by provider policy.",
         actions: [],
       }))],
     }],
@@ -262,7 +255,7 @@ test("an asynchronous typed failure explains a turn that produced nothing", asyn
       assert.equal(err.recoverable, false);
       assert.equal(err.agentLabel, "typed-async");
       assert.match(err.message, /The request was blocked by provider policy\./);
-      assert.equal((err.details as TypedSessionFailure).category, "policy_denied");
+      assert.equal((err.details as TypedSessionFailure).category, "request");
       return true;
     },
   );
@@ -271,7 +264,7 @@ test("an asynchronous typed failure explains a turn that produced nothing", asyn
 test("an asynchronous typed failure never retroactively fails a turn that answered", async () => {
   const { cwd } = configure({
     turns: [{
-      updates: [failureUpdate(failure({ id: "fake-session:error:epoch-1", category: "provider_error" }))],
+      updates: [failureUpdate(failure({ id: "fake-session:error:epoch-1", category: "service" }))],
       text: "the answer",
     }],
   });
@@ -281,12 +274,18 @@ test("an asynchronous typed failure never retroactively fails a turn that answer
   assert.equal(await makeRunner().run("hi", { model: "codex", cwd }), "the answer");
 });
 
-test("a cleared phase retires the latch: an empty turn falls back to AGENT_EMPTY_OUTPUT", async () => {
+test("an advisory warning never latches as a failure: an empty turn falls back to AGENT_EMPTY_OUTPUT", async () => {
   const { cwd } = configure({
     turns: [{
       updates: [
-        failureUpdate(failure({ id: "recovered:error", revision: 1, category: "transport_lost" })),
-        failureUpdate(failure({ id: "recovered:error", revision: 2, phase: "cleared", category: "transport_lost" })),
+        failureUpdate(failure({
+          id: "recovered:notice",
+          revision: 1,
+          severity: "warning",
+          category: "unknown",
+          title: "Reconnecting to Codex…",
+          actions: [],
+        })),
       ],
     }],
   });
@@ -295,7 +294,7 @@ test("a cleared phase retires the latch: an empty turn falls back to AGENT_EMPTY
     () => makeRunner().run("hi", { model: "codex", cwd }),
     (err: unknown) => {
       assert.ok(isWorkflowError(err));
-      assert.equal(err.code, WorkflowErrorCode.AGENT_EMPTY_OUTPUT, "a cleared failure must not stay latched");
+      assert.equal(err.code, WorkflowErrorCode.AGENT_EMPTY_OUTPUT, "an advisory warning must not latch as a failure");
       assert.equal(err.recoverable, true);
       return true;
     },
@@ -306,10 +305,9 @@ test("a stale revision cannot roll the latch back to an older record", async () 
   const { cwd } = configure({
     turns: [{
       updates: [
-        failureUpdate(failure({ id: "same:error", revision: 2, category: "quota_exhausted", retryable: false })),
-        // Re-delivery of the superseded record — and a stale `cleared` frame for the same id.
-        failureUpdate(failure({ id: "same:error", revision: 1, category: "internal_error", retryable: true })),
-        failureUpdate(failure({ id: "same:error", revision: 1, phase: "cleared", category: "internal_error" })),
+        failureUpdate(failure({ id: "same:error", revision: 2, category: "limit", title: "Quota exhausted.", actions: [] })),
+        // Re-delivery of the superseded (lower-revision) record must not roll the latch back.
+        failureUpdate(failure({ id: "same:error", revision: 1, category: "service", title: "Transient blip.", actions: ["retry"] })),
       ],
     }],
   });
@@ -328,7 +326,7 @@ test("a stale revision cannot roll the latch back to an older record", async () 
 test("a failure latched by an earlier turn is not attributed to a later empty one", async () => {
   const { cwd } = configure({
     turns: [
-      { updates: [failureUpdate(failure({ id: "earlier:error", category: "provider_error" }))], text: "first" },
+      { updates: [failureUpdate(failure({ id: "earlier:error", category: "service" }))], text: "first" },
       {},
     ],
   });
@@ -385,7 +383,7 @@ test("a session_info_update carrying unrelated metadata leaves the latch alone",
         { sessionUpdate: "session_info_update", title: "A titled session" },
         { sessionUpdate: "session_info_update", _meta: { quota: { plan: "pro" } } },
         // A malformed typed payload must be treated as absent, not half-trusted.
-        { sessionUpdate: "session_info_update", _meta: failureMeta({ ...failure(), phase: "pending" }) },
+        { sessionUpdate: "session_info_update", _meta: failureMeta({ ...failure(), title: null }) },
       ],
     }],
   });
