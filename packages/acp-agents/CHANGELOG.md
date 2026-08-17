@@ -1,5 +1,50 @@
 # @automatalabs/acp-agents
 
+## 0.37.3
+
+### Patch Changes
+
+- dfe3c34: Mechanical ACP dependency maintenance: bump `@agentclientprotocol/claude-agent-acp` 0.67.0 -> 0.69.0
+  (exact) and lift the wrapped `@anthropic-ai/claude-agent-sdk` to 0.3.234 via a root `pnpm.overrides`
+  pin.
+
+  The two adapter minors add only the JetBrains "AIR" extension features — align typed session
+  failures (0.68.0, #992) and report changed files (0.69.0, #1001) — both gated behind an AIR client
+  capability our Claude backend does not advertise (only `CodexBackend` does), so they are inert for
+  the claude backend; no session-config, permission-mode, steering, or stop-reason surface changed.
+  All three adapter releases (0.67–0.69) exact-pin the same `@anthropic-ai/claude-agent-sdk` 0.3.232,
+  which is below npm latest 0.3.234, so the wrapped-runtime freshness leg needs the root override
+  (re-added — it was dropped in 216bc1c when the adapter briefly matched latest; drop it again once the
+  adapter catches up). 0.3.233/0.3.234 are additive (notification hooks, `ApiKeySource` values, an
+  optional `effort` on `SDKSystemMessage`) plus a TS-only removal of the never-emitted
+  `bypass_permissions_disabled` `ExitReason` we do not import; the runtime is wrapped behind the
+  adapter and never imported directly, so no ACP surface the Claude backend integrates against changed.
+
+  Verified: the protocol-coverage dist probes (steering advertisement, `AUTH_META_MATRIX`) still match
+  the installed 0.69.0 dist, and the docs-drift citations moved 0.67.0 -> 0.69.0.
+
+- 2137490: Adapt the codex-acp negotiated typed-session-failures ("AIR") client to the reshaped wire the
+  `codex-acp` upstream sync (`47b57da`, PR #393 "align typed session failures with AIR protocol")
+  brings in. codex-acp collapsed its `jetbrains.air.sessionFailure` record to the coarser AIR
+  vocabulary: the 11 `SessionFailureCategory` values became six (`connection`, `access`, `limit`,
+  `request`, `service`, `unknown`), the actions became `retry` / `login` / `new_session`, and the
+  record dropped `phase` / `source` / `safeMessage` / `retryable` / `turnId` in favor of `severity`
+  (`error` | `warning`, absent ⇒ `error`), `title`, and optional `details`. The extension version is
+  unchanged (`1`), so our advertising CodexBackend still negotiates it and would otherwise silently
+  fail to parse the new record — a walled turn would look like an empty successful one.
+
+  `readTypedSessionFailure` now parses the new shape; `mapTypedSessionFailure` maps `access` →
+  AUTH_REQUIRED, `limit` → the resumable PROVIDER_USAGE_LIMIT unless the server flags a context/budget
+  ceiling with a `new_session` action (then fail-fast, preserving the previous split), `request` →
+  non-recoverable, and everything else → AGENT_EXECUTION_ERROR with `recoverable = actions.includes("retry")`
+  (the stand-in for the removed `retryable`). Advisory `severity: "warning"` records never enter the
+  failure latch. No public seam behavior changed for the conditions the two channels share.
+
+- Updated dependencies [9b3d8aa]
+- Updated dependencies [3ebbfc3]
+  - @automatalabs/codex-acp@1.9.2
+  - @automatalabs/pi-acp@0.4.1
+
 ## 0.37.2
 
 ### Patch Changes
