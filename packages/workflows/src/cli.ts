@@ -23,9 +23,14 @@ import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { resolve } from "node:path";
 import { openWorkflowDir } from "@automatalabs/workflow-engine";
-import { validateWorkflowScript, formatValidateReport } from "./validate.js";
+import { validateWorkflowScript, formatValidateReport, collapseHarnessOptionsForOutput } from "./validate.js";
 import type { ValidateWorkflowOptions } from "./validate.js";
-import { probeHarnessConfig, formatHarnessConfigReport } from "./config.js";
+import {
+  probeHarnessConfig,
+  formatHarnessConfigReport,
+  buildHarnessModelsView,
+  formatHarnessModels,
+} from "./config.js";
 import type { ProbeHarnessConfigOptions } from "./config.js";
 
 const ROOT_USAGE = `Usage: agentprism-workflows <command> …
@@ -96,13 +101,26 @@ registered via the AGENTPRISM_BACKENDS env var. Default: all of them. A harness 
 cannot spawn or authenticate reports \`probed: false\` with the reason and never blocks
 the others.
 
+A harness with a large model catalog (pi, opencode) has its \`model\` choices collapsed
+to a grouped summary in BOTH the default table and \`--json\`, so the full list never
+floods context on either surface. Reach the leaves explicitly with --models:
+
+  config <harness> --models              provider/group breakdown + counts (no leaf ids)
+  config <harness> --models=<filter>     the leaf model ids matching <filter>, where
+                                         <filter> is a provider/substring or /regex/
+
 Options:
   --cwd <dir>         session cwd for the probes (default: the current directory —
                       harnesses may resolve project-level config, and hence their
                       catalog, from it)
   --timeout-ms <n>    per-harness probe bound in milliseconds (default 60000); a
                       timed-out harness reports probed:false
-  --json              print the machine-readable report to stdout
+  --models[=<filter>] list a harness's model catalog: bare = provider/group breakdown;
+                      =<provider|substring|/regex/> = the matching leaf ids. There is no
+                      unfiltered full-leaf dump on any surface
+  --json              print the machine-readable report to stdout (oversized model
+                      catalogs are summarized here too; --models with --json emits the
+                      structured model view)
   -h, --help          show this help
 
 Exit codes: 0 all probed · 1 at least one probe failed · 3 usage error`;
@@ -153,6 +171,8 @@ function parseIntFlag(name: string, raw: string | undefined): number {
 
 async function mainConfig(rest: string[]): Promise<void> {
   let json = false;
+  let modelsMode = false;
+  let modelsFilter: string | undefined;
   const harnesses: string[] = [];
   const options: ProbeHarnessConfigOptions = {};
 
@@ -167,6 +187,9 @@ async function mainConfig(rest: string[]): Promise<void> {
       case "--json":
         json = true;
         break;
+      case "--models":
+        modelsMode = true;
+        break;
       case "--cwd":
         options.cwd = resolve(rest[++i] ?? fail("--cwd expects a directory"));
         break;
@@ -174,6 +197,11 @@ async function mainConfig(rest: string[]): Promise<void> {
         options.timeoutMs = parseIntFlag("--timeout-ms", rest[++i]);
         break;
       default:
+        if (arg.startsWith("--models=")) {
+          modelsMode = true;
+          modelsFilter = arg.slice("--models=".length);
+          break;
+        }
         if (arg.startsWith("-")) fail(`unknown option "${arg}"`);
         harnesses.push(arg);
     }
@@ -188,9 +216,28 @@ async function mainConfig(rest: string[]): Promise<void> {
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }
+
+  if (modelsMode) {
+    let views;
+    try {
+      views = buildHarnessModelsView(report, modelsFilter); // invalid --models regex fails here
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+    }
+    writeFileSync(
+      process.stdout.fd,
+      json ? `${JSON.stringify({ harnessModels: views }, null, 2)}\n` : `${formatHarnessModels(views)}\n`,
+    );
+    process.exitCode = report.exitCode;
+    return;
+  }
+
+  // The complete catalog stays in `report`; collapse oversized selects only for the
+  // serialized (--json) surface so it cannot flood context any more than the human table.
+  const jsonReport = { ...report, harnessOptions: collapseHarnessOptionsForOutput(report.harnessOptions) };
   writeFileSync(
     process.stdout.fd,
-    json ? `${JSON.stringify(report, null, 2)}\n` : `${formatHarnessConfigReport(report)}\n`,
+    json ? `${JSON.stringify(jsonReport, null, 2)}\n` : `${formatHarnessConfigReport(report)}\n`,
   );
   process.exitCode = report.exitCode;
 }
@@ -449,9 +496,21 @@ async function main(argv: string[]): Promise<void> {
     }
     throw error;
   }
+  // Collapse oversized harness catalogs only in the serialized report — the human render
+  // already summarizes them, and the complete catalog stays in `report` for its own checks.
+  const jsonReport =
+    report.dryRun?.harnessOptions === undefined
+      ? report
+      : {
+          ...report,
+          dryRun: {
+            ...report.dryRun,
+            harnessOptions: collapseHarnessOptionsForOutput(report.dryRun.harnessOptions),
+          },
+        };
   writeFileSync(
     process.stdout.fd,
-    json ? `${JSON.stringify(report, null, 2)}\n` : `${formatValidateReport(report)}\n`,
+    json ? `${JSON.stringify(jsonReport, null, 2)}\n` : `${formatValidateReport(report)}\n`,
   );
   process.exitCode = report.exitCode;
 }

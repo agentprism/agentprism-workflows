@@ -95,6 +95,21 @@ Two outputs:
    // ValidateWorkflowReport.dryRun gains: harnessOptions?: ValidateHarnessOptions[]
    ```
 
+   **Oversized-catalog collapse (rendered surfaces only).** A harness with a large model
+   catalog (pi, opencode advertise hundreds) would flood the reader, so at the *print
+   boundary* any select option above `MAX_INLINE_SELECT_CHOICES` (24) leaf choices — in
+   practice the `model` option — is summarized rather than enumerated, on BOTH the human
+   table and the `--json` output. In `--json` the option's `options` array is replaced by
+   `{ truncated: true, choiceSummary: { total, groups: [{ group, count }], expand } }`,
+   grouped by advertised optgroup name or the id's first `/`-segment. This is applied only
+   when serializing/printing (`agentprism-workflows config` and `validate` CLIs); the
+   in-memory `ValidateHarnessOptions.options` and the programmatic `probeHarnessConfig()` /
+   `validateWorkflowScript()` returns stay complete, so `configOptions` checking below still
+   sees every advertised choice. The full leaf list is reachable only via
+   `config <harness> --models[=<filter>]` (breakdown when bare; matching leaf ids when
+   filtered by provider/substring or `/regex/`) — there is no unfiltered full-leaf dump on
+   any surface.
+
 2. **Authored `configOptions` are checked** against the probed catalog for every call whose harness
    probed successfully:
    - unknown option id → **error**;
