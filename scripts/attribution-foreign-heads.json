@@ -65,6 +65,11 @@
       "sha": "47b57da5641a04df9aeeedc254a3aef53a9497da",
       "imported": "2026-08-17",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (v1.3.0 + v1.4.0 — AIR typed-session-failure reshape #393, native provider-state restore after overrides #400, changed-files AIR extension #403, provider switch for loaded Codex sessions #404)"
+    },
+    {
+      "sha": "3d5682722545a4b2d7cfcf8bdabbbfadbdaa37ea",
+      "imported": "2026-08-18",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (release-please chore(main): release 1.5.0 (#409) — version/CHANGELOG bump only, no source change)"
     }
   ]
 }
