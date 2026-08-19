@@ -13,8 +13,13 @@ import {
 } from "@automatalabs/acp-agents";
 import type { CustomBackendConfig } from "@automatalabs/acp-agents";
 import { createValidateProbeRunner } from "./validate-internal.js";
-import { renderHarnessOptionLines } from "./validate.js";
-import type { ValidateHarnessOptions } from "./validate.js";
+import {
+  renderHarnessOptionLines,
+  selectChoicePairs,
+  summarizeSelectChoices,
+} from "./validate.js";
+import type { SelectChoiceGroup, ValidateHarnessOptions } from "./validate.js";
+import type { SessionConfigOption } from "@automatalabs/acp-agents";
 
 export interface ProbeHarnessConfigOptions {
   /** Harness names to probe (built-in `claude` / `codex` / `opencode` / `pi` or a registered
@@ -99,6 +104,107 @@ export function formatHarnessConfigReport(report: HarnessConfigReport): string {
   }
   const probed = report.harnessOptions.filter((harness) => harness.probed).length;
   lines.push(`result: ${probed}/${report.harnessOptions.length} harness(es) probed`);
+  return lines.join("\n");
+}
+
+/** One harness's slice of the `config <harness> --models[=<filter>]` view. Without a
+ *  filter it carries the provider/group breakdown (never the leaf ids); with a filter it
+ *  carries only the matching leaf ids. There is no unfiltered leaf dump on any surface. */
+export interface HarnessModelsView {
+  backendId: string;
+  probed: boolean;
+  /** Present when probed=false. */
+  error?: string;
+  /** False when the harness advertises no `model` select option. */
+  hasModelOption: boolean;
+  /** The filter as given, when one was supplied. */
+  filter?: string;
+  /** Breakdown mode (no filter): total leaf count and per-group counts. */
+  total?: number;
+  groups?: SelectChoiceGroup[];
+  /** Filter mode: the leaf model ids matching the filter. */
+  matches?: string[];
+}
+
+/** The `model` select option a harness advertises, if any. */
+function modelSelectOption(
+  harness: ValidateHarnessOptions,
+): Extract<SessionConfigOption, { type: "select" }> | undefined {
+  return (harness.options ?? []).find(
+    (option): option is Extract<SessionConfigOption, { type: "select" }> =>
+      option.type === "select" && option.id === "model",
+  );
+}
+
+/** Compile a `--models=<filter>` value into a leaf-value matcher. A value wrapped in
+ *  slashes (`/.../`) is a case-insensitive regex; anything else is a case-insensitive
+ *  substring. Throws a TypeError on an invalid regex (surfaced as a CLI usage error). */
+export function buildModelFilter(filter: string): (value: string) => boolean {
+  if (filter.length >= 2 && filter.startsWith("/") && filter.endsWith("/")) {
+    let re: RegExp;
+    try {
+      re = new RegExp(filter.slice(1, -1), "i");
+    } catch (error) {
+      throw new TypeError(`--models: invalid regex ${filter} — ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return (value) => re.test(value);
+  }
+  const needle = filter.toLowerCase();
+  return (value) => value.toLowerCase().includes(needle);
+}
+
+/** Build the per-harness `--models` view. `filter` undefined = breakdown mode. */
+export function buildHarnessModelsView(
+  report: HarnessConfigReport,
+  filter?: string,
+): HarnessModelsView[] {
+  const match = filter === undefined ? undefined : buildModelFilter(filter);
+  return report.harnessOptions.map((harness) => {
+    if (!harness.probed) {
+      return { backendId: harness.backendId, probed: false, error: harness.error, hasModelOption: false };
+    }
+    const model = modelSelectOption(harness);
+    if (!model) {
+      return { backendId: harness.backendId, probed: true, hasModelOption: false };
+    }
+    if (match === undefined) {
+      const { total, groups } = summarizeSelectChoices(model);
+      return { backendId: harness.backendId, probed: true, hasModelOption: true, total, groups };
+    }
+    const matches = selectChoicePairs(model)
+      .map((pair) => pair.value)
+      .filter((value) => match(value));
+    return { backendId: harness.backendId, probed: true, hasModelOption: true, filter, matches };
+  });
+}
+
+/** Render the `config <harness> --models[=<filter>]` view as human text. */
+export function formatHarnessModels(views: readonly HarnessModelsView[]): string {
+  const lines: string[] = [];
+  if (views.length === 0) {
+    lines.push("(no harnesses requested)");
+    return lines.join("\n");
+  }
+  for (const view of views) {
+    if (!view.probed) {
+      lines.push(`${view.backendId}: probe failed — ${view.error ?? "unknown error"}`);
+      continue;
+    }
+    if (!view.hasModelOption) {
+      lines.push(`${view.backendId}: no model option advertised`);
+      continue;
+    }
+    if (view.filter === undefined) {
+      const groups = view.groups ?? [];
+      lines.push(`${view.backendId}: ${view.total ?? 0} models in ${groups.length} group(s):`);
+      for (const group of groups) lines.push(`  ${group.group} (${group.count})`);
+      lines.push(`  narrow with: config ${view.backendId} --models=<provider|substring|/regex/>`);
+    } else {
+      const matches = view.matches ?? [];
+      lines.push(`${view.backendId}: ${matches.length} model(s) matching ${JSON.stringify(view.filter)}${matches.length ? ":" : ""}`);
+      for (const value of matches) lines.push(`  ${value}`);
+    }
+  }
   return lines.join("\n");
 }
 

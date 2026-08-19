@@ -1271,8 +1271,86 @@ function clampSelectValue(
   return undefined;
 }
 
-function selectChoiceValues(option: Extract<SessionConfigOption, { type: "select" }>): string[] {
+type SelectConfigOption = Extract<SessionConfigOption, { type: "select" }>;
+
+function selectChoiceValues(option: SelectConfigOption): string[] {
   return option.options.flatMap((entry) => ("options" in entry ? entry.options : [entry])).map((entry) => entry.value);
+}
+
+/** Every leaf {value,label} the select advertises, flattening any advertised optgroups. */
+export function selectChoicePairs(option: SelectConfigOption): { value: string; label?: string }[] {
+  return option.options
+    .flatMap((entry) => ("options" in entry ? entry.options : [entry]))
+    .map((entry) => ({ value: entry.value, label: entry.name }));
+}
+
+/**
+ * Above this many advertised choices, a select's inline enumeration is replaced by a
+ * grouped summary in every RENDERED surface — the human table AND `--json` — so a harness
+ * with a huge model catalog (pi, opencode) cannot flood an agent's context on either flag.
+ * The complete list stays in the in-memory report (validation reads it, SDK embedders get
+ * it) and is reachable only through the explicit `config <harness> --models[=<filter>]`
+ * path. Small catalogs — claude, codex, and every effort/mode/boolean option — stay under
+ * this bound and render verbatim, unchanged.
+ */
+export const MAX_INLINE_SELECT_CHOICES = 24;
+
+export interface SelectChoiceGroup {
+  group: string;
+  count: number;
+}
+
+export interface SelectChoiceSummary {
+  total: number;
+  groups: SelectChoiceGroup[];
+}
+
+/** The group a bare (ungrouped) choice value belongs to: its first "/"-segment
+ *  (pi/opencode ids are "<provider>/<model>"); a value with no "/" is "(ungrouped)". */
+function groupOfValue(value: string): string {
+  const slash = value.indexOf("/");
+  return slash > 0 ? value.slice(0, slash) : "(ungrouped)";
+}
+
+/**
+ * Group a select's choices for summary display. Prefers the harness-advertised optgroup
+ * labels; absent those, groups by the first "/"-segment of each value. Groups come back
+ * largest-first, ties broken by first appearance.
+ */
+export function summarizeSelectChoices(option: SelectConfigOption): SelectChoiceSummary {
+  const counts = new Map<string, number>();
+  const order: string[] = [];
+  const bump = (name: string, n: number): void => {
+    if (!counts.has(name)) order.push(name);
+    counts.set(name, (counts.get(name) ?? 0) + n);
+  };
+  const hasAdvertisedGroups = option.options.some((entry) => "options" in entry);
+  for (const entry of option.options) {
+    if ("options" in entry) bump(entry.name ?? entry.group, entry.options.length);
+    else if (hasAdvertisedGroups) bump(groupOfValue(entry.value), 1); // stray leaf beside groups
+    else bump(groupOfValue(entry.value), 1);
+  }
+  const total = [...counts.values()].reduce((sum, n) => sum + n, 0);
+  const groups = order
+    .map((group) => ({ group, count: counts.get(group) ?? 0 }))
+    .sort((a, b) => b.count - a.count || order.indexOf(a.group) - order.indexOf(b.group));
+  return { total, groups };
+}
+
+/** A select whose leaf-choice count exceeds the inline bound — rendered as a summary. */
+export function isOversizedSelect(option: SessionConfigOption): option is SelectConfigOption {
+  return option.type === "select" && selectChoicePairs(option).length > MAX_INLINE_SELECT_CHOICES;
+}
+
+/** The collapsed choices-cell for an oversized select in the human option table. */
+function summaryChoicesCell(option: SelectConfigOption, backendId: string): string {
+  const { total, groups } = summarizeSelectChoices(option);
+  const shown = groups.slice(0, 3).map((group) => `${group.group} (${group.count})`).join(", ");
+  const more = groups.length > 3 ? ", …" : "";
+  return (
+    `${total} choices across ${groups.length} group(s): ${shown}${more} — ` +
+    `list with \`config ${backendId} --models[=<filter>]\``
+  );
 }
 
 function displayValue(value: unknown): string {
@@ -1281,6 +1359,57 @@ function displayValue(value: unknown): string {
 
 function displayAlternatives(values: readonly string[]): string {
   return values.length > 0 ? values.map((value) => JSON.stringify(value)).join(", ") : "(none advertised)";
+}
+
+/** The choices-cell text for a select: verbatim when small, summarized when oversized. */
+function selectChoicesCell(option: SelectConfigOption, backendId: string): string {
+  return isOversizedSelect(option)
+    ? summaryChoicesCell(option, backendId)
+    : displayAlternatives(selectChoiceValues(option));
+}
+
+/** A select option reshaped for SERIALIZED output (--json): the huge `options` leaf array
+ *  is dropped in favor of a compact grouped summary. Every scalar field is preserved. */
+export type CollapsedSelectOption = Omit<SelectConfigOption, "options"> & {
+  truncated: true;
+  choiceSummary: SelectChoiceSummary & { expand: string };
+};
+
+export type RenderedConfigOption = SessionConfigOption | CollapsedSelectOption;
+
+export interface RenderedHarnessOptions extends Omit<ValidateHarnessOptions, "options"> {
+  options?: RenderedConfigOption[];
+}
+
+function collapseSelectOption(option: SelectConfigOption, backendId: string): CollapsedSelectOption {
+  const { options: _leaves, ...scalars } = option;
+  return {
+    ...scalars,
+    truncated: true,
+    choiceSummary: { ...summarizeSelectChoices(option), expand: `config ${backendId} --models=<filter>` },
+  };
+}
+
+/**
+ * Collapse each harness's oversized select options for serialized (`--json`) output — the
+ * only place the full catalog would otherwise reach an agent's context through a machine
+ * flag. Small options and every non-select option pass through untouched. Applied ONLY at
+ * the CLI print boundary; the in-memory report keeps the complete catalog so validation
+ * and programmatic `probeHarnessConfig()` callers are unaffected.
+ */
+export function collapseHarnessOptionsForOutput(
+  harnesses: readonly ValidateHarnessOptions[] | undefined,
+): RenderedHarnessOptions[] | undefined {
+  if (!harnesses) return harnesses === undefined ? undefined : [];
+  return harnesses.map((harness) => {
+    if (!harness.options) return harness;
+    return {
+      ...harness,
+      options: harness.options.map((option) =>
+        isOversizedSelect(option) ? collapseSelectOption(option, harness.backendId) : option,
+      ),
+    };
+  });
 }
 
 /**
@@ -1588,7 +1717,7 @@ export function renderHarnessOptionLines(
       continue;
     }
     for (const option of harness.options ?? []) {
-      const choices = option.type === "select" ? displayAlternatives(selectChoiceValues(option)) : "true, false";
+      const choices = option.type === "select" ? selectChoicesCell(option, harness.backendId) : "true, false";
       lines.push(
         `${indent}  ${option.id} | ${option.type} | ${displayValue(option.currentValue)} | ${choices}`,
       );

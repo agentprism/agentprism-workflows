@@ -292,9 +292,42 @@ test("C3 CLI: config pi executes the hermetic real-pi origin probe and exposes m
   assert.ok(Array.isArray(recognizedValues));
   assert.equal(recognizedValues.length, 7);
   assert.ok(recognizedValues.includes("max"));
-  const model = report.harnessOptions[0]?.options[1];
+  // pi advertises a large model catalog, so the serialized (--json) model option is
+  // collapsed to a grouped summary rather than the full leaf list — the same bound that
+  // keeps it out of the human table also keeps it out of --json (see
+  // config-model-collapse.test.ts). The complete catalog is reachable via `--models`.
+  const model = report.harnessOptions[0]?.options[1] as
+    | { type: string; truncated?: boolean; options?: unknown[]; choiceSummary?: { total: number } }
+    | undefined;
   assert.equal(model?.type, "select");
-  assert.ok(model?.type === "select" && model.options.length > 0);
+  assert.equal(model?.truncated, true);
+  assert.equal(model?.options, undefined, "the huge leaf array is not serialized to --json");
+  assert.ok((model?.choiceSummary?.total ?? 0) > 0, "the summary reports the catalog size");
+
+  // …and the leaves stay reachable through the explicit --models path.
+  const models = spawnSync(
+    process.execPath,
+    ["--import", "tsx", CLI, "config", "pi", "--models", "--json"],
+    {
+      cwd: ROOT,
+      encoding: "utf8",
+      timeout: 30_000,
+      env: {
+        ...process.env,
+        HOME,
+        AGENTPRISM_BACKENDS: undefined,
+        AGENTPRISM_PI_ACP_CMD: process.execPath,
+        AGENTPRISM_PI_ACP_ARGS: HERMETIC_PI_AGENT,
+      },
+    },
+  );
+  assert.equal(models.status, 0, models.stderr);
+  const modelsReport = JSON.parse(models.stdout) as {
+    harnessModels: Array<{ backendId: string; total?: number; groups?: unknown[] }>;
+  };
+  assert.equal(modelsReport.harnessModels[0]?.backendId, "pi");
+  assert.ok((modelsReport.harnessModels[0]?.total ?? 0) > 0);
+  assert.ok(Array.isArray(modelsReport.harnessModels[0]?.groups));
 });
 
 test("CLI: a named harness scopes the probe and renders the human table", () => {

@@ -753,11 +753,19 @@ npx @automatalabs/workflows config claude --json    # machine-readable report
 Harness names are the routing names: built-in `claude` / `codex` / `opencode` / `pi` plus any custom
 backend registered via `AGENTPRISM_BACKENDS` (registered customs also join the no-argument
 default set). Each harness opens one session without a prompt — zero tokens — and reports its
-advertised config-option catalog verbatim: model ids (including bracket variants), effort
+advertised config-option catalog: model ids (including bracket variants), effort
 levels, modes, boolean knobs. A harness that cannot spawn or authenticate reports
 `probed: false` with the reason and never blocks the others. Flags: `--cwd <dir>` (probe
 session cwd; default the current directory), `--timeout-ms <n>` (per-harness bound, default
-60000), `--json`. Exit codes: `0` all probed, `1` at least one probe failed, `3` usage error.
+60000), `--models[=<filter>]`, `--json`. Exit codes: `0` all probed, `1` at least one probe
+failed, `3` usage error.
+
+A harness with a large model catalog (pi, opencode advertise hundreds) has its `model` choices —
+any select above ~24 leaves — collapsed to a grouped summary (total + per-provider/group counts)
+on BOTH the human table and `--json`, so neither floods context; small catalogs (claude, codex)
+print in full. The leaves are reachable only through `--models`: bare prints the provider/group
+breakdown, `--models=<provider|substring|/regex/>` prints the matching leaf ids. There is no
+unfiltered full-leaf dump on any surface.
 
 Programmatic:
 

@@ -511,6 +511,8 @@ Validate's sibling: the same no-prompt config probe, standalone — no script re
 npx @automatalabs/workflows config                  # every routable harness
 npx @automatalabs/workflows config codex opencode   # only the named harnesses
 npx @automatalabs/workflows config claude --json    # machine-readable report
+npx @automatalabs/workflows config opencode --models          # provider/group breakdown
+npx @automatalabs/workflows config pi --models=anthropic      # only matching model ids
 ```
 
 Harness names are the routing names: built-in `claude` / `codex` / `opencode` / `pi` plus any custom backend registered via the `AGENTPRISM_BACKENDS` env var (registered customs also join the no-argument default set). Each harness opens one session without a prompt — zero tokens — and its catalog is read fresh; a harness that cannot spawn or authenticate reports `probed: false` with the reason and never blocks the others.
@@ -518,11 +520,24 @@ Harness names are the routing names: built-in `claude` / `codex` / `opencode` / 
 The no-argument built-in sequence comes from `BUILTIN_BACKEND_IDS`; authoring prose describes the
 current registry rows and does not define a separate supported-backend list.
 
+A harness with a large model catalog (today pi and opencode advertise hundreds) would otherwise
+flood your context, so any select option above ~24 choices — in practice the `model` option — is
+rendered as a grouped **summary** (total + per-provider/group counts) rather than the full leaf
+list. This applies to BOTH the human table and `--json`, so neither surface dumps the whole catalog;
+small catalogs (claude, codex, and every effort/mode/boolean option) are unaffected and print
+verbatim. The complete list is reachable only through `--models`, and there is deliberately no
+unfiltered full-leaf dump on any surface:
+
+- `config <harness> --models` — the provider/group breakdown with counts (no leaf ids)
+- `config <harness> --models=<filter>` — the leaf model ids matching `<filter>`, where `<filter>` is
+  a provider name / case-insensitive substring, or a `/regex/`
+
 | flag | meaning |
 |---|---|
 | `--cwd <dir>` | session cwd for the probes (default: the current directory — harnesses may resolve project-level config, and hence their catalog, from it) |
 | `--timeout-ms <n>` | per-harness probe bound (default 60000); a timed-out harness reports `probed:false` |
-| `--json` | machine-readable `HarnessConfigReport` on stdout (`harnessOptions` uses the same per-harness shape as validate's report) |
+| `--models[=<filter>]` | list a harness's model catalog: bare prints the provider/group breakdown; `=<provider\|substring\|/regex/>` prints the matching leaf ids. The only way to reach the leaves of a summarized catalog; never dumps them all unfiltered. With `--json`, emits the structured model view (`{ harnessModels: [...] }`) |
+| `--json` | machine-readable `HarnessConfigReport` on stdout (`harnessOptions` uses the same per-harness shape as validate's report). An oversized select's `options` array is replaced by `{ truncated: true, choiceSummary: { total, groups, expand } }` — the same summary the human table shows |
 
 Exit codes: `0` all probed · `1` at least one probe failed · `3` usage error.
 
