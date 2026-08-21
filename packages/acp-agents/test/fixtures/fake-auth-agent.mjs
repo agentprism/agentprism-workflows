@@ -2,8 +2,11 @@
 // It carries NO AuthProfile: the runner drives it end-to-end through the identical dispatcher, class
 // inference, advertisement, and error taxonomy that every first-class agent traverses.
 //
-// It advertises one method of each spec type, gated on the client capabilities the runner lights:
-//   - `env_var`  "api-key" with two vars (FAKE_AUTH_TOKEN secret, FAKE_ORG optional) — always visible
+// It advertises one method of each spec type (ACP schema 1.21.0: `agent` | `terminal` — the former
+// `env_var` variant was removed upstream), gated on the client capabilities the runner lights:
+//   - `agent`    "api-key" with a non-gateway `_meta["api-key"]` block naming the env vars it reads
+//                (FAKE_AUTH_TOKEN secret, FAKE_ORG optional) — always visible; the host supplies the
+//                values via an `env` resolution and they are injected at spawn (codex api-key shape)
 //   - `agent`    "gateway" with a gateway-shaped `_meta.gateway` — visible iff auth._meta.gateway
 //   - `terminal` "terminal-login" with a `_meta["terminal-auth"]` launch hint — visible iff the
 //                terminal channel (auth.terminal OR _meta["terminal-auth"]) is lit
@@ -23,7 +26,7 @@ const diskSentinel = process.env.AGENTPRISM_FAKE_AUTH_DISK;
 
 const ENV_KEY = "FAKE_AUTH_TOKEN";
 const GATEWAY_ID = "gateway";
-const ENV_VAR_ID = "api-key";
+const API_KEY_ID = "api-key";
 const TERMINAL_ID = "terminal-login";
 
 function record(entry) {
@@ -77,14 +80,9 @@ class FakeAuthAgent {
     this.clientCaps = params.clientCapabilities;
     const authMethods = [
       {
-        id: ENV_VAR_ID,
+        id: API_KEY_ID,
         name: "API Key",
-        type: "env_var",
-        vars: [
-          { name: ENV_KEY, label: "Fake auth token", secret: true },
-          { name: "FAKE_ORG", label: "Organization", secret: false, optional: true },
-        ],
-        link: "https://example.test/keys",
+        _meta: { "api-key": { env: [ENV_KEY, "FAKE_ORG"], link: "https://example.test/keys" } },
       },
     ];
     if (clientLightsGateway(params.clientCapabilities)) {

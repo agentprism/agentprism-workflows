@@ -38,7 +38,7 @@ const workflowRunLimitsSchema = z.object({
 const authContextSchema = z.object({
   backendId: z.string().optional(),
   methods: z.array(
-    z.object({ id: z.string(), type: z.enum(["agent", "terminal", "env_var"]), name: z.string().optional() }),
+    z.object({ id: z.string(), type: z.enum(["agent", "terminal"]), name: z.string().optional() }),
   ),
 });
 

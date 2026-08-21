@@ -76,7 +76,7 @@ afterEach(async () => {
   for (const key of ENV_KEYS) delete process.env[key];
 });
 
-test("advertisement gating: authCapabilities lights gateway + terminal; unset advertises env_var only", async () => {
+test("advertisement gating: authCapabilities lights gateway + terminal; unset advertises the ungated api-key agent method only", async () => {
   setup();
   const lit = await makeRunner({ authCapabilities: { terminal: true, gateway: true } }).describeAuthMethods({
     model: "claude",
@@ -92,14 +92,17 @@ test("advertisement gating: authCapabilities lights gateway + terminal; unset ad
   assert.deepEqual(off.map((d) => d.id), ["api-key"]);
 });
 
-test("proactive describeAuthMethods dispatches env_var vars with SDK defaults", async () => {
+test("proactive describeAuthMethods dispatches the api-key agent method with its non-gateway _meta carried through", async () => {
   setup();
   const methods = await makeRunner({}).describeAuthMethods({ model: "claude" });
   const apiKey = methods.find((d) => d.id === "api-key");
-  assert.equal(apiKey?.type, "env_var");
-  if (apiKey?.type !== "env_var") return;
-  assert.deepEqual(apiKey.vars[0], { name: "FAKE_AUTH_TOKEN", label: "Fake auth token", secret: true, optional: false });
-  assert.deepEqual(apiKey.vars[1], { name: "FAKE_ORG", label: "Organization", secret: false, optional: true });
+  assert.equal(apiKey?.type, "agent");
+  if (apiKey?.type !== "agent") return;
+  assert.equal(apiKey.expectsMeta, true);
+  assert.equal(apiKey.interactive, false);
+  assert.deepEqual(apiKey.meta, {
+    "api-key": { env: ["FAKE_AUTH_TOKEN", "FAKE_ORG"], link: "https://example.test/keys" },
+  });
 });
 
 test("no resolver: -32000 on session/new maps to non-recoverable AUTH_REQUIRED", async () => {

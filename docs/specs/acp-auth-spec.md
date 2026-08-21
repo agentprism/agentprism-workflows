@@ -13,6 +13,37 @@
 > and their env control is therefore **historical design, not the current server contract**. Hosts
 > that want to drive auth programmatically duck-type `AuthCapableRunner` on the SDK runner directly.
 
+> **Supersession note (2026-08-20) — `env_var` auth methods removed from the protocol.** ACP
+> schema **1.21.0** (shipped in `@agentclientprotocol/sdk` **1.4.0**) removed the UNSTABLE
+> `env_var` `AuthMethod` variant — agentclientprotocol/agent-client-protocol
+> [#1796](https://github.com/agentclientprotocol/agent-client-protocol/pull/1796) ("removes the env
+> var variant as it proved not really adopted and challenging for folks to implement. The providers
+> API will probably replace this") and [#2000](https://github.com/agentclientprotocol/agent-client-protocol/pull/2000)
+> ("stabilize terminal authentication"). `AuthMethod` is now `agent | terminal`; `AuthEnvVar` /
+> `AuthMethodEnvVar` no longer exist, and the SDK's lenient `zAuthMethod` parser reads any
+> `env_var`-shaped object through the `agent` arm (`type`/`vars` stripped), so the variant cannot be
+> emitted or observed on the wire by any SDK ≥ 1.4.0 peer. The §4.6.4 drift tripwires fired exactly
+> as designed, and the implementation was adapted on the same dependency bump (Principle 7 /
+> bump-ACP-deps-every-release):
+>
+> - **Removed**: the `env_var` `AuthMethodDescriptor` variant (§1.3), `AuthMethodType` `"env_var"`,
+>   the `"spawn-env"` `CredentialClass` (§2.1; `env_var` was its only producer), `HANDLED_AUTH_METHOD_TYPES`
+>   `"env_var"`, the `AuthErrorContext.methods[].type` `"env_var"` literal (shared-types, MCP output
+>   schema, engine persistence validation), and the SDK re-exports `AuthEnvVar`/`AuthMethodEnvVar`.
+> - **Retained**: `AuthResolution { outcome: "env", values }` — it already applied to `agent`
+>   methods whose credential is read from the spawn environment (codex `api-key`, §2.9 table); the
+>   §2.8 spawn-env overlay (`AuthIntent.envValues` → spawn env) is unchanged.
+> - **pi-acp** (§3.x pi / `pi-acp-spec.md` §9.5, T13) now advertises only `pi-stored-credentials`;
+>   its five provider API-key methods were `env_var`-typed. Provider keys remain ambient
+>   spawn-environment credentials (the cross-agent "provider env keys" §3.6 row), exactly like
+>   claude/codex/opencode — only the advertisement is gone.
+> - **Tripwire retargeted**, not weakened: `_AuthMethodUnionPinned` pins the two-variant union and
+>   the new `_AuthMethodEnvVarAbsent` fails `tsc` if a future SDK reintroduces `env_var`, so the
+>   decision is re-made consciously.
+>
+> Every passage below that names `env_var`, `AuthMethodEnvVar`, `AuthEnvVar`, the `spawn-env` class,
+> or pi's five provider methods is **historical design record** as of this note.
+
 ## Status and original motivation
 
 AgentPrism's ACP authentication lifecycle is **implemented and shipped**. This document is the
@@ -1418,7 +1449,7 @@ Files: **`packages/acp-agents/src/protocol-coverage.ts`** (add executable auth a
 
 1. `clientCapabilitiesFor({ auth: { terminal, gateway } })` emits the pinned SDK-1.2.1 `AuthCapabilities` shape `{terminal?, _meta}` — fails the build if a bump renames/stabilizes `auth` (`schema/types.gen.d.ts:4318`, `@experimental` region `:4147-4167`).
 2. Compile-time existence assertions for `ClientCapabilities.auth` and `AuthCapabilities.terminal` (type-level `Expect<…>`), pinning the UNSTABLE surface (Principle 7).
-3. The three handled `AuthMethod.type` discriminants (`agent`/`terminal`/`env_var`) — fails if the SDK union widens (`AuthMethod` at `schema/types.gen.d.ts:2159`).
+3. The three handled `AuthMethod.type` discriminants (`agent`/`terminal`/`env_var`) — fails if the SDK union widens (`AuthMethod` at `schema/types.gen.d.ts:2159`). *(2026-08-20: fired on SDK 1.4.0 / schema 1.21.0, which removed `env_var`; retargeted to the two-variant union plus an `env_var`-absent pin — see the supersession note at the top.)*
 4. The full `_meta` support matrix of §3.6 landed as assertions (in `docs-drift.test.ts`), not prose — so an SDK/agent bump changing a `_meta` surface (claude gateway/terminal-auth, codex `api-key`/gateway/`DEFAULT_AUTH_REQUEST`, opencode `terminal-auth`) fails the build.
 5. A doc-note assertion that `-32000` is auth-exclusive (the guarantee the §1.5 matcher relies on).
 

@@ -239,7 +239,7 @@ All versions below were re-verified from the installed workspace dependency grap
 
 ### Agent backends (ACP)
 
-- **`@agentclientprotocol/sdk@1.3.0`** — the ACP protocol SDK (JSON-RPC-over-stdio types +
+- **`@agentclientprotocol/sdk@1.4.0`** — the ACP protocol SDK (JSON-RPC-over-stdio types +
   client/connection helpers). This is what your orchestrator uses to *speak ACP as a client*.
   Ref: https://agentclientprotocol.com · https://github.com/agentclientprotocol
 
@@ -517,7 +517,7 @@ ACP is a *unified* protocol — nothing about the runner is backend-specific exc
 tool.** ACP core models no structured-result field, so the runner owns negotiation, capture, validation,
 and common fallback.
 
-### 6.1 ACP core (`@agentclientprotocol/sdk@1.3.0`) — no native structured output
+### 6.1 ACP core (`@agentclientprotocol/sdk@1.4.0`) — no native structured output
 
 Verified by exhaustive grep (zero matches for `outputSchema|structuredContent|json_schema|…`).
 
@@ -968,7 +968,7 @@ resurrect a snapshot or sidecar after the run was removed.
 
 **Packages (verified versions, 2026-07-09):**
 - `@modelcontextprotocol/sdk` (stdio MCP server) — https://github.com/modelcontextprotocol/typescript-sdk
-- `@agentclientprotocol/sdk@1.3.0` — https://github.com/agentclientprotocol
+- `@agentclientprotocol/sdk@1.4.0` — https://github.com/agentclientprotocol
 - `@agentclientprotocol/claude-agent-acp@0.70.0` (wraps `@anthropic-ai/claude-agent-sdk@0.3.224`) — https://github.com/agentclientprotocol/claude-agent-acp
 - `@automatalabs/codex-acp` (workspace fork of `@agentclientprotocol/codex-acp` at `packages/codex-acp`, patch baked into dist) — upstream: https://github.com/agentclientprotocol/codex-acp
 - `@automatalabs/pi-acp` (Pi ACP server; workspace-lockstep built-in dependency, exact version stamped at publish) — `packages/pi-acp`

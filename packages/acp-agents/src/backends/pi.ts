@@ -16,17 +16,14 @@ import { defineBuiltinBackend } from "./define.js";
 
 const require = createRequire(import.meta.url);
 
+// pi-acp advertises a single ambient method since ACP schema 1.21.0 removed the `env_var` variant
+// the five provider API-key methods used; provider keys remain ambient spawn-environment credentials.
 const PI_AUTH_REMEDIATION: Readonly<Record<string, string>> = {
-  "anthropic-api-key": "Set ANTHROPIC_API_KEY, then retry or resume the workflow.",
-  "openai-api-key": "Set OPENAI_API_KEY, then retry or resume the workflow.",
-  "gemini-api-key": "Set GEMINI_API_KEY, then retry or resume the workflow.",
-  "xai-api-key": "Set XAI_API_KEY, then retry or resume the workflow.",
-  "openrouter-api-key": "Set OPENROUTER_API_KEY, then retry or resume the workflow.",
   "pi-stored-credentials":
-    "Configure pi credentials in ~/.pi/agent/auth.json, then retry or resume the workflow.",
+    "Set a provider API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, XAI_API_KEY, or OPENROUTER_API_KEY) in the environment or configure pi credentials in ~/.pi/agent/auth.json, then retry or resume the workflow.",
 };
 
-/** Pi auth adaptation for provider environment keys and its ambient credential store. */
+/** Pi auth adaptation for its ambient credential store (provider environment keys or ~/.pi/agent/auth.json). */
 export const piAuthProfile: AuthProfile = {
   backendId: "pi",
   clientAuthCapabilities: () => ({ terminal: false, gateway: false }),

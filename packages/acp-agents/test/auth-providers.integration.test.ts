@@ -18,12 +18,7 @@ interface LogEntry {
 }
 
 const AUTH_METHODS: AuthMethod[] = [
-  {
-    id: "api-key",
-    name: "API Key",
-    type: "env_var",
-    vars: [{ name: "OPENAI_API_KEY", label: "OpenAI API key" }],
-  },
+  { id: "api-key", name: "API Key", _meta: { "api-key": { provider: "openai" } } },
   { id: "chat-gpt", name: "ChatGPT" },
 ];
 

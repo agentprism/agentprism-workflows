@@ -3,7 +3,6 @@ import type {
   AuthCapabilities,
   AuthMethod,
   AuthMethodAgent,
-  AuthMethodEnvVar,
   AuthMethodTerminal,
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
@@ -119,23 +118,28 @@ export function assertAuthCapabilityShape(auth: ClientCapabilities["auth"]): voi
 // surface, fails the build BEFORE release (bump-ACP-deps-every-release), never silently.
 // ---------------------------------------------------------------------------------------------
 
-/** The three `AuthMethod` variants the base dispatcher handles (`agent`/`terminal`/`env_var`, §1.3).
- *  `agent` is the default when `type` is absent (`AuthMethodAgent` carries no `type`). */
-export const HANDLED_AUTH_METHOD_TYPES: readonly ["agent", "terminal", "env_var"] = ["agent", "terminal", "env_var"];
+/** The two `AuthMethod` variants the base dispatcher handles (`agent`/`terminal`, §1.3). `agent` is
+ *  the default when `type` is absent (`AuthMethodAgent` carries no `type`). ACP schema 1.21.0
+ *  (`@agentclientprotocol/sdk` 1.4.0) removed the former `env_var` variant
+ *  (agentclientprotocol/agent-client-protocol #1796/#2000); the tripwires below are retargeted to the
+ *  two-variant union and additionally pin that `env_var` stays absent. */
+export const HANDLED_AUTH_METHOD_TYPES: readonly ["agent", "terminal"] = ["agent", "terminal"];
 
-/** §4.6.4 item 3 — the SDK `AuthMethod` union is EXACTLY the three variants the dispatcher handles;
- *  a fourth variant (a widened union) makes this `false` and fails `tsc`. */
+/** §4.6.4 item 3 — the SDK `AuthMethod` union is EXACTLY the two variants the dispatcher handles;
+ *  a third variant (a widened union) makes this `false` and fails `tsc`. */
 export type _AuthMethodUnionPinned = Expect<
-  [AuthMethod] extends [AuthMethodAgent | AuthMethodTerminal | AuthMethodEnvVar] ? true : false
+  [AuthMethod] extends [AuthMethodAgent | AuthMethodTerminal] ? true : false
 >;
-/** The `terminal`/`env_var` discriminants are still the literals the dispatcher branches on: the SDK
- *  intersects the bare method type with `{ type: "…" }` in the `AuthMethod` union, so a dropped
- *  discriminant makes `Extract` collapse to `never` and fails `tsc`. */
+/** The `terminal` discriminant is still the literal the dispatcher branches on: the SDK intersects the
+ *  bare method type with `{ type: "…" }` in the `AuthMethod` union, so a dropped discriminant makes
+ *  `Extract` collapse to `never` and fails `tsc`. */
 export type _AuthMethodTerminalDiscriminant = Expect<
   [Extract<AuthMethod, { type: "terminal" }>] extends [never] ? false : true
 >;
-export type _AuthMethodEnvVarDiscriminant = Expect<
-  [Extract<AuthMethod, { type: "env_var" }>] extends [never] ? false : true
+/** The removed `env_var` discriminant must STAY absent: if a future SDK reintroduces it, this fails
+ *  `tsc` so the dispatcher/descriptor decision is re-made consciously, never by silent widening. */
+export type _AuthMethodEnvVarAbsent = Expect<
+  [Extract<AuthMethod, { type: "env_var" }>] extends [never] ? true : false
 >;
 
 /** The cross-agent `_meta` key conventions the base layer keys on (§1 intro; recognized by literal
@@ -159,14 +163,8 @@ export const ACP_AUTH_REQUIRED_CODE_EXCLUSIVE = -32000 as const;
  *  of leaving the built-in coupled only through prose. */
 export const PI_ACP_PROTOCOL_CONTRACT = {
   mcpCapabilities: { http: true, sse: true },
-  authMethodIds: [
-    "anthropic-api-key",
-    "openai-api-key",
-    "gemini-api-key",
-    "xai-api-key",
-    "openrouter-api-key",
-    "pi-stored-credentials",
-  ],
+  // The five provider API-key methods were `env_var`-typed and left with that variant (ACP 1.21.0).
+  authMethodIds: ["pi-stored-credentials"],
   providerErrorKinds: ["auth_error", "rate_limit", "billing_error", "provider_error"],
 } as const;
 

@@ -208,7 +208,7 @@ test("AUTH_REQUIRED authContext carries advertised method ids/types/names + back
     label: "auth-agent",
     backendId: "codex",
     authMethods: [
-      { type: "env_var", id: "api-key", name: "API Key", vars: [] },
+      { id: "api-key", name: "API Key", _meta: { "api-key": { provider: "openai" } } }, // non-gateway _meta => still "agent"
       { id: "chat-gpt", name: "ChatGPT" }, // no `type` => defaults to "agent"
       { type: "terminal", id: "claude-login", name: "Terminal Login" },
     ],
@@ -217,7 +217,7 @@ test("AUTH_REQUIRED authContext carries advertised method ids/types/names + back
   assert.deepEqual(mapped.authContext, {
     backendId: "codex",
     methods: [
-      { id: "api-key", type: "env_var", name: "API Key" },
+      { id: "api-key", type: "agent", name: "API Key" },
       { id: "chat-gpt", type: "agent", name: "ChatGPT" },
       { id: "claude-login", type: "terminal", name: "Terminal Login" },
     ],

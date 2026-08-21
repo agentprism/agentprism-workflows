@@ -95,7 +95,9 @@ test(
   },
 );
 
-// ---- pi — one of five provider env keys (all six methods are advertised unconditionally) ----
+// ---- pi — one of five ambient provider env keys (the single `pi-stored-credentials` method is
+// advertised unconditionally; ACP schema 1.21.0 removed the `env_var` variant the per-provider
+// methods used, so the key is read from the spawn environment, never advertised) ----
 const PI_PROVIDER_KEY = [
   "ANTHROPIC_API_KEY",
   "OPENAI_API_KEY",
@@ -105,7 +107,7 @@ const PI_PROVIDER_KEY = [
 ].find((name) => Boolean(process.env[name]));
 
 test(
-  "pi: six unconditional methods, inherited provider credential, real prompt completes",
+  "pi: single unconditional method, inherited provider credential, real prompt completes",
   { skip: gate("set a supported Pi provider API key to run the pi auth e2e", Boolean(PI_PROVIDER_KEY)) },
   async () => {
     const runner = makeRunner();
@@ -114,25 +116,9 @@ test(
       ? configuredModel ?? "pi"
       : `pi/${configuredModel}`;
     const methods = await runner.describeAuthMethods({ model });
-    assert.deepEqual(methods.map(({ id }) => id), [
-      "anthropic-api-key",
-      "openai-api-key",
-      "gemini-api-key",
-      "xai-api-key",
-      "openrouter-api-key",
-      "pi-stored-credentials",
-    ]);
+    assert.deepEqual(methods.map(({ id }) => id), ["pi-stored-credentials"]);
 
-    const methodId = PI_PROVIDER_KEY === "ANTHROPIC_API_KEY"
-      ? "anthropic-api-key"
-      : PI_PROVIDER_KEY === "OPENAI_API_KEY"
-        ? "openai-api-key"
-        : PI_PROVIDER_KEY === "GEMINI_API_KEY"
-          ? "gemini-api-key"
-          : PI_PROVIDER_KEY === "XAI_API_KEY"
-            ? "xai-api-key"
-            : "openrouter-api-key";
-    await runner.authenticate({ model, methodId });
+    await runner.authenticate({ model, methodId: "pi-stored-credentials" });
     assertPong(await runner.run(PING_PROMPT, { model }));
   },
 );

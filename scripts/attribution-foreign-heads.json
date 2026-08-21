@@ -70,6 +70,11 @@
       "sha": "3d5682722545a4b2d7cfcf8bdabbbfadbdaa37ea",
       "imported": "2026-08-18",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (release-please chore(main): release 1.5.0 (#409) — version/CHANGELOG bump only, no source change)"
+    },
+    {
+      "sha": "ba5bcc3d7759250dde9d4d2286a1bec11b363208",
+      "imported": "2026-08-20",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (v1.5.1 codex 0.148.0 #410; v1.6.0-1.6.2 release-pipeline hardening #413 + apt timeouts; suppress late session updates after close #418; device-auth elicitation completion #421; npm deps bump incl. @agentclientprotocol/sdk ^1.4.0 #422)"
     }
   ]
 }

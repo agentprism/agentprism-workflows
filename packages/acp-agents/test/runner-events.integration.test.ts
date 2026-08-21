@@ -106,6 +106,8 @@ const ALL_UPDATE_KINDS = [
   "config_option_update",
   "session_info_update",
   "usage_update",
+  "compaction_update",
+  "compaction_summary_chunk",
 ] as const satisfies readonly AcpUpdateKind[];
 
 type Assert<T extends true> = T;
@@ -126,6 +128,9 @@ const ALL_SESSION_UPDATES: AcpSessionUpdate[] = [
   { sessionUpdate: "config_option_update", configOptions: [] },
   { sessionUpdate: "session_info_update", title: "Correlated session" },
   { sessionUpdate: "usage_update", used: 10, size: 100 },
+  // ACP schema 1.21.0 (SDK 1.4.0) — UNSTABLE session compaction updates (#2002).
+  { sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "in_progress" },
+  { sessionUpdate: "compaction_summary_chunk", compactionId: "compaction-1", content: { type: "text", text: "summary" } },
   { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "answer" } },
 ];
 

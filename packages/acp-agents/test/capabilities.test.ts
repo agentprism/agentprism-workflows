@@ -44,7 +44,7 @@ test("negotiateCapabilities extracts version, agentInfo, close support, and the 
     {
       protocolVersion: PROTOCOL_VERSION,
       agentInfo: { name: "codex-acp", title: "Codex", version: "1.2.0" },
-      authMethods: [{ id: "api-key", name: "API Key", type: "env_var", vars: [{ name: "OPENAI_API_KEY" }] }],
+      authMethods: [{ id: "api-key", name: "API Key", _meta: { "api-key": { provider: "openai" } } }],
       _meta: { source: "test", steering: { supported: true } },
       agentCapabilities: {
         auth: { logout: {} },
@@ -61,7 +61,7 @@ test("negotiateCapabilities extracts version, agentInfo, close support, and the 
   assert.equal(negotiated.protocolVersion, PROTOCOL_VERSION);
   assert.deepEqual(negotiated.agentInfo, { name: "codex-acp", title: "Codex", version: "1.2.0" });
   assert.deepEqual(negotiated.authMethods, [
-    { id: "api-key", name: "API Key", type: "env_var", vars: [{ name: "OPENAI_API_KEY" }] },
+    { id: "api-key", name: "API Key", _meta: { "api-key": { provider: "openai" } } },
   ]);
   assert.deepEqual(negotiated.initializeMeta, { source: "test", steering: { supported: true } });
   assert.equal(negotiated.supportsSteering, true);

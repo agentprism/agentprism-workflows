@@ -50,18 +50,13 @@ Pi-acp serves stdio, Streamable HTTP, and legacy SSE MCP servers and consumes st
 
 ## Authentication
 
-Credentials are ambient. The server advertises these exact methods unconditionally:
+Credentials are ambient. The server advertises exactly one method unconditionally:
 
 | id | name | source |
 | --- | --- | --- |
-| `anthropic-api-key` | Anthropic API key | `ANTHROPIC_API_KEY` |
-| `openai-api-key` | OpenAI API key | `OPENAI_API_KEY` |
-| `gemini-api-key` | Google Gemini API key | `GEMINI_API_KEY` |
-| `xai-api-key` | xAI API key | `XAI_API_KEY` |
-| `openrouter-api-key` | OpenRouter API key | `OPENROUTER_API_KEY` |
-| `pi-stored-credentials` | pi stored credentials | pi's `~/.pi/agent/auth.json` |
+| `pi-stored-credentials` | pi stored credentials | pi's `~/.pi/agent/auth.json`, or a provider API key in the server's environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`) |
 
-Authentication requests are no-op acknowledgements because the environment or pi's credential store supplies the secret. A selected or otherwise resolvable model whose credential is missing rejects with `-32000` so clients can pause for authentication. Having no model at all is distinct: it rejects with `-32602` / `invalid_model`.
+The per-provider API-key methods that used to sit alongside it were `env_var`-typed; ACP schema 1.21.0 (`@agentclientprotocol/sdk` 1.4.0) removed that variant from the protocol, so they are no longer advertised — the environment variables themselves are still honored. Authentication requests are no-op acknowledgements because the environment or pi's credential store supplies the secret. A selected or otherwise resolvable model whose credential is missing rejects with `-32000` so clients can pause for authentication. Having no model at all is distinct: it rejects with `-32602` / `invalid_model`.
 
 ## Reserved tool namespaces
 

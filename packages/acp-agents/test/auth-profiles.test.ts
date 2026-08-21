@@ -92,12 +92,10 @@ test("every built-in describe() is a pass-through of the base descriptor (label-
 
 test("piAuthProfile describes every advertised method with non-secret remediation", () => {
   const expected = new Map([
-    ["anthropic-api-key", "Set ANTHROPIC_API_KEY, then retry or resume the workflow."],
-    ["openai-api-key", "Set OPENAI_API_KEY, then retry or resume the workflow."],
-    ["gemini-api-key", "Set GEMINI_API_KEY, then retry or resume the workflow."],
-    ["xai-api-key", "Set XAI_API_KEY, then retry or resume the workflow."],
-    ["openrouter-api-key", "Set OPENROUTER_API_KEY, then retry or resume the workflow."],
-    ["pi-stored-credentials", "Configure pi credentials in ~/.pi/agent/auth.json, then retry or resume the workflow."],
+    [
+      "pi-stored-credentials",
+      "Set a provider API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, XAI_API_KEY, or OPENROUTER_API_KEY) in the environment or configure pi credentials in ~/.pi/agent/auth.json, then retry or resume the workflow.",
+    ],
   ]);
   for (const [id, description] of expected) {
     const method = { id, name: id } as AuthMethod;
@@ -171,17 +169,17 @@ test("claude, opencode, and pi define NO spawnAuthEnv (no DEFAULT_AUTH_REQUEST a
 
 // -- AuthStore.spawnEnvFor wires the codex profile lever into the spawn overlay (§2.8) --------------
 
-test("AuthStore.spawnEnvFor merges env_var values with the codex DEFAULT_AUTH_REQUEST contribution", () => {
+test("AuthStore.spawnEnvFor merges host-collected env values with the codex DEFAULT_AUTH_REQUEST contribution", () => {
   const store = new AuthStore();
   const machine = store.machineFor("codex", codexAuthProfile);
-  // spawn-env api-key intent: env values injected by the host PLUS the profile's DEFAULT_AUTH_REQUEST.
+  // api-key intent from an `env` resolution: env values injected by the host PLUS the profile's DEFAULT_AUTH_REQUEST.
   const intent: AuthIntent = {
     backendId: "codex",
     poolKey: "codex",
     methodId: "api-key",
     methodType: "agent",
-    klass: "spawn-env",
-    diskBacked: false,
+    klass: "disk",
+    diskBacked: true,
     envValues: { CODEX_API_KEY: "sk-secret" },
   };
   machine.send({ t: "host_authenticate", intent });

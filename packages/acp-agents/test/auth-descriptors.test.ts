@@ -82,87 +82,51 @@ test("a bare agent method carrying a terminal-auth hint becomes a terminal descr
   assert.deepEqual(d.launch.args, ["auth", "login"]);
 });
 
-test("env_var descriptor applies SDK defaults: secret=true, optional=false, and carries link + per-var meta", () => {
+test("agent method with a non-gateway _meta (codex api-key shape) expects meta, is not interactive, and carries the meta through", () => {
   const method: AuthMethod = {
     id: "api-key",
     name: "API Key",
-    type: "env_var",
-    link: "https://example.test/keys",
-    vars: [
-      { name: "OPENAI_API_KEY", label: "OpenAI key" }, // no secret/optional -> defaults
-      { name: "ORG", secret: false, optional: true, _meta: { hint: "org id" } },
-    ],
+    _meta: { "api-key": { provider: "openai", env: ["OPENAI_API_KEY"] } },
   };
   const d = buildAuthDescriptor(method, SPAWN);
-  assert.equal(d.type, "env_var");
-  if (d.type !== "env_var") return;
-  assert.equal(d.link, "https://example.test/keys");
-  assert.deepEqual(d.vars[0], { name: "OPENAI_API_KEY", label: "OpenAI key", secret: true, optional: false });
-  assert.deepEqual(d.vars[1], { name: "ORG", secret: false, optional: true, meta: { hint: "org id" } });
+  assert.equal(d.type, "agent");
+  if (d.type !== "agent") return;
+  assert.equal(d.expectsMeta, true);
+  assert.equal(d.interactive, false);
+  assert.deepEqual(d.meta, { "api-key": { provider: "openai", env: ["OPENAI_API_KEY"] } });
+});
+
+test("a method carrying the removed env_var discriminant on the wire is dispatched as the SDK parses it: a bare agent method", () => {
+  // ACP schema 1.21.0 dropped `env_var`; the SDK's lenient `zAuthMethod` union now parses such an
+  // object through the `agent` arm (type/vars stripped). The dispatcher must agree with the SDK, so
+  // it never produces a descriptor type the protocol no longer has.
+  const legacy = { id: "api-key", name: "API Key", type: "env_var", vars: [{ name: "K" }] } as unknown as AuthMethod;
+  const d = buildAuthDescriptor(legacy, SPAWN);
+  assert.equal(d.type, "agent");
+  if (d.type !== "agent") return;
+  assert.equal(d.expectsMeta, false);
+  assert.equal(d.interactive, true);
 });
 
 test("buildAuthDescriptors maps a mixed method list in order", () => {
   const methods: AuthMethod[] = [
     { id: "gateway", name: "Gateway", _meta: { gateway: { protocol: "test" } } },
-    { id: "api-key", name: "API Key", type: "env_var", vars: [{ name: "K" }] },
+    { id: "api-key", name: "API Key", _meta: { "api-key": { provider: "openai" } } },
     { id: "login", name: "Login", type: "terminal" },
   ];
   const ds = buildAuthDescriptors(methods, SPAWN);
   assert.deepEqual(
     ds.map((d) => d.type),
-    ["agent", "env_var", "terminal"],
+    ["agent", "agent", "terminal"],
   );
 });
 
-test("Pi's six advertised auth methods become five env-var descriptors and one ambient agent descriptor", () => {
-  const methods: AuthMethod[] = [
-    {
-      id: "anthropic-api-key",
-      name: "Anthropic API key",
-      type: "env_var",
-      vars: [{ name: "ANTHROPIC_API_KEY", secret: true }],
-    },
-    {
-      id: "openai-api-key",
-      name: "OpenAI API key",
-      type: "env_var",
-      vars: [{ name: "OPENAI_API_KEY", secret: true }],
-    },
-    {
-      id: "gemini-api-key",
-      name: "Google Gemini API key",
-      type: "env_var",
-      vars: [{ name: "GEMINI_API_KEY", secret: true }],
-    },
-    {
-      id: "xai-api-key",
-      name: "xAI API key",
-      type: "env_var",
-      vars: [{ name: "XAI_API_KEY", secret: true }],
-    },
-    {
-      id: "openrouter-api-key",
-      name: "OpenRouter API key",
-      type: "env_var",
-      vars: [{ name: "OPENROUTER_API_KEY", secret: true }],
-    },
-    { id: "pi-stored-credentials", name: "pi stored credentials" },
-  ];
+test("Pi's single advertised auth method becomes one ambient agent descriptor (ACP 1.21.0 removed env_var)", () => {
+  const methods: AuthMethod[] = [{ id: "pi-stored-credentials", name: "pi stored credentials" }];
 
   const descriptors = buildAuthDescriptors(methods, SPAWN);
-  assert.deepEqual(descriptors.map(({ id, type }) => [id, type]), [
-    ["anthropic-api-key", "env_var"],
-    ["openai-api-key", "env_var"],
-    ["gemini-api-key", "env_var"],
-    ["xai-api-key", "env_var"],
-    ["openrouter-api-key", "env_var"],
-    ["pi-stored-credentials", "agent"],
-  ]);
-  assert.deepEqual(
-    descriptors.slice(0, 5).map((descriptor) => descriptor.type === "env_var" && descriptor.vars[0]?.name),
-    ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY"],
-  );
-  assert.deepEqual(descriptors[5], {
+  assert.deepEqual(descriptors.map(({ id, type }) => [id, type]), [["pi-stored-credentials", "agent"]]);
+  assert.deepEqual(descriptors[0], {
     type: "agent",
     id: "pi-stored-credentials",
     name: "pi stored credentials",

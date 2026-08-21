@@ -680,12 +680,12 @@ class FakeAgent {
     // notification. This exercises the unstable SDK methods over the real connection.
     if (turn.elicitation) {
       const request = elicitationRequestFromScenario(turn.elicitation, params.sessionId);
-      const response = await this.conn.unstable_createElicitation(request);
+      const response = await this.conn.createElicitation(request);
       record({ method: "elicitationOutcome", request, response });
     }
     if (turn.elicitationComplete) {
       const notification = elicitationCompleteFromScenario(turn.elicitationComplete);
-      await this.conn.unstable_completeElicitation(notification);
+      await this.conn.completeElicitation(notification);
       record({ method: "elicitationComplete", notification });
     }
 
