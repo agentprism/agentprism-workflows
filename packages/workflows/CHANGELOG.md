@@ -1,5 +1,67 @@
 # @automatalabs/workflows
 
+## 0.50.0
+
+### Minor Changes
+
+- 205d110: ACP dependency maintenance with a protocol surface change: `@agentclientprotocol/sdk` 1.3.0 -> 1.4.0
+  (acp-agents `^1.4.0`, pi-acp exact `1.4.0`, codex-acp `^1.4.0` via the upstream sync) brings ACP
+  schema 1.21.0, which **removed the `env_var` authentication method from the protocol**
+  (agentclientprotocol/agent-client-protocol #1796 "removes the env var variant as it proved not really
+  adopted… the providers API will probably replace this" and #2000 "stabilize terminal authentication").
+  `AuthMethod` is now `agent | terminal`, the `AuthEnvVar` / `AuthMethodEnvVar` types no longer exist, and
+  the SDK's lenient parser reads any `env_var`-shaped method as a bare `agent` method — so the variant
+  cannot be emitted or observed by any SDK >= 1.4.0 peer. We adapted on the same bump rather than holding
+  the pin back (CONTRIBUTING "When the dependency gate blocks"):
+
+  - `@automatalabs/acp-agents` (minor, public types shrink): the `env_var` `AuthMethodDescriptor` variant,
+    `AuthMethodType` `"env_var"`, the `"spawn-env"` `CredentialClass` (its only producer was `env_var`),
+    `HANDLED_AUTH_METHOD_TYPES` `"env_var"`, and the `AuthEnvVar`/`AuthMethodEnvVar` re-exports are removed.
+    `AuthResolution { outcome: "env", values }` is retained for `agent` methods whose credential is read
+    from the spawn environment (codex `api-key`); the spawn-env overlay is unchanged. The §4.6.4 drift
+    tripwires are retargeted to the two-variant union plus a new compile-time pin that `env_var` stays
+    absent. `PI_ACP_PROTOCOL_CONTRACT.authMethodIds` is now `["pi-stored-credentials"]`.
+  - `@automatalabs/pi-acp` (minor, advertised surface shrinks): advertises only `pi-stored-credentials`;
+    the five provider API-key methods (`anthropic-api-key`, `openai-api-key`, `gemini-api-key`,
+    `xai-api-key`, `openrouter-api-key`) were `env_var`-typed and are retired — they now reject with
+    `unknown_auth_method`. Provider keys are still read from the server's environment exactly as before.
+  - `@automatalabs/workflows` (minor): drops the `AuthEnvVar`/`AuthMethodEnvVar` facade re-exports.
+  - `@automatalabs/shared-types` (minor): `AuthErrorContext.methods[].type` is `"agent" | "terminal"`.
+  - `@automatalabs/mcp-server` (minor): the `workflow` tool's `auth_required` output schema enum loses
+    `"env_var"`.
+  - `@automatalabs/workflow-engine` (patch): persisted `authContext` validation accepts only
+    `agent`/`terminal` method types.
+
+  Also carried by SDK 1.4.0 / schema 1.21.0:
+
+  - Two new UNSTABLE `sessionUpdate` kinds, `compaction_update` and `compaction_summary_chunk` (session
+    context compaction, agent-client-protocol #2002). `AcpUpdateKind` / `AcpRunnerEventMap` derive from the
+    SDK type, so `@automatalabs/acp-agents` now emits them as per-kind runner events (and under the
+    `session_update` catch-all) with no code change; they are bookkeeping kinds for the workflows
+    projection (not turn content). The completeness tripwires list them explicitly.
+  - The elicitation stabilization (`unstable_createElicitation`/`unstable_completeElicitation` ->
+    `createElicitation`/`completeElicitation`) touches only the test fixture's agent side; the client
+    binds the method constants, which are unchanged.
+
+- 0cf5bc5: Daemon lifecycle: superseded daemons now actually exit, and the two distributions of the server stop superseding each other.
+
+  - **One identity for one code version.** `@automatalabs/workflows`' bundled `mcp-server.js` reported the _workflows_ package version as the server version (its `require("../package.json")` resolved the wrong manifest), so a client using `npx @automatalabs/workflows` and one using `@automatalabs/mcp-server` saw each other's daemon as "stale" and superseded it on every connect — leaving a lame-duck daemon behind each time. The bundle now bakes in the mcp-server version at build time (`__AGENTPRISM_MCP_SERVER_VERSION__`).
+  - **Version is a total order.** A shim supersedes only a daemon strictly _older_ than itself and adopts an equal or newer one, so an old client migrating off a lame duck can never resurrect its old code and flip discovery back.
+  - **Env families instead of env supersession.** Clients are keyed by their env fingerprint (`~/.agentprism/workflows/daemons/<fingerprint>.json`, plus `instances/<pid>.json` per live daemon); different env → different daemon, never contending.
+  - **Lame ducks drain and exit.** A superseded daemon closes its idle sessions (their shims transparently re-initialize on the successor; sessions with a request in flight, an active run, or a REPL workspace mid-turn are kept), and exits on the next reaper tick once nothing is busy — it no longer waits for the idle TTL, even when idle shutdown is disabled.
+  - **Dead-client sessions are collected in 5 minutes** (`AGENTPRISM_SESSION_TTL_MS`, was 2 h); the REPL client-presence drain keeps its 2 h bound under its own knob, `AGENTPRISM_REPL_DRAIN_BOUND_MS`.
+  - **Shim recovery.** A lame duck's 503, the 404 of a closed session, a network error, or the standalone GET stream failing all take the same recovery path, now triggered proactively (not only on the client's next frame). Requests that were in flight when their session was lost are answered with a JSON-RPC error instead of hanging the host forever; recovery that loops is rate-limited.
+  - **Ops.** `daemon status` lists every daemon on the machine (current, draining, other env families, legacy `daemon.json` ones) with in-flight request counts; `daemon stop --all` stops them all; a successor honours an explicit `--port`; the "port taken by another process" log names a draining daemon of ours when that is what holds it.
+
+### Patch Changes
+
+- Updated dependencies [205d110]
+- Updated dependencies [205d110]
+  - @automatalabs/acp-agents@0.38.0
+  - @automatalabs/shared-types@0.31.0
+  - @automatalabs/workflow-engine@0.36.1
+  - @automatalabs/repl-engine@0.3.3
+
 ## 0.49.0
 
 ### Minor Changes
