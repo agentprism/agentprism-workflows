@@ -114,7 +114,7 @@ test("AUTH_REQUIRED authContext carries only advertised ids/types/names — neve
       // The advertised method ids/types are present; no secret payload keys are.
       assert.equal(serialized.includes("authenticateMeta"), false);
       assert.equal(serialized.includes("envValues"), false);
-      for (const m of ctx?.methods ?? []) assert.ok(["agent", "terminal", "env_var"].includes(m.type));
+      for (const m of ctx?.methods ?? []) assert.ok(["agent", "terminal"].includes(m.type));
       return true;
     },
   );

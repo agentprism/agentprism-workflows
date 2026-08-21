@@ -1,37 +1,13 @@
 import type { AuthMethod } from "@agentclientprotocol/sdk";
 import { adapterError } from "./errors.js";
 
+// ACP schema 1.21.0 (`@agentclientprotocol/sdk` 1.4.0) removed the `env_var` auth method variant
+// (agentclientprotocol/agent-client-protocol #1796/#2000), so the five provider API-key methods this
+// server used to advertise (`anthropic-api-key`, `openai-api-key`, `gemini-api-key`, `xai-api-key`,
+// `openrouter-api-key`) no longer have a wire shape. Provider keys stay ambient: pi reads
+// ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / XAI_API_KEY / OPENROUTER_API_KEY from the
+// spawn environment exactly as before; only the advertisement is gone.
 export const AUTH_METHODS: AuthMethod[] = [
-  {
-    id: "anthropic-api-key",
-    name: "Anthropic API key",
-    type: "env_var",
-    vars: [{ name: "ANTHROPIC_API_KEY", secret: true }],
-  },
-  {
-    id: "openai-api-key",
-    name: "OpenAI API key",
-    type: "env_var",
-    vars: [{ name: "OPENAI_API_KEY", secret: true }],
-  },
-  {
-    id: "gemini-api-key",
-    name: "Google Gemini API key",
-    type: "env_var",
-    vars: [{ name: "GEMINI_API_KEY", secret: true }],
-  },
-  {
-    id: "xai-api-key",
-    name: "xAI API key",
-    type: "env_var",
-    vars: [{ name: "XAI_API_KEY", secret: true }],
-  },
-  {
-    id: "openrouter-api-key",
-    name: "OpenRouter API key",
-    type: "env_var",
-    vars: [{ name: "OPENROUTER_API_KEY", secret: true }],
-  },
   { id: "pi-stored-credentials", name: "pi stored credentials" },
 ];
 

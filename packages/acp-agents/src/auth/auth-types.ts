@@ -4,6 +4,11 @@
 // conventions (`gateway`/`terminal-auth`; NOT SDK schema fields — the SDK types every `_meta` as
 // opaque). There is ZERO agent-*id* branching anywhere in this file.
 //
+// ACP schema 1.21.0 (`@agentclientprotocol/sdk` 1.4.0, agentclientprotocol/agent-client-protocol
+// #1796/#2000) removed the `env_var` method variant; `AuthMethod` is now `agent | terminal` and the
+// former `env_var` descriptor is gone with it. Host-supplied env credentials still ride the `env`
+// resolution outcome against an `agent` method (e.g. codex `api-key`) and are injected at spawn.
+//
 // Secret material flows only through resolver RETURN values and the spawn env — never through
 // events, journals, logs, or error messages (Principle 9). The advertised `_meta` a descriptor
 // carries here (e.g. `gateway.protocol`, `api-key.provider`) is agent-PUBLISHED metadata, not a
@@ -39,17 +44,6 @@ export type AuthMethodDescriptor =
        *  agent binary + `AuthMethodTerminal.args`/`env` (spec baseline). */
       launch: { command: string; args: string[]; env?: Record<string, string>; label?: string };
       meta?: Record<string, unknown>;
-    }
-  | {
-      type: "env_var";
-      id: string;
-      name: string;
-      description?: string;
-      link?: string;
-      /** Per-var `meta` carries the SDK-first-class `AuthEnvVar._meta` through unchanged, so no
-       *  env_var surface is silently dropped (Principle 3, §3.6). */
-      vars: Array<{ name: string; label?: string; secret: boolean; optional: boolean; meta?: Record<string, unknown> }>;
-      meta?: Record<string, unknown>;
     };
 
 /** The host-collected outcome of one auth step. `env`/`meta` payloads are SECRET (Principle 9). */
@@ -58,7 +52,8 @@ export type AuthResolution =
   | { outcome: "completed"; methodId?: string }
   // bare `agent` method runs its OWN login NOW via a one-shot authenticate({ methodId }) RPC
   | { outcome: "agent-login"; methodId: string }
-  // env_var values (SECRET)
+  // host-supplied env credentials (SECRET) for an `agent` method whose credential is read from the
+  // spawn environment (e.g. codex `api-key`); injected at spawn via the §2.8 overlay
   | { outcome: "env"; values: Record<string, string>; methodId?: string }
   // agent-type payload, e.g. gateway (SECRET)
   | { outcome: "meta"; methodId: string; meta: Record<string, unknown> }
@@ -99,8 +94,8 @@ function metaOf(method: AuthMethod): Record<string, unknown> | undefined {
 }
 
 /** The SDK types a missing `type` discriminant as `agent` (AuthMethodAgent carries no `type`). */
-function typeOf(method: AuthMethod): "agent" | "terminal" | "env_var" {
-  return (("type" in method ? method.type : undefined) ?? "agent") as "agent" | "terminal" | "env_var";
+function typeOf(method: AuthMethod): "agent" | "terminal" {
+  return (("type" in method ? method.type : undefined) ?? "agent") as "agent" | "terminal";
 }
 
 function terminalAuthHint(
@@ -119,9 +114,7 @@ function terminalAuthHint(
  *  `opencode-login` becomes a `terminal` descriptor for us, while codex's `gateway` (which carries
  *  `_meta.gateway`, not `terminal-auth`) does not (§3.1 decision). */
 function isTerminalShaped(method: AuthMethod): boolean {
-  const type = typeOf(method);
-  if (type === "terminal") return true;
-  if (type === "env_var") return false;
+  if (typeOf(method) === "terminal") return true;
   return terminalAuthHint(metaOf(method)) !== undefined;
 }
 
@@ -156,27 +149,6 @@ export function buildAuthDescriptor(method: AuthMethod, spawn: SpawnConfig): Aut
       name: method.name,
       ...(description ? { description } : {}),
       launch,
-      ...(meta ? { meta } : {}),
-    };
-  }
-
-  if (type === "env_var") {
-    const envMethod = method as Extract<AuthMethod, { type: "env_var" }>;
-    const vars = (envMethod.vars ?? []).map((v) => ({
-      name: v.name,
-      ...(v.label != null ? { label: v.label } : {}),
-      // SDK defaults: `secret` defaults TRUE, `optional` defaults FALSE.
-      secret: v.secret ?? true,
-      optional: v.optional ?? false,
-      ...(v._meta ? { meta: v._meta as Record<string, unknown> } : {}),
-    }));
-    return {
-      type: "env_var",
-      id: method.id,
-      name: method.name,
-      ...(description ? { description } : {}),
-      ...(envMethod.link != null ? { link: envMethod.link } : {}),
-      vars,
       ...(meta ? { meta } : {}),
     };
   }

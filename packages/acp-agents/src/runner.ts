@@ -1245,7 +1245,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       );
     }
     const chosen = advertised.find((m) => m.id === methodId);
-    const methodType: AuthMethodType = chosen ? authMethodType(chosen) : resolution.outcome === "env" ? "env_var" : "agent";
+    const methodType: AuthMethodType = chosen ? authMethodType(chosen) : "agent";
     const advertisedMeta = chosen ? authMethodMeta(chosen) : undefined;
 
     if (resolution.outcome === "agent-login") {
@@ -1626,10 +1626,11 @@ function resolutionMethodId(resolution: AuthResolution): string | undefined {
 }
 
 /** Infer the target method for an env/completed resolution that did not name one: match by outcome
- *  against the advertised methods (there is typically exactly one env_var / terminal method). */
+ *  against the advertised methods (an `env` resolution targets an `agent` method whose credential is
+ *  read from the spawn environment; there is typically exactly one terminal method). */
 function inferMethodId(resolution: AuthResolution, advertised: readonly AuthMethod[]): string | undefined {
   if (resolution.outcome === "env") {
-    return advertised.find((m) => authMethodType(m) === "env_var")?.id ?? advertised.find((m) => authMethodType(m) === "agent")?.id;
+    return advertised.find((m) => authMethodType(m) === "agent")?.id;
   }
   if (resolution.outcome === "completed") {
     return (

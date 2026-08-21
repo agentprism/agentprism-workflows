@@ -229,7 +229,7 @@ try {
 ## Authentication lifecycle
 
 The built-in runner is auth-capable without widening the minimal `AgentRunner` interface.
-`describeAuthMethods()` returns normalized `agent` / `terminal` / `env_var` descriptors;
+`describeAuthMethods()` returns normalized `agent` / `terminal` descriptors;
 `completeAuth()` applies a host resolution; and `runner.auth.status()`, `.authenticate()`, and
 `.logout()` provide the controller form. Construct the runner with `authCapabilities` to advertise
 what the host can complete and `onAuth` to resolve an `AuthContext` inline.

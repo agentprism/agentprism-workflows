@@ -110,9 +110,10 @@ test("assertAuthCapabilityShape trips on a drifted (unpinned) auth key", () => {
   );
 });
 
-// §4.6.4 item 3 — the base dispatcher handles exactly the three SDK AuthMethod discriminants.
-test("HANDLED_AUTH_METHOD_TYPES is exactly agent/terminal/env_var", () => {
-  assert.deepEqual([...HANDLED_AUTH_METHOD_TYPES], ["agent", "terminal", "env_var"]);
+// §4.6.4 item 3 — the base dispatcher handles exactly the two SDK AuthMethod discriminants (ACP
+// schema 1.21.0 removed `env_var`; the compile-time `_AuthMethodEnvVarAbsent` pin keeps it out).
+test("HANDLED_AUTH_METHOD_TYPES is exactly agent/terminal", () => {
+  assert.deepEqual([...HANDLED_AUTH_METHOD_TYPES], ["agent", "terminal"]);
 });
 
 // §4.6.4 items 4–5 — the cross-agent `_meta` convention surfaces the base layer keys on must still be
@@ -254,14 +255,7 @@ test("the pinned auth-required code is the SDK's exclusively-reserved -32000", (
 test("the first-class Pi backend pins the frozen pi-acp capability/auth/error surface", () => {
   assert.deepEqual(PI_ACP_PROTOCOL_CONTRACT, {
     mcpCapabilities: { http: true, sse: true },
-    authMethodIds: [
-      "anthropic-api-key",
-      "openai-api-key",
-      "gemini-api-key",
-      "xai-api-key",
-      "openrouter-api-key",
-      "pi-stored-credentials",
-    ],
+    authMethodIds: ["pi-stored-credentials"],
     providerErrorKinds: ["auth_error", "rate_limit", "billing_error", "provider_error"],
   });
   assert.ok(PI_AGENT_DIST.includes("http: true"));

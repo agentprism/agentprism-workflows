@@ -1674,6 +1674,18 @@ structured-output state.
 
 ### 9.5 Auth (`src/auth.ts`) — resolves design-minimalism finding 1 / adversarial finding 12
 
+> **Supersession note (2026-08-20) — five of the six auth methods retired.** ACP schema **1.21.0**
+> (`@agentclientprotocol/sdk` **1.4.0**) removed the UNSTABLE `env_var` `AuthMethod` variant
+> (agentclientprotocol/agent-client-protocol #1796/#2000; `AuthMethod` is now `agent | terminal`).
+> The five provider API-key methods below (`anthropic-api-key`, `openai-api-key`, `gemini-api-key`,
+> `xai-api-key`, `openrouter-api-key`) were `env_var`-typed and no longer have a wire shape, so
+> `src/auth.ts` advertises **only** `pi-stored-credentials` (the `agent`-typed ambient method).
+> Nothing changes about how pi obtains provider keys: they are read from the spawn environment
+> (`env-api-keys.ts`) exactly as before — only the advertisement is gone. T13 now asserts the single
+> method and that the retired ids reject with `unknown_auth_method`. The table, the `AuthMethodEnvVar`
+> citations, and "all six methods" below are historical record as of this note; see
+> `docs/specs/acp-auth-spec.md` (supersession note) for the client-side consequences.
+
 `authMethods` are derived from pi-ai's env-key catalog (`env-api-keys.ts:64-110`, `getApiKeyEnvVars`),
 kept **small and justified** — the major providers plus one stored-credentials method — and advertised
 **UNCONDITIONALLY**:
@@ -1961,7 +1973,7 @@ cites the normative statement it covers.
 | T10 | §5 | initialize returns the exact agent capabilities: load/resume/fork/list/close, image prompts, and `mcpCapabilities:{ http:true, sse:true }`, with no Pi private capability namespace, delete, or additionalDirectories |
 | T11 | §9.2 | permission wire order + exactly-once: for each `toolCallId`, the pending `tool_call` (from `tool_execution_start`) is on the wire **before** `session/request_permission` (drain enforced), and the wrapper emits **no** `session/update`; exactly one pending + one terminal `tool_call_update` on **every** path — allow_once, allow_always, reject_once, **unknown/missing `optionId` → fail-safe deny**, cancelled-outcome, turn-abort-wins-race, transport-failure(fail-safe deny, turn continues), inner-hook block, inner-hook throw; **wrapper delegates to `inner` after BOTH a fresh allow AND an `allow_always` cache hit** (a cache hit combined with an inner block/throw still blocks); `allow_always` name-scoped single-session cache skips only the round-trip |
 | S1–S4 | §9.4 | PiBackend enables common prompt embedding and HTTP StructuredOutput injection, carries no private metadata/native hook, actual runner+pi-acp transport captures a schema-valid call, and invalid/absent capture uses only the common validated last-text ladder |
-| T13 | §9.5 | six auth methods advertised **unconditionally** (incl. when client sends no `auth` capability), each with its **exact pinned `id` + `name`** payload; `authenticate(env_var/agent)` no-op success; `pi-stored-credentials` is `agent`-typed ambient-disk (no interactive login); unknown method → `unknown_auth_method` |
+| T13 | §9.5 | six auth methods advertised **unconditionally** (incl. when client sends no `auth` capability), each with its **exact pinned `id` + `name`** payload; `authenticate(env_var/agent)` no-op success; `pi-stored-credentials` is `agent`-typed ambient-disk (no interactive login); unknown method → `unknown_auth_method`. **Superseded 2026-08-20 (ACP schema 1.21.0 / SDK 1.4.0 removed `env_var`, see §9.5 note):** exactly ONE method, `pi-stored-credentials`, advertised unconditionally with its exact `id` + `name`; `authenticate(pi-stored-credentials)` no-op success; the five retired provider ids reject with `unknown_auth_method` |
 
 ### 13.2 Integration (scripted ACP client over the injected stream)
 

@@ -47,7 +47,7 @@ describe("WorkflowError.authContext", () => {
     const authContext: AuthErrorContext = {
       backendId: "codex",
       methods: [
-        { id: "api-key", type: "env_var", name: "API Key" },
+        { id: "api-key", type: "agent", name: "API Key" },
         { id: "chat-gpt", type: "agent", name: "ChatGPT" },
         { id: "claude-login", type: "terminal" },
       ],
@@ -58,10 +58,10 @@ describe("WorkflowError.authContext", () => {
     });
     assert.equal(e.code, WorkflowErrorCode.AUTH_REQUIRED);
     assert.deepEqual(e.authContext, authContext);
-    // The three method type discriminants are exactly the allowed union values.
+    // The two method type discriminants (ACP schema 1.21.0) are exactly the allowed union values.
     assert.deepEqual(
       e.authContext?.methods.map((m) => m.type),
-      ["env_var", "agent", "terminal"],
+      ["agent", "agent", "terminal"],
     );
   });
 

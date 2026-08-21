@@ -59,7 +59,8 @@ export enum WorkflowErrorCode {
  */
 export type AuthErrorContext = {
   backendId?: string;
-  methods: { id: string; type: "agent" | "terminal" | "env_var"; name?: string }[];
+  /** `type` is the SDK `AuthMethod.type` discriminant (ACP schema 1.21.0: `agent` | `terminal`). */
+  methods: { id: string; type: "agent" | "terminal"; name?: string }[];
 };
 
 /** Machine-readable provider-limit metadata carried by a `PROVIDER_USAGE_LIMIT` error.
