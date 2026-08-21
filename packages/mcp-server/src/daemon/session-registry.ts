@@ -9,6 +9,12 @@
  * DELETE. Eviction closes the transport; runs are unaffected (they live in the per-project
  * manager), and a wrongly-evicted client re-initializes on the spec's 404.
  *
+ * Connections and REQUESTS are tracked separately: the standalone GET stream is a connection
+ * but not work, while an in-flight POST is both. A superseded (lame-duck) daemon uses the
+ * distinction to migrate sessions that have nothing in flight — closing such a session costs
+ * the client nothing but a transparent re-initialize on the successor — while never cutting a
+ * request that is being processed.
+ *
  * The presence signals are tri-state, and the REPL ledger needs all three (the roadmap
  * doc's client-presence policy):
  *
@@ -36,6 +42,8 @@ export interface SessionRecord {
   server: WorkflowServer;
   lastActivityAt: number;
   openConnections: number;
+  /** Requests (POSTs) currently being processed on this session. */
+  inflightRequests: number;
 }
 
 export class SessionRegistry {
@@ -75,8 +83,8 @@ export class SessionRegistry {
    */
   onSessionDeleted: ((sessionId: string) => void) | undefined;
 
-  add(record: SessionRecord): void {
-    this.sessions.set(record.sessionId, record);
+  add(record: Omit<SessionRecord, "inflightRequests"> & { inflightRequests?: number }): void {
+    this.sessions.set(record.sessionId, { ...record, inflightRequests: record.inflightRequests ?? 0 });
   }
 
   get(sessionId: string): SessionRecord | undefined {
@@ -121,6 +129,25 @@ export class SessionRegistry {
     }
   }
 
+  /** A request (POST) started being processed on the session. */
+  requestStarted(sessionId: string): void {
+    const record = this.sessions.get(sessionId);
+    if (record !== undefined) record.inflightRequests++;
+  }
+
+  /** The request's response finished (or its connection closed). */
+  requestFinished(sessionId: string): void {
+    const record = this.sessions.get(sessionId);
+    if (record !== undefined) record.inflightRequests = Math.max(0, record.inflightRequests - 1);
+  }
+
+  /** Requests being processed right now, across every session. */
+  inflightCount(): number {
+    let total = 0;
+    for (const record of this.sessions.values()) total += record.inflightRequests;
+    return total;
+  }
+
   get size(): number {
     return this.sessions.size;
   }
@@ -135,6 +162,22 @@ export class SessionRegistry {
     for (const record of this.sessions.values()) {
       if (record.openConnections > 0) continue;
       if (now - record.lastActivityAt <= ttlMs) continue;
+      evicted.push(record.sessionId);
+      void record.transport.close().catch(() => undefined);
+    }
+    return evicted;
+  }
+
+  /**
+   * Close every session with NO request in flight — the lame-duck migration: the client's
+   * next frame (or its standalone GET stream ending) makes it re-initialize on the successor.
+   * `keep` can veto a session (the daemon keeps sessions whose REPL workspace is mid-turn).
+   */
+  evictDrainable(keep: (sessionId: string) => boolean = () => false): string[] {
+    const evicted: string[] = [];
+    for (const record of this.sessions.values()) {
+      if (record.inflightRequests > 0) continue;
+      if (keep(record.sessionId)) continue;
       evicted.push(record.sessionId);
       void record.transport.close().catch(() => undefined);
     }

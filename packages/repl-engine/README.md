@@ -635,8 +635,9 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
 - **The client-presence drain** (`Broker.drainForDisconnect`, phase-D review round 2):
   in-flight turns DRAIN TO COMPLETION **within the bound** (each settlement boundary
   snapshots — a turn that finishes in time is never cancelled), bounded by the spec-owed
-  concrete bound, which REUSES the daemon's session-eviction TTL (the daemon passes
-  `SESSION_IDLE_TTL_MS`; a turn that OVERRUNS the bound is force-cancelled — the honest
+  concrete bound — the daemon's `REPL_DRAIN_BOUND_MS` (`AGENTPRISM_REPL_DRAIN_BOUND_MS`,
+  default 2 h; it originally reused the session-eviction TTL, since decoupled so dead
+  clients are collected promptly; a turn that OVERRUNS the bound is force-cancelled — the honest
   bounded teardown, settled as the recoverable `AGENT_CANCELLED`), then every idle child
   closes (`keepSession` keeps the backend
   sessions re-openable; queued-but-undelivered steers are re-queued durably against
@@ -901,8 +902,9 @@ still connected. A project whose client set becomes EMPTY is DRAINED: in-flight 
 turns drain to completion — `Broker.drainForDisconnect` pumps until no session has a turn
 running, each settlement boundary snapshots, so "close the laptop while two researchers
 run" ends with the findings durable in the workspace — bounded by the SPEC-OWED concrete
-bound, which REUSES the daemon's session-eviction TTL (`SESSION_IDLE_TTL_MS`; the runner's
-own runaway protections already bound individual turns — the TTL is the outer ceiling; a
+bound, the daemon's `REPL_DRAIN_BOUND_MS` (`AGENTPRISM_REPL_DRAIN_BOUND_MS`, default 2 h;
+originally the session-eviction TTL, since decoupled; the runner's
+own runaway protections already bound individual turns — the bound is the outer ceiling; a
 turn that overruns the bound is force-cancelled, the honest bounded teardown), and then
 every idle child closes (`keepSession` keeps the backend sessions re-openable). A client
 that **reconnects mid-drain ABORTS it** — `drainForDisconnect` re-checks presence every

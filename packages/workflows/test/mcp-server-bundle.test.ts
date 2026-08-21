@@ -1,6 +1,6 @@
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -17,6 +17,10 @@ const MCP_SOURCE_ENTRY = resolve(REPOSITORY_ROOT, "packages/mcp-server/src/index
 // load-bearing).
 const MCP_BUNDLE = resolve(REPOSITORY_ROOT, "packages/mcp-server/dist/mcp-server-bundle-smoke.js");
 const MCP_PACKAGE = (await import("../../mcp-server/package.json", { with: { type: "json" } })).default;
+// The PUBLISHED bundle: built by scripts/bundle-mcp-server.mjs into this package's dist, where a
+// naive `require("../package.json")` would resolve THIS package's manifest.
+const PUBLISHED_BUNDLE = resolve(WORKFLOWS_ROOT, "dist/mcp-server.js");
+const WORKFLOWS_PACKAGE = (await import("../package.json", { with: { type: "json" } })).default;
 
 interface JsonRpcFrame {
   jsonrpc?: unknown;
@@ -189,6 +193,25 @@ test("the bundled stdio server initializes once and advertises the workflow tool
     }, 5_000);
     await childDone;
     clearTimeout(forceKill);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("the published dist/mcp-server.js reports the mcp-server package version as its identity, not the workflows version", { timeout: 30_000 }, () => {
+  assert.ok(existsSync(PUBLISHED_BUNDLE), "workflows dist/mcp-server.js must be built (pnpm build) before this test");
+  assert.notEqual(MCP_PACKAGE.version, WORKFLOWS_PACKAGE.version, "the two packages carry different versions — that is the point");
+  // `daemon status` prints the CLIENT version (= SERVER_VERSION, the identity the daemon
+  // succession compares) without starting anything; an isolated HOME sees no daemon.
+  const home = mkdtempSync(join(tmpdir(), "agentprism-workflows-bundle-version-"));
+  try {
+    const result = spawnSync(process.execPath, [PUBLISHED_BUNDLE, "daemon", "status"], {
+      env: { ...process.env, HOME: home },
+      encoding: "utf-8",
+      timeout: 20_000,
+    });
+    assert.match(result.stdout, new RegExp(`client v${MCP_PACKAGE.version.replace(/\./g, "\\.")}\\b`), result.stdout + result.stderr);
+    assert.doesNotMatch(result.stdout, new RegExp(`client v${WORKFLOWS_PACKAGE.version.replace(/\./g, "\\.")}\\b`));
+  } finally {
     rmSync(home, { recursive: true, force: true });
   }
 });

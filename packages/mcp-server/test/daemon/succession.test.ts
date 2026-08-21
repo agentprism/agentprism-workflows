@@ -5,8 +5,13 @@
 // session and reset its idle clock, so a superseded daemon never died and served out-of-date
 // code forever. The fix: a divergent shim never adopts. It spawns a current-version successor
 // on an ephemeral port, atomically repoints daemon.json at it, and connects there; the old
-// daemon becomes a lame duck that finishes its existing work, admits no new sessions, and
-// exits within the normal idle-TTL bound.
+// daemon becomes a lame duck that admits no new sessions, migrates its idle sessions to the
+// successor (closing them so their shims re-initialize there), finishes in-flight work, and
+// exits as soon as nothing is busy — without waiting for the idle TTL.
+//
+// Version is a TOTAL ORDER inside a family: only a daemon strictly OLDER than the shim is
+// superseded; an equal or newer one is adopted (otherwise two client versions would flip
+// discovery back and forth forever, spawning a daemon per flip).
 //
 // These tests drive the REAL seams — createDaemon() over real loopback HTTP, the real
 // ensureDaemonRunning() orchestration (only the OS process spawn is injected, so an in-process
@@ -14,6 +19,7 @@
 // and the real pid-guarded daemon.json — all under _harness's isolated $HOME.
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import "../_harness.js"; // TEST_HOME isolation for daemon.json reads/writes
@@ -36,9 +42,9 @@ import { SERVER_VERSION } from "../../src/server.js";
 
 /** Wipe the shared discovery files so each test starts from a clean slate. */
 function resetDiscovery(): void {
-  for (const path of [daemonInfoPath(), daemonLockPath()]) {
+  for (const path of [daemonInfoPath(), daemonLockPath(), join(dirname(daemonInfoPath()), "instances")]) {
     try {
-      rmSync(path, { force: true });
+      rmSync(path, { force: true, recursive: true });
     } catch {
       /* best-effort */
     }
@@ -219,7 +225,7 @@ test("lame-duck admission: a superseded daemon (daemon.json names a different pi
   }
 });
 
-test("lame-duck exit: a superseded daemon with zero sessions and zero runs idles out within the existing idle-TTL bound — supersession neither resets nor extends the idle clock", async () => {
+test("lame-duck exit: a superseded daemon with zero sessions and zero runs exits on the next reaper tick — it does NOT wait for the idle TTL", async () => {
   resetDiscovery();
   const daemon = await createDaemon({ runner: okRunner(), port: 0, log: () => undefined });
   // Superseded from the outset: discovery names a different pid.
@@ -231,21 +237,92 @@ test("lame-duck exit: a superseded daemon with zero sessions and zero runs idles
     daemon,
     runner: { dispose: async () => undefined } as never,
     ownPid: process.pid,
-    idleTtlMs: 80,
+    idleTtlMs: 60_000, // a long idle TTL must not delay a superseded daemon's exit
     sessionTtlMs: 1_000,
     reaperIntervalMs: 20,
     process: handle,
     log: () => undefined,
   });
   try {
-    // With no sessions and no runs, the reaper's busy check is false, so the idle clock runs.
-    await sleep(60);
-    assert.deepEqual(exits, [], "must not exit before the idle TTL elapses (no early lame-duck exit)");
-    // Within the TTL bound it exits — supersession did not extend the clock.
-    await sleep(180);
-    assert.deepEqual(exits, [0], "the superseded, idle daemon exits within the idle-TTL bound");
+    await sleep(150);
+    assert.deepEqual(exits, [0], "the superseded, idle daemon exits within a reaper tick, not the idle TTL");
   } finally {
     if (exits.length === 0) await lifecycle.shutdown("SIGTERM");
+    resetDiscovery();
+  }
+});
+
+test("lame-duck migration: a superseded daemon closes its idle sessions (their clients re-initialize on the successor) and then exits; nothing is cut mid-request", async () => {
+  resetDiscovery();
+  const daemon = await createDaemon({ runner: okRunner(), port: 0, log: () => undefined });
+  const { handle, exits } = fakeProcess();
+  const logs: string[] = [];
+  let lifecycle: ReturnType<typeof installDaemonLifecycle> | undefined;
+  try {
+    const projectDir = makeProjectDir("lame-duck-migration");
+    // A live session (standalone GET stream open, nothing in flight) on the daemon.
+    const session = await connectHttp(daemon.url, { listTools: true });
+    const before = await session.client.callTool({ name: "workflow", arguments: { script: NO_AGENT_SCRIPT, projectDir } });
+    assert.equal(structured(before)?.status, "completed", textOf(before));
+    assert.equal(daemon.sessions.size, 1);
+    assert.equal(daemon.inflightRequestCount(), 0, "no request in flight between calls");
+
+    // The daemon is NOT superseded: the reaper leaves the live session alone.
+    lifecycle = installDaemonLifecycle({
+      daemon,
+      runner: { dispose: async () => undefined } as never,
+      ownPid: process.pid,
+      idleTtlMs: 60_000,
+      sessionTtlMs: 60_000,
+      reaperIntervalMs: 20,
+      process: handle,
+      log: (line) => logs.push(line),
+    });
+    await sleep(80);
+    assert.equal(daemon.sessions.size, 1, "a live session on a current daemon is never evicted");
+    assert.deepEqual(exits, []);
+
+    // A successor takes over discovery → lame duck → the idle session is migrated (closed) and
+    // the daemon exits on its own.
+    writeDaemonInfo(infoForHandle(daemon, process.pid + 1, SERVER_VERSION));
+    await sleep(200);
+    assert.ok(logs.some((line) => line.includes("migrated 1 idle session(s)")), logs.join(" | "));
+    assert.equal(daemon.sessions.size, 0, "the idle session was closed");
+    assert.deepEqual(exits, [0], "with nothing left the lame duck exited");
+    // The client's session is gone — its next request gets the spec's 404 (the shim's cue to
+    // re-initialize on the successor). Here the raw HTTP client sees the rejection.
+    await assert.rejects(
+      session.client.callTool({ name: "workflow", arguments: { script: NO_AGENT_SCRIPT, projectDir } }),
+      "the migrated session no longer exists on the lame duck",
+    );
+    await session.dispose().catch(() => undefined);
+  } finally {
+    if (exits.length === 0 && lifecycle !== undefined) await lifecycle.shutdown("SIGTERM");
+    else await daemon.close().catch(() => undefined);
+    resetDiscovery();
+  }
+});
+
+test("version order: a daemon NEWER than the shim is adopted, never superseded (an old client migrating off a lame duck must not resurrect its old code)", async () => {
+  resetDiscovery();
+  const newer = await createDaemon({ runner: okRunner(), port: 0, log: () => undefined, version: "999.0.0" });
+  try {
+    writeDaemonInfo(infoForHandle(newer, process.pid, "999.0.0"));
+    let spawned = false;
+    const logs: string[] = [];
+    const info = await ensureDaemonRunning({
+      bundlePath: "unused-in-test",
+      log: (line) => logs.push(line),
+      spawn: () => {
+        spawned = true;
+      },
+    });
+    assert.equal(spawned, false, "no successor is spawned for a newer daemon");
+    assert.equal(info.url, newer.url, "the newer daemon is adopted");
+    assert.ok(logs.some((line) => line.includes("adopting daemon v999.0.0")), logs.join(" | "));
+    assert.equal(isSupersededBy(process.pid), false, "discovery still names the newer daemon");
+  } finally {
+    await newer.close();
     resetDiscovery();
   }
 });

@@ -315,8 +315,10 @@ stay warm while any MCP client is connected to the project (the daemon's session
 already measures liveness by connection presence — a live client always holds an open
 connection; the presence ledger is shared with the `workflow` tool, so a workflow-only client
 keeps the workspace warm too). On last-client disconnect, in-flight subagent turns **drain to
-completion within a bound** — the daemon's session-eviction TTL (`SESSION_IDLE_TTL_MS`,
-default 2 h) — their results settle into the VM and each settlement boundary snapshots, so
+completion within a bound** — the daemon's REPL drain bound (`REPL_DRAIN_BOUND_MS`,
+default 2 h; *amended 2026-08-20:* originally the session-eviction TTL `SESSION_IDLE_TTL_MS`
+itself, decoupled when that TTL was shortened to collect dead-client sessions promptly — the
+drain's value and semantics are unchanged) — their results settle into the VM and each settlement boundary snapshots, so
 "close the laptop while two researchers run" ends with the findings durable in the workspace;
 a turn that overruns the bound is force-settled as the recoverable `AGENT_CANCELLED`, and then
 idle children close. A client that **reconnects mid-drain aborts it**, keeping the children
@@ -352,8 +354,9 @@ envelope makes that a clean rejection rather than a surprise.
 
 These decisions the concept doc left open were made and shipped in phases C–F:
 
-- The drain-completion bound on disconnect **reuses the daemon's session-eviction TTL**
-  (`SESSION_IDLE_TTL_MS`); a turn that overruns it is force-settled as the recoverable
+- The drain-completion bound on disconnect is the daemon's `REPL_DRAIN_BOUND_MS` (2 h —
+  *amended 2026-08-20:* it originally **reused the session-eviction TTL** `SESSION_IDLE_TTL_MS`,
+  now a separate, shorter knob); a turn that overruns it is force-settled as the recoverable
   `AGENT_CANCELLED`, and a mid-drain reconnect aborts the drain.
 - Snapshot-write mechanics (atomic tmp+rename, debounce within a drain burst) and the config
   knobs landed — the per-eval deadline is `AGENTPRISM_REPL_EVAL_TIMEOUT_MS` (default 30 000 ms).

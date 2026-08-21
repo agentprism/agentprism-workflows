@@ -15,6 +15,8 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import { envFingerprint } from "../../src/daemon/daemon-info.js";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema, ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -52,7 +54,7 @@ interface E2eDaemonInfo {
 
 function readInfo(): E2eDaemonInfo | undefined {
   try {
-    return JSON.parse(readFileSync(join(e2eHome, ".agentprism", "workflows", "daemon.json"), "utf-8")) as E2eDaemonInfo;
+    return JSON.parse(readFileSync(join(e2eHome, ".agentprism", "workflows", "daemons", `${envFingerprint(childEnv)}.json`), "utf-8")) as E2eDaemonInfo;
   } catch {
     return undefined;
   }
@@ -287,6 +289,38 @@ test("subscriptions survive daemon death: the shim re-subscribes on session reco
   } finally {
     await session.close();
   }
+});
+
+test("a request in flight when the daemon dies is answered with an error (never left hanging), and the same client keeps working on the fresh daemon", { timeout: 60_000 }, async () => {
+  const session = await connectShim();
+  assert.equal((await callWorkflow(session.client))?.status, "completed");
+  const before = readInfo();
+  assert.ok(before);
+
+  // A request that will never complete on this daemon: a synchronous never-yielding eval
+  // blocks the daemon's main thread (the repl-break e2e's fixture). It is in flight when the
+  // daemon is killed outright.
+  const inflight = session.client.callTool(
+    { name: "repl", arguments: { action: "eval", projectDir: e2eHome, code: "while (true) {}" } },
+    undefined,
+    { timeout: 50_000 },
+  );
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+  process.kill(before.pid, "SIGKILL");
+  await waitFor(() => !pidAlive(before.pid), "old daemon to die");
+
+  // A second request from the same client: the shim detects the dead daemon, recovers, and
+  // the orphaned first request is failed explicitly rather than hanging forever.
+  const second = callWorkflow(session.client);
+  await assert.rejects(inflight, (error: unknown) => {
+    assert.match(String((error as Error).message), /session lost|daemon unreachable/i, String((error as Error).message));
+    return true;
+  });
+  assert.equal((await second)?.status, "completed", "the client keeps working on the fresh daemon");
+  const after = readInfo();
+  assert.ok(after);
+  assert.notEqual(after.pid, before.pid);
+  await session.close();
 });
 
 test("daemon stop terminates the daemon and clears discovery state", async () => {

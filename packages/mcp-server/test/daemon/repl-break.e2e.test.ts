@@ -19,6 +19,8 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import { envFingerprint } from "../../src/daemon/daemon-info.js";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -45,7 +47,7 @@ interface E2eDaemonInfo {
 
 function readInfo(): E2eDaemonInfo | undefined {
   try {
-    return JSON.parse(readFileSync(join(e2eHome, ".agentprism", "workflows", "daemon.json"), "utf-8")) as E2eDaemonInfo;
+    return JSON.parse(readFileSync(join(e2eHome, ".agentprism", "workflows", "daemons", `${envFingerprint(childEnv)}.json`), "utf-8")) as E2eDaemonInfo;
   } catch {
     return undefined;
   }

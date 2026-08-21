@@ -14,10 +14,19 @@ import {
   DAEMON_NAME,
   DAEMON_PORT_ENV,
   DEFAULT_DAEMON_PORT,
+  REPL_DRAIN_BOUND_ENV,
+  REPL_DRAIN_BOUND_MS,
   SESSION_IDLE_TTL_ENV,
   SESSION_IDLE_TTL_MS,
 } from "./constants.js";
-import { envFingerprint, pidIsAlive, probeHealthz, readDaemonInfo, writeDaemonInfo } from "./daemon-info.js";
+import {
+  envFingerprint,
+  findDaemonInstanceOnPort,
+  pidIsAlive,
+  probeHealthz,
+  readDaemonInfo,
+  writeDaemonInfo,
+} from "./daemon-info.js";
 import { installDaemonLifecycle } from "./daemon-lifecycle.js";
 import { createDaemon, DaemonPortInUseError } from "./http-daemon.js";
 import { createEvalBreakChannel } from "@automatalabs/repl-engine";
@@ -25,11 +34,12 @@ import { createEvalBreakChannel } from "@automatalabs/repl-engine";
 export interface RunDaemonOptions {
   port?: number;
   /**
-   * Replace a divergent daemon that still holds discovery. The predecessor is deliberately
-   * left running to drain its in-flight sessions and runs, so a successor never fights for
-   * the port — it binds an ephemeral one and repoints `daemon.json` at itself, demoting the
-   * predecessor to a lame duck (whose pid no longer matches `daemon.json`). Set by the shim
-   * (`--supersede`) when its version/env fingerprint diverges from the live daemon.
+   * Replace a stale daemon that still holds the family's discovery pointer. The predecessor is
+   * deliberately left running to finish its in-flight work, so a successor never fights for
+   * the port — it binds the explicitly requested port if one was given (falling back to an
+   * ephemeral one when that is taken), otherwise an ephemeral one, and repoints the pointer at
+   * itself, demoting the predecessor to a lame duck (whose pid no longer matches the pointer).
+   * Set by the shim (`--supersede`) when the live daemon is older than the shim.
    */
   supersede?: boolean;
 }
@@ -60,39 +70,61 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
 
   let daemon;
   const sessionTtlMs = envInt(SESSION_IDLE_TTL_ENV, SESSION_IDLE_TTL_MS);
+  const replDrainBoundMs = envInt(REPL_DRAIN_BOUND_ENV, REPL_DRAIN_BOUND_MS);
+  const describePortHolder = (port: number): string => {
+    const holder = findDaemonInstanceOnPort(port);
+    if (holder === undefined) return `port ${port} is taken by another process`;
+    return (
+      `port ${port} is still held by ${holder.legacy ? "a legacy " : ""}daemon pid ${holder.info.pid} ` +
+      `(v${holder.info.version}, started ${holder.info.startedAt})`
+    );
+  };
   // The eval-break relay (phase-F review round 2): a worker-thread
   // channel whose loopback endpoint stays reachable while the daemon's
   // main thread is blocked in a synchronous eval — the `interrupt`
   // tool's no-id break. Its address travels in daemon.json so the shim
   // can fire it out of band.
   const evalBreakChannel = createEvalBreakChannel();
+  const daemonOptions = { runner, log, replDrainBoundMs, evalBreakChannel };
   if (supersede) {
-    // Succession: the divergent predecessor may still hold the default port and is left
-    // running to drain, so never contend for it — bind an ephemeral port. daemon.json
-    // (repointed below) is the sole discovery channel, so an ephemeral port is fully
-    // functional; the predecessor becomes a lame duck the moment we repoint.
-    log(`[${DAEMON_NAME}] starting as a successor to a superseded daemon (ephemeral port)`);
-    daemon = await createDaemon({ runner, port: 0, log, sessionTtlMs, evalBreakChannel });
+    // Succession: the stale predecessor may still hold the default port and is left running
+    // to finish its in-flight work, so never contend for it — bind the explicitly requested
+    // port if there is one (it is the caller's, not the predecessor's), else an ephemeral
+    // port. The family pointer (repointed below) is the sole discovery channel, so an
+    // ephemeral port is fully functional; the predecessor becomes a lame duck the moment we
+    // repoint.
+    let port = options.port ?? 0;
+    try {
+      daemon = await createDaemon({ ...daemonOptions, port });
+    } catch (error) {
+      if (!(error instanceof DaemonPortInUseError) || port === 0) throw error;
+      log(`[${DAEMON_NAME}] ${describePortHolder(port)}; successor falling back to an ephemeral port`);
+      port = 0;
+      daemon = await createDaemon({ ...daemonOptions, port });
+    }
+    log(`[${DAEMON_NAME}] starting as a successor to a superseded daemon (port ${daemon.port})`);
   } else {
     const port = resolveDaemonPort(options.port);
     try {
-      daemon = await createDaemon({ runner, port, log, sessionTtlMs, evalBreakChannel });
+      daemon = await createDaemon({ ...daemonOptions, port });
     } catch (error) {
       if (!(error instanceof DaemonPortInUseError)) throw error;
       if (await ownDaemonAlreadyRunning()) {
         log(`[${DAEMON_NAME}] already running (port ${port}); nothing to do`);
         return "already-running";
       }
-      // A foreign process owns the default port. Discovery goes through daemon.json, never a
-      // blind dial of the default port, so an ephemeral port is fully functional.
-      log(`[${DAEMON_NAME}] port ${port} is taken by another process; falling back to an ephemeral port`);
-      daemon = await createDaemon({ runner, port: 0, log, sessionTtlMs, evalBreakChannel });
+      // Something else owns the default port — a draining daemon of ours (its pointer no
+      // longer names it) or a foreign process. Discovery goes through the family pointer,
+      // never a blind dial of the default port, so an ephemeral port is fully functional.
+      log(`[${DAEMON_NAME}] ${describePortHolder(port)}; falling back to an ephemeral port`);
+      daemon = await createDaemon({ ...daemonOptions, port: 0 });
     }
   }
 
-  // Atomically (tmp+rename) repoint daemon.json at THIS process. For a succession this is the
-  // step that demotes the predecessor to a lame duck (its pid no longer matches daemon.json);
-  // the pid-guarded clearDaemonInfo means the predecessor's own shutdown never clobbers it.
+  // Atomically (tmp+rename) repoint the family pointer at THIS process (and record the
+  // instance). For a succession this is the step that demotes the predecessor to a lame duck
+  // (its pid no longer matches the pointer); the pid-guarded clearDaemonInfo means the
+  // predecessor's own shutdown never clobbers it.
   writeDaemonInfo({
     name: DAEMON_NAME,
     version: SERVER_VERSION,
@@ -112,7 +144,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
     runner,
     ownPid: process.pid,
     idleTtlMs: envInt(DAEMON_IDLE_TTL_ENV, DAEMON_IDLE_TTL_MS),
-    sessionTtlMs: envInt(SESSION_IDLE_TTL_ENV, SESSION_IDLE_TTL_MS),
+    sessionTtlMs,
     log,
   });
 

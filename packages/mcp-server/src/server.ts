@@ -84,7 +84,7 @@ import { registerAuthoringPrompt } from "./authoring-prompt.js";
 import { registerReplTool } from "./repl-tool.js";
 import { ReplPresenceLedger } from "./repl-presence.js";
 import { createReplProjectState, DEFAULT_REPL_EVAL_TIMEOUT_MS } from "./repl-project.js";
-import { SESSION_IDLE_TTL_MS } from "./daemon/constants.js";
+import { REPL_DRAIN_BOUND_MS } from "./daemon/constants.js";
 import type { WorkflowServerControl } from "./lifecycle.js";
 import {
   WorkflowScriptResources,
@@ -93,7 +93,18 @@ import {
 
 const SERVER_NAME = "agentprism-workflow";
 const require = createRequire(import.meta.url);
-export const SERVER_VERSION = (require("../package.json") as { version: string }).version;
+/**
+ * The server's code identity — ALWAYS the mcp-server package version, whichever artifact
+ * carries the code. The `@automatalabs/workflows` bundle embeds this source and defines
+ * `__AGENTPRISM_MCP_SERVER_VERSION__` at build time (its own `../package.json` is a different
+ * package with a different version; reporting that made the two distributions supersede each
+ * other's daemon forever). Unbundled, the package's own manifest is the source of truth.
+ */
+declare const __AGENTPRISM_MCP_SERVER_VERSION__: string | undefined;
+export const SERVER_VERSION: string =
+  typeof __AGENTPRISM_MCP_SERVER_VERSION__ === "string"
+    ? __AGENTPRISM_MCP_SERVER_VERSION__
+    : (require("../package.json") as { version: string }).version;
 
 // Server-wide guidance returned in the MCP initialize response (ServerOptions.instructions),
 // surfaced by hosts to orient the calling agent to the two model-facing tools and when to reach
@@ -1311,7 +1322,7 @@ export function createWorkflowServer(
   // client's presence was invisible to the last-client-disconnect drain
   // and a repl client's disconnect could drain children while the
   // workflow client was still connected).
-  const replPresence = options.replPresence ?? new ReplPresenceLedger(options.replDrainBoundMs ?? SESSION_IDLE_TTL_MS);
+  const replPresence = options.replPresence ?? new ReplPresenceLedger(options.replDrainBoundMs ?? REPL_DRAIN_BOUND_MS);
 
   /** Route a parsed input to its project context; undefined = runId found in no known store. */
   const resolveContext = (input: ReturnType<typeof parseWorkflowToolInput>): ProjectContext | undefined => {
