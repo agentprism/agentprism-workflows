@@ -27,15 +27,26 @@ function fakeHandle(state: {
   sessions: number;
   activeRuns: number;
   activeDrains: number;
+  superseded?: boolean;
+  /** Sessions closed by the lame-duck migration; `evictDrainable` empties `sessions`. */
+  migrated?: number;
 }): DaemonHandle {
   return {
     port: 0,
     url: "http://127.0.0.1:0/mcp",
     startedAt: new Date().toISOString(),
-    sessions: { get size() { return state.sessions; }, evictIdle: () => [] } as never,
+    sessions: { get size() { return state.sessions; }, evictIdle: () => [], inflightCount: () => 0 } as never,
     projects: { disposeReplStates: async () => undefined } as never,
     activeRunCount: () => state.activeRuns,
     activeReplDrainCount: () => state.activeDrains,
+    inflightRequestCount: () => 0,
+    isSuperseded: () => state.superseded ?? false,
+    evictDrainableSessions: () => {
+      const ids = Array.from({ length: state.sessions }, (_, i) => `s${i}`);
+      state.migrated = (state.migrated ?? 0) + ids.length;
+      state.sessions = 0;
+      return ids;
+    },
     close: async () => undefined,
   };
 }
@@ -114,4 +125,56 @@ test("sessions and runs still count as busy alongside drains (the pre-existing a
   state.activeDrains = 0;
   await sleep(220);
   assert.deepEqual(process.exits, [0], "idle shutdown fires once the drain completed");
+});
+
+test("a superseded daemon does not wait for the idle TTL: it migrates idle sessions and exits as soon as nothing is busy, even with idle shutdown disabled", async () => {
+  const state = { sessions: 3, activeRuns: 0, activeDrains: 0, superseded: true, migrated: 0 };
+  const { handle, exits } = fakeProcess();
+  const logs: string[] = [];
+  const lifecycle = installDaemonLifecycle({
+    daemon: fakeHandle(state),
+    runner: { dispose: async () => undefined } as unknown as AgentRunner,
+    ownPid: process.pid,
+    idleTtlMs: 0, // disabled — supersession must still exit the daemon
+    sessionTtlMs: 60_000,
+    reaperIntervalMs: 15,
+    process: handle,
+    log: (line) => logs.push(line),
+  });
+  try {
+    await sleep(120);
+    assert.equal(state.migrated, 3, "every idle session was closed so its client re-initializes on the successor");
+    assert.deepEqual(exits, [0], "the superseded daemon exited without waiting for any idle TTL");
+    assert.ok(logs.some((line) => line.includes("superseded by a newer daemon; draining")), logs.join(" | "));
+    assert.ok(logs.some((line) => line.includes("migrated 3 idle session(s)")), logs.join(" | "));
+    assert.ok(logs.some((line) => line.includes("superseded and nothing in flight; exiting")), logs.join(" | "));
+  } finally {
+    if (exits.length === 0) await lifecycle.shutdown("SIGTERM");
+  }
+});
+
+test("a superseded daemon with active runs keeps its sessions (a paused run's checkpoint stays answerable) and exits once the runs finish", async () => {
+  const state = { sessions: 2, activeRuns: 1, activeDrains: 0, superseded: true, migrated: 0 };
+  const { handle, exits } = fakeProcess();
+  const lifecycle = installDaemonLifecycle({
+    daemon: fakeHandle(state),
+    runner: { dispose: async () => undefined } as unknown as AgentRunner,
+    ownPid: process.pid,
+    idleTtlMs: 0,
+    sessionTtlMs: 60_000,
+    reaperIntervalMs: 15,
+    process: handle,
+    log: () => undefined,
+  });
+  try {
+    await sleep(80);
+    assert.equal(state.migrated, 0, "sessions are kept while a run is active");
+    assert.deepEqual(exits, []);
+    state.activeRuns = 0;
+    await sleep(80);
+    assert.equal(state.migrated, 2, "once the runs finished, the idle sessions migrated");
+    assert.deepEqual(exits, [0]);
+  } finally {
+    if (exits.length === 0) await lifecycle.shutdown("SIGTERM");
+  }
 });

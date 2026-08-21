@@ -164,6 +164,20 @@ export class ReplPresenceLedger {
     return this.draining.size;
   }
 
+  /**
+   * True when any workspace the session has affinity with has a subagent turn running. The
+   * lame-duck migration keeps such sessions: closing one would drain the workspace here while
+   * the migrated client re-opens it on the successor — a workspace split across two daemons.
+   */
+  sessionHasBusyWorkspace(clientId: string): boolean {
+    const projects = this.bySession.get(clientId);
+    if (projects === undefined) return false;
+    for (const state of projects) {
+      if (state.broker !== null && state.broker.busySessionCount() > 0) return true;
+    }
+    return false;
+  }
+
   /** Drop every session's presence (daemon shutdown): the scheduled
    *  drains see the projects' client sets emptied and run to completion
    *  on the already-disposed brokers — a no-op there, cleared here. */

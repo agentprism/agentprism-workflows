@@ -5,13 +5,21 @@
  * process is disposable by design: the client may kill it at will; runs live in the daemon.
  *
  * The only frames the shim inspects:
- *  - the client's `initialize` request — cached for 404 recovery, and its response sniffed
- *    to call setProtocolVersion() (there is no protocol layer to do it);
+ *  - the client's `initialize` request — cached for recovery, and its response sniffed to
+ *    call setProtocolVersion() (there is no protocol layer to do it);
  *  - the `initialized` notification — forwarded verbatim; the SDK client transport then
  *    auto-opens the standalone GET stream (SSE) for server-initiated messages;
- *  - a 404 on send — the spec's "session terminated": the shim transparently re-ensures the
- *    daemon (it may have restarted on a new port), re-initializes a fresh session with the
- *    cached initialize, and retries. The client never notices an eviction or daemon restart.
+ *  - client requests — their ids are tracked until the response arrives, so a request whose
+ *    daemon session dies underneath it is answered with an error instead of hanging forever.
+ *
+ * Session recovery — the spec's 404 after eviction or a daemon restart, a 503 from a
+ * superseded (lame-duck) daemon, a network error because the daemon died, or the standalone
+ * GET stream failing for any of those reasons — always takes the same path: re-ensure the
+ * daemon (it may have been replaced by a newer one on another port), re-initialize a fresh
+ * session with the cached initialize, re-arm subscriptions, and drain the queue. The client
+ * never notices an eviction, a daemon restart, or a version upgrade. Recovery is triggered
+ * PROACTIVELY from the GET stream's failure (not only from the client's next frame) so that
+ * server-push continuity resumes promptly after a migration.
  */
 
 import { realpathSync } from "node:fs";
@@ -21,8 +29,8 @@ import {
   StreamableHTTPClientTransport,
   StreamableHTTPError,
 } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { isJSONRPCRequest, isJSONRPCResponse } from "@modelcontextprotocol/sdk/types.js";
-import type { JSONRPCMessage, RequestId } from "@modelcontextprotocol/sdk/types.js";
+import { isJSONRPCError, isJSONRPCRequest, isJSONRPCResponse } from "@modelcontextprotocol/sdk/types.js";
+import type { JSONRPCMessage, JSONRPCRequest, RequestId } from "@modelcontextprotocol/sdk/types.js";
 
 import { DAEMON_NAME } from "../daemon/constants.js";
 import { ensureDaemonRunning } from "./ensure-daemon.js";
@@ -33,10 +41,32 @@ export interface RunShimOptions {
   port?: number;
 }
 
+/** Recoveries allowed inside the window before the shim gives up (a crash-looping daemon). */
+const RECOVERY_WINDOW_MS = 60_000;
+const RECOVERY_MAX_PER_WINDOW = 6;
+
 function initializeResultProtocolVersion(message: JSONRPCMessage): string | undefined {
   if (!isJSONRPCResponse(message)) return undefined;
   const version = (message.result as { protocolVersion?: unknown }).protocolVersion;
   return typeof version === "string" ? version : undefined;
+}
+
+/**
+ * Session loss in every shape it reaches the shim:
+ *  - 404: the spec's "session terminated" (eviction, migration off a lame duck, daemon restart);
+ *  - 503: a superseded daemon refusing a new session (discovery moved between our probe and
+ *    our request) — re-ensure finds the successor;
+ *  - TypeError: undici's network failure ("fetch failed") — the daemon died;
+ *  - the SDK client's stream-recovery exhaustion/refusal messages, which wrap the above after
+ *    the standalone GET (or a resumable POST stream) failed to reconnect.
+ */
+function isRecoverableError(error: unknown): boolean {
+  if (error instanceof StreamableHTTPError) return error.code === 404 || error.code === 503;
+  if (error instanceof TypeError) return true;
+  if (error instanceof Error) {
+    return /Maximum reconnection attempts|Failed to reconnect|Failed to open SSE stream/.test(error.message);
+  }
+  return false;
 }
 
 export async function runShim(options: RunShimOptions): Promise<void> {
@@ -51,6 +81,7 @@ export async function runShim(options: RunShimOptions): Promise<void> {
   // eval (the daemon processes the forwarded request only after the
   // eval ends or breaks; the relay's flag is what breaks it mid-run).
   let replBreakUrl: string | undefined = info.replBreakUrl;
+  let exiting = false;
 
   /** Fire the out-of-band break for a `repl` interrupt without an id
    *  (best-effort, fire-and-forget: the daemon's own processing clears
@@ -96,16 +127,86 @@ export async function runShim(options: RunShimOptions): Promise<void> {
   const subscribedUris = new Set<string>();
   const swallowedIds = new Set<string>();
 
+  // Client requests forwarded to the daemon whose response has not arrived yet, keyed by
+  // request id and remembering which transport carried them. When that transport is retired
+  // (its session is gone) every request still pending on it is answered with an error — the
+  // daemon will never answer it, and a request left unanswered hangs the host forever.
+  interface PendingRequest {
+    transport: StreamableHTTPClientTransport;
+    message: JSONRPCRequest;
+  }
+  const pending = new Map<string, PendingRequest>();
+  const keyOf = (id: RequestId): string => `${typeof id}:${String(id)}`;
+  /** Transports taken out of service (their session is gone); their late errors/replies are noise. */
+  const retired = new WeakSet<StreamableHTTPClientTransport>();
+
+  const recoveryTimes: number[] = [];
+  function recoveryAllowed(now = Date.now()): boolean {
+    while (recoveryTimes.length > 0 && now - recoveryTimes[0]! > RECOVERY_WINDOW_MS) recoveryTimes.shift();
+    return recoveryTimes.length < RECOVERY_MAX_PER_WINDOW;
+  }
+
   const makeHttpTransport = (url: string): StreamableHTTPClientTransport => {
     const transport = new StreamableHTTPClientTransport(new URL(url));
-    transport.onmessage = onDaemonMessage;
-    transport.onerror = (error) => log(`[${DAEMON_NAME} shim] http transport error: ${String(error)}`);
+    transport.onmessage = (message) => onDaemonMessage(message, transport);
+    transport.onerror = (error) => onTransportError(transport, error);
     return transport;
   };
 
   let http = makeHttpTransport(info.url);
 
-  function onDaemonMessage(message: JSONRPCMessage): void {
+  function failPendingOn(transport: StreamableHTTPClientTransport, reason: string): number {
+    let failed = 0;
+    for (const [key, entry] of [...pending.entries()]) {
+      if (entry.transport !== transport) continue;
+      pending.delete(key);
+      failed++;
+      void stdio
+        .send({
+          jsonrpc: "2.0",
+          id: entry.message.id,
+          error: {
+            code: -32603,
+            message:
+              `workflow daemon session lost before the response arrived (${reason}); ` +
+              `the request may or may not have completed — inspect before retrying`,
+          },
+        })
+        .catch(() => undefined);
+    }
+    return failed;
+  }
+
+  /**
+   * Take a transport out of service: its session is gone, so nothing pending on it can
+   * complete. The pending sweep is deferred one macrotask: the SDK reports a failed send
+   * through `onerror` BEFORE throwing it to the sender, and the sender's own catch must get
+   * to un-register (and re-queue) that frame first — it never reached the daemon, so it is
+   * replayed, not failed.
+   */
+  function retireTransport(transport: StreamableHTTPClientTransport, reason: string): void {
+    retired.add(transport);
+    void transport.close().catch(() => undefined);
+    setImmediate(() => {
+      const failed = failPendingOn(transport, reason);
+      if (failed > 0) log(`[${DAEMON_NAME} shim] ${failed} in-flight request(s) failed with the lost session (${reason})`);
+    });
+  }
+
+  function onTransportError(transport: StreamableHTTPClientTransport, error: unknown): void {
+    if (retired.has(transport) || exiting) return; // a retired transport's late errors are noise
+    log(`[${DAEMON_NAME} shim] http transport error: ${String(error)}`);
+    // The active transport's standalone stream (or a resumable request stream) is gone for a
+    // reason that means the session is gone: recover now rather than on the client's next
+    // frame, so server-push (subscriptions, notifications) resumes promptly.
+    if (isRecoverableError(error)) void startReinitialize(`stream error: ${String(error)}`);
+  }
+
+  function onDaemonMessage(message: JSONRPCMessage, transport: StreamableHTTPClientTransport): void {
+    if ((isJSONRPCResponse(message) || isJSONRPCError(message)) && message.id !== null && message.id !== undefined) {
+      pending.delete(keyOf(message.id));
+    }
+    if (retired.has(transport)) return; // a retired transport's late replies belong to a dead session
     if (pendingReinitId !== undefined && isJSONRPCResponse(message) && message.id === pendingReinitId) {
       // Shim-internal re-initialize: swallow the response, restore protocol state, re-arm
       // the client's subscriptions on the fresh session, then drain.
@@ -133,7 +234,7 @@ export async function runShim(options: RunShimOptions): Promise<void> {
         .catch((error: unknown) => failPump(`re-initialize handshake failed: ${String(error)}`));
       return;
     }
-    if (isJSONRPCResponse(message) && typeof message.id === "string" && swallowedIds.delete(message.id)) {
+    if ((isJSONRPCResponse(message) || isJSONRPCError(message)) && typeof message.id === "string" && swallowedIds.delete(message.id)) {
       return;
     }
     if (clientInitializeId !== undefined && isJSONRPCResponse(message) && message.id === clientInitializeId) {
@@ -156,16 +257,22 @@ export async function runShim(options: RunShimOptions): Promise<void> {
     void shutdown(1);
   }
 
-  async function startReinitialize(): Promise<void> {
-    if (reinitializing) return;
+  async function startReinitialize(reason: string): Promise<void> {
+    if (reinitializing || exiting) return;
+    if (!recoveryAllowed()) {
+      failPump(`daemon session recovery is looping (${RECOVERY_MAX_PER_WINDOW} attempts within ${RECOVERY_WINDOW_MS}ms; last: ${reason})`);
+      return;
+    }
+    recoveryTimes.push(Date.now());
     reinitializing = true;
     if (cachedInitialize === undefined) {
       failPump("daemon session lost before the client ever initialized");
       return;
     }
+    log(`[${DAEMON_NAME} shim] recovering the daemon session (${reason})`);
     try {
-      await http.close().catch(() => undefined);
-      // Re-ensure: the daemon may have restarted (new port).
+      retireTransport(http, reason);
+      // Re-ensure: the daemon may have restarted (new port) or been superseded by a newer one.
       const fresh = await ensureDaemonRunning({ bundlePath: options.bundlePath, port: options.port, log });
       replBreakUrl = fresh.replBreakUrl;
       http = makeHttpTransport(fresh.url);
@@ -175,36 +282,33 @@ export async function runShim(options: RunShimOptions): Promise<void> {
       await http.send(reinit);
       // Continues in onDaemonMessage when the InitializeResult for pendingReinitId arrives.
     } catch (error) {
+      if (isRecoverableError(error) && recoveryAllowed()) {
+        // Discovery moved again underneath us (a second succession, a lame duck's 503):
+        // take the recovery path once more rather than dying on a transient.
+        reinitializing = false;
+        pendingReinitId = undefined;
+        setTimeout(() => void startReinitialize(`retry after: ${String(error)}`), 250);
+        return;
+      }
       failPump(`could not re-establish a daemon session: ${String(error)}`);
     }
   }
-
-  // Session loss (spec 404 after eviction/daemon restart) and daemon death (network error —
-  // undici surfaces those as TypeError "fetch failed") both recover the same way: re-ensure
-  // the daemon and re-initialize a fresh session. The streak counter stops a crash-looping
-  // daemon from cycling forever; any successful send resets it.
-  let recoveryStreak = 0;
-  function isRecoverableSendError(error: unknown): boolean {
-    if (error instanceof StreamableHTTPError && error.code === 404) return true;
-    return error instanceof TypeError;
-  }
-
-  /** Serializes client→daemon forwarding so frames reach the daemon in the order sent. */
-  let sendChain: Promise<void> = Promise.resolve();
 
   async function pumpSend(message: JSONRPCMessage): Promise<void> {
     if (reinitializing) {
       queue.push(message);
       return;
     }
+    const transport = http;
+    if (isJSONRPCRequest(message)) pending.set(keyOf(message.id), { transport, message });
     try {
-      await http.send(message);
-      recoveryStreak = 0;
+      await transport.send(message);
     } catch (error) {
-      if (isRecoverableSendError(error) && recoveryStreak < 3) {
-        recoveryStreak++;
+      // The frame never reached the daemon: it is not pending there, and it can be replayed.
+      if (isJSONRPCRequest(message)) pending.delete(keyOf(message.id));
+      if (isRecoverableError(error)) {
         queue.push(message);
-        void startReinitialize();
+        void startReinitialize(`send failed: ${String(error)}`);
         return;
       }
       log(`[${DAEMON_NAME} shim] send failed: ${String(error)}`);
@@ -219,6 +323,9 @@ export async function runShim(options: RunShimOptions): Promise<void> {
       }
     }
   }
+
+  /** Serializes client→daemon forwarding so frames reach the daemon in the order sent. */
+  let sendChain: Promise<void> = Promise.resolve();
 
   stdio.onmessage = (message) => {
     if (isJSONRPCRequest(message)) {
@@ -258,7 +365,6 @@ export async function runShim(options: RunShimOptions): Promise<void> {
     sendChain = sendChain.then(() => pumpSend(message)).catch(() => undefined);
   };
 
-  let exiting = false;
   async function shutdown(code: number): Promise<void> {
     if (exiting) return;
     exiting = true;

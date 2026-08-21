@@ -3,16 +3,21 @@
 // Importing _harness isolates $HOME so daemon.json lands in a throwaway workflow home.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { test } from "node:test";
 
 import "../_harness.js";
 import {
   claimSpawnLock,
   clearDaemonInfo,
+  compareVersions,
   daemonInfoPath,
+  daemonInstancePath,
   daemonLockPath,
   envFingerprint,
+  findDaemonInstanceOnPort,
+  legacyDaemonInfoPath,
+  listDaemonInstances,
   pidIsAlive,
   readDaemonInfo,
   releaseSpawnLock,
@@ -96,7 +101,62 @@ test("envFingerprint tracks runner-relevant vars and ignores unrelated or TTL-on
   assert.notEqual(base, envFingerprint({ AGENTPRISM_BACKENDS: '{"a":2}' }));
   assert.notEqual(base, envFingerprint({}));
   assert.equal(
-    envFingerprint({ AGENTPRISM_DAEMON_IDLE_TTL_MS: "1", AGENTPRISM_SESSION_TTL_MS: "2" }),
+    envFingerprint({ AGENTPRISM_DAEMON_IDLE_TTL_MS: "1", AGENTPRISM_SESSION_TTL_MS: "2", AGENTPRISM_REPL_DRAIN_BOUND_MS: "3" }),
     envFingerprint({}),
   );
+});
+
+test("family pointers: writeDaemonInfo records the instance and repoints ONLY its own env family", () => {
+  const familyA = envFingerprint({ AGENTPRISM_BACKENDS: "a" });
+  const familyB = envFingerprint({ AGENTPRISM_BACKENDS: "b" });
+  writeDaemonInfo(info({ pid: process.pid, envFingerprint: familyA, port: 41001 }));
+  assert.equal(readDaemonInfo(familyA)?.port, 41001);
+  assert.equal(readDaemonInfo(familyB), undefined, "another env family is untouched");
+  assert.equal(existsSync(daemonInstancePath(process.pid)), true, "the instance record exists");
+  assert.equal(findDaemonInstanceOnPort(41001)?.info.pid, process.pid);
+  // Clearing the instance removes its pointer (pid-guarded) and its record.
+  clearDaemonInfo(process.pid);
+  assert.equal(readDaemonInfo(familyA), undefined);
+  assert.equal(existsSync(daemonInstancePath(process.pid)), false);
+});
+
+test("listDaemonInstances lists live instances and a live legacy daemon.json, pruning dead instance records", () => {
+  const dead = deadPid();
+  writeFileSync(daemonInstancePath(dead), JSON.stringify(info({ pid: dead })));
+  writeDaemonInfo(info({ pid: process.pid, port: 41002 }));
+  writeFileSync(legacyDaemonInfoPath(), JSON.stringify(info({ pid: process.pid, port: 41003, version: "0.0.0-legacy" })));
+  try {
+    const instances = listDaemonInstances();
+    assert.deepEqual(
+      instances.map((i) => [i.info.port, i.legacy]),
+      [[41002, false]],
+      "the live instance is listed; the legacy file names the same (already listed) pid so it is not duplicated; the dead one is pruned",
+    );
+    assert.equal(existsSync(daemonInstancePath(dead)), false, "dead instance records are pruned");
+    // A legacy daemon with a pid of its own is listed as legacy.
+    clearDaemonInfo(process.pid);
+    assert.deepEqual(
+      listDaemonInstances().map((i) => [i.info.port, i.legacy, i.info.version]),
+      [[41003, true, "0.0.0-legacy"]],
+    );
+  } finally {
+    clearDaemonInfo(process.pid);
+    try {
+      rmSync(legacyDaemonInfoPath(), { force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
+});
+
+test("compareVersions is a total order: numeric fields, prerelease below release, unparseable falls back to string order", () => {
+  assert.ok(compareVersions("0.29.0", "0.29.2") < 0);
+  assert.ok(compareVersions("0.49.0", "0.29.2") > 0);
+  assert.equal(compareVersions("1.2.3", "1.2.3"), 0);
+  assert.ok(compareVersions("1.2.3-beta.1", "1.2.3") < 0);
+  assert.ok(compareVersions("1.2.3", "1.2.3-beta.1") > 0);
+  assert.ok(compareVersions("1.2.3-alpha", "1.2.3-beta") < 0);
+  assert.ok(compareVersions("1.10.0", "1.9.9") > 0, "numeric, not lexicographic");
+  assert.ok(compareVersions("0.0.0-old", "0.0.0-test") < 0);
+  assert.ok(compareVersions("garbage", "0.1.0") > 0, "string fallback keeps the order total");
 });

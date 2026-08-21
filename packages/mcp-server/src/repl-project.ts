@@ -93,9 +93,11 @@
  * in-flight subagent turns drain to completion (their results settle
  * into the VM and each settlement boundary snapshots — "close the laptop
  * while two researchers run" ends with the findings durable), then idle
- * children close. The concrete drain bound REUSES the daemon's
- * session-eviction TTL (`SESSION_IDLE_TTL_MS` — the spec-owed decision;
- * the runner's own runaway protections already bound individual turns).
+ * children close. The concrete drain bound is the daemon's
+ * `REPL_DRAIN_BOUND_MS` (`AGENTPRISM_REPL_DRAIN_BOUND_MS`; it used to
+ * reuse the session-eviction TTL, which has since been decoupled so dead
+ * clients are collected promptly — the runner's own runaway protections
+ * already bound individual turns).
  * The workspace and broker stay alive; the next client's
  * followUp/steer/cancel lazily re-attaches the recorded backend
  * sessions (the broker's capability-gated lazy re-attach).

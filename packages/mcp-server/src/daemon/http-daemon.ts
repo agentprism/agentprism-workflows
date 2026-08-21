@@ -22,7 +22,7 @@ import type { BrokerRunner, EvalBreakChannel } from "@automatalabs/repl-engine";
 import { createWorkflowServer, SERVER_VERSION } from "../server.js";
 import { WorkflowProjectRegistry } from "../project-registry.js";
 import { ReplPresenceLedger } from "../repl-presence.js";
-import { DAEMON_NAME, HEALTHZ_PATH, MCP_ENDPOINT_PATH, SESSION_IDLE_TTL_MS } from "./constants.js";
+import { DAEMON_NAME, HEALTHZ_PATH, MCP_ENDPOINT_PATH, REPL_DRAIN_BOUND_MS } from "./constants.js";
 import { envFingerprint, isSupersededBy } from "./daemon-info.js";
 import { BoundedEventStore } from "./event-store.js";
 import { validateRequest } from "./middleware.js";
@@ -41,13 +41,14 @@ export interface CreateDaemonOptions {
    */
   replRunner?: BrokerRunner;
   /**
-   * The concrete REPL client-presence drain bound (the doc's spec-owed
-   * decision): the daemon REUSES its session-eviction TTL — a project
-   * whose last client disconnected drains its in-flight subagent turns
-   * up to this bound, then closes idle children. Defaults to
-   * `SESSION_IDLE_TTL_MS` (the same knob the session registry evicts
-   * dead clients with).
+   * The concrete REPL client-presence drain bound: a project whose last
+   * client disconnected drains its in-flight subagent turns up to this
+   * bound, then closes idle children. Defaults to `REPL_DRAIN_BOUND_MS`
+   * (its own knob — decoupled from the session-eviction TTL, which is
+   * now short enough to collect dead clients promptly).
    */
+  replDrainBoundMs?: number;
+  /** @deprecated alias of `replDrainBoundMs` (the two used to share one constant). */
   sessionTtlMs?: number;
   /** The REPL eval-break relay (phase-F review round 2; see
    *  repl-engine's `EvalBreakChannel`): the worker-thread channel whose
@@ -92,6 +93,16 @@ export interface DaemonHandle {
    * shutdown must never replace that bound with the shutdown deadline).
    */
   activeReplDrainCount(): number;
+  /** Requests (POSTs) being processed right now, across every session. */
+  inflightRequestCount(): number;
+  /** True when a newer daemon owns this family's discovery pointer (this one is a lame duck). */
+  isSuperseded(): boolean;
+  /**
+   * The lame-duck migration: close every session with no request in flight and no REPL
+   * workspace mid-turn, so its client transparently re-initializes on the successor. Returns
+   * the closed session ids.
+   */
+  evictDrainableSessions(): string[];
   close(): Promise<void>;
 }
 
@@ -125,7 +136,8 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
   // The REPL client-presence ledger: every session touches the projects it addresses; on
   // last-connection-closed a project with no clients left is drained (the doc's
   // client-presence policy; the bound reuses the session-eviction TTL).
-  const replPresence = new ReplPresenceLedger(options.sessionTtlMs ?? SESSION_IDLE_TTL_MS);
+  const replDrainBoundMs = options.replDrainBoundMs ?? options.sessionTtlMs ?? REPL_DRAIN_BOUND_MS;
+  const replPresence = new ReplPresenceLedger(replDrainBoundMs);
   // The three presence signals (phase-E review rejection: only the
   // disconnect was wired — a transient standalone-GET drop followed by a
   // reconnect of the SAME live session used to leave the session's
@@ -152,7 +164,14 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
         return;
       }
       sessions.connectionOpened(sessionId);
-      res.on("close", () => sessions.connectionClosed(sessionId));
+      // A POST is work in flight (a GET is only the standalone stream; a DELETE ends the
+      // session): the lame-duck migration never cuts a request being processed.
+      const isRequest = req.method === "POST";
+      if (isRequest) sessions.requestStarted(sessionId);
+      res.on("close", () => {
+        if (isRequest) sessions.requestFinished(sessionId);
+        sessions.connectionClosed(sessionId);
+      });
       await record.transport.handleRequest(req, res);
       return;
     }
@@ -194,7 +213,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
       replRunner: options.replRunner,
       replPresence,
       replClientId: () => transport.sessionId,
-      replDrainBoundMs: options.sessionTtlMs ?? SESSION_IDLE_TTL_MS,
+      replDrainBoundMs,
       replEvalBreakChannel: options.evalBreakChannel,
     });
     await server.connect(transport);
@@ -240,6 +259,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
             envFingerprint: envFingerprint(env),
             projects: projects.snapshot(),
             lameDuck: isSuperseded(),
+            inflightRequests: sessions.inflightCount(),
           }),
         );
         return;
@@ -276,6 +296,9 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     projects,
     activeRunCount: () => projects.activeRunCount(),
     activeReplDrainCount: () => replPresence.drainingCount(),
+    inflightRequestCount: () => sessions.inflightCount(),
+    isSuperseded,
+    evictDrainableSessions: () => sessions.evictDrainable((sessionId) => replPresence.sessionHasBusyWorkspace(sessionId)),
     async close() {
       const closed = new Promise<void>((resolvePromise) => {
         httpServer.close(() => resolvePromise());
