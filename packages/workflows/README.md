@@ -578,7 +578,8 @@ await runner.dispose();
 **Event names.** The ACP `sessionUpdate` discriminants verbatim — `user_message_chunk`,
 `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`,
 `plan_update`, `plan_removed`, `available_commands_update`, `current_mode_update`,
-`config_option_update`, `session_info_update`, `usage_update` — plus a few cross-cutting events:
+`config_option_update`, `session_info_update`, `usage_update`, and (ACP schema 1.21.0, UNSTABLE)
+`compaction_update`, `compaction_summary_chunk` — plus a few cross-cutting events:
 
 | event | payload |
 |-------|---------|

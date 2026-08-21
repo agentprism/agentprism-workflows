@@ -274,14 +274,12 @@ test("S3 pi-acp has no bespoke structured-output channel", async () => {
 });
 
 test("T13 auth methods are unconditional and exact; authenticate is ambient/no-op", () => {
-  assert.deepEqual(AUTH_METHODS.map(({ id, name }) => ({ id, name })), [
-    { id: "anthropic-api-key", name: "Anthropic API key" },
-    { id: "openai-api-key", name: "OpenAI API key" },
-    { id: "gemini-api-key", name: "Google Gemini API key" },
-    { id: "xai-api-key", name: "xAI API key" },
-    { id: "openrouter-api-key", name: "OpenRouter API key" },
-    { id: "pi-stored-credentials", name: "pi stored credentials" },
-  ]);
+  // ACP schema 1.21.0 removed the `env_var` variant, so only the ambient `agent` method remains
+  // (spec §9.5 supersession note, 2026-08-20). `type` is absent = `agent`.
+  assert.deepEqual(AUTH_METHODS, [{ id: "pi-stored-credentials", name: "pi stored credentials" }]);
+  for (const retired of ["anthropic-api-key", "openai-api-key", "gemini-api-key", "xai-api-key", "openrouter-api-key"]) {
+    assert.throws(() => authenticateMethod(retired), (error) => wire(error as RequestError).data.errorKind === "unknown_auth_method");
+  }
   assert.deepEqual(authenticateMethod("pi-stored-credentials"), {});
   assert.throws(() => authenticateMethod("missing"), (error) => wire(error as RequestError).data.errorKind === "unknown_auth_method");
 });

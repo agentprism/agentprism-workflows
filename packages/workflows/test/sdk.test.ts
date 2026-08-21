@@ -508,6 +508,8 @@ const ALL_ACP_UPDATE_KINDS = [
   "config_option_update",
   "session_info_update",
   "usage_update",
+  "compaction_update",
+  "compaction_summary_chunk",
 ] as const satisfies readonly AcpUpdateKind[];
 type _AllAcpUpdateKindsComplete = Assert<
   IsNever<Exclude<AcpUpdateKind, (typeof ALL_ACP_UPDATE_KINDS)[number]>>
@@ -543,6 +545,9 @@ const ALL_ACP_SESSION_UPDATES: AcpSessionUpdate[] = [
   { sessionUpdate: "config_option_update", configOptions: [] },
   { sessionUpdate: "session_info_update", title: "Session" },
   { sessionUpdate: "usage_update", used: 10, size: 100 },
+  // ACP schema 1.21.0 (SDK 1.4.0) — UNSTABLE session compaction updates (#2002).
+  { sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "in_progress" },
+  { sessionUpdate: "compaction_summary_chunk", compactionId: "compaction-1", content: { type: "text", text: "summary" } },
 ];
 
 function deferred() {
@@ -859,35 +864,37 @@ test("facade re-exports isAuthRequired as a value alongside isProviderUsageLimit
 // wiring compiling at all.
 test("facade re-exports the §4.2 runner-facing auth types", () => {
   const descriptor: AuthMethodDescriptor = {
-    type: "env_var",
+    type: "agent",
     id: "openai",
     name: "OpenAI",
-    vars: [{ name: "OPENAI_API_KEY", secret: true, optional: false }],
+    expectsMeta: true,
+    interactive: false,
+    meta: { "api-key": { provider: "openai" } },
   };
   const resolution: AuthResolution = { outcome: "env", values: { OPENAI_API_KEY: "sk-x" }, methodId: "openai" };
   const context: AuthContext = { backendId: "claude", methods: [descriptor], cause: "proactive" };
   const completeOpts: CompleteAuthOptions = { methodId: "openai", resolution };
   const outcome: AuthOutcome = { status: "authenticated", methodId: "openai", recycled: false };
-  const errorContext: AuthErrorContext = { methods: [{ id: "openai", type: "env_var" }] };
+  const errorContext: AuthErrorContext = { methods: [{ id: "openai", type: "agent" }] };
   const snapshot: AuthStatusSnapshot = {
     backendId: "claude",
     poolKey: "claude",
     state: "unauthenticated",
     authenticated: false,
     canResume: false,
-    methods: [{ id: "openai", type: "env_var", name: "OpenAI" }],
+    methods: [{ id: "openai", type: "agent", name: "OpenAI" }],
   };
   // Function/interface typedefs referenced purely as compile-gates through the facade barrel.
   const resolver: AuthResolver = async () => resolution;
   const controller: AuthController | undefined = undefined;
   const capable: AuthCapableRunner | undefined = undefined;
 
-  assert.equal(descriptor.type, "env_var");
+  assert.equal(descriptor.type, "agent");
   assert.equal(resolution.outcome, "env");
   assert.equal(context.cause, "proactive");
   assert.equal(completeOpts.methodId, "openai");
   assert.equal(outcome.status, "authenticated");
-  assert.equal(errorContext.methods[0]?.type, "env_var");
+  assert.equal(errorContext.methods[0]?.type, "agent");
   assert.equal(snapshot.state, "unauthenticated");
   assert.equal(typeof resolver, "function");
   assert.equal(controller, undefined);

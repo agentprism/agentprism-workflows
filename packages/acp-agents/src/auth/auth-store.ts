@@ -11,13 +11,16 @@ import type { AuthMethod } from "@agentclientprotocol/sdk";
 import type { AuthProfile } from "./auth-profiles.js";
 import { isGatewayShapedMeta } from "./auth-types.js";
 
-export type AuthMethodType = "agent" | "terminal" | "env_var";
+/** The SDK `AuthMethod.type` discriminants (ACP schema 1.21.0: `agent` | `terminal`; the former
+ *  `env_var` variant was removed upstream — agentclientprotocol/agent-client-protocol #1796/#2000). */
+export type AuthMethodType = "agent" | "terminal";
 
-/** The three-value strategy that collapses onto the two credential classes (§2.1):
+/** The two credential classes (§2.1):
  *   "disk"       -> disk-persisted; apply on a fresh connection = NOTHING.
  *   "in-process" -> per-spawn via authenticate RPC replay (§2.5).
- *   "spawn-env"  -> per-spawn via env injection + recycle (§2.8). */
-export type CredentialClass = "disk" | "in-process" | "spawn-env";
+ *  Host-supplied env values (`AuthIntent.envValues`) ride a `disk` intent and are injected at spawn
+ *  via the §2.8 overlay; the former `spawn-env` class went with the removed `env_var` method. */
+export type CredentialClass = "disk" | "in-process";
 
 /** Type-driven, agent-agnostic classification (§2.1). Keys ONLY on the method type + whether the
  *  advertised `_meta` is gateway-shaped — never on an agent id. */
@@ -26,8 +29,6 @@ export function classifyCredential(
   advertisedMeta: Record<string, unknown> | null | undefined,
 ): { klass: CredentialClass; diskBacked: boolean } {
   switch (methodType) {
-    case "env_var":
-      return { klass: "spawn-env", diskBacked: false };
     case "terminal":
       return { klass: "disk", diskBacked: true };
     case "agent":
@@ -50,7 +51,7 @@ export interface AuthIntent {
    *  or codex `{ "api-key": { apiKey } }`). Populated for BOTH in-process and disk intents; how it is
    *  consumed depends on `klass`, not on whether it is set. */
   readonly authenticateMeta?: Record<string, unknown>;
-  /** SECRET; spawn-env only. Env values injected at agent spawn. */
+  /** SECRET; `env` resolutions only. Env values injected at agent spawn (§2.8 overlay). */
   readonly envValues?: Record<string, string>;
   /** klass === "disk": a fresh process re-reads the native store; survives cold resume (§2.13). */
   readonly diskBacked: boolean;
@@ -212,7 +213,7 @@ export class AuthStore {
     return [...this.machines.keys()];
   }
 
-  /** The spawn-env overlay (§2.8): the machine's `env_var` collected values merged with the backend
+  /** The spawn-env overlay (§2.8): the machine's host-collected `envValues` merged with the backend
    *  profile's `spawnAuthEnv(intent)` contribution. Undefined when neither applies. Secret — passed
    *  straight to `spawn`, never logged. */
   spawnEnvFor(poolKey: string): Record<string, string> | undefined {

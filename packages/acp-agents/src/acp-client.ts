@@ -1552,7 +1552,7 @@ export interface PooledConnectionDeps {
   authCapabilities?: { terminal?: boolean; gateway?: boolean };
   /** The runner's single auth store (§2). When present, this connection reconciles to the current
    *  intent at the end of `initialize` (replay for in-process creds), overlays the spawn env with
-   *  collected `env_var` values, and carries a generation stamp the pool gates selection on.
+   *  host-collected env values, and carries a generation stamp the pool gates selection on.
    *  Undefined => no auth wiring, byte-identical to the pre-auth baseline (default-OFF). */
   authStore?: AuthStore;
   /** The runner's single provider-intent store. When present, this connection replays the recorded
@@ -1658,7 +1658,7 @@ export class PooledConnection {
     );
 
     const { command, args, env } = backend.spawnConfig();
-    // Spawn-env auth overlay (§2.8): host-collected `env_var` values (and, for a profiled backend,
+    // Spawn-env auth overlay (§2.8): host-collected env values (and, for a profiled backend,
     // its `spawnAuthEnv` contribution) stacked ABOVE the backend's own env. Undefined when nothing is
     // held — byte-identical to today. Passed straight to spawn; never logged (§2.14, Principle 9).
     const authOverlay = this.authStore?.spawnEnvFor(backend.poolKey ?? backend.id);
@@ -1932,7 +1932,7 @@ export class PooledConnection {
   }
 
   /** Reconcile this connection to the current intent at the end of `initialize` (§2.5). For an
-   *  in-process cred, replay `authenticate({methodId,_meta})`; for disk/spawn-env a fresh process
+   *  in-process cred, replay `authenticate({methodId,_meta})`; for disk (incl. env-at-spawn) a fresh process
    *  already carries the credential, so only stamp it current. */
   private async applyAuthIntent(machine: BackendAuthMachine): Promise<void> {
     if (machine.state !== "credentials_held" && machine.state !== "authenticated") {
@@ -1941,7 +1941,7 @@ export class PooledConnection {
     }
     const intent = machine.intentView();
     if (intent?.klass !== "in-process") {
-      // disk (native store) + spawn-env (env at spawn) need no RPC — a fresh process already has them.
+      // disk (native store, or env injected at spawn) needs no RPC — a fresh process already has them.
       this.stampApplied(machine.generation);
       return;
     }
@@ -2053,7 +2053,7 @@ export class PooledConnection {
       // Reconcile this connection to the current auth intent (§2.5). Runs identically on pooled,
       // dedicated, and interactive connections — the intent is durable in the AuthStore, so a fresh
       // process always re-primes an in-process (gateway) credential here, which is the direct fix
-      // for the dispose-after-authenticate bug (gap 3). Disk/spawn-env intents are only stamped.
+      // for the dispose-after-authenticate bug (gap 3). Disk intents are only stamped.
       const machine = this.authMachine();
       if (machine) {
         machine.send({ t: "initialize_ok", connectionId: this.id, advertised: negotiated.authMethods });

@@ -27,7 +27,6 @@ function stamp(appliedGeneration: number): ConnectionAuthStamp {
 }
 
 test("classifyCredential is type-driven and agent-agnostic (§2.1)", () => {
-  assert.deepEqual(classifyCredential("env_var", undefined), { klass: "spawn-env", diskBacked: false });
   assert.deepEqual(classifyCredential("terminal", undefined), { klass: "disk", diskBacked: true });
   // agent + gateway-shaped _meta -> in-process (claude/codex gateway).
   assert.deepEqual(classifyCredential("agent", { gateway: { protocol: "x" } }), { klass: "in-process", diskBacked: false });
@@ -158,11 +157,11 @@ test("isStale: a stamp older than the machine generation is stale; host_authenti
   assert.equal(m.isStale(stamp(1)), false);
 });
 
-test("AuthStore.spawnEnvFor returns the machine's collected env_var values (§2.8)", () => {
+test("AuthStore.spawnEnvFor returns the machine's host-collected env values (§2.8)", () => {
   const store = new AuthStore();
   assert.equal(store.spawnEnvFor("codex"), undefined); // no machine yet
   const m = store.machineFor("codex");
-  m.send({ t: "host_authenticate", intent: intent({ backendId: "codex", poolKey: "codex", methodId: "api-key", methodType: "env_var", klass: "spawn-env", envValues: { OPENAI_API_KEY: "sk-test" } }) });
+  m.send({ t: "host_authenticate", intent: intent({ backendId: "codex", poolKey: "codex", methodId: "api-key", methodType: "agent", klass: "disk", diskBacked: true, envValues: { OPENAI_API_KEY: "sk-test" } }) });
   assert.deepEqual(store.spawnEnvFor("codex"), { OPENAI_API_KEY: "sk-test" });
 });
 

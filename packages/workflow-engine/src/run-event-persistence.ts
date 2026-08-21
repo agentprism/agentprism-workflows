@@ -415,7 +415,7 @@ function isAuthContext(value: unknown, projected: boolean): boolean {
     (method) =>
       isObject(method) &&
       hasRequired(method, "id", text) &&
-      (method.type === "agent" || method.type === "terminal" || method.type === "env_var") &&
+      (method.type === "agent" || method.type === "terminal") &&
       hasOptional(method, "name", text),
   );
 }

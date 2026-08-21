@@ -255,7 +255,7 @@ export class AcpAgentPool {
       if (c.canLiveReapply(machine) && c.activeSessions === 0) {
         c.scheduleReapply(machine); // in-process: re-auth the idle connection live
       } else if (c.activeSessions === 0) {
-        this.disposeAndDrop(key, c); // disk/spawn-env: recycle the idle process now
+        this.disposeAndDrop(key, c); // disk (incl. env-at-spawn): recycle the idle process now
       } else {
         c.markForRecycleWhenIdle(machine); // BUSY: drain, then recycle on release
       }
@@ -265,7 +265,7 @@ export class AcpAgentPool {
   /** Reconcile every live connection for a key to the current provider-routing generation. There
    *  is no live re-apply lane here (provider changes are rare host-level config): an idle stale
    *  process is recycled now, a busy one drains and recycles on release — mirroring the
-   *  disk/spawn-env branches of reconcileStale. Never blocks. */
+   *  disk branch of reconcileStale. Never blocks. */
   private reconcileProviderStale(key: string): void {
     const store = this.deps.providerStore;
     if (!store) return;
