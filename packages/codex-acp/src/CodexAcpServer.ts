@@ -1,7 +1,13 @@
 import * as acp from "@agentclientprotocol/sdk";
 import {RequestError, type SessionId, type SessionModeState} from "@agentclientprotocol/sdk";
 import {CodexEventHandler, type CompletedPlan} from "./CodexEventHandler";
-import {CodexApprovalHandler} from "./CodexApprovalHandler";
+import {CodexApprovalHandler} from "./permissions/CodexApprovalHandler";
+import {PermissionLifecycleContext} from "./permissions/lifecycle";
+import {
+    planImplementationApproved,
+    planImplementationPermissionRequest,
+    planImplementationToolCallId,
+} from "./permissions/plan-review";
 import {CodexElicitationHandler} from "./CodexElicitationHandler";
 import {type CodexAuthRequest, getCodexAuthMethods, isCodexAuthRequest} from "./CodexAuthMethod";
 import {clientSupportsUrlElicitation} from "./ElicitationCapabilities";
@@ -131,8 +137,6 @@ import {
     parseAgentFileChangeReportRequest,
 } from "./AgentFileChangeReport";
 
-const IMPLEMENT_PLAN_OPTION_ID = "implement_plan";
-const REVISE_PLAN_OPTION_ID = "revise_plan";
 
 export interface SessionState {
     sessionId: string,
@@ -338,6 +342,7 @@ export class CodexAcpServer {
      *  could scramble the accumulated text). */
     private readonly loadedTurnUpdateChains = new Map<string, Promise<void>>();
     private readonly goalControlGenerations: Map<string, number>;
+    private readonly permissionLifecycleContexts: WeakMap<SessionState, PermissionLifecycleContext>;
     private readonly codexProcessState: CodexProcessState | null;
     private initializeRequest: acp.InitializeRequest | null = null;
     private providerUpdate: Promise<void> | null = null;
@@ -359,6 +364,7 @@ export class CodexAcpServer {
         this.sessionGenerations = new Map();
         this.sessionOpenGenerations = new Map();
         this.goalControlGenerations = new Map();
+        this.permissionLifecycleContexts = new WeakMap();
         this.connection = connection;
         this.codexAcpClient = codexAcpClient;
         this.defaultAuthRequest = defaultAuthRequest ?? null;
@@ -2294,6 +2300,14 @@ export class CodexAcpServer {
         return sessionState;
     }
 
+    private permissionLifecycleContext(sessionState: SessionState): PermissionLifecycleContext {
+        const existing = this.permissionLifecycleContexts.get(sessionState);
+        if (existing) return existing;
+        const context = new PermissionLifecycleContext(sessionState);
+        this.permissionLifecycleContexts.set(sessionState, context);
+        return context;
+    }
+
     private resolveSessionMcpServers(
         mcpServers: Array<acp.McpServer>,
         recoverFromStartup: boolean,
@@ -2647,10 +2661,18 @@ export class CodexAcpServer {
                 (turn) => this.pushLoadedTurnEndedOrdered(sessionState, turn),
             );
             eventHandler = promptEventHandler;
-            const approvalHandler = new CodexApprovalHandler(this.connection, sessionState, activePrompt.signal);
+            const permissionLifecycle = this.permissionLifecycleContext(sessionState);
+            const permissionContext = permissionLifecycle.beginPrompt();
+            const approvalHandler = new CodexApprovalHandler(
+                this.connection,
+                sessionState,
+                permissionContext,
+                activePrompt.signal,
+            );
             const elicitationHandler = new CodexElicitationHandler(
                 this.connection,
                 sessionState,
+                permissionContext,
                 this.clientCapabilities,
                 activePrompt.signal,
             );
@@ -2662,6 +2684,7 @@ export class CodexAcpServer {
                     }
                     const completesActiveTurn = event.method === "turn/completed"
                         && event.params.turn.id === sessionState.currentTurnId;
+                    permissionContext.handleNotification(event);
                     await elicitationHandler.handleNotification(event);
                     await promptEventHandler.handleNotification(event);
                     if (completesActiveTurn) {
@@ -3013,42 +3036,14 @@ export class CodexAcpServer {
         plan: CompletedPlan,
         cancellationSignal: AbortSignal,
     ): Promise<boolean> {
-        const toolCallId = `plan-review:${plan.itemId}`;
+        const toolCallId = planImplementationToolCallId(plan);
         try {
             const response = await this.connection.request(
                 acp.methods.client.session.requestPermission,
-                {
-                    sessionId: sessionState.sessionId,
-                    toolCall: {
-                        toolCallId,
-                        title: "Implement this plan?",
-                        kind: "switch_mode",
-                        status: "pending",
-                        rawInput: {plan: plan.text},
-                    },
-                    options: [
-                        {
-                            optionId: IMPLEMENT_PLAN_OPTION_ID,
-                            name: "Yes, implement this plan",
-                            kind: "allow_once",
-                        },
-                        {
-                            optionId: REVISE_PLAN_OPTION_ID,
-                            name: "No, and tell Codex what to do differently",
-                            kind: "reject_once",
-                        },
-                    ],
-                    _meta: {
-                        codex: {
-                            kind: "plan_review",
-                            planItemId: plan.itemId,
-                        },
-                    },
-                },
+                planImplementationPermissionRequest(sessionState.sessionId, plan),
                 {cancellationSignal},
             );
-            const approved = response.outcome.outcome === "selected"
-                && response.outcome.optionId === IMPLEMENT_PLAN_OPTION_ID;
+            const approved = planImplementationApproved(response);
             await this.connection.notify(acp.methods.client.session.update, {
                 sessionId: sessionState.sessionId,
                 update: {
