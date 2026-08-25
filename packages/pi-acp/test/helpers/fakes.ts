@@ -302,6 +302,7 @@ export function fakeDeps(behavior: FakeBehavior = "normal"): FakeDepsResult {
   const modelRuntime = {
     getModel(provider: string, id: string) { return provider === "test" && id === "model" ? model : undefined; },
     async getAvailable() { return [model]; },
+    getAvailableSnapshot() { return [model]; },
     hasConfiguredAuth() { return true; },
   } as unknown as ModelRuntime;
   const deps: PiAcpDeps = {

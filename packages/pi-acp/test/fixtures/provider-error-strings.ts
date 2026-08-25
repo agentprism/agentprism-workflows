@@ -1,4 +1,12 @@
-export const FIXTURE_PI_PIN = "0.84.2";
+export const FIXTURE_PI_PIN = "0.84.3";
+// 2026-08-25 bump 0.84.2 -> 0.84.3: the release adds PowerShell, model/thinking controls,
+// compaction events, and provider/runtime fixes. AgentSession.setModel now keeps selection
+// session-scoped unless persistence is explicitly requested, which matches pi-acp's per-session
+// model configuration. The steering/follow-up SDK methods and the error-classification surface are
+// unchanged. E1 re-verified against the installed v0.84.3 dists: auth-guidance.js is byte-identical;
+// agent-session.js still emits the same "Authentication failed for" / "Run '/login" /
+// "to re-authenticate" templates; and pi-ai dist/utils/{retry,overflow,error-body,provider-retry}.js
+// are byte-identical to 0.84.2. The fixture strings therefore remain byte-identical.
 // 2026-08-17 bump 0.84.1 -> 0.84.2: a no-breaking-changes patch (fullscreen transcript search,
 // configurable default tools, a native Mistral Chat Completions transport, plus TUI /
 // provider-stream and JSON/RPC usage-streaming fixes) that touches no classified surface. E1
