@@ -1,5 +1,13 @@
 # @automatalabs/acp-agents
 
+## 0.38.1
+
+### Patch Changes
+
+- Updated dependencies [cad804a]
+  - @automatalabs/codex-acp@1.9.5
+  - @automatalabs/pi-acp@0.5.1
+
 ## 0.38.0
 
 ### Minor Changes
