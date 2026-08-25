@@ -1,0 +1,1095 @@
+---
+title: "REPL strict steering and queued turns"
+description: "Frozen implementation contract for removing followUp, making steering active-turn-only, and adding broker-owned queued turns."
+status: "frozen"
+created: "2026-08-25"
+updated: "2026-08-25"
+base_commit: "71a2d3d4"
+---
+
+# REPL strict steering and queued turns
+
+## Status and authority
+
+This is the **frozen implementation contract** for the REPL steering and queued-turn change. Build is
+authorized. There are no open product or semantic decisions in this document. Implementers and reviewers
+MUST NOT add compatibility behavior, infer alternate semantics, or defer a choice described here.
+
+The owner-approved decisions are:
+
+1. `.followUp()` is removed.
+2. `.steer()` controls only a currently active turn. It never creates, schedules, or owns a turn.
+3. `.queue()` creates a distinct, addressable future turn on the same ACP session.
+4. The REPL broker owns queued-turn scheduling. No backend-native follow-up or queue API implements
+   `.queue()`.
+5. ACP extension metadata and extension responses pass through `@automatalabs/acp-agents` without
+   backend-declared filtering or response narrowing. The REPL interprets the steering extension because
+   the REPL owns the model-facing steering contract.
+6. Pi ACP and Codex ACP implement strict steering only. Their idle-steering behavior never starts a turn.
+7. Guest snapshots from the previous REPL format are incompatible. They are never translated or run
+   against the new broker.
+8. No behavior removed by this contract is retained through an alias, deprecated method, version branch,
+   backend-name branch, or fallback.
+
+Normative words `MUST`, `MUST NOT`, `SHOULD`, and `MAY` are used in their ordinary specification sense.
+
+---
+
+## 1. Goals
+
+The implementation MUST produce this separation:
+
+```text
+steer  = transient control of the active public turn
+queue  = durable creation of a later public turn
+cancel = explicit cancellation of one selected active or queued turn
+```
+
+The implementation MUST retain these behaviors for workspaces created by the new version:
+
+- one reusable ACP session per `agent()` handle;
+- one independently awaitable answer for the founding turn and every queued turn;
+- stable REPL call IDs;
+- structured-output validation and repair;
+- global concurrency enforcement;
+- per-project persistence and daemon-restart recovery;
+- lazy ACP session reattachment after client-presence drain;
+- cancellation by handle and by out-of-band `interrupt` ID;
+- backend-native active-turn steering where the ACP server advertises the steering extension;
+- support for custom ACP backends that advertise and implement the same extension contract.
+
+The implementation MUST NOT retain these behaviors:
+
+- `.followUp()` on any new guest handle;
+- steering while opening by saving the message for later;
+- steering on an idle session by sending `session/prompt`;
+- steering on an unsupported backend by queueing the message;
+- converting a backend `startedNewTurn` result into a queued result;
+- replaying an unresolved steering request after daemon restart;
+- loading or executing a pre-change guest snapshot;
+- filtering extension `_meta` through `customCapabilities` declarations.
+
+---
+
+## 2. Guest API
+
+### 2.1 Exact handle types
+
+The guest library MUST expose behavior equivalent to these types:
+
+```ts
+type SteerResult = "injected" | "idle" | "unsupported";
+type CancelResult = "cancelled" | "idle";
+
+interface TurnOptions {
+  promptMeta?: Record<string, unknown>;
+}
+
+interface QueuedTurnHandle<T = unknown> extends Promise<T> {
+  readonly id: string;
+  cancel(): Promise<CancelResult>;
+}
+
+interface AgentHandle<T = unknown> extends Promise<T> {
+  readonly id: string;
+  steer(prompt: string, options?: TurnOptions): Promise<SteerResult>;
+  queue(prompt: string, options?: TurnOptions): QueuedTurnHandle<T>;
+  cancel(): Promise<CancelResult>;
+}
+
+declare function agent<T = unknown>(
+  model: string,
+  prompt: string,
+  options?: AgentOptions,
+): AgentHandle<T>;
+```
+
+The actual guest values MAY be native promises with non-enumerable own properties, as they are today,
+but their observable behavior MUST match the types above.
+
+`AgentHandle` is both the founding turn's promise and the reusable session handle. `QueuedTurnHandle`
+is only a handle for one queued turn. A queued-turn handle MUST NOT expose `.queue()`, `.steer()`, or a
+session-wide cancellation method.
+
+### 2.2 Handle retention
+
+The model-facing contract MUST continue to teach callers to retain the handle before awaiting it:
+
+```js
+const a = agent("codex", "Inspect the failure");
+const first = await a;
+
+const q = a.queue("Implement the fix");
+console.log(q.id);
+const second = await q;
+```
+
+`const answer = await agent(...)` stores only the answer. It does not store a reusable handle.
+
+### 2.3 Removal of `.followUp()`
+
+The new guest library MUST NOT define `followUp` on agent handles or queued-turn handles. Calling
+`a.followUp(...)` in a new workspace MUST fail as an ordinary guest `TypeError` because the property is
+not callable.
+
+The broker bridge MUST NOT accept a `"followUp"` action. The call store MUST NOT mint new
+`detail:"followUp"` records. No compatibility alias from `followUp` to `queue` is permitted.
+
+### 2.4 Argument validation
+
+`queue()` and `steer()` MUST require a JavaScript string; the empty string remains valid. Their
+optional second argument MAY contain only `promptMeta`. Unknown option keys, a non-object options value,
+or a non-object `promptMeta` MUST reject the operation with `SCRIPT_VALIDATION_ERROR` before any ACP
+request is sent. `queue()` MUST still return a `QueuedTurnHandle` with a minted ID for a rejected
+admission; that handle rejects with the validation error and receives a durable refusal record, but it
+MUST NOT enter the session FIFO or `agents()` live projection.
+
+Neither method accepts a per-turn `schema`, `model`, `mode`, `configOptions`, `cwd`, or MCP-server list.
+A caller that needs any of those to differ MUST create a new `agent()` handle.
+
+---
+
+## 3. Queued-turn semantics
+
+### 3.1 Creation and identity
+
+`a.queue(prompt, options?)` MUST synchronously mint a new REPL call ID and return a
+`QueuedTurnHandle`. The handle's `id` MUST be readable before the turn is opened, scheduled, handed to
+ACP, or settled.
+
+Every queue invocation creates exactly one public turn. Queue calls are never coalesced, injected into
+another turn, or represented only as messages inside another call.
+
+A queued turn MUST have its own:
+
+- call-store dispatch record;
+- promise settlement;
+- cancellation target;
+- `agents()` entry while pending or running;
+- completion or rejection record;
+- answer extraction and structured-output validation.
+
+### 3.2 Session and schema
+
+A queued turn runs on the founding handle's ACP session. It MUST preserve the session's conversation
+history, model, mode, config options, cwd, tools, MCP servers, and permission configuration.
+
+A queued turn inherits the founding handle's output schema:
+
+- a schema-less founding handle yields final assistant text for every queued turn;
+- a schema-bearing founding handle yields a schema-validated object for every queued turn;
+- the existing structured-output extraction and repair ladder applies independently to each queued
+  turn;
+- all repair prompts for one queued turn remain part of that queued turn's public call and concurrency
+  slot;
+- a later queue item cannot start until the preceding item's repair ladder settles.
+
+### 3.3 FIFO order
+
+Each agent session owns one FIFO queue. Queue items on that session MUST be handed to ACP in the exact
+order in which `queue()` minted their call IDs.
+
+At most one public turn may be active on a session. A queue item is eligible only when all of these are
+true:
+
+1. it is the first unsettled item in that session's FIFO;
+2. the founding session has opened or has been successfully reattached;
+3. the session has no active public turn;
+4. the session has no unresolved steering operation targeting the preceding active turn;
+5. the workspace has a free agent-concurrency slot;
+6. the item has not been cancelled.
+
+When work from multiple sessions is eligible for a newly free concurrency slot, the broker MUST select
+the eligible item with the oldest workspace admission sequence. Initial `agent()` calls and queued
+turns participate in the same admission sequence. Ineligible work does not block newer eligible work.
+
+### 3.4 Idle sessions
+
+Calling `queue()` on an idle session still creates a distinct queued turn. After its dispatch record is
+durable, the broker MUST run the scheduler. If the item is the FIFO head and a concurrency slot is free,
+the scheduler MUST hand it off without waiting for another MCP call or unrelated settlement. This does
+not change its identity or result semantics.
+
+### 3.5 Opening and reattachment
+
+If the founding `agent()` call is queued above the concurrency cap or its ACP session is still opening,
+new queue items MUST remain pending behind the founding turn.
+
+If the founding session was released by the client-presence drain, the queue head MUST trigger the
+existing lazy `session/load` reattachment path. A reattachment failure rejects that item and all later
+items on the session as specified in §6.4. The broker MUST NOT open a fresh unrelated session as a
+fallback.
+
+### 3.6 Backend transport
+
+A queued turn MUST be sent as an ordinary ACP `session/prompt` only when it reaches the head of the
+broker queue. The implementation MUST NOT map `.queue()` to:
+
+- Pi `AgentSession.followUp()`;
+- Codex `thread/queue/add`;
+- OpenCode internal follow-up queues;
+- Claude detached prompts;
+- `_session/steering`;
+- any future native backend queue unless this contract is explicitly replaced.
+
+The broker-owned transport is required because the REPL, not the backend, owns the queued turn's ID,
+answer, cancellation, persistence, concurrency slot, and restore record.
+
+---
+
+## 4. Steering semantics
+
+### 4.1 Public meaning
+
+`a.steer(prompt, options?)` is transient control of the session's currently active public turn.
+Steering does not create a public turn, does not own an answer, does not consume another concurrency
+slot, and does not enter the queued-turn FIFO.
+
+The returned promise resolves only with:
+
+| Result | Exact meaning |
+|---|---|
+| `"injected"` | The ACP server accepted the instruction into the active turn. |
+| `"idle"` | No active turn existed at admission or the backend reported `promptRequired` because the active turn ended before delivery. Nothing was queued or started. |
+| `"unsupported"` | A turn was active, but the server's raw initialize metadata did not advertise the steering extension. Nothing was sent, queued, or started. |
+
+Transport errors, server `failed` outcomes, malformed responses, and protocol violations MUST reject
+the steering promise with `AGENT_EXECUTION_ERROR`. They MUST NOT resolve as another result token.
+
+### 4.2 Admission order
+
+The broker MUST evaluate steering in this order:
+
+1. If the founding session or a queued turn has an ACP `session/prompt` currently in flight, capture
+   that prompt's owning public turn call ID as the steering target and continue.
+2. If no ACP prompt is in flight, including local answer extraction or the gap before a structured-output
+   repair prompt, resolve `"idle"` without opening or reattaching a session and without sending an ACP
+   request.
+3. Inspect the active session's raw initialize metadata. If steering is not advertised exactly as
+   specified in §8.2, resolve `"unsupported"` without sending an ACP request.
+4. Enqueue the steering operation in that session's steering-control FIFO.
+5. When it reaches the head of the control FIFO, send it only if the captured target call ID is still
+   the active public turn. If the target has settled, resolve `"idle"` without sending it.
+
+This ordering means steering an idle OpenCode session resolves `"idle"`, while steering an active
+OpenCode turn resolves `"unsupported"`.
+
+### 4.3 Steering-control FIFO and queue interlock
+
+Steering operations on one session MUST be sent one at a time in invocation order. Each operation
+captures the active public turn ID at admission.
+
+While at least one steering operation targeting the current or just-settled public turn is unresolved,
+the broker MUST NOT dispatch the next queued turn on that session. If the active turn ends before a
+steering response arrives, the session remains idle until the steering operation resolves. This prevents
+a late steering request from crossing the host-owned boundary and changing the next queued turn.
+
+Once all steering operations targeting the completed turn have settled, normal queued-turn dispatch may
+resume.
+
+### 4.4 Strict request metadata
+
+For every wire steering request, the REPL broker MUST send:
+
+```json
+{
+  "_meta": {
+    "steering": {
+      "idleBehavior": "promptRequired"
+    }
+  }
+}
+```
+
+Caller `promptMeta` is preserved, but the broker-owned strict value wins on collision. The merge is:
+
+```ts
+const strictSteeringMeta = {
+  ...userPromptMeta,
+  steering: {
+    ...(isPlainObject(userPromptMeta?.steering) ? userPromptMeta.steering : {}),
+    idleBehavior: "promptRequired",
+  },
+};
+```
+
+Neither guest code nor a backend adapter may override or remove `idleBehavior:"promptRequired"`.
+
+### 4.5 Raw response interpretation
+
+The REPL, not `acp-agents`, MUST validate the raw extension response.
+
+The accepted response outcomes are:
+
+```text
+injected       → resolve "injected"
+promptRequired → resolve "idle"
+failed         → reject AGENT_EXECUTION_ERROR
+```
+
+A response with `outcome:"startedNewTurn"` is a fatal steering protocol violation. On that outcome the
+broker MUST:
+
+1. issue best-effort ACP `session/cancel` immediately;
+2. mark the session lane unusable;
+3. reject the steering operation with non-recoverable `AGENT_EXECUTION_ERROR` and
+   `details.reason:"steering_started_new_turn"`;
+4. reject the active public turn if it has not settled;
+5. reject every remaining queued turn on the session;
+6. release/quarantine the session through the existing fatal-session path.
+
+A missing response object, missing/non-string `outcome`, or unknown outcome is also a fatal protocol
+violation and follows the same lane-fatal procedure with `details.reason:"invalid_steering_response"`.
+
+### 4.6 Steering durability
+
+Steering dispatches and settlements may be recorded for guest-promise recovery and diagnostics, but a
+steering payload MUST NOT be replayed after daemon restart.
+
+If a restored call store contains a steering operation without a durable completion, reconciliation
+MUST reject it with recoverable `AGENT_EXECUTION_ERROR` and
+`details.reason:"steering_interrupted"`. It MUST NOT send the steering request again, convert it into a
+queued turn, or attach it to whichever turn is active after restore.
+
+---
+
+## 5. Cancellation semantics
+
+### 5.1 Queued-turn cancellation
+
+`q.cancel()` targets exactly the queued turn represented by `q`.
+
+| Target state | Required behavior | `q.cancel()` result | Queued-turn promise |
+|---|---|---|---|
+| pending, not handed off | Remove it from every scheduler/FIFO index and durably cancel it without sending ACP | `"cancelled"` | Reject `AGENT_CANCELLED` |
+| active or in structured-output repair | Durably fence its result, reject its promise, send one ACP `session/cancel`, and keep the session lane blocked until the backend prompt settles or 5,000 ms elapse | `"cancelled"` | Reject `AGENT_CANCELLED` |
+| already fulfilled or rejected | No operation | `"idle"` | Remains settled |
+| session already fatally lost while turn pending | No additional operation | `"idle"` | Already rejected with the lane-fatal error |
+
+A cancellation method MUST resolve `"cancelled"` only after the target's `AGENT_CANCELLED` completion
+is durable and, for a handed-off turn, the single ACP cancel notification has been attempted. It does
+not wait for the backend prompt to terminate; the session lane remains blocked as described below.
+
+If cancellation races the ACP handoff, the session-lane arbiter decides the boundary:
+
+- cancellation wins before the handoff callback: no prompt is sent;
+- handoff wins first: ACP `session/cancel` is sent and the result is fenced.
+
+A cancelled queue item never blocks later items after the backend prompt settles. If the backend does
+not settle within 5,000 ms of the cancel request, the broker MUST close/quarantine the ACP connection,
+mark the lane fatal with `details.reason:"cancellation_not_honored"`, and reject every later queue item.
+It MUST NOT reattach that session to continue the queue.
+
+### 5.2 Session-handle cancellation
+
+`a.cancel()` targets the current public turn on `a`'s session. It never clears later explicit queue
+items merely because they are queued.
+
+| Session state | Required behavior | `a.cancel()` result |
+|---|---|---|
+| founding call queued above cap or opening before any ACP prompt handoff | Fence and reject the founding call with `AGENT_CANCELLED`; close any late-opened child without prompting; reject every queued turn with non-recoverable `AGENT_EXECUTION_ERROR` and `details.reason:"founding_turn_cancelled_before_session"` because no reusable session was established | `"cancelled"` |
+| founding or queued public turn active | Cancel that active turn exactly as in §5.1; later queued turns remain and MUST be reconsidered by the scheduler after the backend prompt settles | `"cancelled"` |
+| no public turn active | No operation; queued items remain eligible under §3 and the scheduler MUST apply the ordinary eligibility rules | `"idle"` |
+
+When the active public turn is a queued turn, `a.cancel()` and that turn's `q.cancel()` target the same
+turn. The first accepted cancellation sends at most one ACP cancel and records one `AGENT_CANCELLED`
+turn-promise settlement. Until the backend prompt itself reaches terminal state or the 5,000 ms
+escalation fires, the lane remains `cancelling`; additional cancellation calls resolve `"cancelled"`
+without sending another ACP cancel. After the backend prompt terminates, later cancellation calls for
+that turn resolve `"idle"`.
+
+### 5.3 Out-of-band interrupt
+
+`repl { action:"interrupt", id }` remains exact-call cancellation:
+
+- a queued-turn ID applies §5.1;
+- the founding call ID cancels that call if it is queued, opening, or active;
+- a settled or unknown ID returns the existing no-target result;
+- omitting `id` retains the existing eval-break behavior and does not define queue-wide cancellation.
+
+### 5.4 Reset
+
+Guest `reset()` retains its current full-workspace meaning. It cancels/fences all active turns, rejects
+all queued turns, releases all ACP sessions, clears the guest state and call ledger, and creates a fresh
+workspace generation. This is the only existing operation that clears every session lane at once.
+
+---
+
+## 6. Failure semantics
+
+### 6.1 Turn-local failures
+
+A turn-local failure rejects only that public turn. Later queued turns remain scheduled when the ACP
+session is still attached and usable.
+
+Turn-local failures include:
+
+- provider or model rejection returned while the ACP connection remains alive;
+- schema noncompliance after the repair ladder is exhausted;
+- empty output;
+- tool or prompt failure that does not close/release the interactive session;
+- explicit cancellation after an ACP session was successfully established.
+
+After any turn-local settlement, the broker MUST release the turn's concurrency slot, finish pending
+steering-control settlements for that turn, and then consider the next queue head.
+
+### 6.2 Lane-fatal failures
+
+A lane-fatal failure rejects the active turn and every queued turn on that session. The broker MUST NOT
+create a replacement ACP session and MUST NOT continue the queue on a blank context.
+
+Exactly these conditions are lane-fatal:
+
+1. the founding ACP session cannot open;
+2. required lazy or restore-time session reattachment fails;
+3. the ACP server process or connection dies while the session lane is live;
+4. `InteractiveSession` is released because of backend/process death;
+5. the steering protocol violations in §4.5 occur;
+6. mandatory queue-state persistence fails.
+
+All remaining queued items settle in FIFO order with the same causal error code and a
+`details.reason` identifying the lane-fatal condition. They are not retried, rerouted, or transferred
+to another session.
+
+### 6.3 Founding-turn failure
+
+If the founding session successfully opened and the founding `session/prompt` then fails locally while
+the session remains usable, queued turns continue under §6.1.
+
+If the founding session never opens, or opening ends in a lane-fatal condition, all queue items reject
+under §6.2.
+
+### 6.4 Reattachment failure
+
+When a queue head requires lazy reattachment and `session/load` cannot establish the recorded session,
+the broker MUST reject that item and every later item with non-recoverable `AGENT_EXECUTION_ERROR` and
+`details.reason:"session_reattach_failed"`. It MUST NOT:
+
+- use `session/new`;
+- rerun the founding prompt;
+- route to the current default backend;
+- create a session from only the recorded model spec;
+- leave later queue promises pending.
+
+### 6.5 Error mapping
+
+The affected operations MUST use this error mapping:
+
+| Condition | Code | Recoverable | Lane consequence |
+|---|---|---:|---|
+| queued or active turn explicitly cancelled | `AGENT_CANCELLED` | `true` | continue after backend settlement, unless cancellation is not honored |
+| backend returns steering `failed` | `AGENT_EXECUTION_ERROR` with `details.reason:"steering_failed"` | `true` | active turn and queue continue |
+| steering request rejects while connection remains usable | mapped underlying code, otherwise `AGENT_EXECUTION_ERROR` with `details.reason:"steering_request_failed"` | preserve mapped value, otherwise `true` | active turn and queue continue |
+| advertised steering method returns method-not-found | `AGENT_EXECUTION_ERROR` with `details.reason:"advertised_steering_missing"` | `false` | active turn and queue continue; later active steering calls repeat the same explicit failure |
+| unresolved steering found during restore | `AGENT_EXECUTION_ERROR` with `details.reason:"steering_interrupted"` | `true` | no replay; queue recovery continues |
+| malformed steering response or `startedNewTurn` | `AGENT_EXECUTION_ERROR` with §4.5 reason | `false` | lane fatal |
+| session open/load/process loss | mapped underlying code plus the §6.2 reason | preserve mapped value | lane fatal |
+| cancellation not honored in 5,000 ms | `AGENT_EXECUTION_ERROR` with `details.reason:"cancellation_not_honored"` | `false` | lane fatal |
+| mandatory queue persistence failure | `PERSISTENCE_ERROR` | `false` | workspace operation and lane fatal |
+
+---
+
+## 7. Concurrency and lifecycle
+
+A public queued turn consumes one workspace agent-concurrency slot from the beginning of ACP prompt
+handoff through final answer extraction, structured-output repair, cancellation settlement, or failure.
+
+The following do not consume an additional slot:
+
+- a pending queue item;
+- an idle held-open ACP session;
+- a steering operation;
+- a cancellation operation;
+- lazy reattachment before a queued prompt becomes eligible, except for any existing bounded
+  connection-acquisition accounting that is not exposed as an agent slot.
+
+A session may never run two public turns concurrently. Structured-output repair prompts remain under the
+same public turn ID and slot.
+
+Client-presence drain retains its existing behavior:
+
+- in-flight turns are allowed to drain up to the existing bound;
+- pending queue items remain durable;
+- idle child sessions may be released with backend session state kept loadable;
+- the next eligible queue item reattaches lazily;
+- no queue item is converted to a new session because a client disconnected.
+
+---
+
+## 8. ACP metadata and transport ownership
+
+### 8.1 Transparency rule
+
+`@automatalabs/acp-agents` remains responsible for standard ACP negotiation and client adaptation. It
+MUST remain responsible for:
+
+- protocol-version compatibility;
+- standard prompt content capabilities;
+- MCP transport capabilities;
+- standard session lifecycle capabilities;
+- standard auth/provider capabilities;
+- truthful client capability advertisement;
+- session routing, update accumulation, cancellation, and error mapping.
+
+For vendor/extension metadata, it MUST act as a transparent transport:
+
+- preserve all keys in `InitializeResponse._meta`;
+- preserve all keys in response `_meta` objects exposed by its public interactive APIs;
+- pass caller-provided request `_meta` without deleting keys according to backend declarations;
+- return the complete `_session/steering` response object rather than only its outcome;
+- keep request prompt content and request metadata out of public steering events for privacy, while
+  exposing the complete server response in the event.
+
+Backend-computed protocol-critical request keys, such as the session's structured-output schema, may
+win on direct collision as they do today. The implementation MUST document every such collision rule;
+it MUST NOT delete unrelated keys.
+
+### 8.2 Steering advertisement
+
+The REPL determines steering availability directly from the raw initialize metadata. Steering is
+advertised only when this exact condition is true:
+
+```ts
+isPlainObject(initializeMeta) &&
+isPlainObject(initializeMeta.steering) &&
+initializeMeta.steering.supported === true
+```
+
+No backend name, package version, distribution probe, `agentCapabilities._meta` lookalike, registry
+field, missing-field compatibility rule, or truthy coercion may enable steering.
+
+### 8.3 `acp-agents` removals
+
+Remove the following project-defined metadata gates:
+
+- `Backend.customCapabilities`;
+- `CustomBackendConfig.customCapabilities`;
+- `GATED_CUSTOM_META_KEYS`;
+- `customMetaSupport` and `gatedKeys` from negotiated capabilities;
+- `gateCustomMeta()` and `PooledConnection.gateCustomMeta()`;
+- registry validation and documentation for `customCapabilities`;
+- every call-site filter on session/new, session/prompt, and steering metadata.
+
+Remove the derived public `supportsSteering` and `supportsLoadedTurnTerminalState` fields from
+`NegotiatedCapabilities`. The raw `initializeMeta` remains available. The REPL broker parses §8.2
+itself. `InteractiveSession.awaitCurrentTurn()` remains the consumer of the loaded-turn extension and
+MUST inspect the raw `initializeMeta.loadedTurn` advertisement directly at the point where it chooses
+that extension request; it MUST NOT recreate a connection-level duplicate boolean.
+
+The runtime steering decision MUST NOT be sourced from `ACP_EXTENSION_SUPPORT_MATRIX`. Distribution
+probes may remain as tests documenting what installed built-ins advertise, but they do not route
+runtime behavior.
+
+### 8.4 Interactive response surfaces
+
+`InteractiveSession.steer()` MUST return the complete raw extension response. It MUST retain the
+active-prompt precondition and content adaptation but MUST NOT reject before the wire solely because
+`acp-agents` parsed no steering capability.
+
+`InteractiveTurn` MUST expose the complete underlying `PromptResponse` in addition to its existing
+turn-local text convenience fields, so response metadata is not lost at the interactive wrapper. Any
+existing typed-session-failure handling that intentionally converts a terminal response into a thrown
+error remains authoritative and must document that conversion.
+
+The REPL's structural `BrokerSession` interface MUST expose raw initialize metadata and raw steering
+responses rather than `{ supportsSteering?: boolean }` and `Promise<string>`.
+
+### 8.5 Bounded model-facing projection
+
+Raw initialize or response metadata MUST NOT be copied wholesale into guest values, `agents()`, MCP
+text, or MCP structured content. The REPL MUST project only the boolean `supportsSteering` needed by `agents()` by applying §8.2.
+Raw metadata remains available at the host/session API and typed event layers.
+
+---
+
+## 9. ACP server contracts
+
+### 9.1 Common strict steering response
+
+Pi ACP and Codex ACP MUST serve `_session/steering` with exactly these successful outcomes:
+
+```ts
+type StrictSteeringResponse =
+  | { outcome: "injected" }
+  | { outcome: "promptRequired"; reason: "noRunningTurn" };
+```
+
+Unexpected internal failures MUST reject the JSON-RPC request through the server's normal structured
+error path. The owned servers MUST NOT return `failed` or `startedNewTurn`.
+
+### 9.2 Pi ACP
+
+The Pi dependencies MUST be updated together from `0.84.2` to `0.84.3` before implementing the
+adapter change.
+
+Pi ACP steering MUST behave as follows:
+
+- active Pi agent run: convert content and call native `AgentSession.steer()`, then return `injected`;
+- idle session: return `promptRequired/noRunningTurn` without calling `prompt()`, `followUp()`, or any
+  detached-turn helper;
+- active-turn settlement race: recover/remove any Pi queue item that was not consumed by the ending
+  turn, then return `promptRequired/noRunningTurn`;
+- cancellation race: return/reject through the existing cancellation path and never restart generation;
+- unexpected failure: reject the request; never start a turn.
+
+Delete the idle fire-and-forget turn path and its tests. No request-metadata omission branch preserves
+that behavior.
+
+### 9.3 Codex ACP
+
+Codex ACP steering MUST behave as follows:
+
+- active Codex turn: call the native active-turn steering operation and return `injected`;
+- idle session or settlement race: return `promptRequired/noRunningTurn`;
+- unexpected failure: reject the request;
+- never call `startNewTurnFromSteering()`.
+
+Delete `startNewTurnFromSteering`, `startedNewTurn` outcomes, and tests that expect them. Codex's
+experimental native queue API is not used by this contract.
+
+### 9.4 Claude ACP
+
+The pinned Claude ACP server remains external and unchanged. The REPL MUST always send the strict
+metadata in §4.4. The installed distribution's initialize advertisement and
+`promptRequired/noRunningTurn` behavior remain covered by the live/distribution probe suite.
+
+If Claude returns `startedNewTurn` despite the strict request, §4.5 applies. There is no Claude-specific
+mapping or recovery path.
+
+### 9.5 OpenCode
+
+The current OpenCode ACP server does not advertise the steering extension. An active OpenCode turn
+therefore yields `"unsupported"`; an idle OpenCode session yields `"idle"`. Queueing works through
+ordinary broker-owned `session/prompt` turns.
+
+No OpenCode internal steer or queue implementation may be inferred or invoked without the raw
+advertisement and extension contract in §8.2 and §9.1.
+
+### 9.6 Custom backends
+
+A custom backend requires no host-side capability declaration. For an active prompt:
+
+- metadata that does not satisfy §8.2 resolves `"unsupported"` without a wire request;
+- metadata that satisfies §8.2 causes one strict steering request;
+- an accepted §9.1 response is interpreted by §4.5;
+- a rejected or malformed response follows §4.5 and §6.5.
+
+---
+
+## 10. Persistence and incompatible snapshots
+
+### 10.1 Version bump
+
+The implementation MUST bump:
+
+- `GUEST_LIBRARY_VERSION` from `0.4.0` to `0.5.0`;
+- `SNAPSHOT_FORMAT_VERSION` from `2` to `3`;
+- the call-store record schema to include first-class `kind:"queue"` records.
+
+Format 3 MUST NOT parse format-2 guest state or reuse a format-2 call ledger.
+
+### 10.2 Old-workspace handling
+
+On first touch of a format-2 snapshot, the existing refused-snapshot auto-reset path MUST:
+
+1. refuse the snapshot before QuickJS restore or guest execution;
+2. rename the old snapshot aside using the existing collision-safe `.refused-<timestamp>` mechanism;
+3. clear the old `calls.jsonl` ledger;
+4. create a fresh format-3 workspace with guest library 0.5.0;
+5. emit the existing one-time loud auto-reset notice naming the refused file and version mismatch.
+
+It MUST NOT translate the snapshot, inspect or execute its guest `.followUp` code, retain its call
+ledger, or route old action records through compatibility handlers.
+
+This is invalidation, not compatibility execution: old bytes are retained aside for operator recovery,
+but they never participate in the new workspace.
+
+### 10.3 New-version queue restore
+
+For format-3 workspaces:
+
+- a queue item with no ACP handoff marker is eligible for reattachment and delivery;
+- a queue item with a handoff marker MUST NOT be blindly resent;
+- `InteractiveSession.awaitCurrentTurn()` MUST retain the exact authoritative classification algorithm
+  present at base commit `71a2d3d4`: the advertised loaded-turn extension for servers that provide it,
+  and the verified built-in observation path for Claude/OpenCode; this contract changes its metadata
+  source from a duplicate boolean to raw initialize metadata but does not change its terminal evidence;
+- if the backend cannot authoritatively classify the handed-off turn, reject the lane with
+  `AGENT_EXECUTION_ERROR` and `details.reason:"queued_turn_indeterminate"`; do not resend;
+- unresolved steering operations follow §4.6 and are never replayed.
+
+### 10.4 Delivery guarantee
+
+The contract guarantees FIFO delivery during normal operation and durable recovery. It does not claim
+universal exactly-once execution across a process crash between ACP wire send and durable handoff-marker
+write.
+
+Every queued `session/prompt` MUST carry the REPL queue call ID in host-owned request metadata as a
+stable correlation/idempotency key. The exact key is:
+
+```json
+{
+  "_meta": {
+    "@automatalabs/agentprism": {
+      "replCallId": "c7"
+    }
+  }
+}
+```
+
+The broker MUST preserve caller metadata and merge the namespace exactly as follows; the broker-owned
+value wins on collision:
+
+```ts
+const queuePromptMeta = {
+  ...userPromptMeta,
+  "@automatalabs/agentprism": {
+    ...(isPlainObject(userPromptMeta?.["@automatalabs/agentprism"])
+      ? userPromptMeta["@automatalabs/agentprism"]
+      : {}),
+    replCallId: callId,
+  },
+};
+```
+
+Owned backends MAY use the ID for deduplication, but queue correctness MUST NOT assume an external
+backend deduplicates it.
+
+The documented crash semantics are:
+
+- before wire send: restore sends once;
+- after marker write: restore never blindly resends;
+- after wire send but before marker write: restore may resend, so execution is at-least-once in that
+  narrow window.
+
+---
+
+## 11. Broker and store implementation
+
+### 11.1 Separate bridge actions
+
+The guest bridge MUST use distinct actions or callbacks for:
+
+- queue creation;
+- steering control;
+- session-handle cancellation;
+- queued-turn cancellation.
+
+A single state-dependent `"followUp" | "steer" | "cancel"` handler MUST NOT remain.
+
+### 11.2 Required broker state
+
+Each live session entry MUST explicitly track:
+
+```ts
+interface SessionLaneState {
+  activeTurnId: string | null;
+  promptInFlight: boolean;       // true only while ACP session/prompt is unresolved
+  queuedTurnIds: string[];       // strict FIFO
+  steeringControlIds: string[];  // strict FIFO
+  steeringInFlight: boolean;
+  laneState: "opening" | "usable" | "fatal" | "released";
+}
+```
+
+Equivalent internal representation is permitted only if each state and transition is directly testable.
+The implementation MUST NOT derive active-turn identity solely from the founding call's settled flag.
+
+Rename/remove misleading state:
+
+- `followUpTurns` becomes `queuedTurns`;
+- `queuedSteers` becomes `queuedTurns` in guest/status projections;
+- answer-mode delivery tasks become queued-turn tasks;
+- non-answer queued steering delivery is deleted.
+
+### 11.3 Call-store records
+
+A queued turn dispatch record MUST use `kind:"queue"` and include:
+
+- its own call ID;
+- founding session call ID;
+- prompt and prompt metadata;
+- admitted timestamp/sequence;
+- queued timestamp;
+- handoff timestamp when sent;
+- completion or rejection;
+- cancellation marker when cancelled before completion.
+
+Steering records remain `kind:"steer"` and MUST never be interpreted as queue records.
+
+The store's first-completion-wins and record-before-settle invariants remain unchanged.
+
+### 11.4 `agents()` projection
+
+`agents()` MUST retain the founding session entry and list every unsettled queued turn under its own
+call ID.
+
+Affected fields are:
+
+```ts
+interface LiveAgentInfo {
+  callId: string;
+  modelSpec: string;
+  task: string;
+  state: "opening" | "running" | "idle" | "queued";
+  supportsSteering: boolean;
+  queuedTurns: number;
+}
+```
+
+For the founding session entry, `queuedTurns` is the count of unsettled pending items in that session's
+FIFO, excluding the active turn. For a queued-turn entry, `queuedTurns` is `0`. A queued-turn entry is
+visible from mint time through settlement and is targetable by `interrupt` throughout that interval.
+
+`supportsSteering` is the §8.2 projection from raw metadata. It is not supplied by a derived
+`acp-agents` boolean.
+
+---
+
+## 12. MCP model-facing contract
+
+The MCP `repl` input and output schemas remain unchanged. The tool description and README MUST replace
+all `followUp` examples and state-dependent steering language with this exact semantic content:
+
+> `agent()` returns a persistent promise-handle. Assign the handle before awaiting it:
+> `const a = agent("codex", "inspect the failure"); const first = await a`. `a.steer(text)` targets
+> only the currently running turn. It never starts or queues another turn and resolves `"injected"`,
+> `"idle"`, or `"unsupported"`; transport and protocol failures reject. `const q = a.queue(text)`
+> creates a distinct FIFO turn on the same session. `q.id` is available immediately, `await q` returns
+> that turn's answer, and `q.cancel()` or an out-of-band interrupt of `q.id` cancels that exact turn.
+> Queueing works on every backend that can continue the session; steering requires the ACP server's raw
+> steering advertisement. Do not write `const a = await agent(...)` when you intend to reuse the
+> handle, because that stores only the answer.
+
+The description MUST include this persistent-workspace example without implying that steering during
+session opening is retained for later:
+
+```js
+// First REPL eval:
+const a = agent("codex", "Investigate the parser failure");
+
+// A later REPL eval, only while agents() reports a's turn as running:
+const steering = await a.steer("Focus on the parser state machine");
+
+// After the founding answer settles, create explicit future work:
+const first = await a;
+const q1 = a.queue("Implement the fix");
+const q2 = a.queue("Run the focused tests");
+console.log(q1.id, q2.id, steering);
+const fixed = await q1;
+const tested = await q2;
+```
+
+The description MUST warn that steering while idle returns `"idle"` and loses the instruction by
+design; callers that require later work MUST use `queue()`.
+
+---
+
+## 13. Tests and acceptance criteria
+
+All tests below are required. Fake-agent tests MUST assert exact ACP request counts and payloads so a
+hidden prompt-start or queue fallback cannot pass by returning a plausible result.
+
+### 13.1 Guest library
+
+- agent handles expose `id`, `steer`, `queue`, and `cancel`;
+- agent handles do not expose `followUp`;
+- queued-turn handles expose only `id` and `cancel` in addition to promise behavior;
+- `queue()` exposes its ID before settlement;
+- queue options reject unknown keys and malformed metadata;
+- queue answers inherit the founding schema;
+- calling missing `followUp` raises guest `TypeError`.
+
+### 13.2 Queue ordering and scheduling
+
+- three queue calls on one busy session are handed to ACP in exact mint order;
+- three queue calls on one idle session remain distinct turns with distinct answers;
+- a queued item above the global cap is visible and cancellable before it starts;
+- oldest eligible admission wins a free global slot;
+- an ineligible old item does not block eligible work on another session;
+- structured-output repair blocks the next queue item and remains under the same public turn ID;
+- queueing never calls `_session/steering` or a backend-native queue API.
+
+### 13.3 Strict steering
+
+For each fake backend:
+
+- active advertised turn sends exactly one `_session/steering` request and no additional
+  `session/prompt`;
+- idle session sends no wire request and resolves `idle`;
+- opening session sends no wire request and resolves `idle`;
+- active unadvertised session sends no wire request and resolves `unsupported`;
+- caller metadata reaches the wire unchanged except for the host-owned strict override;
+- `promptRequired` resolves `idle` and does not start a turn;
+- `failed` rejects `AGENT_EXECUTION_ERROR`;
+- `startedNewTurn` triggers the fatal-lane procedure and is never mapped to queue;
+- malformed/unknown outcomes trigger the fatal-lane procedure;
+- two concurrent steering calls are emitted in invocation order;
+- queue dispatch remains blocked until all steering operations targeting the previous turn settle;
+- a steer whose captured target settled resolves `idle` without reaching the next queued turn.
+
+### 13.4 Cancellation and failure
+
+- cancelling a pending queue item sends no ACP request, rejects it `AGENT_CANCELLED`, and runs the next
+  item;
+- cancelling an active queue item sends ACP cancel, fences late output, rejects it `AGENT_CANCELLED`,
+  and runs the next item after cancellation settlement;
+- cancelling a settled item resolves `idle`;
+- `a.cancel()` cancels the active queued turn but preserves later queue items;
+- cancelling the founding call before session establishment rejects every queued item;
+- a turn-local failure permits the next queue item;
+- each lane-fatal condition in §6.2 rejects every remaining item and sends no replacement prompt.
+
+### 13.5 Persistence
+
+- format-2 snapshots are renamed aside, their call ledger is cleared, and a fresh 0.5.0 guest starts;
+- format-2 guest code is never evaluated;
+- a format-3 queued item not handed off is restored and delivered;
+- a handed-off item is never blindly resent;
+- an indeterminate handed-off item rejects rather than reruns;
+- unresolved steering rejects with `steering_interrupted` and is never sent after restore;
+- queue call ID metadata is present on every queued `session/prompt`;
+- cancelled queue state survives restart.
+
+### 13.6 ACP metadata transparency
+
+- arbitrary nested initialize `_meta` survives unchanged;
+- arbitrary session/new, prompt, and steering `_meta` keys reach the wire unchanged except documented
+  host/backend collision winners;
+- `customCapabilities` no longer exists in built-in or custom backend configuration;
+- full steering response metadata reaches `InteractiveSession.steer()` and steering events;
+- full prompt response metadata reaches `InteractiveTurn`;
+- standard ACP capability adaptation tests remain green.
+
+### 13.7 Built-in servers
+
+- Pi active steering uses native `AgentSession.steer()`;
+- Pi idle and settlement-race steering never invoke prompt/follow-up and return `promptRequired`;
+- Codex active steering uses native turn steering;
+- Codex idle and settlement-race steering never start a thread turn and return `promptRequired`;
+- installed Claude active/idle strict steering passes live smoke coverage;
+- installed OpenCode continues to advertise no steering and resolves active REPL steering as
+  `unsupported`;
+- queue smoke coverage passes on Claude, Codex, OpenCode, and Pi through ordinary multi-turn prompts.
+
+### 13.8 Model-facing documentation
+
+- MCP description contains `queue`, strict active-turn steering, handle-retention guidance, and exact
+  cancellation semantics;
+- MCP description and package READMEs contain no model-facing `followUp` guidance;
+- generated steering mechanism documentation no longer describes queued steering fallbacks;
+- `agents()` documentation uses `queuedTurns`, not `queuedSteers`.
+
+---
+
+## 14. Required file families
+
+The implementation MUST inspect and update or deliberately delete/replace each applicable file family
+below. A file that requires no textual change MUST still be covered by the acceptance tests governing
+its surface.
+
+### ACP client
+
+- `packages/acp-agents/src/backend.ts`
+- `packages/acp-agents/src/registry.ts`
+- `packages/acp-agents/src/capabilities.ts`
+- `packages/acp-agents/src/acp-client.ts`
+- `packages/acp-agents/src/interactive.ts`
+- `packages/acp-agents/src/events.ts`
+- `packages/acp-agents/src/backends/codex.ts`
+- `packages/acp-agents/src/backends/custom.ts`
+- `packages/acp-agents/src/protocol-coverage.ts`
+- corresponding unit, integration, distribution-probe, and live tests
+
+### Owned ACP servers
+
+- `packages/pi-acp/package.json`
+- `packages/pi-acp/src/steering.ts`
+- `packages/pi-acp/src/session.ts`
+- `packages/pi-acp/README.md`
+- `packages/pi-acp/test/steering.test.ts`
+- `packages/codex-acp/src/AcpExtensions.ts`
+- `packages/codex-acp/src/CodexAcpServer.ts`
+- Codex steering tests
+- `pnpm-lock.yaml`
+
+### REPL engine
+
+- `packages/repl-engine/src/guest/guest-library.ts`
+- `packages/repl-engine/src/bridge.ts`
+- `packages/repl-engine/src/broker.ts`
+- `packages/repl-engine/src/store.ts`
+- `packages/repl-engine/src/snapshot-envelope.ts`
+- `packages/repl-engine/src/steering-table.ts` or its deletion/replacement
+- `packages/repl-engine/docs/steering-mechanism-table.md` or its deletion/replacement
+- guest, broker, restore, workspace, store, steering-table, and public-type tests
+
+### MCP server and docs
+
+- `packages/mcp-server/src/repl-tool.ts`
+- `packages/mcp-server/src/repl-project.ts`
+- `packages/mcp-server/README.md`
+- `packages/mcp-server/test/repl-tool.test.ts`
+- `packages/acp-agents/README.md`
+- `docs/api.md`
+- generated authoring/reference text that mentions custom backend capability declarations
+- related package changesets
+
+---
+
+## 15. Delivery order
+
+Implementation MUST land in this dependency order inside one coordinated breaking release train:
+
+1. Pi dependency update and strict Pi/Codex server responses.
+2. `acp-agents` metadata transparency and raw steering response surface.
+3. REPL store/guest format bump and first-class queue records.
+4. Broker session-lane, strict steering, cancellation, failure, scheduling, and restore behavior.
+5. Guest handles and model-facing MCP description.
+6. Full unit/integration/restore/live test matrix.
+7. Package changesets and release notes explicitly naming the breaking removals.
+
+Intermediate commits MAY temporarily fail downstream typechecking, but the merged train MUST contain no
+compatibility shim and MUST pass the repository build, typecheck, and test suites.
+
+---
+
+## 16. Rejected alternatives
+
+The following alternatives are explicitly rejected and MUST NOT appear in implementation or review
+suggestions without reopening this contract with the owner:
+
+- keeping `.followUp()` deprecated for one release;
+- accepting old `"followUp"` broker actions;
+- interpreting old guest snapshots through a version branch;
+- making idle steering start a prompt;
+- making unsupported steering queue a prompt;
+- mapping `startedNewTurn` to `queued`;
+- adding `supportsStrictSteering` to `acp-agents`;
+- using backend names or package versions to infer runtime steering;
+- using backend-native follow-up/queue APIs for `.queue()`;
+- replaying steering after restart;
+- allowing per-queued-turn schema changes;
+- allowing guest metadata to override strict steering or REPL queue-call IDs;
+- silently opening a replacement session after session loss;
+- claiming universal exactly-once queue execution without backend idempotency support.
+
+---
+
+## 17. Definition of done
+
+This contract is implemented only when all of the following are simultaneously true:
+
+- the only reusable agent-handle turn methods are strict `.steer()` and durable `.queue()`;
+- no runtime or documented `followUp` compatibility path remains;
+- no steer path can call `session/prompt`, enqueue a turn, or start a backend turn;
+- every queue invocation owns a stable ID, FIFO position, answer, cancellation target, persistence
+  record, and concurrency slot when active;
+- cancellation and failure follow §§5–6 exactly;
+- steering-control and queue dispatch cannot cross a public turn boundary;
+- `acp-agents` transports extension metadata/responses without custom capability filtering;
+- Pi and Codex cannot start a turn from `_session/steering`;
+- old guest snapshots are invalidated without execution;
+- new-version queued turns restore under §10;
+- all acceptance tests in §13 pass;
+- the MCP tool description teaches the exact API and no removed behavior.
