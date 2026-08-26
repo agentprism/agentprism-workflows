@@ -293,14 +293,14 @@ test("the session registry signals last-connection-closed and the repl presence 
   const fakeSession = {
     sessionId: "fake-s1",
     backendId: "pi",
-    capabilities: { supportsSteering: true },
+    initializeMeta: { steering: { supported: true } },
     async prompt(): Promise<import("@automatalabs/repl-engine").BrokerTurn> {
       return new Promise((resolve) => {
         pendingTurn = { resolve };
       });
     },
-    async steer(): Promise<string> {
-      return "injected";
+    async steer(): Promise<unknown> {
+      return { outcome: "injected" };
     },
     async cancel(): Promise<void> {},
     async release(): Promise<void> {

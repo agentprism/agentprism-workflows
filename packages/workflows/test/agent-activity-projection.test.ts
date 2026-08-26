@@ -87,7 +87,7 @@ test("steering remains a live observation and never becomes durable workflow act
       backendId: "claude",
       runId: "run-1",
       callIndex: 0,
-      outcome: "injected",
+      response: { outcome: "injected" },
     },
     backendId: "claude",
     sessionId: "session-1",

@@ -413,11 +413,22 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         "is \"backend/model\" (a bare \"backend\" runs its default model); an unknown backend rejects the call " +
         "immediately, naming the known backends. The opts keys are schema (a structured-output JSON schema, " +
         "validated per call), cwd, configOptions (backend-specific knobs, validated at admission), and mode — " +
-        "unknown option keys reject synchronously. Start-and-don't-await is idiomatic: `const research = " +
-        "agent(\"pi/deepseek-v4-flash-max\", \"research X and report the top 3 findings\", { cwd: \"/repo\", " +
-        "mode: \"plan\" })` returns immediately and keeps running server-side; await it in a later eval. Handles " +
-        "carry followUp / steer / cancel. checkpoint(question) parks a promise for a human answer, resolved by " +
-        "checkpoint.answer(id, value) in a later eval. parallel, pipeline, verify, judgePanel, gate, retry, " +
+        "unknown option keys reject synchronously. agent() returns a persistent promise-handle. Assign the handle " +
+        "before awaiting it: `const a = agent(\"codex\", \"inspect the failure\"); const first = await a`. " +
+        "a.steer(text) targets only the currently running turn. It never starts or queues another turn and resolves " +
+        "\"injected\", \"idle\", or \"unsupported\"; transport and protocol failures reject. Steering while " +
+        "idle returns \"idle\" and loses the instruction by design. `const q = a.queue(text)` creates a distinct " +
+        "FIFO turn on the same session. q.id is available immediately, await q returns that turn's answer, and " +
+        "q.cancel() or an out-of-band interrupt of q.id cancels that exact turn. Queueing works on every backend " +
+        "that can continue the session; steering requires the ACP server's raw steering advertisement. Do not write " +
+        "`const a = await agent(...)` when you intend to reuse the handle, because that stores only the answer. " +
+        "Persistent-workspace example — first eval: `const a = agent(\"codex\", \"Investigate the parser " +
+        "failure\")`; a later eval, only while agents() reports a's turn as running: `const steering = await " +
+        "a.steer(\"Focus on the parser state machine\")`; after the founding answer settles: `const first = await " +
+        "a; const q1 = a.queue(\"Implement the fix\"); const q2 = a.queue(\"Run the focused tests\"); " +
+        "console.log(q1.id, q2.id, steering); const fixed = await q1; const tested = await q2`. " +
+        "checkpoint(question) parks a promise for a human answer, resolved by checkpoint.answer(id, value) in a " +
+        "later eval. parallel, pipeline, verify, judgePanel, gate, retry, " +
         "loopUntilDry, and sleep(ms) round out the guest library. Introspection is in-band: workspace() returns " +
         "{ bindings, inFlight, checkpoints, diagnostics }; agents() lists live agents with their call ids and " +
         "states; reset() tears the workspace down. `_` holds the previous eval's completion value. No fs, no " +
@@ -439,7 +450,8 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         "(corrupt, a format upgrade, a wasm-binary mismatch) AUTO-RESETS — the file is renamed aside, never " +
         "deleted, and the next eval's output leads with a notice naming the file and reason. Reconcile reports " +
         "and drain errors live in workspace().diagnostics. On last-client disconnect the workspace drains " +
-        "in-flight subagent turns to completion and closes idle children; followUp re-attaches lazily. Subagent " +
+        "in-flight subagent turns to completion and closes idle children; the next eligible queued turn re-attaches " +
+        "its founding session lazily. Subagent " +
         "output passes through UNFILTERED — backend harness noise (e.g. codex's \"Warning: Skill descriptions " +
         "were shortened…\") is forwarded verbatim, never curated away. Every result carries the machine-readable " +
         "shape (see the output schema) as structuredContent alongside the human text.",

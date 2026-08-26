@@ -31,7 +31,7 @@
  * - the lifecycle drain driven by the daemon's session registry: the
  *   last-client disconnect drains the in-flight subagent turn to
  *   completion (mock runner), closes the idle child, and the next
- *   connect's followUp lazily re-attaches the recorded backend session,
+ *   explicit queued turn lazily re-attaches the recorded backend session,
  * - interrupt without an id breaks a RUNNING eval: an eval held open by
  *   the fused pump is in flight while the interrupt lands (the pump
  *   releases the broker chain between iterations) and the armed signal
@@ -70,9 +70,9 @@ import { okRunner, textOf } from "./_harness.js";
  *  runs standalone). */
 class FakeSession implements BrokerSession {
   readonly sessionId: string;
-  capabilities: { supportsSteering: boolean } | undefined;
+  initializeMeta: Readonly<Record<string, unknown>> | undefined;
   readonly prompts: Array<{ content: string; resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
-  readonly steers: Array<{ content: string; resolve: (outcome: string) => void; reject: (error: unknown) => void }> = [];
+  readonly steers: Array<{ content: string; resolve: (outcome: unknown) => void; reject: (error: unknown) => void }> = [];
   releases = 0;
   cancelCalls = 0;
   stopReason = "end_turn";
@@ -82,7 +82,7 @@ class FakeSession implements BrokerSession {
 
   constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
     this.sessionId = `fake-session-${FakeSession.nextId++}`;
-    this.capabilities = { supportsSteering: true };
+    this.initializeMeta = { steering: { supported: true } };
   }
 
   static nextId = 0;
@@ -94,7 +94,7 @@ class FakeSession implements BrokerSession {
     });
   }
 
-  steer(content: string): Promise<string> {
+  steer(content: string): Promise<unknown> {
     return new Promise((resolve, reject) => {
       this.steers.push({ content, resolve, reject });
     });
@@ -566,7 +566,7 @@ test("MCP-session churn never touches the workspace: bindings survive a client d
   }
 });
 
-test("the session registry drives the client-presence drain on the real daemon: last-client disconnect drains the in-flight turn to completion, closes the idle child, and the next connect's followUp lazily re-attaches", async () => {
+test("the session registry drives the client-presence drain on the real daemon: last-client disconnect drains the in-flight turn to completion, closes the idle child, and the next queued turn lazily re-attaches", async () => {
   const runner = new FakeRunner();
   const daemon = await startReplDaemon(runner);
   try {
@@ -593,7 +593,7 @@ test("the session registry drives the client-presence drain on the real daemon: 
     }
     assert.equal(session.releases, 1, "the idle child closed after the drain");
     // The next client connect: the workspace is still live (the drain
-    // never drops it), children closed — and followUp on the settled
+    // never drops it), children closed — and queue() on the settled
     // handle lazily re-attaches the recorded backend session via the
     // capability matrix (loadSession with the SAME session id).
     const session2 = await connectHttp(daemon.url);
@@ -602,12 +602,12 @@ test("the session registry drives the client-presence drain on the real daemon: 
         diagnostics: { childrenClosed: boolean };
       };
       assert.equal(ws.diagnostics.childrenClosed, true, "children closed after the drain");
-      const probe = await repl(session2, { action: "eval", projectDir: PROJECT, code: 'p.followUp("more"); "fired"' });
+      const probe = await repl(session2, { action: "eval", projectDir: PROJECT, code: 'p.queue("more"); "fired"' });
       assert.ok(!isErrorResult(probe), textOf(probe));
       await tick();
       assert.equal(runner.loadedWith.length, 1, "the recorded session was loaded lazily on the next connect");
       assert.equal(runner.loadedWith[0].sessionId, session.sessionId, "the SAME backend session");
-      // The followUp's delivery starts a new turn on the re-attached
+      // The queued turn starts on the re-attached
       // session; completing it lets the next disconnect's drain (and the
       // daemon's bounded teardown) finish instead of waiting out their
       // bounds on a parked turn.
@@ -995,7 +995,7 @@ test("review round 8: interrupt { id } cancels a call whose openSession is still
       assert.ok(!isErrorResult(read), textOf(read));
       const sc1 = structuredOf(read);
       assert.ok(
-        String(sc1.result).includes("was cancelled by interrupt while its session was still opening"),
+        String(sc1.result).includes("turn c1 was cancelled"),
         `guest-visible settlement: ${sc1.result}`,
       );
     } finally {
@@ -1017,7 +1017,7 @@ test("review round 8: interrupt { id } cancels a call whose openSession is still
       assert.ok(!isErrorResult(read), textOf(read));
       const sc = structuredOf(read);
       assert.ok(
-        String(sc.result).includes("was cancelled by interrupt"),
+        String(sc.result).includes("turn c1 was cancelled"),
         `the restart settles the durable cancellation: ${sc.result}`,
       );
     } finally {
@@ -1090,7 +1090,7 @@ test("review round 9: interrupt { id } on a still-OPENING call is IMMEDIATELY du
       assert.ok(!isErrorResult(read), textOf(read));
       const sc1 = structuredOf(read);
       assert.ok(
-        String(sc1.result).includes("was cancelled by interrupt"),
+        String(sc1.result).includes("turn c1 was cancelled"),
         `the restart settles the durable cancellation: ${sc1.result}`,
       );
     } finally {

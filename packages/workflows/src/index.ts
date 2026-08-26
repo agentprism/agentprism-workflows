@@ -238,7 +238,7 @@ export type {
   DeleteSessionOptions,
   InteractiveSessionOptions,
   InteractiveTurn,
-  SteeringOutcome,
+  SteeringResponse,
   ListProvidersOptions,
   ListSessionsOptions,
   LogoutOptions,

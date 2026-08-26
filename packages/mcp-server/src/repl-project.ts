@@ -98,9 +98,9 @@
  * reuse the session-eviction TTL, which has since been decoupled so dead
  * clients are collected promptly — the runner's own runaway protections
  * already bound individual turns).
- * The workspace and broker stay alive; the next client's
- * followUp/steer/cancel lazily re-attaches the recorded backend
- * sessions (the broker's capability-gated lazy re-attach).
+ * The workspace and broker stay alive; the next eligible queued turn
+ * lazily re-attaches its recorded backend session (the broker's
+ * capability-gated lazy re-attach).
  *
  * ## Ownership
  *
@@ -408,7 +408,7 @@ export function renameAsideNeverOverwriting(snapshotPath: string, atMs: number):
  *  The workspace stays warm while any session is present, and the drain
  *  latch resets: a present client makes the workspace warmable again, so
  *  the NEXT disconnect must drain whatever the workspace warmed (phase-D
- *  review: drain → reconnect → followUp re-attaches children → a second
+ *  review: drain → reconnect → a queue head re-attaches children → a second
  *  disconnect used to skip the drain and leave the reattached children
  *  running). */
 export function touchReplProject(state: ReplProjectState, clientId: string): void {
@@ -429,8 +429,8 @@ export function disconnectReplProject(state: ReplProjectState, clientId: string)
  * — the findings land durable in the workspace), bounded by `boundMs`
  * (the daemon's session-eviction TTL — the spec-owed concrete bound),
  * then every idle child closes. The workspace and broker stay alive; the
- * next client's followUp/steer/cancel lazily re-attaches the recorded
- * backend sessions. A client that reconnected before the drain started
+ * next eligible queue head lazily re-attaches its recorded backend session.
+ * A client that reconnected before the drain started
  * skips it (presence is re-checked); one that reconnects MID-DRAIN
  * ABORTS it — the broker's `drainForDisconnect` consults this state's
  * client set every iteration and before every destructive phase, so the
@@ -449,7 +449,7 @@ export function disconnectReplProject(state: ReplProjectState, clientId: string)
  * The latch is not a permanent skip: `touchReplProject` clears it on
  * every connect, and a stale latch (the broker reports warm children —
  * a lazy re-attach after the latch was set) never skips the drain
- * (phase-D review: drain → reconnect → followUp → second disconnect
+ * (phase-D review: drain → reconnect → queue dispatch → second disconnect
  * left the reattached child running).
  */
 export async function drainReplProject(state: ReplProjectState, boundMs: number): Promise<void> {
