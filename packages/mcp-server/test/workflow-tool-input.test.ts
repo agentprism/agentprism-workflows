@@ -20,6 +20,13 @@ test("input shape: primitive validation allows the union and the parser requires
   assert.equal(parseWorkflowToolInput(Schema.parse({ action: "run", script: "x" })).action, "run");
 });
 
+test("input shape: script description gives the exact optional phase-entry contract", () => {
+  assert.match(
+    workflowToolInputShape.script.description ?? "",
+    /phases MUST be an array of objects shaped `\{ title: string, detail\?: string, model\?: string \}`, never an array of strings/,
+  );
+});
+
 test("input shape: args is OPTIONAL and accepts an arbitrary JSON value", () => {
   assert.doesNotThrow(() => Schema.parse({ script: "x" }), "args omitted is fine");
   const withArgs = parseWorkflowToolInput(

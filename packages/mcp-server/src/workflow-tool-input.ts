@@ -37,7 +37,7 @@ export const workflowToolInputShape = {
     .min(1)
     .optional()
     .describe(
-      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/stop. First statement MUST be `export const meta = { name, description, phases? }`.",
+      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/stop. First statement MUST be `export const meta = { name, description, phases? }`. When present, phases MUST be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings.",
     ),
   scriptPath: z
     .string()
