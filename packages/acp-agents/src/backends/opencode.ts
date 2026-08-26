@@ -34,7 +34,7 @@ const require = createRequire(import.meta.url);
  *  not real for the opencode built-in despite it advertising `loadSession: true`). The stable
  *  root keeps every spawned server's persisted sessions reachable by later processes — pool
  *  recycles within one daemon AND daemon restarts — so the restore path's re-attach arm and the
- *  lazy followUp re-attach both work. It lives OUTSIDE the user's real opencode data dir (a
+ *  lazy session/load re-attachment both work. It lives OUTSIDE the user's real opencode data dir (a
  *  sibling `agentprism/opencode` tree under the same data home), so the daemon's instances
  *  never contend with the user's own interactive TUI for the sqlite store; the contention
  *  protection that motivated the original isolation is retained for exactly that overlap. The
