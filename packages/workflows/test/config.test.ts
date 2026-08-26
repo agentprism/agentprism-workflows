@@ -129,6 +129,30 @@ test("registered custom backends join the default target list (env and programma
   }
 });
 
+test("a host-owned probe runner supplies default targets and is never disposed", async () => {
+  let disposed = 0;
+  const restore = setValidateProbeFactoryForTests(() => {
+    throw new Error("owned probe factory must not be used");
+  });
+  const probeRunner = {
+    listBackends: () => ["claude", "team"],
+    async probeConfigOptions(spec?: string) {
+      return { backendId: spec ?? "claude", options: ADVERTISED_OPTIONS };
+    },
+    async dispose() {
+      disposed++;
+    },
+  };
+  try {
+    const report = await probeHarnessConfig({ probeRunner });
+    assert.deepEqual(report.harnessOptions.map((harness) => harness.backendId), ["claude", "team"]);
+    assert.equal(report.ok, true);
+    assert.equal(disposed, 0, "the caller retains ownership of its live runner");
+  } finally {
+    restore();
+  }
+});
+
 test("explicit harnesses replace the defaults and deduplicate in request order", async () => {
   const probes: string[] = [];
   const restore = setValidateProbeFactoryForTests(() => ({
@@ -148,6 +172,25 @@ test("explicit harnesses replace the defaults and deduplicate in request order",
   } finally {
     restore();
   }
+});
+
+test("modelSpecs select exact routed models and report model-specific catalogs", async () => {
+  const probes: Array<{ spec?: string; selectModel?: boolean }> = [];
+  const probeRunner = {
+    async probeConfigOptions(spec?: string, options?: { selectModel?: boolean }) {
+      probes.push({ spec, selectModel: options?.selectModel });
+      return { backendId: spec?.split("/", 1)[0] ?? "claude", options: ADVERTISED_OPTIONS };
+    },
+  };
+  const report = await probeHarnessConfig({
+    modelSpecs: ["claude/opus[1m]", "codex/gpt"],
+    probeRunner,
+  });
+  assert.deepEqual(probes, [
+    { spec: "claude/opus[1m]", selectModel: true },
+    { spec: "codex/gpt", selectModel: true },
+  ]);
+  assert.deepEqual(report.harnessOptions.map((harness) => harness.model), ["claude/opus[1m]", "codex/gpt"]);
 });
 
 test("a failing probe reports probed:false with the reason and flips the exit code only", async () => {
@@ -171,11 +214,15 @@ test("a failing probe reports probed:false with the reason and flips the exit co
   }
 });
 
-test("a hung probe times out per harness without blocking the others", async () => {
+test("a hung probe times out, aborts its request, and does not block the others", async () => {
   let disposed = 0;
+  let aborted = false;
   const restore = setValidateProbeFactoryForTests(() => ({
-    probeConfigOptions(spec) {
-      if (spec === "opencode") return new Promise(() => {});
+    probeConfigOptions(spec, options) {
+      if (spec === "opencode") {
+        options?.signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+        return new Promise(() => {});
+      }
       return Promise.resolve({ backendId: spec ?? "claude", options: [] });
     },
     async dispose() {
@@ -189,6 +236,7 @@ test("a hung probe times out per harness without blocking the others", async () 
     assert.match(report.harnessOptions[0].error ?? "", /probe timed out after 50ms/);
     assert.equal(report.harnessOptions[1].probed, true);
     assert.equal(disposed, 1);
+    assert.equal(aborted, true);
   } finally {
     restore();
   }

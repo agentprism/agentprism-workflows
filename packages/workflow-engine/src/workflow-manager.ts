@@ -608,6 +608,12 @@ export class WorkflowManager extends EventEmitter {
     return listeners.length > 0;
   }
 
+  /** Resolve one host-served workflow by name without executing it. Validation uses the
+   * same resolver as live execution so a mocked preflight cannot disagree with admission. */
+  resolveSavedWorkflow(name: string): string | undefined {
+    return this.loadSavedWorkflow?.(name);
+  }
+
   /** Bind the manager to the current session, so new runs are tagged with it and
    * the navigator/task-panel show only this session's runs (set on session_start). */
   setSessionId(id: string | undefined): void {

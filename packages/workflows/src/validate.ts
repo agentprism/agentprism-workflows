@@ -20,6 +20,7 @@ import {
   redactText,
 } from "@automatalabs/workflow-engine";
 import {
+  BUILTIN_BACKEND_IDS,
   builtinThoughtLevelDomainSemantics,
   registryWithRunBackends,
   resolveBackendRegistry,
@@ -34,7 +35,7 @@ import type {
 import type { WorkflowDir } from "@automatalabs/workflow-engine";
 import type { AgentRunner, AgentUsage, WorkflowMeta } from "@automatalabs/shared-types";
 import { Check, Errors } from "typebox/value";
-import { createValidateProbeRunner } from "./validate-internal.js";
+import { createValidateProbeRunner, type ValidateProbeRunner } from "./validate-internal.js";
 
 export type MockAnswerJson =
   | null
@@ -68,6 +69,12 @@ export interface ValidateWorkflowOptions {
   maxAgents?: number;
   /** Dry-run wall-clock limit. Default 30_000 ms. */
   timeoutMs?: number;
+  /** Per routed backend/model config-probe limit. Default 60_000 ms. */
+  probeTimeoutMs?: number;
+  /** Host-owned no-prompt probe runner. When supplied it is reused and never disposed. */
+  probeRunner?: ValidateProbeRunner;
+  /** Optional saved-workflow resolver used by nested workflow("name") calls in the dry run. */
+  loadSavedWorkflow?: (name: string) => string | undefined;
   /** Dry-run answers selected by the resolved agent label. */
   mockAnswers?: MockAnswers;
 }
@@ -850,15 +857,18 @@ async function probeHarnessConfigOptions(
   hostRegistry: BackendRegistry,
   declared: Record<string, CustomBackendConfig> | undefined,
   warnings: string[],
+  probeRunner: ValidateProbeRunner | undefined,
+  probeTimeoutMs: number,
 ): Promise<ProbeStageResult> {
   const targets = configProbeTargets(calls, registry, hostRegistry, declared);
   const harnessOptions: ValidateHarnessOptions[] = [];
   const catalogs = new Map<string, SessionConfigOption[]>();
   if (targets.length === 0) return { harnessOptions, catalogs };
 
-  let runner: ReturnType<typeof createValidateProbeRunner>;
+  let runner: ValidateProbeRunner;
+  const ownsRunner = probeRunner === undefined;
   try {
-    runner = createValidateProbeRunner(registryOptions(registry));
+    runner = probeRunner ?? createValidateProbeRunner(registryOptions(registry));
   } catch (error) {
     const reason = errorMessage(error);
     for (const target of targets) {
@@ -886,10 +896,15 @@ async function probeHarnessConfigOptions(
       if (cached) return cached;
       if (failures.has(key)) return undefined;
       try {
-        const result = await runner.probeConfigOptions(target.model ?? target.backendId, {
-          cwd,
-          selectModel: target.model !== undefined,
-        });
+        const result = await withValidationProbeTimeout(
+          (signal) => runner.probeConfigOptions(target.model ?? target.backendId, {
+            cwd,
+            selectModel: target.model !== undefined,
+            backends: declared,
+            signal,
+          }),
+          probeTimeoutMs,
+        );
         catalogs.set(key, result.options);
         if (reportHarness) {
           harnessOptions.push({
@@ -942,13 +957,36 @@ async function probeHarnessConfigOptions(
       );
     }
   } finally {
-    try {
-      await runner.dispose();
-    } catch {
-      // Probe results are complete; process cleanup must not change validation semantics.
+    if (ownsRunner) {
+      try {
+        await runner.dispose?.();
+      } catch {
+        // Probe results are complete; process cleanup must not change validation semantics.
+      }
     }
   }
   return { harnessOptions, catalogs };
+}
+
+function withValidationProbeTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`config probe timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref?.();
+    operation(controller.signal).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function isThoughtLevelSelect(
@@ -1423,6 +1461,10 @@ export async function validateWorkflowScript(
 ): Promise<ValidateWorkflowReport> {
   const mockAnswerState = options.mockAnswers === undefined ? undefined : normalizeMockAnswers(options.mockAnswers);
   const warnings: string[] = [];
+  const probeTimeoutMs = options.probeTimeoutMs ?? 60_000;
+  if (!Number.isFinite(probeTimeoutMs) || probeTimeoutMs <= 0) {
+    throw new TypeError("validateWorkflowScript: probeTimeoutMs must be a positive number");
+  }
 
   let meta: WorkflowMeta;
   try {
@@ -1440,7 +1482,22 @@ export async function validateWorkflowScript(
     meta.backends && Object.keys(meta.backends).length > 0
       ? (meta.backends as Record<string, CustomBackendConfig>)
       : undefined;
-  const hostRegistry = resolveBackendRegistry();
+  const configuredHostRegistry = resolveBackendRegistry();
+  const runnerCustomBackends =
+    options.probeRunner?.listCustomBackends?.() ??
+    (options.probeRunner?.listBackends?.() ?? []).filter(
+      (name) => !BUILTIN_BACKEND_IDS.includes(name.toLowerCase() as typeof BUILTIN_BACKEND_IDS[number]),
+    );
+  const discoveredHostBackends = Object.fromEntries(
+    runnerCustomBackends
+      .map((name) => name.toLowerCase())
+      .filter((name) => !configuredHostRegistry.has(name))
+      .map((name) => [name, { command: "__host_owned_probe_runner__" }]),
+  );
+  const hostRegistry =
+    Object.keys(discoveredHostBackends).length === 0
+      ? configuredHostRegistry
+      : resolveBackendRegistry(discoveredHostBackends);
   const backendRegistry = registryWithRunBackends(hostRegistry, declaredBackends);
   if (declaredBackends) {
     warnings.push(
@@ -1538,7 +1595,7 @@ export async function validateWorkflowScript(
     ...(mockAnswerState ? { concurrency: 1 } : {}),
     journaling: false,
     persistenceRoot,
-    loadSavedWorkflow: flows?.resolve,
+    loadSavedWorkflow: options.loadSavedWorkflow ?? flows?.resolve,
   });
   manager.on("agentStart", (event: {
     label: string;
@@ -1635,6 +1692,8 @@ export async function validateWorkflowScript(
       hostRegistry,
       declaredBackends,
       warnings,
+      options.probeRunner,
+      probeTimeoutMs,
     );
     const optionErrors = configOptionErrors(
       agentCalls,

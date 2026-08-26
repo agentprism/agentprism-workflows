@@ -118,6 +118,49 @@ test("valid script: parse + dry run complete; calls, backends, checkpoints, phas
   assert.equal(report.warnings.length, 0);
 });
 
+test("validate reuses a host-owned probe runner, passes approved script backends, and never disposes it", async () => {
+  let disposed = 0;
+  const probes: Array<{ spec?: string; hasBrowser: boolean }> = [];
+  const probeRunner = {
+    async probeConfigOptions(spec?: string, options?: { backends?: Record<string, { command: string }> }) {
+      probes.push({ spec, hasBrowser: options?.backends?.browser?.command === "browser-acp" });
+      return { backendId: spec?.split("/", 1)[0] ?? "claude", options: ADVERTISED_OPTIONS };
+    },
+    async dispose() {
+      disposed++;
+    },
+  };
+  const report = await validateWorkflowScript(
+    [
+      'export const meta = { name: "host-probe", description: "d", backends: { browser: { command: "browser-acp" } } };',
+      'return await agent("look", { label: "look", model: "browser/visual" });',
+    ].join("\n"),
+    { cwd: TEST_HOME, probeRunner },
+  );
+  assert.equal(report.ok, true);
+  assert.deepEqual(probes, [{ spec: "browser/visual", hasBrowser: true }]);
+  assert.equal(disposed, 0, "validation does not own the server runner");
+});
+
+test("host-owned runner backend names drive custom routing attribution without exposing spawn configs", async () => {
+  const probeRunner = {
+    listBackends: () => ["claude", "codex", "opencode", "pi", "team"],
+    async probeConfigOptions(spec?: string) {
+      return { backendId: spec?.split("/", 1)[0] ?? "claude", options: ADVERTISED_OPTIONS };
+    },
+  };
+  const report = await validateWorkflowScript(
+    [
+      'export const meta = { name: "host-custom", description: "d" };',
+      'return await agent("look", { label: "look", model: "team/model-a" });',
+    ].join("\n"),
+    { cwd: TEST_HOME, probeRunner },
+  );
+  assert.equal(report.ok, true);
+  assert.equal(report.dryRun?.agentCalls[0]?.backend, "team");
+  assert.equal(report.dryRun?.harnessOptions?.[0]?.backendId, "team");
+});
+
 test("validate probes each distinct routed backend/model pair and surfaces catalogs without authored configOptions", async () => {
   const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
   process.env.AGENTPRISM_DEFAULT_BACKEND = "browser";

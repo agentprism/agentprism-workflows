@@ -774,13 +774,13 @@ Programmatic:
 import { probeHarnessConfig, formatHarnessConfigReport } from "@automatalabs/workflows";
 
 const report = await probeHarnessConfig({ harnesses: ["codex"] });
+const exact = await probeHarnessConfig({ modelSpecs: ["codex/gpt-5.6-sol"] }); // selects it first
 report.ok;             // every requested harness probed
 report.harnessOptions; // [{ backendId, model?, probed, options?: SessionConfigOption[], error?: string }]
 formatHarnessConfigReport(report); // the CLI's human table
 ```
 
-`probeHarnessConfig({ harnesses?, backends?, cwd?, timeoutMs? })` — `backends` merges over
-`AGENTPRISM_BACKENDS` exactly like `createAcpRunner({ backends })`.
+`probeHarnessConfig({ harnesses?, modelSpecs?, backends?, cwd?, timeoutMs?, probeRunner? })` — `modelSpecs` selects exact routed models before reading their model-specific option domains; `probeRunner` reuses a host-owned live runner without disposing it; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner({ backends })`.
 
 ---
 
