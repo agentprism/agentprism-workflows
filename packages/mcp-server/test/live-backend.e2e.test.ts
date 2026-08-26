@@ -470,3 +470,68 @@ test("live-backend e2e: pi drives injected StructuredOutput with process-exclusi
   const out = await runLiveBackend("pi");
   assertBackend("pi", out);
 });
+
+test("live REPL queue smoke: Claude, Codex, OpenCode, and Pi continue one session through broker-owned FIFO prompts", {
+  skip: SKIP,
+  timeout: 600_000,
+}, async () => {
+  assert.ok(existsSync(SERVER_ENTRY), `built server entry missing — run \`pnpm build\` first: ${SERVER_ENTRY}`);
+  const projectDir = fileURLToPath(new URL("../../..", import.meta.url));
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [SERVER_ENTRY],
+    env: env as Record<string, string>,
+    stderr: "pipe",
+    cwd: projectDir,
+  });
+  const client = new Client({ name: "live-repl-queue", version: "0.0.0" }, { capabilities: {} });
+  const specs = {
+    claude: CLAUDE_E2E_MODEL,
+    codex: "codex",
+    opencode: OPENCODE_E2E_MODEL,
+    pi: `pi/${PI_E2E_MODEL}`,
+  } as const;
+  const names = Object.keys(specs) as Array<keyof typeof specs>;
+  const lastLine = (value: unknown): string =>
+    typeof value === "string" ? (value.trim().split("\n").at(-1)?.trim() ?? "") : "";
+  try {
+    await client.connect(transport);
+    const foundingSource = names.map((name) =>
+      `const live_${name} = agent(${JSON.stringify(specs[name])}, ${JSON.stringify(`Reply with exactly FOUNDING_${name.toUpperCase()} and no other text. Do not call tools.`)});`,
+    ).join("\n") +
+      `\nJSON.stringify(await Promise.all([${names.map((name) => `live_${name}`).join(", ")}]))`;
+    const founding = await client.callTool({
+      name: "repl",
+      arguments: { action: "eval", projectDir, code: foundingSource, timeoutMs: 120_000 },
+    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    assert.equal(founding.isError, false, JSON.stringify(founding));
+    const foundingResult = (founding.structuredContent as Record<string, unknown> | undefined)?.result;
+    assert.equal(typeof foundingResult, "string", JSON.stringify(founding.structuredContent));
+    const foundingValues = JSON.parse(foundingResult as string) as unknown[];
+    assert.deepEqual(
+      foundingValues.map(lastLine),
+      names.map((name) => `FOUNDING_${name.toUpperCase()}`),
+    );
+
+    const queueSource = names.map((name) =>
+      `const queued_${name} = live_${name}.queue(${JSON.stringify(`Reply with exactly QUEUE_${name.toUpperCase()} and no other text. Do not call tools.`)});`,
+    ).join("\n") +
+      `\nJSON.stringify(await Promise.all([${names.map((name) => `queued_${name}`).join(", ")}]))`;
+    const queued = await client.callTool({
+      name: "repl",
+      arguments: { action: "eval", projectDir, code: queueSource, timeoutMs: 120_000 },
+    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    assert.equal(queued.isError, false, JSON.stringify(queued));
+    const queuedResult = (queued.structuredContent as Record<string, unknown> | undefined)?.result;
+    assert.equal(typeof queuedResult, "string", JSON.stringify(queued.structuredContent));
+    const queuedValues = JSON.parse(queuedResult as string) as unknown[];
+    assert.deepEqual(
+      queuedValues.map(lastLine),
+      names.map((name) => `QUEUE_${name.toUpperCase()}`),
+    );
+  } finally {
+    await client.close().catch(() => undefined);
+    await transport.close().catch(() => undefined);
+  }
+});
