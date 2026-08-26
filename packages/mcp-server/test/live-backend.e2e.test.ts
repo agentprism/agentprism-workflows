@@ -493,19 +493,22 @@ test("live REPL queue smoke: Claude, Codex, OpenCode, and Pi continue one sessio
     pi: `pi/${PI_E2E_MODEL}`,
   } as const;
   const names = Object.keys(specs) as Array<keyof typeof specs>;
+  const suffix = `${Date.now().toString(36)}_${process.pid}`;
+  const handleName = (name: keyof typeof specs): string => `live_${name}_${suffix}`;
+  const queueName = (name: keyof typeof specs): string => `queued_${name}_${suffix}`;
   const lastLine = (value: unknown): string =>
     typeof value === "string" ? (value.trim().split("\n").at(-1)?.trim() ?? "") : "";
   try {
     await client.connect(transport);
     const foundingSource = names.map((name) =>
-      `const live_${name} = agent(${JSON.stringify(specs[name])}, ${JSON.stringify(`Reply with exactly FOUNDING_${name.toUpperCase()} and no other text. Do not call tools.`)});`,
+      `const ${handleName(name)} = agent(${JSON.stringify(specs[name])}, ${JSON.stringify(`Reply with exactly FOUNDING_${name.toUpperCase()} and no other text. Do not call tools.`)});`,
     ).join("\n") +
-      `\nJSON.stringify(await Promise.all([${names.map((name) => `live_${name}`).join(", ")}]))`;
+      `\nJSON.stringify(await Promise.all([${names.map(handleName).join(", ")}]))`;
     const founding = await client.callTool({
       name: "repl",
       arguments: { action: "eval", projectDir, code: foundingSource, timeoutMs: 120_000 },
     }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
-    assert.equal(founding.isError, false, JSON.stringify(founding));
+    assert.notEqual(founding.isError, true, JSON.stringify(founding));
     const foundingResult = (founding.structuredContent as Record<string, unknown> | undefined)?.result;
     assert.equal(typeof foundingResult, "string", JSON.stringify(founding.structuredContent));
     const foundingValues = JSON.parse(foundingResult as string) as unknown[];
@@ -515,14 +518,14 @@ test("live REPL queue smoke: Claude, Codex, OpenCode, and Pi continue one sessio
     );
 
     const queueSource = names.map((name) =>
-      `const queued_${name} = live_${name}.queue(${JSON.stringify(`Reply with exactly QUEUE_${name.toUpperCase()} and no other text. Do not call tools.`)});`,
+      `const ${queueName(name)} = ${handleName(name)}.queue(${JSON.stringify(`Reply with exactly QUEUE_${name.toUpperCase()} and no other text. Do not call tools.`)});`,
     ).join("\n") +
-      `\nJSON.stringify(await Promise.all([${names.map((name) => `queued_${name}`).join(", ")}]))`;
+      `\nJSON.stringify(await Promise.all([${names.map(queueName).join(", ")}]))`;
     const queued = await client.callTool({
       name: "repl",
       arguments: { action: "eval", projectDir, code: queueSource, timeoutMs: 120_000 },
     }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
-    assert.equal(queued.isError, false, JSON.stringify(queued));
+    assert.notEqual(queued.isError, true, JSON.stringify(queued));
     const queuedResult = (queued.structuredContent as Record<string, unknown> | undefined)?.result;
     assert.equal(typeof queuedResult, "string", JSON.stringify(queued.structuredContent));
     const queuedValues = JSON.parse(queuedResult as string) as unknown[];
