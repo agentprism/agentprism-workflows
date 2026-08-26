@@ -471,6 +471,45 @@ test("live-backend e2e: pi drives injected StructuredOutput with process-exclusi
   assertBackend("pi", out);
 });
 
+test("live workflow config discovery: every backend exposes its no-prompt catalog without a run", {
+  skip: SKIP,
+  timeout: 300_000,
+}, async () => {
+  assert.ok(existsSync(SERVER_ENTRY), `built server entry missing — run \`pnpm build\` first: ${SERVER_ENTRY}`);
+  const projectDir = fileURLToPath(new URL("../../..", import.meta.url));
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [SERVER_ENTRY],
+    env: { ...process.env } as Record<string, string>,
+    stderr: "pipe",
+    cwd: projectDir,
+  });
+  const client = new Client({ name: "live-config-discovery", version: "0.0.0" }, { capabilities: {} });
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({
+      name: "workflow",
+      arguments: {
+        action: "config",
+        projectDir,
+        harnesses: ["claude", "codex", "opencode", "pi"],
+        probeTimeoutMs: 120_000,
+      },
+    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    assert.notEqual(result.isError, true, JSON.stringify(result));
+    const output = result.structuredContent as Record<string, unknown>;
+    assert.equal(output.action, "config");
+    assert.equal(output.ok, true, JSON.stringify(output));
+    assert.equal(output.runId, undefined, "config discovery creates no workflow run");
+    const rows = output.harnessOptions as Array<Record<string, unknown>>;
+    assert.deepEqual(rows.map((row) => row.backendId), ["claude", "codex", "opencode", "pi"]);
+    assert.ok(rows.every((row) => row.probed === true), JSON.stringify(rows));
+  } finally {
+    await client.close().catch(() => undefined);
+    await transport.close().catch(() => undefined);
+  }
+});
+
 test("live REPL queue smoke: Claude, Codex, OpenCode, and Pi continue one session through broker-owned FIFO prompts", {
   skip: SKIP,
   timeout: 600_000,
