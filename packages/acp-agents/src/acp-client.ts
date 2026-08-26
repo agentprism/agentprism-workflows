@@ -2662,6 +2662,9 @@ type ModelSelectOption = Extract<SessionConfigOption, { type: "select" }>;
 interface ActiveTurn {
   ended: Promise<void>;
   resolveEnded(): void;
+  /** Resolves once the single ACP cancel notification has been attempted. */
+  cancelRequested?: Promise<void>;
+  /** Full cancellation lifecycle, including the 5s settle-or-quarantine escalation. */
   cancellation?: Promise<void>;
 }
 
@@ -2983,15 +2986,16 @@ export class SessionHandle implements StructuredSource {
     return this.state.subscribeLoadedTurnEnded(listener);
   }
 
-  /** Cancel the active turn. A backend that does not settle within the grace window is closed and
-   *  its pooled child is quarantined for recycle after sibling sessions drain. */
+  /** Request cancellation of the active turn. Resolves once the single ACP cancel notification
+   *  has been attempted; the 5s settle-or-quarantine lifecycle continues in the background. */
   async cancel(): Promise<void> {
     const turn = this.activeTurn;
     if (!turn) {
       await this.pooled.cancelSession(this.sessionId);
       return;
     }
-    await this.cancelTurn(turn);
+    this.beginTurnCancellation(turn);
+    await turn.cancelRequested;
   }
 
   private cancelAfterAbort(): Promise<void> {
@@ -3002,12 +3006,24 @@ export class SessionHandle implements StructuredSource {
   }
 
   private cancelTurn(turn: ActiveTurn): Promise<void> {
-    turn.cancellation ??= this.cancelAndEscalate(turn.ended);
-    return turn.cancellation;
+    this.beginTurnCancellation(turn);
+    return turn.cancellation!;
+  }
+
+  private beginTurnCancellation(turn: ActiveTurn): void {
+    turn.cancelRequested ??= this.pooled.cancelSession(this.sessionId);
+    turn.cancellation ??= this.escalateAfterCancel(turn.cancelRequested, turn.ended);
+    // Public interactive cancellation resolves at the request boundary; keep escalation observed.
+    void turn.cancellation.catch(() => undefined);
   }
 
   private async cancelAndEscalate(observedEnd: Promise<void>): Promise<void> {
-    await this.pooled.cancelSession(this.sessionId);
+    const requested = this.pooled.cancelSession(this.sessionId);
+    return this.escalateAfterCancel(requested, observedEnd);
+  }
+
+  private async escalateAfterCancel(requested: Promise<void>, observedEnd: Promise<void>): Promise<void> {
+    await requested;
     if (await resolvesWithin(observedEnd, CANCEL_NOT_HONORED_GRACE_MS)) return;
     this.pooled.quarantineAfterIgnoredCancel();
     await this.release();
