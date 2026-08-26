@@ -41,43 +41,28 @@ test('the generated table reflects the live probe dispositions (every built-in b
   const rows = steeringMechanismRows();
   // The built-in backends' `_session/steering` dispositions, straight
   // from the probed matrix (protocol-coverage.ts): claude, codex and pi
-  // advertise the extension (live injection); opencode is
-  // typed-unsupported (queued-for-next-turn delivery).
+  // advertise the extension; opencode is typed-unsupported. This table
+  // is documentation only — runtime routing reads raw initialize metadata.
   const byBackend = new Map(rows.map((row) => [row.backend, row]));
   assert.deepEqual([...byBackend.keys()].sort(), ['claude', 'codex', 'opencode', 'pi']);
   assert.equal(byBackend.get('claude')!.advertised, true);
-  assert.equal(byBackend.get('claude')!.mechanism, 'live injection');
+  assert.equal(byBackend.get('claude')!.mechanism, 'strict active-turn injection');
   assert.equal(byBackend.get('claude')!.distProbe, 'claude');
   assert.equal(byBackend.get('codex')!.advertised, true);
-  assert.equal(byBackend.get('codex')!.mechanism, 'live injection');
+  assert.equal(byBackend.get('codex')!.mechanism, 'strict active-turn injection');
   assert.equal(byBackend.get('codex')!.distProbe, 'codex');
   assert.equal(byBackend.get('pi')!.advertised, true);
-  assert.equal(byBackend.get('pi')!.mechanism, 'live injection');
+  assert.equal(byBackend.get('pi')!.mechanism, 'strict active-turn injection');
   assert.equal(byBackend.get('opencode')!.advertised, false);
-  assert.equal(byBackend.get('opencode')!.disposition, 'typed-unsupported');
-  assert.equal(byBackend.get('opencode')!.mechanism, 'queued delivery');
-  // The document carries the custom-backend capability-gated row and the
-  // per-case mechanism table.
+  assert.equal(byBackend.get('opencode')!.disposition, 'not-advertised');
+  assert.equal(byBackend.get('opencode')!.mechanism, 'unsupported');
   const doc = generateSteeringMechanismTable();
-  assert.ok(doc.includes('custom backend'), 'the capability-gated custom row is documented');
-  assert.ok(doc.includes('queued'), 'the queued-for-next-turn fallback is documented');
-  // The CORRECTED cancel-during-opening case (phase-E review rejection:
-  // the table used to claim cancel() during opening is a no-op that
-  // returns `failed` while the call continues — broker.cancelCall now
-  // cancels the opening call, fences it, settles it durably as
-  // AGENT_CANCELLED, and returns `cancelled`; the generated table must
-  // pin the implemented behavior, never the stale prose).
+  assert.ok(doc.includes('custom backend'), 'the raw-metadata custom row is documented');
+  assert.ok(doc.includes('handle.queue(prompt)'), 'future turns are documented as explicit queue work');
+  assert.ok(doc.includes('no steering wire request'), 'unadvertised steering never falls back to a prompt');
   assert.ok(
-    doc.includes('the opening call is fenced and settled durably as cancelled'),
-    'the table documents the fenced + durable opening-cancel',
-  );
-  assert.ok(
-    doc.includes('`cancelled` (the cancelled call rejects with the recoverable `AGENT_CANCELLED`)'),
-    'the opening-cancel outcome is the honest `cancelled`',
-  );
-  assert.ok(
-    !doc.includes('no-op — nothing was running to cancel'),
-    'the stale no-op claim is gone from the generated document',
+    !doc.includes('queued-for-next-turn delivery'),
+    'the removed queued-steering fallback is absent',
   );
   // EXACTLY ONE terminal newline (phase-E review rejection: the
   // generator emitted two, so `git diff --check` failed with "new blank

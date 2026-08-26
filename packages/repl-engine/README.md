@@ -161,11 +161,11 @@ roadmap doc's DSL split: only a sliver needs host effects, everything else is pu
   the backend-routing spec; `task` the worker's prompt; `options` (structured-output
   schema, cwd, backend config) cross the bridge as JSON. The returned promise **is** the
   live handle: it may sit in a variable across evals, and it carries own non-enumerable
-  handle methods `followUp(prompt, opts?)` / `steer(prompt, opts?)` / `cancel()` — each
-  resolving with **what actually happened** (the host settles with the steering outcome,
-  live injection vs queued delivery, mirroring the outcome values `acp-agents` surfaces
-  in its steering events) — plus `id` (the stable call id `"c1"`, … used by
-  `interrupt` and reported by `agents()`).
+  handle methods `queue(prompt, opts?)` / `steer(prompt, opts?)` / `cancel()`, plus `id`
+  (the stable call id `"c1"`, … used by `interrupt` and reported by `agents()`). `steer`
+  targets only an ACP prompt currently in flight and resolves `injected`, `idle`, or
+  `unsupported`; it never starts or queues work. `queue` synchronously returns a distinct
+  promise-handle with its own `id` and exact `cancel()`, then resolves with that FIFO turn's answer.
 - `checkpoint(question, options?) → Promise` and `checkpoint.answer(callId, value) → boolean`
   — the data plane interrupting the intent plane. The answer enters the data plane only
   through `checkpoint.answer` (the `__host_checkpoint` trailing-argument answer mode); it
@@ -188,7 +188,10 @@ roadmap doc's DSL split: only a sliver needs host effects, everything else is pu
 |---|---|
 | `__host_agent(callId, modelSpec, task, optionsJson)` | Kick off one worker run against the backend routed by `modelSpec`. May return a thenable (the bridge's `GuestCall` promise) — the guest chains onto it — or `undefined` (settle later via the surface). |
 | `__host_checkpoint(callId, question, optionsJson, answerJson?)` | Question mode: three arguments, like `__host_agent`. Answer mode: a PRESENT fourth argument (the JSON-encoded answer) — the host settles the pending checkpoint and returns a boolean synchronously; nothing new pends. |
-| `__host_agent_steer(callId, sessionId, action, payloadJson)` | Steering: `callId` is the operation's OWN registry id (the settlement key), `sessionId` the FOUNDING call id of the session being steered (the dispatch and post-restore re-issue target); `action` is `"followUp"` \| `"steer"` \| `"cancel"` and `payloadJson` is `{ prompt, options }` or `null` for cancel. The host settles with the steering outcome. |
+| `__host_agent_queue(callId, sessionId, payloadJson)` | Create one durable queued public turn on the founding session. |
+| `__host_agent_steer(callId, sessionId, payloadJson)` | Strict transient control of the ACP prompt currently in flight. |
+| `__host_agent_cancel(callId, sessionId)` | Cancel the session's current public turn. |
+| `__host_queue_cancel(callId, queueCallId)` | Cancel exactly one queued-turn handle. |
 | `__host_console(level, payloadJson)` | The console bridge, called synchronously with the rendered `{ line }` payload (one joined line per call). |
 
 Settlement is first-wins idempotent by call id, through two always-valid routes: the live
@@ -343,9 +346,8 @@ the doc's broker contract against real ACP sessions through `@automatalabs/acp-a
 
 - **`agent(modelSpec, task, opts)` dispatches a held-open ACP session** — the runner's
   `openSession` with the routing grammar, model spec and per-call `cwd` (default: the workspace's
-  project directory). The guest option bag is exactly `{ schema, cwd, configOptions, mode, tier,
-  label, toolNames, disallowedToolNames, meta, promptMeta, maxSchemaRetries, baseInstructions,
-  developerInstructions }` — any other key refuses the call (`recoverable: false`). `schema` is a
+  project directory). The guest option bag is exactly `{ schema, cwd, configOptions, mode }` —
+  any other key refuses the call (`recoverable: false`). `schema` is a
   JSON Schema object validated by acp-agents' own structured-output ladder (`resolveStructuredOutput`
   driven over the session: convert/check, native + prose extraction, re-prompt, `SCHEMA_NONCOMPLIANCE`
   — the one divergence from `run()`: the client-hosted StructuredOutput MCP capture tool is not
@@ -354,18 +356,16 @@ the doc's broker contract against real ACP sessions through `@automatalabs/acp-a
   backend for the restore path's lazy re-attach.
 - **Six concurrent subagents per workspace** (doc-settled; `maxConcurrentAgents` configurable —
   server configuration, invisible to the guest). The limit counts live work: unsettled agent calls
-  plus sessions running a queued-steer delivery turn. Additional dispatches **QUEUE for the
-  next free slot in dispatch order** (§4.1 [D]) — never a rejection, matching the workflow
+  plus active queued turns. Founding calls and queued turns share one admission sequence; the
+  oldest eligible item takes the next free slot while an ineligible old item never blocks another
+  session — never a rejection, matching the workflow
   engine's semantics (`parallel(items.map(...))` never loses work).
-- **Steering resolves with what actually happened** (the doc's "nothing is hidden, nothing
-  hard-errors"): `followUp`/`steer` settle with acp-agents' steering-outcome vocabulary where the
-  backend advertises `_session/steering`, with the broker's honest `queued` marker where it does
-  not (the per-backend steering mechanism table is the GENERATED artifact in
-  `docs/steering-mechanism-table.md` — see `src/steering-table.ts` and its gate test). Steering calls NEVER
-  hard-error: backend/wire failures resolve `failed`; the only rejections are guest protocol
-  violations. `cancel()` resolves `cancelled` (turn in flight), `idle` (nothing running) or
-  `failed`; a cancelled call rejects with the RECOVERABLE `AGENT_CANCELLED` (one worker's
-  cancellation never halts the surrounding orchestration).
+- **Strict steering is transient active-turn control.** With an ACP prompt in flight and the exact
+  raw initialize advertisement, the broker sends one `_session/steering` request with
+  `idleBehavior: "promptRequired"`; otherwise it sends nothing and resolves `idle` or `unsupported`.
+  Transport/server failures reject. Malformed responses and `startedNewTurn` are fatal protocol
+  violations; no path converts steering into future work. `queue()` is the only future-turn API:
+  every call owns a durable FIFO record, answer, cancellation target, and ordinary `session/prompt`.
 - **The append-only call store** (`src/store.ts`, transfer lesson 1): every call's outcome is
   recorded by call id BEFORE it is settled into the guest. `InMemoryCallStore` for tests and
   ephemeral hosts; `JsonlCallStore` is the durable append-only JSON-lines file — every mutation
@@ -455,39 +455,25 @@ below).
 Phase C decisions (the broker, the call store, the eval tool-result semantics):
 
 - **The broker dispatches held-open sessions** (`runner.openSession`), not one-shot `run()`
-  calls: the live-handle contract (followUp/steer/cancel on a settled call) requires a session
+  calls: the reusable-handle queue contract requires a session
   that outlives the call. Sessions are opened with `keepSession: true` (the ACP session persists
   on the backend for the restore path's re-attach) and stay open while any MCP client is
   connected to the project; on last-client disconnect the daemon drives the client-presence
   drain (`drainForDisconnect` — in-flight turns drain to completion, then idle children
-  close) and later followUp/steer/cancel re-attach the session lazily. `schema` calls
+  close); the next eligible queued turn re-attaches its recorded session lazily. Idle steering
+  and idle cancellation never reattach. `schema` calls
   drive acp-agents' own `resolveStructuredOutput` over the session (`tryNative` = raw
   structured output, else the generic parse-final-JSON dialect) — the one divergence from
   `run()`: the client-hosted StructuredOutput MCP capture tool is not injected on the
   interactive path.
-- **The concurrency limit counts live work** — unsettled agent calls plus sessions running a
-  queued-steer delivery turn (a follow-up turn is a subagent working). Additional dispatches
-  QUEUE in dispatch order for the next free slot (§4.1 [D]).
-  `recoverable: true` remains the one signal the guest needs.
-- **The steering mechanism table** (the doc's spec-owed decision): extension backend + turn in
-  flight → live `_session/steering` wire call, resolving with the §4.2 delivery-outcome
-  vocabulary (`injected` for live injection; a backend `startedNewTurn` — the injection raced
-  the turn's end — maps to `queued`, accepted for next-turn delivery; `failed`); extension
-  backend + idle session → a new turn (the §4.2 [D] turn minted with its own call id; its
-  promise resolves with the turn's ANSWER); no-extension backend + turn in flight → queued
-  for next-turn delivery,
-  resolving `queued` IMMEDIATELY (the delivery happens at the next turn boundary; a delivery
-  turn's failure surfaces as a warn-level line in the next tool result; a cancelled call drops
-  its queue — both documented); no-extension backend + idle session → a new turn, same as the
-  idle extension case (the §4.2 [C] alias: idle-session `steer` = `followUp`, and both carry
-  the followUp answer semantics — no path runs a turn and discards its result). Any wire
-  failure resolves `failed` — steering never hard-errors. `cancel`
-  resolves `cancelled` (a turn was in flight and ACP `session/cancel` completed; the cancelled
-  call itself rejects with the recoverable `AGENT_CANCELLED` — never a halt signal for the
-  orchestration owning it), `idle` (nothing was running), or `failed`. The
-  outcome surface is the honest `injected`/`queued`/`failed` plus `cancelled`/`idle` —
-  urgency delivery (`injected`) is always distinguishable from next-turn delivery
-  (`queued`); the v1 bare `startedNewTurn` token never reaches the guest.
+- **The concurrency limit counts active public turns.** Founding calls and queued turns share one
+  workspace admission sequence; the oldest eligible item gets a free slot, while pending queue
+  items, idle sessions, steering, and cancellation consume no extra slot.
+- **Steering and queueing are separate.** `steer()` is strict active-prompt control and returns
+  `injected`, `idle`, or `unsupported`; transport/protocol failures reject and no prompt fallback
+  exists. `queue()` creates one addressable FIFO public turn whose answer and schema repair remain
+  under its own call id. `cancel()` returns `cancelled` or `idle`; the selected public turn rejects
+  recoverably with `AGENT_CANCELLED`.
 - **The store records refused calls too** (dispatched + rejected with the refusal error):
   without the record, a restore would re-issue a call that was deliberately refused.
 - **`completed` excludes checkpoint answers** (the harness's pump convention): an answered id
@@ -623,15 +609,10 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   the recorded pin — never by the CURRENT configured default, so a changed default
   across a restart can never load or re-issue on the wrong backend and miss a
   still-resumable original session.
-- **Settled handles re-attach lazily** (phase-D review round 2; the doc: "followUp
-  re-attaches the subagent session lazily via the capability matrix"): after the
-  client-presence drain (or a restore that left settled calls unattached),
-  followUp/steer/cancel on a settled handle load its recorded backend session through
-  the runner's own `loadSession` — capability-gated exactly like the restore arm (a
-  custom backend without the capability degrades through the same gate, surfaced
-  guest-visibly as a warn line and the honest `failed` outcome); the loaded session
-  serves the steering operation per the mechanism table. Concurrent lazy re-attaches of
-  one session share a single load.
+- **Queued turns re-attach lazily.** After the client-presence drain, the next eligible
+  queue head loads its recorded backend session through `loadSession`; failure rejects the entire
+  lane with `session_reattach_failed`, never opens a blank replacement. Idle steering and idle
+  cancellation perform no load. Concurrent queue admissions share one reattachment.
 - **The client-presence drain** (`Broker.drainForDisconnect`, phase-D review round 2):
   in-flight turns DRAIN TO COMPLETION **within the bound** (each settlement boundary
   snapshots — a turn that finishes in time is never cancelled), bounded by the spec-owed
@@ -640,16 +621,15 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   clients are collected promptly; a turn that OVERRUNS the bound is force-cancelled — the honest
   bounded teardown, settled as the recoverable `AGENT_CANCELLED`), then every idle child
   closes (`keepSession` keeps the backend
-  sessions re-openable; queued-but-undelivered steers are re-queued durably against
-  their founding session ids and delivered by the next re-attach exactly once). The
-  workspace and broker stay alive; the next client's followUp/steer/cancel lazily
-  re-attaches. Phase-D review round 3 hardens both edges: the drain WAITS for calls
+  sessions re-openable; pending queued turns remain durable against their founding
+  session ids). The workspace and broker stay alive; the next eligible queue head lazily
+  re-attaches. The drain WAITS for calls
   still OPENING (`openSession` parked — an opening call has no session entry yet, so a
   drain that considered only registered busy sessions returned `true` immediately and
   let the child open and run after the last client disconnected) and in-flight lazy
   re-attaches, and a parked open that outlives the bound is STOPPED (the late child is
   closed before it ever prompts, the call settles as the recoverable `AGENT_CANCELLED`,
-  queued steers are dropped durably); and the outer bound is ABSOLUTE — every
+  and queued turns fail explicitly when no reusable session was established); the outer bound is ABSOLUTE — every
   post-deadline cancel/release await races the remaining time, so a hung backend can
   never block disconnect/shutdown past the eviction TTL.
 - **The per-eval wall-clock deadline** (`BrokerOptions.evalTimeoutMs`, default 30 s,
@@ -680,11 +660,11 @@ Phase D decisions (snapshots + restore; see also the "Snapshots and durability" 
   `provenanceAtMs` (the attribution wall clock; phase-D review round 3: bindings used
   to carry only the label and an internal timestamp). The sole result-history global is `_`
   (the previous eval's completion value, §4.4).
-- **Pending steers whose wire call died with the process resolve `failed`** (recorded +
-  settled; the reason demotes to workspace().diagnostics.reconcileNotes, §6.2): their outcome
-  is unknowable and re-injecting would duplicate; the one
-  exception is queued-but-undelivered steers, whose payload is in the store (the phase-C
-  queue rebuild). Pending checkpoints re-surface into the broker's checkpoint table
+- **Pending steering is never replayed.** A steering operation interrupted by restart rejects
+  recoverably with `details.reason: "steering_interrupted"`; re-injecting would duplicate control.
+  First-class queue records are restored independently: an unhanded queue head remains eligible,
+  while a handed-off turn requires authoritative terminal classification and is never blindly resent.
+  Pending checkpoints re-surface into the broker's checkpoint table
   (`PendingCheckpoint.call` is null on that path; answers settle through the reconciliation
   surface). Reconcile is idempotent (an `isTracked` guard never re-attaches/re-issues twice)
   and adopts store-unknown entries (foreign snapshot / wiped store) so the replay ledger
@@ -711,7 +691,7 @@ Phase B decisions (the guest library, bridge, previewer):
   `agentprism.guest`/`__AGENTPRISM_GUEST_VERSION` are its sibling project's).
 - **Four host callbacks**: `__host_agent`, `__host_checkpoint`, `__host_console`, and
   `__host_agent_steer`. The steering callback carries the handle methods
-  (`followUp`/`steer`/`cancel`) as a new host-callback name in the initial major.
+  (`queue`/`steer`/`cancel`) as a new host-callback name in the initial major.
 - **`agent(modelSpec, task, opts?)` carries the model spec as a first-class argument** — the
   roadmap doc's own signature (`agent("pi/deepseek-v4-flash-max", "research X")`). The spec
   crosses the bridge to `__host_agent` verbatim and is recorded in the pending-call registry
@@ -731,9 +711,9 @@ Phase B decisions (the guest library, bridge, previewer):
   host-routed to the configured default backend (mirrors dsl.d.ts, where reviewers
   inherit the run's default model when none is given).
 - **The handle is the promise**: `agent()` returns the promise itself with own non-enumerable
-  `id`/`followUp`/`steer`/`cancel` — started-not-awaited handles come free with top-level
+  `id`/`queue`/`steer`/`cancel` — started-not-awaited handles come free with top-level
   await, per the doc (`const research = agent(...)`; end the eval; check in next call). No
-  `agent.start`/`agent.continue` variants (the doc does not carry them; `followUp` is the
+  `agent.start`/`agent.continue` variants (the doc does not carry them; `queue` is the
   continuation vector).
 - **Non-recoverable = `recoverable: false` exclusively.**
 - **`retry` mirrors the workflow engine exactly**: without `until`, the FIRST attempt's
@@ -846,10 +826,9 @@ restarts — the property that makes a "persistent REPL" trustworthy. Three coop
   (the post-load continuation watch plus the connection-death replay probe — never a
   blind possibly-running re-issue, never a permanent pending hold); a turn that failed at
   the backend settles as a definite rejection). Pending checkpoints re-surface (answerable
-  across a restore, through the reconciliation surface) and pending steers whose wire call
-  died with the process resolve the honest `failed` with a warn line (their outcome is
-  unknowable; re-injecting would duplicate; queued-but-undelivered steers are the one
-  exception — the phase-C queue rebuild re-queues them exactly once). Reconcile is
+  across a restore, through the reconciliation surface); pending steering rejects
+  `steering_interrupted` and is never replayed; first-class queue records restore under their
+  handoff markers and authoritative loaded-turn evidence. Reconcile is
   idempotent: a repeated reconcile never re-attaches or re-issues twice. Reconcile-time
   re-issue refusals (invalid registry options, the concurrency cap — including the
   no-recorded-session and adapter-without-seam branches) settle the guest and participate
@@ -910,12 +889,11 @@ every idle child closes (`keepSession` keeps the backend sessions re-openable). 
 that **reconnects mid-drain ABORTS it** — `drainForDisconnect` re-checks presence every
 iteration and before every destructive phase, so the children stay warm while any client
 is connected. The workspace and broker stay alive; on the next client connect
-`followUp`/`steer`/`cancel` on a settled handle RE-ATTACHES the recorded backend session
+`queue`/`steer`/`cancel` on a settled handle RE-ATTACHES the recorded backend session
 lazily via the capability matrix (`Broker.canLazyReattach`/`lazyReattach` — the runner's
-own `loadSession` gate; a custom backend without the capability degrades through the same
-gate, surfaced guest-visibly). Queued-but-undelivered steers survive the drain (re-queued
-durably against their founding session ids — the next re-attach delivers them exactly
-once). At daemon shutdown every workspace drains with the shutdown deadline before the
+own `loadSession` gate. Pending queued turns survive the drain durably against their
+founding session ids; the next eligible queue head reattaches and delivers them in FIFO order.
+At daemon shutdown every workspace drains with the shutdown deadline before the
 broker teardown.
 
 ## The generated steering mechanism table
@@ -927,10 +905,9 @@ the live capability probes in `@automatalabs/acp-agents`'s
 `ACP_EXTENSION_SUPPORT_MATRIX` (see `src/steering-table.ts`), and
 `test/steering-table.test.ts` GATES it — the suite regenerates the document and fails
 when the checked-in file drifts from the probes. Regenerate with
-`pnpm --filter @automatalabs/repl-engine generate:steering-table`. The mechanism per
-backend follows directly from the probed disposition: `supported` → live injection via
-`session.steer()`; anything else → queued-for-next-turn delivery; a custom backend is
-capability-gated per session at open.
+`pnpm --filter @automatalabs/repl-engine generate:steering-table`. The matrix is documentation
+only: runtime steering parses each session's raw initialize metadata. Unadvertised active
+steering is `unsupported`, idle steering is `idle`, and neither path queues a prompt.
 
 ## Development
 
@@ -960,7 +937,7 @@ pinning the opaque `WasmModule` boundary.
 Phase B pins the guest library and bridge: install/version-marker/idempotence (re-eval and
 re-install are no-ops), agent
 round trips with the model-spec signature and JSON options, rejections normalizing to Errors
-carrying `code`/`recoverable`, the live handle (`id`/`followUp`/`steer`/`cancel`,
+carrying `code`/`recoverable`, the live handle (`id`/`queue`/`steer`/`cancel`,
 non-enumerable, steering addressed to the founding session id), synchronous host-refusal
 rejection, started-not-awaited settlement through a later standalone drain, the checkpoint
 question→answer flow across evals (with `false` for unknown/answered ids and a TypeError for
@@ -1067,13 +1044,11 @@ still-running turn is never re-issued (no fresh session ever opens); an `interru
 turn re-issues immediately; a built-in backend WITHOUT the extension is classified by the
 observation path — a completed-while-down turn settles from the replay with no re-issue
 and no extension query on the wire, under the connection-death contract). Phase-D
-review round 2 adds `review2.test.ts` (the lazy re-attach of settled handles after the
-client-presence drain — followUp/steer/cancel re-attach the recorded backend session
-through the capability gate, and a gate failure degrades to the honest `failed` surfaced
-guest-visibly; the persisted backend routing pin — restore and re-issue route by the
-recorded backend id, never the current default; the `drainForDisconnect` policy — turns
-drain to completion with settlement boundaries, the bound cancels an over-bound turn as
-the recoverable `AGENT_CANCELLED`, queued-but-undelivered steers survive durably; the
+review round 2 adds `review2.test.ts` (the persisted backend routing pin — restore and
+re-issue route by the recorded backend id, never the current default; the
+`drainForDisconnect` policy — turns drain to completion with settlement boundaries, the
+bound cancels an over-bound turn as the recoverable `AGENT_CANCELLED`, and pending queued
+turns remain durable; the
 workspace manifest — structure-only tokens, provenance labels, live-handle status,
 metadata-never-content asserted hard; the per-eval wall-clock deadline breaking a
 currently-running runaway eval with the VM usable after; the provenance passes; the §6.2

@@ -76,7 +76,10 @@ async function createVm(): Promise<ReplVm> {
   await installGuestBridge(vm, {
     agent: () => undefined,
     checkpoint: () => undefined,
+    queue: () => undefined,
     steer: () => undefined,
+    cancelSession: () => undefined,
+    cancelQueue: () => undefined,
     console: () => undefined,
     sleep: () => undefined,
     workspace: () => '{}',

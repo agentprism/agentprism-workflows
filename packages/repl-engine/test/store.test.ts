@@ -13,17 +13,26 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { InMemoryCallStore, JsonlCallStore, type CallOutcome, type CallRecord } from '../src/index.js';
+import { InMemoryCallStore, JsonlCallStore, type CallKind, type CallOutcome, type CallRecord } from '../src/index.js';
 
-function record(callId: string, kind: 'agent' | 'checkpoint' | 'steer' = 'agent'): CallRecord {
+function record(callId: string, kind: CallKind = 'agent'): CallRecord {
   return {
     callId,
     kind,
     detail: `task ${callId}`,
     optionsJson: null,
+    modelSpec: kind === 'agent' ? 'pi/x' : null,
+    backendId: null,
+    foundingCallId: kind === 'queue' || kind === 'steer' || kind === 'cancel' ? 'c1' : null,
+    admittedAtMs: 1,
+    admissionSequence: Number(callId.slice(1)),
     dispatchedAtMs: 1,
     reissues: 0,
     completion: null,
+    sessionId: null,
+    queuedAtMs: null,
+    handoffAtMs: null,
+    cancelledAtMs: null,
   };
 }
 
@@ -62,6 +71,38 @@ test('in-memory store: first-wins dispatch and completion, unknown ids refused',
   assert.deepEqual(store.all().map((r) => r.callId), ['c1', 'c2']);
 });
 
+test('in-memory store: queue admission, handoff, cancellation, and refusal settlement are durable first-wins fields', () => {
+  const store = new InMemoryCallStore();
+  store.recordDispatched({
+    ...record('c2', 'queue'),
+    detail: 'implement the fix',
+    optionsJson: '{"promptMeta":{"trace":"yes"}}',
+  });
+  store.recordQueued('c2', 10);
+  store.recordQueued('c2', 11);
+  store.recordHandoff('c2', 20);
+  store.recordHandoff('c2', 21);
+  store.recordCancelled('c2', 30);
+  store.recordCancelled('c2', 31);
+  assert.deepEqual(store.lookup('c2'), {
+    ...record('c2', 'queue'),
+    detail: 'implement the fix',
+    optionsJson: '{"promptMeta":{"trace":"yes"}}',
+    queuedAtMs: 10,
+    handoffAtMs: 20,
+    cancelledAtMs: 30,
+  });
+
+  store.recordDispatched({ ...record('c3', 'queue'), detail: 'invalid admission' });
+  assert.equal(store.recordCompleted('c3', outcome({
+    message: 'queue options: unknown option "schema"',
+    code: 'SCRIPT_VALIDATION_ERROR',
+    recoverable: false,
+  }, 'reject')), true);
+  assert.equal(store.lookup('c3')!.queuedAtMs, null, 'a validation refusal never enters the FIFO');
+  assert.equal(store.lookup('c3')!.completion!.outcome, 'reject', 'the refusal is nevertheless durable');
+});
+
 // ────────────────────────────────────────────────────────────────────────
 // JSONL store: replay
 // ────────────────────────────────────────────────────────────────────────
@@ -71,6 +112,10 @@ test('jsonl store: appends replay on reopen; first-wins holds across reopens', (
   const store = JsonlCallStore.open(path);
   store.recordDispatched(record('c1'));
   store.recordDispatched(record('c2', 'checkpoint'));
+  store.recordDispatched(record('c3', 'queue'));
+  store.recordQueued('c3', 3);
+  store.recordHandoff('c3', 4);
+  store.recordCancelled('c3', 5);
   store.recordCompleted('c1', outcome('done'));
   store.close();
 
@@ -78,6 +123,10 @@ test('jsonl store: appends replay on reopen; first-wins holds across reopens', (
   assert.equal(reopened.lookup('c1')!.completion!.value, 'done');
   assert.equal(reopened.lookup('c2')!.kind, 'checkpoint');
   assert.equal(reopened.lookup('c2')!.completion, null);
+  assert.equal(reopened.lookup('c3')!.kind, 'queue');
+  assert.equal(reopened.lookup('c3')!.queuedAtMs, 3);
+  assert.equal(reopened.lookup('c3')!.handoffAtMs, 4);
+  assert.equal(reopened.lookup('c3')!.cancelledAtMs, 5);
   // A second completion after reopen is refused (first-wins, log unchanged).
   assert.equal(reopened.recordCompleted('c1', outcome('second')), false);
   assert.equal(reopened.recordCompleted('c2', outcome('answered')), true);

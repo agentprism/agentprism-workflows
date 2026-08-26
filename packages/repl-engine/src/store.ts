@@ -45,7 +45,7 @@ import {
 } from 'node:fs';
 
 /** Which guest call produced a record. */
-export type CallKind = 'agent' | 'checkpoint' | 'steer';
+export type CallKind = 'agent' | 'checkpoint' | 'queue' | 'steer' | 'cancel';
 
 /** How a completed call settled. */
 export type CallOutcomeKind = 'resolve' | 'reject';
@@ -67,7 +67,7 @@ export interface CallRecord {
   /** The stable guest-facing call id (`"c1"`, `"c2"`, …). */
   callId: string;
   kind: CallKind;
-  /** Verbatim prompt (agent), question (checkpoint), or action (steer). */
+  /** Verbatim prompt (agent/queue), question (checkpoint), or control label. */
   detail: string;
   /** Verbatim `optionsJson` string, or null. */
   optionsJson: string | null;
@@ -91,40 +91,22 @@ export interface CallRecord {
    * agent records whose session never opened, and legacy logs.
    */
   backendId: string | null;
+  /** Founding reusable agent/session call id for queue, steer, and cancel records. */
+  foundingCallId: string | null;
+  /** Workspace admission time and total ordering sequence. */
+  admittedAtMs: number;
+  admissionSequence: number;
   dispatchedAtMs: number;
   /** Times this call was re-issued after being found lost (same call id). */
   reissues: number;
   /** Present once the call completed (first completion wins). */
   completion: CallOutcome | null;
-  /** The FOUNDING session id for steer records (the session being steered
-   *  — the restore path's queue rebuild keys on it); for AGENT records, the
-   *  backend ACP session id the call's session opened under (`recordAttached`
-   *  — the restore path's re-attach key), overwritten by a re-issue's new
-   *  session. Null for checkpoint records, for steer records is the founding
-   *  id, and for agent records whose session never opened (or whose record
-   *  predates the attachment log). */
+  /** Backend ACP session id for agent records after open/reattach. */
   sessionId: string | null;
-  /** Queued-for-next-turn delivery state (steer records whose completion
-   *  is the `queued` outcome): the unix-ms moment the queued payload was
-   *  handed to the session as a delivery turn, or null while the steer
-   *  still awaits delivery. A `delivered` marker is the point of no
-   *  return: a restored broker must never re-deliver a marked steer
-   *  (replay without duplication). */
-  deliveredAtMs: number | null;
-  /** The unix-ms moment a §4.2 followUp/steer was QUEUED for a delivery
-   *  turn (cap pressure on an idle session, the answer semantics — its
-   *  promise stays pending until the delivery runs, so it carries NO
-   *  completion). The durable counterpart of the delivery-outcome
-   *  completion: the restore's queue rebuild re-queues these exactly
-   *  once (see `recordQueued`); null otherwise. */
+  /** Queue admission, ACP handoff, and explicit-cancellation timestamps. */
   queuedAtMs: number | null;
-  /** The unix-ms moment a queued steer's delivery was DROPPED (the
-   *  founding call was cancelled, its delivery turn was cancelled, or
-   *  the founding session never opened) — the durable counterpart of
-   *  the in-memory queue drop, so a restore never resurrects a dropped
-   *  delivery. Null while undropped. At most one of `deliveredAtMs` /
-   *  `droppedAtMs` is ever set. */
-  droppedAtMs: number | null;
+  handoffAtMs: number | null;
+  cancelledAtMs: number | null;
 }
 
 /**
@@ -158,21 +140,11 @@ export interface CallStore {
    * change). Throws for an id the store has never seen dispatched.
    */
   recordCompleted(callId: string, outcome: CallOutcome): boolean;
-  /**
-   * Record a queued steer's delivery state (first-wins per state; a
-   * second `delivered`/`dropped` record for the same call is a no-op).
-   * Throws for an id the store has never seen dispatched.
-   */
-  recordDelivery(callId: string, state: 'delivered' | 'dropped', atMs: number): void;
-  /**
-   * Record that a §4.2 followUp/steer was QUEUED for a delivery turn
-   * (the answer semantics — its completion is deliberately NOT
-   * recorded here: the promise resolves with the turn's answer when
-   * the delivery runs, and the store's first completion is the
-   * settlement authority). First-wins; the restore's queue rebuild
-   * keys on this marker. Throws for an id the store has never seen
-   * dispatched.
-   */
+  /** Record the queue prompt's point-of-no-return handoff marker. */
+  recordHandoff(callId: string, atMs: number): void;
+  /** Record explicit cancellation of a public turn. */
+  recordCancelled(callId: string, atMs: number): void;
+  /** Record queue admission into the durable per-session FIFO. */
   recordQueued(callId: string, atMs: number): void;
   lookup(callId: string): CallRecord | undefined;
   /** Every record, in first-dispatch order. */
@@ -199,11 +171,14 @@ export class InMemoryCallStore implements CallStore {
     this.records.set(record.callId, {
       ...record,
       sessionId: record.sessionId ?? null,
+      foundingCallId: record.foundingCallId ?? null,
+      admittedAtMs: record.admittedAtMs ?? record.dispatchedAtMs,
+      admissionSequence: record.admissionSequence ?? 0,
       modelSpec: record.modelSpec ?? null,
       backendId: record.backendId ?? null,
-      deliveredAtMs: record.deliveredAtMs ?? null,
-      droppedAtMs: record.droppedAtMs ?? null,
       queuedAtMs: record.queuedAtMs ?? null,
+      handoffAtMs: record.handoffAtMs ?? null,
+      cancelledAtMs: record.cancelledAtMs ?? null,
     });
   }
 
@@ -230,16 +205,18 @@ export class InMemoryCallStore implements CallStore {
     return true;
   }
 
-  recordDelivery(callId: string, state: 'delivered' | 'dropped', atMs: number): void {
+  recordHandoff(callId: string, atMs: number): void {
     const record = this.records.get(callId);
     if (record === undefined) throw unknownCall(callId);
-    if (state === 'delivered') {
-      if (record.deliveredAtMs !== null) return; // first-wins
-      record.deliveredAtMs = atMs;
-      return;
-    }
-    if (record.droppedAtMs !== null) return; // first-wins
-    record.droppedAtMs = atMs;
+    if (record.handoffAtMs !== null) return;
+    record.handoffAtMs = atMs;
+  }
+
+  recordCancelled(callId: string, atMs: number): void {
+    const record = this.records.get(callId);
+    if (record === undefined) throw unknownCall(callId);
+    if (record.cancelledAtMs !== null) return;
+    record.cancelledAtMs = atMs;
   }
 
   recordQueued(callId: string, atMs: number): void {
@@ -268,7 +245,8 @@ type LogLine =
   | { event: 'reissued'; callId: string; atMs: number }
   | { event: 'attached'; callId: string; sessionId: string; atMs: number; backendId?: string | null }
   | { event: 'completed'; callId: string; outcome: CallOutcome }
-  | { event: 'delivery'; callId: string; state: 'delivered' | 'dropped'; atMs: number }
+  | { event: 'handoff'; callId: string; atMs: number }
+  | { event: 'cancelled'; callId: string; atMs: number }
   | { event: 'queued'; callId: string; atMs: number };
 
 function isLogLine(value: unknown): value is LogLine {
@@ -311,13 +289,9 @@ function isLogLine(value: unknown): value is LogLine {
       typeof (o as CallOutcome).completedAtMs === 'number'
     );
   }
-  if (v.event === 'delivery') {
-    const d = value as { callId?: unknown; state?: unknown; atMs?: unknown };
-    return (
-      typeof d.callId === 'string' &&
-      (d.state === 'delivered' || d.state === 'dropped') &&
-      typeof d.atMs === 'number'
-    );
+  if (v.event === 'handoff' || v.event === 'cancelled') {
+    const d = value as { callId?: unknown; atMs?: unknown };
+    return typeof d.callId === 'string' && typeof d.atMs === 'number';
   }
   if (v.event === 'queued') {
     const q = value as { callId?: unknown; atMs?: unknown };
@@ -493,13 +467,20 @@ export class JsonlCallStore implements CallStore {
     return this.index.recordCompleted(callId, outcome);
   }
 
-  recordDelivery(callId: string, state: 'delivered' | 'dropped', atMs: number): void {
+  recordHandoff(callId: string, atMs: number): void {
     const existing = this.index.lookup(callId);
     if (existing === undefined) throw unknownCall(callId);
-    const marker = state === 'delivered' ? existing.deliveredAtMs : existing.droppedAtMs;
-    if (marker !== null) return; // first-wins per state
-    this.append({ event: 'delivery', callId, state, atMs });
-    this.index.recordDelivery(callId, state, atMs);
+    if (existing.handoffAtMs !== null) return;
+    this.append({ event: 'handoff', callId, atMs });
+    this.index.recordHandoff(callId, atMs);
+  }
+
+  recordCancelled(callId: string, atMs: number): void {
+    const existing = this.index.lookup(callId);
+    if (existing === undefined) throw unknownCall(callId);
+    if (existing.cancelledAtMs !== null) return;
+    this.append({ event: 'cancelled', callId, atMs });
+    this.index.recordCancelled(callId, atMs);
   }
 
   recordQueued(callId: string, atMs: number): void {
@@ -570,7 +551,8 @@ function replay(index: InMemoryCallStore, line: LogLine): void {
   else if (line.event === 'attached') index.recordAttached(line.callId, line.sessionId, line.atMs, line.backendId ?? null);
   else if (line.event === 'completed') index.recordCompleted(line.callId, line.outcome);
   else if (line.event === 'queued') index.recordQueued(line.callId, line.atMs);
-  else index.recordDelivery(line.callId, line.state, line.atMs);
+  else if (line.event === 'handoff') index.recordHandoff(line.callId, line.atMs);
+  else index.recordCancelled(line.callId, line.atMs);
 }
 
 /** Current file size of an open fd. */

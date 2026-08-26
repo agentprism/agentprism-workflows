@@ -46,7 +46,7 @@ const CHECKPOINTS = 16_500;
 /** The fake held-open ACP session (the same shape as eval-break.test.ts's). */
 class FakeSession implements BrokerSession {
   readonly sessionId: string;
-  capabilities: { supportsSteering: boolean } | undefined;
+  initializeMeta: Readonly<Record<string, unknown>> | undefined;
   readonly prompts: Array<{ content: string; resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
   releases = 0;
   cancelCalls = 0;
@@ -55,7 +55,7 @@ class FakeSession implements BrokerSession {
 
   constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
     this.sessionId = `fake-session-${FakeSession.nextId++}`;
-    this.capabilities = { supportsSteering: true };
+    this.initializeMeta = { steering: { supported: true } };
   }
 
   static nextId = 0;
@@ -67,7 +67,7 @@ class FakeSession implements BrokerSession {
     });
   }
 
-  steer(content: string): Promise<string> {
+  steer(content: string): Promise<unknown> {
     return new Promise((_, reject) => reject(new Error('steer not used in this suite')));
   }
 

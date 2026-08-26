@@ -2,14 +2,9 @@
  * Phase-D review round 2 regression suite: the reviewer's rejected items,
  * pinned at the engine boundary.
  *
- * 1. Lazy re-attach of SETTLED handles (the doc: "followUp re-attaches
- *    the subagent session lazily via the capability matrix"): after the
- *    client-presence drain released every child — or after a restore
- *    that left settled calls unattached — followUp/steer/cancel on a
- *    settled handle must load the recorded backend session on demand
- *    (capability-gated through the runner's own loadSession; a custom
- *    backend without the capability degrades through the same gate,
- *    surfaced guest-visibly) instead of resolving the honest `failed`.
+ * 1. Explicit queued turns reattach settled sessions lazily; strict idle
+ *    steering and idle cancellation never reattach. The first-class queue
+ *    acceptance matrix lives in broker.test.ts.
  * 2. Backend identity/pool routing is persisted (modelSpec + the
  *    RESOLVED backendId recorded at session open), so a restore or
  *    re-issue never re-resolves the model spec against the CURRENT
@@ -17,8 +12,7 @@
  * 3. The client-presence drain: in-flight turns drain to completion
  *    (each settlement boundary snapshots), then idle children close;
  *    the spec-owed concrete bound applies (an over-bound turn is
- *    cancelled — the honest bounded teardown); queued steers survive
- *    durably.
+ *    cancelled — the honest bounded teardown); pending queued turns remain durable.
  * 4. The workspace manifest: top-level bindings with structure-only
  *    tokens, provenance, and live-handle status — metadata, never
  *    content.
@@ -68,9 +62,9 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
 /** The fake held-open ACP session (see broker.test.ts). */
 class FakeSession implements BrokerSession {
   readonly sessionId: string;
-  capabilities: { supportsSteering: boolean } | undefined;
+  initializeMeta: Readonly<Record<string, unknown>> | undefined;
   readonly prompts: Array<{ content: string; resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
-  readonly steers: Array<{ content: string; resolve: (outcome: string) => void; reject: (error: unknown) => void }> = [];
+  readonly steers: Array<{ content: string; resolve: (outcome: unknown) => void; reject: (error: unknown) => void }> = [];
   releases = 0;
   stopReason = 'end_turn';
   readonly completedTexts: string[] = [];
@@ -81,7 +75,7 @@ class FakeSession implements BrokerSession {
 
   constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
     this.sessionId = `fake-session-${FakeSession.nextId++}`;
-    this.capabilities = { supportsSteering: FakeSession.supportsSteering };
+    this.initializeMeta = FakeSession.supportsSteering ? { steering: { supported: true } } : {};
   }
 
   static nextId = 0;
@@ -95,7 +89,7 @@ class FakeSession implements BrokerSession {
   }
   readonly texts: string[] = [];
 
-  steer(content: string): Promise<string> {
+  steer(content: string): Promise<unknown> {
     return new Promise((resolve, reject) => {
       this.steers.push({ content, resolve, reject });
     });
@@ -204,128 +198,8 @@ function output(result: { output: string[] }): string[] {
   return result.output;
 }
 
-// ── 1. Lazy re-attach of settled handles ───────────────────────────────
-
-test('review 2/1: after the client-presence drain, followUp/steer/cancel on a settled handle lazily re-attach the recorded backend session (the doc\'s lazy re-attach)', async () => {
-  const runner = new FakeRunner();
-  const { ws, broker } = await setup({ runner });
-  await broker.eval('const p = agent("pi/x", "task"); "started"');
-  await tick();
-  runner.last().completeTurn('settled result');
-  await tick();
-  await broker.pump();
-  // The drain releases every child and drops the live session entries.
-  assert.equal(await broker.drainForDisconnect(5000), true, 'the settled call drains immediately');
-  assert.equal(runner.sessions[0].releases, 1, 'the child closed');
-  assert.ok(broker.isDrained, 'the broker reports drained');
-
-  // followUp on the settled handle re-attaches the recorded session and
-  // starts a new turn on it (startedNewTurn).
-  await broker.eval('p.followUp("continue"); "fired"');
-  await tick();
-  assert.equal(runner.loadedWith.length, 1, 'the recorded session was loaded lazily');
-  assert.equal(runner.loadedWith[0].sessionId, runner.sessions[0].sessionId, 'the SAME backend session');
-  assert.equal(runner.loadedWith[0].model, 'pi', 'routing pins the recorded backend id');
-  const loaded = runner.sessions[1];
-  assert.equal(loaded.releases, 0, 'the re-attached child stays warm');
-  loaded.completeTurn('follow-up answer');
-  await tick();
-  await broker.pump();
-  assert.equal(broker.store().lookup('c2')!.completion!.value, 'follow-up answer', 'the followUp settled with the TURN\'S ANSWER (§4.2)');
-  // The lazy re-attach info line surfaces guest-visibly in the next tool
-  // result.
-  let sawReattachLine = false;
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const got = await broker.eval('1');
-    if (output(got).some((l) => l.includes('lazily re-attached'))) {
-      sawReattachLine = true;
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.ok(sawReattachLine, 'the lazy re-attach info line surfaced guest-visibly');
-  // steer on the re-attached idle session starts a new turn
-  // (startedNewTurn).
-  await broker.eval('p.steer("urgent"); "fired"');
-  await tick();
-  runner.sessions[1].completeTurn('steered answer');
-  await tick();
-  await broker.pump();
-  assert.equal(broker.store().lookup('c3')!.completion!.value, 'steered answer', 'the re-attached followUp settles with the TURN\'S ANSWER');
-  // cancelCall (the interrupt tool's engine path) reports the honest idle
-  // no-op for the now-warm re-attached session (no second load — the
-  // session entry is live again).
-  assert.equal(await broker.cancelCall('c1'), 'idle');
-  assert.equal(runner.loadedWith.length, 1, 'the warm session served the cancel');
-  assert.ok(!broker.isDrained, 'the lazy re-attach warmed the children again');
-  await broker.dispose();
-  ws.dispose();
-});
-
-test('review 2/1b: a lazy re-attach that fails through the capability gate (or a lost session) degrades to the honest failed, surfaced guest-visibly', async () => {
-  const runner = new FakeRunner();
-  const { ws, broker } = await setup({ runner });
-  await broker.eval('const p = agent("pi/x", "task"); "started"');
-  await tick();
-  runner.last().completeTurn('settled');
-  await tick();
-  await broker.pump();
-  await broker.drainForDisconnect(5000);
-
-  runner.loadError = new Error('session/load not supported by this backend');
-  await broker.eval('p.followUp("continue"); "fired"');
-  await tick();
-  await broker.pump();
-  // Nothing was steered: the steer settled the honest `failed`, recorded
-  // durably, and the degradation surfaced guest-visibly as a warn line.
-  assert.equal(broker.store().lookup('c2')!.completion!.value, 'failed');
-  let sawWarn = false;
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const probe = await broker.eval('1');
-    if (
-      output(probe).some(
-        (l) => l.startsWith('warn: ') && l.includes('lazy re-attach') && l.includes('failed'),
-      )
-    ) {
-      sawWarn = true;
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.ok(sawWarn, 'the capability-gate degradation surfaced guest-visibly');
-  await broker.dispose();
-  ws.dispose();
-});
-
-test('review 2/1c: a settled handle whose session never opened (no recorded backend session) keeps the honest failed — never a load', async () => {
-  const runner = new FakeRunner();
-  const { ws, broker } = await setup({ runner });
-  // The call's session fails to open (the runner throws): the record has
-  // no backend session id.
-  runner.openSession = async () => {
-    throw new Error('no backend');
-  };
-  await broker.eval('const p = agent("pi/x", "task"); "started"');
-  await tick();
-  await broker.pump();
-  const got = await broker.eval('await p.followUp("x")');
-  await tick();
-  await broker.pump();
-  let outcome: string | undefined;
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const probe = await broker.eval('await p.followUp("x")');
-    if (probe.result !== undefined) {
-      outcome = probe.result;
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.equal(outcome, 'failed');
-  assert.equal(runner.loadedWith.length, 0, 'nothing to load — the session never opened');
-  void got;
-  await broker.dispose();
-  ws.dispose();
-});
+// Queue reattachment, strict idle steering, and failed-reattachment semantics are
+// covered by the first-class queue acceptance matrix in broker.test.ts.
 
 // ── 2. Backend identity/pool routing is persisted ──────────────────────
 
@@ -459,65 +333,6 @@ test('review 2/3b: the drain bound is the outer ceiling — an over-bound turn i
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.ok(result?.includes('cancelled'), `recoverable cancel: ${result}`);
-  await broker.dispose();
-  ws.dispose();
-});
-
-test('review 2/3c: the drain WAITS for a call still opening (a parked openSession is in flight, not done), the opening call drains within the bound, and the queued-but-undelivered steer survives the drain — delivered by the drained session', async () => {
-  const runner = new FakeRunner();
-  const { ws, broker } = await setup({ runner });
-  // The founding session's open is PARKED (the backend is slow): the call
-  // is still opening, so a steer in the same window queues for the
-  // call's next-turn boundary (the honest `queued`).
-  let releaseOpen!: () => void;
-  const parkedOpen = new Promise<void>((resolve) => {
-    releaseOpen = resolve;
-  });
-  const originalOpen = runner.openSession.bind(runner);
-  runner.openSession = async (opts) => {
-    await parkedOpen;
-    return originalOpen(opts);
-  };
-  await broker.eval('const p = agent("pi/x", "task"); "started"');
-  await tick();
-  await broker.eval('const s = p.steer("queued content"); "steered"');
-  await tick();
-  await broker.pump();
-  assert.equal(broker.store().lookup('c2')!.completion!.value, 'queued', 'the steer queued');
-  // The drain must NOT return while the open is parked: the call is still
-  // in flight without a session entry, and draining past it would let the
-  // child open and run after the last client disconnected (phase-D review
-  // round 3: the drain used to consider only registered busy sessions and
-  // returned `true` immediately).
-  let drainReturned = false;
-  const draining = broker.drainForDisconnect(5000).then((drained) => {
-    drainReturned = true;
-    return drained;
-  });
-  await tick();
-  assert.equal(drainReturned, false, 'the drain waits for the parked open');
-  assert.equal(runner.sessions.length, 0, 'no child has opened yet');
-  // The slow open completes WITHIN the bound: the session registers, the
-  // founding turn runs and drains to completion (each settlement boundary
-  // snapshots), the undelivered steer's delivery turn starts and drains
-  // too — the steer survives the drain, delivered as the next turn on
-  // the drained session.
-  releaseOpen();
-  await waitFor(() => runner.sessions.length === 1);
-  const session = runner.sessions[0];
-  session.completeTurn('founding done');
-  // The founding settlement kicks the queued steer's delivery turn (the
-  // six-agent ceiling has a free slot); the drain waits for it like any
-  // in-flight turn.
-  await waitFor(() => session.prompts.length === 1);
-  session.completeTurn('delivered');
-  assert.equal(await draining, true, 'the opening call and its delivery turn drained within the bound');
-  assert.ok(broker.isDrained);
-  await broker.pump();
-  // The surviving steer delivered as the next turn on the drained
-  // session (the founding prompt was consumed by completeTurn).
-  assert.equal(session.texts[1], 'queued content', 'the surviving steer delivered as the next turn');
-  assert.equal(broker.store().lookup('c2')!.deliveredAtMs !== null, true, 'the delivered marker recorded');
   await broker.dispose();
   ws.dispose();
 });
@@ -657,7 +472,7 @@ test('review 2/4: the workspace manifest lists top-level bindings with structure
   assert.equal(byName.get('note')!.token, 'string \u00b7 10B');
   assert.equal(byName.get('count')!.token, 'number \u00b7 8B');
   assert.equal(byName.get('count')!.sizeBytes, 8, 'the size is exposed as its own field');
-  assert.equal(byName.get('research')!.token, 'agent handle \u00b7 pending \u00b7 call c1 \u00b7 151B');
+  assert.equal(byName.get('research')!.token, 'agent handle \u00b7 pending \u00b7 call c1 \u00b7 148B');
   assert.equal(byName.get('research')!.provenance, 'eval 1');
   assert.equal(manifest.logs.count, 0, 'the $N capture system is deleted — the logs range is always empty');
   assert.equal(manifest.logs.first, null);
@@ -685,7 +500,7 @@ test('review 2/4: the workspace manifest lists top-level bindings with structure
   await broker.eval('globalThis.finding = research; "stored"');
   manifest = broker.workspaceManifest();
   const finding = manifest.bindings.find((b) => b.name === 'finding');
-  assert.equal(finding?.token, 'agent handle \u00b7 settled \u00b7 call c1 \u00b7 151B');
+  assert.equal(finding?.token, 'agent handle \u00b7 settled \u00b7 call c1 \u00b7 148B');
   // The worker-produced binding carries the worker's TASK text (the "from
   // what task" half) and the attribution wall clock (the "when" half).
   assert.equal(finding?.task, 'investigate', 'the worker provenance carries its task');
@@ -728,8 +543,8 @@ test('review 2/4b: the manifest lists GLOBAL LEXICAL bindings — top-level let/
   // the handle token and the binding's own sizeBytes field (phase-E
   // review rejection: the size surface used to stop at the handle
   // marker).
-  assert.equal(byName.get('research')!.token, 'agent handle \u00b7 pending \u00b7 call c1 \u00b7 151B');
-  assert.equal(byName.get('research')!.sizeBytes, 151);
+  assert.equal(byName.get('research')!.token, 'agent handle \u00b7 pending \u00b7 call c1 \u00b7 148B');
+  assert.equal(byName.get('research')!.sizeBytes, 148);
   assert.equal(byName.get('research')!.provenance, 'eval 1');
   assert.equal(byName.get('research')!.task, 'investigate');
   assert.equal(typeof byName.get('research')!.provenanceAtMs, 'number');

@@ -128,12 +128,27 @@ async function exercisePhaseB(): Promise<void> {
       call?.resolve('answered');
       return undefined;
     },
-    steer: (call, callId, sessionId, action, payloadJson) => {
+    queue: (call, callId, sessionId, payloadJson) => {
       callId satisfies string;
       sessionId satisfies string;
-      action satisfies string;
+      payloadJson satisfies string | null;
+      call.resolve('queued answer');
+    },
+    steer: (call, callId, sessionId, payloadJson) => {
+      callId satisfies string;
+      sessionId satisfies string;
       payloadJson satisfies string | null;
       call.resolve('injected');
+    },
+    cancelSession: (call, callId, sessionId) => {
+      callId satisfies string;
+      sessionId satisfies string;
+      call.resolve('idle');
+    },
+    cancelQueue: (call, callId, queueCallId) => {
+      callId satisfies string;
+      queueCallId satisfies string;
+      call.resolve('idle');
     },
     console: (event: ConsoleEvent) => {
       event.level satisfies ConsoleLevel;
@@ -236,19 +251,23 @@ function storeTyping(store: CallStore): void {
     optionsJson: null,
     modelSpec: 'pi/x',
     backendId: 'pi',
+    foundingCallId: null,
+    admittedAtMs: 1,
+    admissionSequence: 1,
     dispatchedAtMs: 1,
     reissues: 0,
     completion: null,
     sessionId: null,
-    deliveredAtMs: null,
-    droppedAtMs: null,
     queuedAtMs: null,
+    handoffAtMs: null,
+    cancelledAtMs: null,
   });
   store.recordReissued('c1', 2);
   store.recordQueued('c1', 4);
   store.recordAttached('c1', 'backend-session-1', 5, 'pi');
   store.recordCompleted('c1', { outcome: 'resolve', value: { ok: true }, completedAtMs: 3 }) satisfies boolean;
-  store.recordDelivery('c1', 'delivered', 4);
+  store.recordHandoff('c1', 4);
+  store.recordCancelled('c1', 5);
   store.lookup('c1') satisfies CallRecord | undefined;
   store.all() satisfies CallRecord[];
 }
@@ -266,12 +285,12 @@ function brokerSurfaceTyping(ws: Workspace): void {
         return {
           sessionId: 's1',
           backendId: 'pi',
-          capabilities: { supportsSteering: true },
+          initializeMeta: { steering: { supported: true } },
           async prompt(_content: string, _opts?: BrokerPromptOptions): Promise<BrokerTurn> {
             return { stopReason: 'end_turn', text: 'ok' };
           },
-          async steer(_content: string, _opts?: BrokerPromptOptions): Promise<string> {
-            return 'injected';
+          async steer(_content: string, _opts?: BrokerPromptOptions): Promise<unknown> {
+            return { outcome: 'injected' };
           },
           async cancel(): Promise<void> {},
           async release(): Promise<void> {},
@@ -295,8 +314,8 @@ function brokerSurfaceTyping(ws: Workspace): void {
           async prompt(): Promise<BrokerTurn> {
             return { stopReason: 'end_turn', text: 'ok' };
           },
-          async steer(): Promise<string> {
-            return 'injected';
+          async steer(): Promise<unknown> {
+            return { outcome: 'injected' };
           },
           async cancel(): Promise<void> {},
           async release(): Promise<void> {},
@@ -324,7 +343,7 @@ function brokerSurfaceTyping(ws: Workspace): void {
   } satisfies BrokerOptions;
   void brokerTyping(ws, options);
   DEFAULT_MAX_CONCURRENT_AGENTS satisfies number;
-  const outcome: SteeringOutcomeValue = 'queued';
+  const outcome: SteeringOutcomeValue = 'unsupported';
   outcome satisfies string;
   const recordKind: CallKind = 'steer';
   recordKind satisfies string;
@@ -339,7 +358,7 @@ function brokerSurfaceTyping(ws: Workspace): void {
     task: 't',
     state: 'running',
     supportsSteering: true,
-    queuedSteers: 0,
+    queuedTurns: 0,
   };
   const report: ReconcileReport = {
     settledFromStore: ['c1'],

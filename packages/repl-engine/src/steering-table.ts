@@ -1,64 +1,15 @@
-/**
- * The per-backend steering MECHANISM table — the roadmap doc's spec-owed
- * decision ("the table is documentation generated from the capability
- * probes"), implemented as a GENERATED artifact: this module derives the
- * table from the live capability probes in `@automatalabs/acp-agents`'s
- * `ACP_EXTENSION_SUPPORT_MATRIX` (`packages/acp-agents/src/protocol-
- * coverage.ts` — probed by the protocol-coverage suite against the
- * installed Claude/Codex distributions; pi is workspace-owned and tested
- * in its own suite; opencode's `typed-unsupported` disposition means the
- * public wrapper exists and rejects from initialize negotiation before
- * emitting a wire request).
- *
- * The mechanism per backend follows directly from the disposition:
- *
- * - `supported` → the backend advertises `_session/steering` → LIVE
- *   INJECTION via `session.steer()` while a turn is in flight (a fresh
- *   `session.prompt` when the session is idle — there is nothing to
- *   inject into);
- * - anything else (`typed-unsupported`, `not-advertised`) → the backend
- *   does NOT advertise the extension → QUEUED-FOR-NEXT-TURN DELIVERY
- *   (the honest `queued` outcome; the payload is delivered durably on
- *   the session's next turn boundary, see the broker's module docs);
- * - a CUSTOM backend is capability-gated per session at open time
- *   (`session.capabilities.supportsSteering` — whatever the agent's
- *   initialize response advertises): live injection when advertised,
- *   queued delivery otherwise.
- *
- * The generated markdown is checked in at `docs/steering-mechanism-
- * table.md` and GATED by `test/steering-table.test.ts`: the gate
- * regenerates the document in memory and compares it byte-for-byte with
- * the checked-in file, so a capability-matrix change that is not
- * reflected in the documentation fails the suite (the doc's "the table
- * is documentation generated from the capability probes" is enforced,
- * never deferred). Regenerate with
- * `pnpm --filter @automatalabs/repl-engine generate:steering-table`.
- */
-
 import { ACP_EXTENSION_SUPPORT_MATRIX, SESSION_STEERING_METHOD } from '@automatalabs/acp-agents';
 
-/** One generated table row: the backend's advertised `_session/steering`
- *  disposition and the mechanism that follows from it. */
+/** One documentation-only distribution-probe row. Runtime routing never reads this table. */
 export interface SteeringMechanismRow {
   backend: string;
-  /** Whether the backend advertises `_session/steering` (the probe
-   *  matrix's disposition, rendered for the table). */
   advertised: boolean;
-  /** The steering mechanism the broker uses for this backend. */
-  mechanism: 'live injection' | 'queued delivery';
-  /** The probe evidence (the matrix row's disposition token). */
+  mechanism: 'strict active-turn injection' | 'unsupported';
   disposition: 'supported' | 'typed-unsupported' | 'not-advertised';
-  /** The installed-distribution probe backing the row, when the matrix
-   *  carries one (`claude` / `codex`); none for pi (workspace-owned) and
-   *  opencode. */
   distProbe?: 'claude' | 'codex';
 }
 
-/** Derive the per-backend steering mechanism table from the capability
- *  probes (see the module docs). The built-in backends come from
- *  `ACP_EXTENSION_SUPPORT_MATRIX` (the `_session/steering` rows, in the
- *  matrix's order); the custom-backend row is the capability-gated
- *  fallback every session negotiates at open. */
+/** Derive the checked-in inventory from executable distribution probes. */
 export function steeringMechanismRows(): SteeringMechanismRow[] {
   const rows: SteeringMechanismRow[] = [];
   for (const row of ACP_EXTENSION_SUPPORT_MATRIX) {
@@ -67,7 +18,7 @@ export function steeringMechanismRows(): SteeringMechanismRow[] {
     rows.push({
       backend: row.agent,
       advertised,
-      mechanism: advertised ? 'live injection' : 'queued delivery',
+      mechanism: advertised ? 'strict active-turn injection' : 'unsupported',
       disposition: row.disposition,
       distProbe: row.distProbe,
     });
@@ -75,69 +26,46 @@ export function steeringMechanismRows(): SteeringMechanismRow[] {
   return rows;
 }
 
-/** The mechanism table's fixed prose sections (the outcome surface and
- *  the per-case mechanism rows are the broker's documented behavior,
- *  sourced from the same capability decision; the generator emits them
- *  so the document stays one artifact). */
-const MECHANISM_CASES = `The per-session capability is read ONCE at session open (\`session.capabilities.supportsSteering\`);
-the mechanism table for one session:
+const MECHANISM_CASES = `Runtime steering availability is read from the session's raw initialize metadata only:
+\`initializeMeta.steering.supported === true\`. The distribution matrix above is documentation,
+not a runtime router.
 
-| Case | Mechanism | Outcome the handle resolves with |
+| Case | Wire behavior | Result |
 |---|---|---|
-| backend advertises \`_session/steering\`, turn in flight | \`session.steer(content)\` — live injection | \`injected\` (live injection); a backend \`startedNewTurn\` — the injection raced the turn's end and the backend started a new turn with the content — maps to \`queued\` (accepted for next-turn delivery) |
-| backend advertises \`_session/steering\`, session idle | \`session.prompt(content)\` — a NEW TURN with its own call id | the TURN'S ANSWER (the founding handle's schema drives the schema-validated object; a schema-less handle resolves the final text — the §4.2 semantics) |
-| backend does NOT advertise steering, turn in flight | content enqueued for next-turn delivery | \`queued\` (immediately — accepted for next-turn delivery; if the call is later cancelled the queue is dropped, and a delivery-turn failure surfaces as a warn-level line in the next tool result) |
-| backend does NOT advertise steering, session idle | \`session.prompt(content)\` — a NEW TURN with its own call id | the TURN'S ANSWER (the §4.2 semantics; idle-session \`steer\` is the followUp alias) |
-| ANY backend, session idle, but the workspace cap is exhausted | content enqueued for the next free slot (the same durable queue); the steer's promise stays PENDING | the TURN'S ANSWER once the delivery runs (a follow-up turn IS the subagent working — the six-agent ceiling is absolute; the steer starts the moment a slot frees) |
-| any backend/wire failure on the steering path | — | \`failed\` (never a hard rejection) |
-| the founding call is still OPENING (its session does not exist yet — a steer in the same eval as the dispatch) | content queued for the call's next-turn boundary | \`queued\` |
-| no live session for the founding call at all (never opened, or lost) | — | \`failed\` (nothing was steered) |
-| \`cancel()\` with a turn in flight | ACP \`session/cancel\` | \`cancelled\` (the cancelled call itself rejects with the recoverable \`CancelledError\`) |
-| \`cancel()\` with the session idle | no-op — the agent is already stopped | \`idle\` |
-| \`cancel()\` while the call is still opening | the opening call is fenced and settled durably as cancelled (an eventual late child is closed without prompting) | \`cancelled\` (the cancelled call rejects with the recoverable \`AGENT_CANCELLED\`) |
+| ACP prompt in flight; raw steering advertised | one strict \`_session/steering\` request with \`idleBehavior: "promptRequired"\` | \`injected\`, or \`idle\` for \`promptRequired\` |
+| ACP prompt in flight; raw steering not advertised | no request | \`unsupported\` |
+| no ACP prompt in flight, including opening/extraction/repair gaps | no request | \`idle\` |
+| steering transport/server failure | no prompt fallback | rejects \`AGENT_EXECUTION_ERROR\` |
+| malformed response or \`startedNewTurn\` | cancel + fatal session lane | rejects non-recoverably |
 
-A MID-TURN steer resolves EXACTLY the delivery-outcome vocabulary (\`injected\` / \`queued\` /
-\`failed\` — the backend's \`startedNewTurn\` maps to \`queued\`, never the bare v1 token), plus
-the cancel vocabulary (\`cancelled\` / \`idle\`); IDLE-session followUp/steer resolve with the
-turn's ANSWER instead — no path runs a turn and discards its result, and the orchestrator can
-always tell urgency delivery (injected) from next-turn delivery (queued), which is the doc's
-stated requirement.`;
+Future work is always explicit: \`handle.queue(prompt)\` creates a distinct, durable FIFO public
+turn and the broker sends it through ordinary \`session/prompt\` only when it reaches the queue
+head. Queueing never uses \`_session/steering\` or a backend-native queue.`;
 
-/** Generate the full per-backend steering mechanism table as markdown
- *  (the doc's generated documentation). Deterministic: the same matrix
- *  always produces the same document, so the gate test can compare it
- *  byte-for-byte with the checked-in artifact. */
+/** Generate the complete deterministic documentation artifact. */
 export function generateSteeringMechanismTable(): string {
   const rows = steeringMechanismRows();
   const lines: string[] = [];
   lines.push('# Per-backend steering mechanism table');
   lines.push('');
-  lines.push('<!-- GENERATED — do not edit by hand. Sourced from the live capability probes in');
-  lines.push('`@automatalabs/acp-agents`\'s `ACP_EXTENSION_SUPPORT_MATRIX`');
-  lines.push('(`packages/acp-agents/src/protocol-coverage.ts`; claude/codex probed against the installed');
-  lines.push('distributions by the protocol-coverage suite, pi workspace-owned and covered in its own');
-  lines.push('suite, opencode `typed-unsupported`). Regenerate:');
-  lines.push('`pnpm --filter @automatalabs/repl-engine generate:steering-table`. The gate test');
-  lines.push('(`test/steering-table.test.ts`) fails when this file drifts from the probes. -->');
+  lines.push('<!-- GENERATED — do not edit by hand. Sourced from the executable distribution probes in');
+  lines.push('`@automatalabs/acp-agents`\'s `ACP_EXTENSION_SUPPORT_MATRIX`. Regenerate:');
+  lines.push('`pnpm --filter @automatalabs/repl-engine generate:steering-table`. Runtime behavior does');
+  lines.push('NOT read this table; it parses each session\'s raw initialize metadata. -->');
   lines.push('');
-  lines.push('The per-backend inventory — which backends advertise `_session/steering` today versus');
-  lines.push('fall back to queued-for-next-turn delivery (the roadmap doc\'s spec-owed table, generated');
-  lines.push('from the capability probes; the mechanism per disposition is the broker\'s decision, see');
-  lines.push('`src/broker.ts`\'s module docs):');
+  lines.push('The installed-distribution inventory:');
   lines.push('');
-  lines.push('| Backend | `_session/steering` | Steering mechanism |');
+  lines.push('| Backend | `_session/steering` | Strict steering behavior |');
   lines.push('|---|---|---|');
   for (const row of rows) {
     const probe = row.distProbe !== undefined ? ` (probed: ${row.distProbe})` : '';
-    lines.push(
-      `| ${row.backend} | ${row.advertised ? 'advertised' : 'NOT advertised'}${probe} | ${row.mechanism} via \`session.${row.advertised ? 'steer()' : 'prompt()/queue'}\` |`,
-    );
+    const behavior = row.advertised
+      ? 'strict active-turn injection via `session.steer()`'
+      : 'unsupported (no steering wire request)';
+    lines.push(`| ${row.backend} | ${row.advertised ? 'advertised' : 'NOT advertised'}${probe} | ${behavior} |`);
   }
-  lines.push('| custom backend | whatever the agent\'s initialize response advertises (capability-gated per session at open) | live injection when advertised, queued delivery otherwise |');
+  lines.push('| custom backend | whatever its raw initialize metadata advertises | strict active-turn injection when advertised; unsupported otherwise |');
   lines.push('');
   lines.push(MECHANISM_CASES);
-  // EXACTLY ONE terminal newline (phase-E review rejection: the extra
-  // trailing empty line made `git diff --check` fail with "new blank
-  // line at EOF" on the generated artifact).
   return `${lines.join('\n')}\n`;
 }

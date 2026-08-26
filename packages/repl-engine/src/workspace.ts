@@ -158,7 +158,7 @@ export class Workspace {
   /** The parking bridge's per-call KIND (agent/steer/checkpoint) and
    *  per-call question text — the introspection handlers (`workspace()`/
    *  `agents()`) serve them in the §4.5 shapes. */
-  private readonly parkedKinds = new Map<string, 'agent' | 'steer' | 'checkpoint'>();
+  private readonly parkedKinds = new Map<string, 'agent' | 'queue' | 'steer' | 'cancel' | 'checkpoint'>();
   private readonly parkedQuestions = new Map<string, string>();
   /** The parking bridge's per-call AGENT data (the §4.5 agents() shape
    *  serves the real model spec and task — a parked call records what
@@ -817,9 +817,21 @@ export class Workspace {
         parkedQuestions.set(callId, question ?? '');
         return undefined;
       },
+      queue: (call, callId) => {
+        parked.set(callId, call);
+        parkedKinds.set(callId, 'queue');
+      },
       steer: (call, callId) => {
         parked.set(callId, call);
         parkedKinds.set(callId, 'steer');
+      },
+      cancelSession: (call, callId) => {
+        parked.set(callId, call);
+        parkedKinds.set(callId, 'cancel');
+      },
+      cancelQueue: (call, callId) => {
+        parked.set(callId, call);
+        parkedKinds.set(callId, 'cancel');
       },
       console: (event) => {
         events.push(event);
@@ -880,7 +892,7 @@ export class Workspace {
               task: metadataHeadTail(parkedTasks.get(callId) ?? '', 200),
               state: 'opening',
               supportsSteering: false,
-              queuedSteers: 0,
+              queuedTurns: 0,
             })),
         ),
       reset: () => {

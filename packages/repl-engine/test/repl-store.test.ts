@@ -26,6 +26,7 @@ import { gzipSync } from 'node:zlib';
 
 import {
   CALL_STORE_FILENAME,
+  GUEST_LIBRARY_VERSION,
   REPL_STORE_SUBDIR,
   SNAPSHOT_FILENAME,
   SNAPSHOT_FORMAT_VERSION,
@@ -103,12 +104,18 @@ test('write/load round trip: the enveloped snapshot restores the workspace; the 
     kind: 'agent',
     detail: 'task',
     optionsJson: null,
+    modelSpec: 'pi/x',
+    backendId: null,
+    foundingCallId: null,
+    admittedAtMs: 1,
+    admissionSequence: 1,
     dispatchedAtMs: 1,
     reissues: 0,
     completion: null,
     sessionId: null,
-    deliveredAtMs: null,
-    droppedAtMs: null,
+    queuedAtMs: null,
+    handoffAtMs: null,
+    cancelledAtMs: null,
   });
   calls.recordCompleted('c1', { outcome: 'resolve', value: 'done', completedAtMs: 2 });
   store.close();
@@ -212,6 +219,38 @@ test('version-bump refusal through the store: an upgraded format version refuses
   assert.ok(error.message.includes(String(SNAPSHOT_FORMAT_VERSION + 1)), error.message);
   assert.ok(error.message.includes(String(SNAPSHOT_FORMAT_VERSION)), error.message);
   assert.ok(error.message.includes(store.snapshotPath), error.message);
+  teardown(dir);
+});
+
+test('format 3 / guest 0.5: a format-2 snapshot is refused before old guest state can be restored or executed', async () => {
+  assert.equal(SNAPSHOT_FORMAT_VERSION, 3);
+  assert.equal(GUEST_LIBRARY_VERSION, '0.5.0');
+  const { dir, module, store } = await setup();
+  const ws = await Workspace.create(PROJECT, { wasm: module });
+  await ws.eval(`
+    globalThis.oldGuestExecutionSentinel = "must never be observed by a new workspace";
+    globalThis.followUp = () => { throw new Error("old guest followUp executed"); };
+  `);
+  store.writeSnapshot(ws.snapshot(), module);
+  ws.dispose();
+
+  const raw = readFileSync(store.snapshotPath);
+  const nl = raw.indexOf(0x0a);
+  const header = JSON.parse(raw.subarray(0, nl).toString('utf8'));
+  writeFileSync(store.snapshotPath, Buffer.concat([
+    Buffer.from(JSON.stringify({ ...header, formatVersion: 2 }) + '\n'),
+    raw.subarray(nl + 1),
+  ]));
+
+  const error = captureThrows(() => store.loadSnapshot(module));
+  assert.ok(error instanceof SnapshotEnvelopeError, error.message);
+  assert.equal((error as SnapshotEnvelopeError).code, 'VERSION_MISMATCH');
+  assert.equal(error.recorded, '2');
+  assert.equal(error.expected, '3');
+  assert.match(error.message, /format version 2/);
+  // No decoded snapshot is returned, so Workspace.restore — the only path
+  // that can register callbacks or resume guest jobs — is never reachable.
+  assert.equal(store.hasSnapshot(), true, 'the incompatible bytes remain available for the refusal/rename-aside path');
   teardown(dir);
 });
 
@@ -374,12 +413,18 @@ test('reset tears the repl/ directory down (the reset() guest function\'s engine
     kind: 'checkpoint',
     detail: 'question?',
     optionsJson: null,
+    modelSpec: null,
+    backendId: null,
+    foundingCallId: null,
+    admittedAtMs: 1,
+    admissionSequence: 1,
     dispatchedAtMs: 1,
     reissues: 0,
     completion: null,
     sessionId: null,
-    deliveredAtMs: null,
-    droppedAtMs: null,
+    queuedAtMs: null,
+    handoffAtMs: null,
+    cancelledAtMs: null,
   });
   assert.equal(store.hasSnapshot(), true);
   // A refused snapshot that auto-reset renamed aside survives the wipe
