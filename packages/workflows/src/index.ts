@@ -95,6 +95,7 @@ export {
   formatValidateReport,
   MOCK_TOKENS_PER_AGENT,
   ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT,
+  collapseHarnessOptionsForOutput,
 } from "./validate.js";
 export type {
   MockAnswerJson,
@@ -111,12 +112,22 @@ export type {
   ValidatedMockAnswers,
   ValidatedMockAnswerUse,
 } from "./validate.js";
+export type { ValidateProbeRunner } from "./validate-internal.js";
 
 // ── Harness config discovery: validate's sibling (`agentprism-workflows config`) — probe
 //    any routable ACP harness's advertised config-option catalog (model ids, effort levels,
 //    modes, …) without authoring a script. ──
-export { probeHarnessConfig, formatHarnessConfigReport } from "./config.js";
-export type { ProbeHarnessConfigOptions, HarnessConfigReport } from "./config.js";
+export {
+  probeHarnessConfig,
+  formatHarnessConfigReport,
+  buildHarnessModelsView,
+  buildModelFilter,
+} from "./config.js";
+export type {
+  ProbeHarnessConfigOptions,
+  HarnessConfigReport,
+  HarnessModelsView,
+} from "./config.js";
 export type {
   WorkflowRunOptions,
   WorkflowRunLimitOptions,

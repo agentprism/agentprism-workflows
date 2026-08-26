@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { connect, okRunner } from "./_harness.js";
+import { buildAuthoringPromptText } from "../src/authoring-prompt.js";
 import { AUTHORING_PROMPT_CONTENT } from "../src/generated/authoring-prompt-content.js";
 // The generator is the single source of truth (reads the skill files); the checked-in
 // generated module must match a fresh generation byte-for-byte, or someone edited the
@@ -111,11 +112,13 @@ test("Pi authoring guidance contains only the injected HTTP MCP channel", () => 
   }
 });
 
-test("generated authoring-prompt teaches configOptions and validate-time probe surfacing", () => {
+test("generated authoring-prompt teaches MCP-native configOptions discovery and automatic preflight", () => {
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("| `configOptions` |"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Ids and string/boolean values pass through verbatim"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("advertised-options table"));
-  assert.ok(AUTHORING_PROMPT_CONTENT.includes("`probed:false`, skips only that pair's checks"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('action:"config"'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("automatically before admission"));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes('status:"rejected"'));
+  assert.ok(AUTHORING_PROMPT_CONTENT.includes("no-prompt checks for every routed backend/model pair"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Pi's thought-level option is named `thinkingLevel`"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("warning that names the effective clamp target"));
   assert.ok(AUTHORING_PROMPT_CONTENT.includes("Claude and Codex are also ordered"));
@@ -160,9 +163,9 @@ test("prompts/get returns the self-contained guide with the task framed in", asy
     assert.ok(text.includes("loopUntilDry"), "contains the quick-wins example script");
     assert.ok(text.includes("{ ok, value, verdict, attempts }"), "contains the complete gate result contract");
     assert.ok(text.includes("outcome.verdict"), "shows authors how to consume the terminal verdict");
-    assert.ok(text.includes("--mock-answers"), "documents inline validator mock answers");
-    assert.ok(text.includes("--mock-answers-file"), "documents reusable validator fixture files");
-    assert.ok(text.includes("$sequence"), "documents finite repeated-call fixtures");
+    assert.ok(text.includes('action:"config"'), "documents protocol-native config discovery");
+    assert.ok(text.includes("mocked dry run"), "documents automatic pre-admission validation");
+    assert.ok(text.includes('status:"rejected"'), "documents rejected preflight results");
     assert.ok(text.includes("Find flaky tests and fix them"), "frames the task argument");
     assert.ok(text.includes("`workflow` tool"), "directs the host at the workflow tool");
 
@@ -172,6 +175,15 @@ test("prompts/get returns the self-contained guide with the task framed in", asy
     assert.ok(!text.includes("](reference.md)"), "no relative reference.md links survive");
   } finally {
     await dispose();
+  }
+});
+
+test("MCP-facing authoring guidance contains no terminal validation or config commands", () => {
+  for (const text of [AUTHORING_PROMPT_CONTENT, buildAuthoringPromptText()]) {
+    assert.doesNotMatch(text, /npx @automatalabs\/workflows (?:validate|config)/i);
+    assert.doesNotMatch(text, /agentprism-workflows (?:validate|config)/i);
+    assert.doesNotMatch(text, /--mock-answers/);
+    assert.doesNotMatch(text, /if (?:a )?shell|validator is available/i);
   }
 });
 

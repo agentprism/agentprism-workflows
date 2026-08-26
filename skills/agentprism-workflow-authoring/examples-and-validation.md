@@ -114,9 +114,11 @@ When the inline examples above aren't enough, study the complete, validated scri
 
 [`examples/README.md`](examples/README.md) maps each script to what it teaches.
 
-## Validate before you run
+## Automatic MCP validation and the terminal validator
 
-The SDK ships a validator that costs **zero tokens** — always run it on a script you just wrote or edited:
+The MCP `workflow` tool validates every run automatically before admission: static parse, mocked dry run, then routed no-prompt config checks. Invalid scripts return `status:"rejected"` diagnostics without creating a run ID, reserving a background slot, or spending tokens. When pinning model, mode, or `configOptions`, use `action:"config"` first.
+
+Terminal and CI users can run the same zero-token validator explicitly:
 
 ```bash
 npx @automatalabs/workflows validate my-workflow.js --args '{"target":"src/"}'

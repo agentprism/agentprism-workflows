@@ -12,7 +12,7 @@ import {
   resolveBackendRegistry,
 } from "@automatalabs/acp-agents";
 import type { CustomBackendConfig } from "@automatalabs/acp-agents";
-import { createValidateProbeRunner } from "./validate-internal.js";
+import { createValidateProbeRunner, type ValidateProbeRunner } from "./validate-internal.js";
 import {
   renderHarnessOptionLines,
   selectChoicePairs,
@@ -26,6 +26,8 @@ export interface ProbeHarnessConfigOptions {
    *  custom name; any model spec routes like an agent() call's). Default: every routable
    *  harness — the four built-ins plus each registered custom backend. */
   harnesses?: string[];
+  /** Exact routed model specs to select before reading their model-specific option catalogs. */
+  modelSpecs?: string[];
   /** Programmatic custom-backend registry, merged over the AGENTPRISM_BACKENDS env var
    *  exactly like `createAcpRunner({ backends })`. */
   backends?: Record<string, CustomBackendConfig>;
@@ -35,6 +37,8 @@ export interface ProbeHarnessConfigOptions {
   /** Per-harness wall-clock bound. A timed-out harness reports `probed:false` without
    *  affecting the others. Default 60000. */
   timeoutMs?: number;
+  /** Host-owned no-prompt probe runner. When supplied it is reused and never disposed. */
+  probeRunner?: ValidateProbeRunner;
 }
 
 export interface HarnessConfigReport {
@@ -63,30 +67,54 @@ export async function probeHarnessConfig(
   }
   const cwd = options.cwd ?? process.cwd();
   const registry = resolveBackendRegistry(options.backends);
+  const defaultHarnesses = options.probeRunner?.listBackends?.() ?? [...BUILTIN_BACKEND_IDS, ...registry.keys()];
+  const harnessTargets =
+    options.harnesses && options.harnesses.length > 0
+      ? options.harnesses
+      : options.modelSpecs && options.modelSpecs.length > 0
+        ? []
+        : defaultHarnesses;
   const targets = [
-    ...new Set(
-      options.harnesses && options.harnesses.length > 0
-        ? options.harnesses
-        : [...BUILTIN_BACKEND_IDS, ...registry.keys()],
-    ),
+    ...new Map(
+      [
+        ...harnessTargets.map((spec) => ({ spec, selectModel: false })),
+        ...(options.modelSpecs ?? []).map((spec) => ({ spec, selectModel: true })),
+      ].map((target) => [JSON.stringify([target.spec, target.selectModel]), target]),
+    ).values(),
   ];
 
   const harnessOptions: ValidateHarnessOptions[] = [];
-  const runner = createValidateProbeRunner(options.backends);
+  const ownsRunner = options.probeRunner === undefined;
+  const runner = options.probeRunner ?? createValidateProbeRunner(options.backends);
   try {
     for (const target of targets) {
       try {
-        const result = await withProbeTimeout(runner.probeConfigOptions(target, { cwd }), timeoutMs);
-        harnessOptions.push({ backendId: result.backendId, probed: true, options: result.options });
+        const result = await withProbeTimeout(
+          (signal) => runner.probeConfigOptions(target.spec, { cwd, selectModel: target.selectModel, signal }),
+          timeoutMs,
+        );
+        harnessOptions.push({
+          backendId: result.backendId,
+          ...(target.selectModel ? { model: target.spec } : {}),
+          probed: true,
+          options: result.options,
+        });
       } catch (error) {
-        harnessOptions.push({ backendId: target, probed: false, error: probeErrorMessage(error) });
+        harnessOptions.push({
+          backendId: target.spec.split("/", 1)[0] ?? target.spec,
+          ...(target.selectModel ? { model: target.spec } : {}),
+          probed: false,
+          error: probeErrorMessage(error),
+        });
       }
     }
   } finally {
-    try {
-      await runner.dispose();
-    } catch {
-      // Probe results are already complete; disposal (e.g. of a timed-out process) is best-effort.
+    if (ownsRunner) {
+      try {
+        await runner.dispose?.();
+      } catch {
+        // Probe results are already complete; disposal (e.g. of a timed-out process) is best-effort.
+      }
     }
   }
 
@@ -209,11 +237,15 @@ export function formatHarnessModels(views: readonly HarnessModelsView[]): string
 }
 
 /** Bound one probe; the underlying promise keeps its handlers, so a late settle is inert. */
-function withProbeTimeout<T>(op: Promise<T>, ms: number): Promise<T> {
+function withProbeTimeout<T>(op: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`probe timed out after ${ms}ms`)), ms);
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`probe timed out after ${ms}ms`));
+    }, ms);
     timer.unref?.();
-    op.then(
+    op(controller.signal).then(
       (value) => {
         clearTimeout(timer);
         resolve(value);

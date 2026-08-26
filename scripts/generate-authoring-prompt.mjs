@@ -138,6 +138,26 @@ export function buildAuthoringPromptContent() {
     "SKILL.md",
   );
 
+  // MCP recipients already have the server and its workflow tool. Keep this bundled prompt
+  // protocol-native: discovery is action:"config" and run validation is automatic. Terminal
+  // installation/validator/config commands remain in the on-disk skill for terminal users but
+  // are deliberately absent from the MCP prompt.
+  skill = replaceOnce(
+    skill,
+    'Agents run workflows through the `workflow` tool served by `@automatalabs/mcp-server` (the server also registers a separate `repl` tool for interactive REPL orchestration, out of scope here). Register it once in the host\'s MCP configuration (project-scoped is typical):\n\n```json\n{ "mcpServers": { "agentprism-workflows": { "command": "npx", "args": ["-y", "@automatalabs/mcp-server@latest"] } } }\n```',
+    'Use the connected `workflow` tool for deterministic batch orchestration (the server also registers a separate `repl` tool for interactive orchestration, out of scope here).',
+    "mcp-server-setup.md",
+  );
+  const validationStart = skill.indexOf("## Automatic MCP validation and the terminal validator");
+  const validationEnd = skill.length;
+  if (validationStart === -1) {
+    throw new Error("generate-authoring-prompt: examples validation section not found");
+  }
+  skill =
+    skill.slice(0, validationStart) +
+    '## Automatic validation before admission\n\nThe workflow tool validates every `run` automatically before admission: static parse, mocked dry run, then no-prompt checks for every routed backend/model pair. Invalid scripts return `status:"rejected"` with bounded structured diagnostics, create no run ID, reserve no background slot, and spend no tokens. A successful preflight proceeds directly to the requested foreground or background run. Use `action:"config"` before authoring pinned values: `harnesses` / `modelFilter` discover model ids, then `modelSpecs` selects exact models and returns their model-specific mode and config-option domains. A green mocked dry run proves structure and reachable control flow, not the quality of prompts or schemas.\n' +
+    skill.slice(validationEnd);
+
   // reference.md same-directory pointer → the guide above.
   reference = replaceOnce(
     reference,
@@ -145,8 +165,21 @@ export function buildAuthoringPromptContent() {
     "The guide above covers authoring; this section is the lookup companion.",
     "reference.md",
   );
+  const validatorStart = reference.indexOf("## The validator — `agentprism-workflows validate`");
+  const workflowFoldersStart = reference.indexOf("## Workflow folders", validatorStart);
+  if (validatorStart === -1 || workflowFoldersStart === -1) {
+    throw new Error("generate-authoring-prompt: reference validator/config sections not found");
+  }
+  reference =
+    reference.slice(0, validatorStart) +
+    '## MCP-native validation and config discovery\n\n`action:"config"` probes the live server runner without prompting or starting a workflow. Omit `harnesses` to inspect every registered backend; pass `modelFilter` to retrieve bounded matching model ids, then pass `modelSpecs` to select exact models and inspect their model-specific option domains. `action:"run"` always performs static validation, a mocked dry run, and routed model/mode/config checks before admission. A rejected preflight returns structured diagnostics without a run ID.\n\n' +
+    reference.slice(workflowFoldersStart);
 
-  return [
+  const promptQuickWins = quickWins.replace(
+    "//   npx agentprism-workflows validate quick-wins --workflows-dir workflows\n",
+    "// The workflow tool validates this script automatically before admission.\n",
+  );
+  const content = [
     skill.trimEnd(),
     "\n\n---\n\n",
     reference.trimEnd(),
@@ -154,9 +187,19 @@ export function buildAuthoringPromptContent() {
     "# Complete example — quick-wins.workflow.js\n\n",
     "A complete, validated script (`loopUntilDry()` with per-round vendor rotation, dedup threading via a `seen` list, and an args-controlled round cap; runs standalone or nested):\n\n",
     "```js\n",
-    quickWins.trimEnd(),
+    promptQuickWins.trimEnd(),
     "\n```\n",
   ].join("");
+  for (const forbidden of [
+    /npx @automatalabs\/workflows (?:validate|config)/i,
+    /agentprism-workflows (?:validate|config)/i,
+    /--mock-answers/,
+  ]) {
+    if (forbidden.test(content)) {
+      throw new Error(`generate-authoring-prompt: terminal-only guidance survived MCP prompt transform: ${forbidden}`);
+    }
+  }
+  return content;
 }
 
 function main() {

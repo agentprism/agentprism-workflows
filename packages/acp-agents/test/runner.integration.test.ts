@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { Type } from "typebox";
 import { isWorkflowError, WorkflowErrorCode, type AgentUsage, type McpServerConfig } from "@automatalabs/shared-types";
 import { AcpAgentRunner, BUILTIN_BACKEND_IDS } from "../src/index.js";
-import { createFakeAgentHarness, waitFor } from "./helpers/fake-agent.js";
+import { createFakeAgentHarness, FAKE_AGENT_FIXTURE, waitFor } from "./helpers/fake-agent.js";
 
 const SCHEMA = Type.Object({ city: Type.String(), hot: Type.Boolean() });
 
@@ -1155,6 +1155,21 @@ test("probeConfigOptions opens and closes exactly one session without sending a 
   assert.equal(readLog().filter((entry) => entry.method === "setSessionConfigOption").length, 0);
 });
 
+test("probeConfigOptions can route through an approved run-scoped backend without mutating the host registry", async () => {
+  const { cwd, readLog } = configure({ configOptions: [] });
+  const runner = makeRunner();
+  const probed = await runner.probeConfigOptions("visual/model-a", {
+    cwd,
+    backends: {
+      visual: { command: process.execPath, args: [FAKE_AGENT_FIXTURE] },
+    },
+  });
+  assert.equal(probed.backendId, "visual");
+  assert.equal(readLog().filter((entry) => entry.method === "newSession").length, 1);
+  assert.equal(readLog().filter((entry) => entry.method === "prompt").length, 0);
+  assert.equal(runner.listBackends().includes("visual"), false, "run-scoped discovery does not register the backend globally");
+});
+
 test("probeConfigOptions can select the routed model and returns its echoed catalog without prompting", async () => {
   const advertised = [
     {
@@ -1209,6 +1224,14 @@ test("probeConfigOptions preserves OpenCode's full slash-containing provider/mod
   assert.equal(selected[0]?.params?.configId, "model");
   assert.equal(selected[0]?.params?.value, innerModel);
   assert.equal(readLog().filter((entry) => entry.method === "prompt").length, 0);
+});
+
+test("probeConfigOptions honors an aborted discovery request before opening a session", async () => {
+  const { cwd, readLog } = configure({ configOptions: [] });
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(() => makeRunner().probeConfigOptions("claude", { cwd, signal: controller.signal }));
+  assert.equal(readLog().filter((entry) => entry.method === "newSession").length, 0);
 });
 
 test("probeConfigOptions propagates an authentication failure cleanly", async () => {

@@ -312,10 +312,14 @@ locally against the ext-apps reference host, run
 
 | Param | Type | Notes |
 |---|---|---|
-| `action` | `"run" \| "inspect" \| "await" \| "stop"` | Omit for the run form. `"inspect"` reads immediately; `"await"` waits only for terminal lifecycle state; `"stop"` durably aborts a live run (or one in-flight agent with `callIndex`). |
+| `action` | `"config" \| "run" \| "inspect" \| "await" \| "stop"` | `"config"` performs zero-token live backend discovery. Omit or use `"run"` for automatic pre-admission validation followed by execution. The remaining actions operate on an admitted run. |
 | `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/stop. |
 | `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for inspect/await/stop. |
-| `projectDir` | absolute path string | Run only: the project the run belongs to (its project-scoped run store + default cwd). **Required for run** on the shared daemon; defaults to the server's own project under `--in-process`. Forbidden for inspect/await/stop — a `runId` locates its project. |
+| `projectDir` | absolute path string | Config/run: project-sensitive discovery cwd and the run's project store/default cwd. Required for both on the shared daemon; defaults to the server's project under `--in-process`. |
+| `harnesses` | string[] | Config only: optional backend names to probe; omission discovers every registered backend. |
+| `modelSpecs` | string[] | Config only: select exact routed models before reading their model-specific options. |
+| `modelFilter` | string | Config only: bounded model-id substring or `/regex/` filter. |
+| `probeTimeoutMs` | integer | Config only: per-backend timeout, default 60,000 ms. |
 | `background` | boolean | Run only; default `false`. `true` acknowledges after durable admission and executes in the daemon (returns `{ runId, status: "running" }`). |
 | `args` | any | Exposed to the script as the global `args`. |
 | `maxAgents` | number | Default 1000. |
@@ -332,7 +336,13 @@ locally against the ext-apps reference host, run
 | `labelGlob` | string | Inspect/await/stop: case-sensitive whole-label glob (`*`, `?`, backslash escaping). |
 | `logLines` | integer | Inspect/await/stop: latest log lines, default 20, range 0–50. |
 
-Foreground remains the default. For long work, start it and retain the new run ID:
+When pinning a model, mode, or `configOptions`, discover exact live values first:
+
+```json
+{ "action": "config", "projectDir": "/absolute/project", "harnesses": ["codex"], "modelFilter": "gpt" }
+```
+
+Every run is statically checked, mock-executed, and config-probed before admission. Invalid scripts return `status:"rejected"` diagnostics without a run ID, background reservation, or token spend. Foreground remains the default. For long work, start it and retain the new run ID:
 
 ```json
 { "script": "export const meta = { name: 'review', description: 'review' }; return await agent('Review the repo');", "background": true }
@@ -447,7 +457,7 @@ A script is plain JavaScript whose **first statement** is the `meta` literal. In
 
 Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in the realm) so replay identities and input fingerprints are reproducible. Eligible new-format calls match by exact path/hash or unique content; uncertain correspondence runs live.
 
-> **Writing scripts with an AI agent?** This repo publishes a backend-agnostic authoring skill —
+> **Writing scripts with an AI agent?** The MCP `workflow` tool is self-contained: its description teaches the compact DSL, `action:"config"` exposes live choices, and `run` validates automatically. This repo also publishes an optional exhaustive backend-agnostic authoring skill —
 > [`skills/agentprism-workflow-authoring`](skills/agentprism-workflow-authoring/SKILL.md) — in the standard
 > `SKILL.md` format. Install it into your coding agent (Claude Code, Codex, Cursor, OpenCode, …) with the
 > [skills.sh](https://skills.sh) CLI:
@@ -459,7 +469,7 @@ Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in t
 > It teaches the full DSL: per-call backend routing, structured outputs, checkpoints, isolation,
 > and the determinism rules.
 
-Validate a script **without spending tokens**: `npx @automatalabs/workflows validate <file> --args '<json>'`.
+MCP users need no separate validation or discovery step outside the tool. For terminal and CI workflows, the packages retain equivalent commands. Validate a script **without spending tokens**: `npx @automatalabs/workflows validate <file> --args '<json>'`.
 After its static parse and mock-agent dry run, validation opens each distinctly routed ACP harness
 once without a prompt to surface its advertised config-option table and check authored
 `configOptions`. An unavailable or unauthenticated harness adds one warning and skips only its

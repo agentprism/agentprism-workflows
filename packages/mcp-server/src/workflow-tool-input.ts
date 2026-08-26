@@ -27,17 +27,17 @@ const checkpointRepliesSchema = z
 
 export const workflowToolInputShape = {
   action: z
-    .enum(["run", "inspect", "await", "stop"])
+    .enum(["run", "config", "inspect", "await", "stop"])
     .optional()
     .describe(
-      "Operation. Omit or use run to execute; inspect reads immediately; await waits for terminal status; stop aborts a live run, or cancels one in-flight agent when callIndex is supplied.",
+      "Operation. Omit or use run to validate then execute; config discovers live backend/model/mode/config options without starting a run; inspect reads immediately; await waits for terminal status; stop aborts a live run or cancels one in-flight agent.",
     ),
   script: z
     .string()
     .min(1)
     .optional()
     .describe(
-      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for inspect/await/stop. First statement MUST be `export const meta = { name, description, phases? }`.",
+      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/stop. First statement MUST be `export const meta = { name, description, phases? }`.",
     ),
   scriptPath: z
     .string()
@@ -46,7 +46,7 @@ export const workflowToolInputShape = {
     .optional()
     .describe(
       "Absolute path, on the server's filesystem, to a workflow script file read once at admission. " +
-        "Exactly one of script or scriptPath is required for run; both are forbidden for inspect/await/stop. " +
+        "Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/stop. " +
         "Relative paths are rejected.",
     ),
   projectDir: z
@@ -55,11 +55,40 @@ export const workflowToolInputShape = {
     .refine((value) => isAbsolute(value), "projectDir must be an absolute path")
     .optional()
     .describe(
-      "Absolute project directory the run belongs to: it selects the project-scoped run store " +
-        "(where the runId, journal, and resume state live) and is the run's default execution cwd. " +
-        "Required for run on the shared workflow daemon; on a single-project (in-process) server it " +
+      "Absolute project directory used as the cwd for config discovery and, for run, the project-scoped store " +
+        "(where the runId, journal, and resume state live) plus default execution cwd. " +
+        "Required for run and config on the shared workflow daemon; on a single-project (in-process) server it " +
         "defaults to that server's own project. Forbidden for inspect/await/stop — a runId locates its project.",
     ),
+  harnesses: z
+    .array(z.string().regex(/^[a-z][a-z0-9._-]*$/i, "invalid backend name"))
+    .min(1)
+    .max(16)
+    .optional()
+    .describe('With action="config", backend names to probe. Omit to probe every backend registered on this server.'),
+  modelSpecs: z
+    .array(z.string().min(1).max(256))
+    .min(1)
+    .max(16)
+    .optional()
+    .describe(
+      'With action="config", exact routed model specs to select before reading their model-specific mode and config-option catalogs.',
+    ),
+  modelFilter: z
+    .string()
+    .min(1)
+    .max(128)
+    .optional()
+    .describe(
+      'With action="config", return model ids matching this case-insensitive substring or /regular expression/. Omit for bounded per-provider model summaries.',
+    ),
+  probeTimeoutMs: z
+    .number()
+    .int()
+    .min(1)
+    .max(120_000)
+    .optional()
+    .describe('With action="config", per-backend no-prompt probe timeout. Default 60000; range 1..120000.'),
   args: z.unknown().optional().describe("Optional JSON value exposed to the script as the global `args`."),
   maxAgents: z
     .number()
@@ -109,7 +138,7 @@ export const workflowToolInputShape = {
     .max(128)
     .regex(/^[a-z0-9]+-[a-z0-9]+$/, "runId must be an engine-generated run ID")
     .optional()
-    .describe("Project-scoped workflow run ID. Required for inspect/await/stop; forbidden for run."),
+    .describe("Project-scoped workflow run ID. Required for inspect/await/stop; forbidden for config/run."),
   callIndex: z
     .number()
     .int()
@@ -165,6 +194,19 @@ export type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase &
     | { script?: never; scriptPath: string }
   );
 
+export interface WorkflowConfigToolInput {
+  action: "config";
+  /** Absolute project cwd used for project-sensitive backend discovery. */
+  projectDir?: string;
+  harnesses?: string[];
+  modelSpecs?: string[];
+  modelFilter?: string;
+  probeTimeoutMs?: number;
+  script?: never;
+  scriptPath?: never;
+  runId?: never;
+}
+
 export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
   action: "inspect";
   runId: string;
@@ -211,15 +253,20 @@ export interface WorkflowStopToolInput extends WorkflowRunInspectionOptions {
 
 export type WorkflowToolInput =
   | WorkflowExecuteToolInput
+  | WorkflowConfigToolInput
   | WorkflowInspectToolInput
   | WorkflowAwaitToolInput
   | WorkflowStopToolInput;
 
 interface RawWorkflowToolInput {
-  action?: "run" | "inspect" | "await" | "stop";
+  action?: "run" | "config" | "inspect" | "await" | "stop";
   script?: string;
   scriptPath?: string;
   projectDir?: string;
+  harnesses?: string[];
+  modelSpecs?: string[];
+  modelFilter?: string;
+  probeTimeoutMs?: number;
   args?: unknown;
   maxAgents?: number;
   concurrency?: number;
@@ -235,6 +282,10 @@ interface RawWorkflowToolInput {
   labelGlob?: string;
   logLines?: number;
   waitMs?: number;
+}
+
+function hasConfigFields(raw: RawWorkflowToolInput): boolean {
+  return raw.harnesses !== undefined || raw.modelSpecs !== undefined || raw.modelFilter !== undefined || raw.probeTimeoutMs !== undefined;
 }
 
 function hasExecutionFields(raw: RawWorkflowToolInput): boolean {
@@ -272,9 +323,46 @@ export function parseWorkflowToolInput(
   raw: RawWorkflowToolInput,
   options: ParseWorkflowToolInputOptions = {},
 ): WorkflowToolInput {
+  if (raw.action === "config") {
+    if (
+      raw.script !== undefined ||
+      raw.scriptPath !== undefined ||
+      raw.args !== undefined ||
+      raw.maxAgents !== undefined ||
+      raw.concurrency !== undefined ||
+      raw.agentRetries !== undefined ||
+      raw.agentTimeoutMs !== undefined ||
+      raw.resumeFromRunId !== undefined ||
+      raw.resumePolicy !== undefined ||
+      raw.checkpointReplies !== undefined ||
+      raw.background !== undefined ||
+      raw.runId !== undefined ||
+      raw.callIndex !== undefined ||
+      raw.waitMs !== undefined ||
+      raw.lastN !== undefined ||
+      raw.labelGlob !== undefined ||
+      raw.logLines !== undefined
+    ) {
+      invalid('action="config" accepts only projectDir, harnesses, modelSpecs, modelFilter, and probeTimeoutMs');
+    }
+    if (options.requireProjectDir === true && raw.projectDir === undefined) {
+      invalid(
+        "config requires projectDir (the absolute project directory) on this server so project-sensitive backend options are discovered in the correct cwd",
+      );
+    }
+    return {
+      action: "config",
+      projectDir: raw.projectDir,
+      harnesses: raw.harnesses,
+      modelSpecs: raw.modelSpecs,
+      modelFilter: raw.modelFilter,
+      probeTimeoutMs: raw.probeTimeoutMs,
+    };
+  }
+
   if (raw.action === "inspect") {
     if (!raw.runId) invalid('action="inspect" requires runId');
-    if (hasExecutionFields(raw) || raw.waitMs !== undefined || raw.callIndex !== undefined) {
+    if (hasExecutionFields(raw) || hasConfigFields(raw) || raw.waitMs !== undefined || raw.callIndex !== undefined) {
       invalid('action="inspect" cannot include execution fields');
     }
     return {
@@ -288,7 +376,7 @@ export function parseWorkflowToolInput(
 
   if (raw.action === "await") {
     if (!raw.runId) invalid('action="await" requires runId');
-    if (hasExecutionFields(raw) || raw.callIndex !== undefined) {
+    if (hasExecutionFields(raw) || hasConfigFields(raw) || raw.callIndex !== undefined) {
       invalid('action="await" cannot include execution fields');
     }
     return {
@@ -303,7 +391,7 @@ export function parseWorkflowToolInput(
 
   if (raw.action === "stop") {
     if (!raw.runId) invalid('action="stop" requires runId');
-    if (hasExecutionFields(raw) || raw.waitMs !== undefined) {
+    if (hasExecutionFields(raw) || hasConfigFields(raw) || raw.waitMs !== undefined) {
       invalid('action="stop" cannot include execution fields or waitMs');
     }
     return {
@@ -322,7 +410,8 @@ export function parseWorkflowToolInput(
     raw.waitMs !== undefined ||
     raw.lastN !== undefined ||
     raw.labelGlob !== undefined ||
-    raw.logLines !== undefined
+    raw.logLines !== undefined ||
+    hasConfigFields(raw)
   ) {
     invalid("run inputs cannot include inspection fields");
   }

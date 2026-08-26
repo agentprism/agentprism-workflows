@@ -323,6 +323,57 @@ const waitSchema = z.object({
   returnedBecause: z.enum(["terminal", "timeout", "immediate"]),
 });
 
+const diagnosticRecordSchema = z.record(z.string(), z.unknown());
+const harnessDiagnosticSchema = z.object({
+  backendId: z.string(),
+  model: z.string().optional(),
+  probed: z.boolean(),
+  error: z.string().optional(),
+  options: z.array(z.unknown()),
+  omittedOptions: z.number().int().nonnegative(),
+});
+const validationSummarySchema = z.object({
+  ok: z.literal(false),
+  exitCode: z.union([z.literal(1), z.literal(2)]),
+  parse: z.object({
+    ok: z.boolean(),
+    error: z.string().optional(),
+    meta: z.object({
+      name: z.string(),
+      description: z.string(),
+      phases: z.array(z.string()),
+    }).optional(),
+  }),
+  dryRun: z.object({
+    ok: z.boolean(),
+    status: z.string(),
+    reason: z.string().optional(),
+    timedOut: z.boolean(),
+    durationMs: z.number().nonnegative(),
+    agentCalls: z.array(diagnosticRecordSchema),
+    omittedAgentCalls: z.number().int().nonnegative(),
+    checkpoints: z.array(diagnosticRecordSchema),
+    omittedCheckpoints: z.number().int().nonnegative(),
+    phasesVisited: z.array(z.string()),
+    harnessOptions: z.array(harnessDiagnosticSchema),
+    omittedHarnesses: z.number().int().nonnegative(),
+  }).optional(),
+  warnings: z.array(z.string()),
+  omittedWarnings: z.number().int().nonnegative(),
+});
+const configModelDiagnosticSchema = z.object({
+  backendId: z.string(),
+  probed: z.boolean(),
+  error: z.string().optional(),
+  hasModelOption: z.boolean(),
+  filter: z.string().optional(),
+  total: z.number().int().nonnegative().optional(),
+  groups: z.array(z.unknown()).optional(),
+  matches: z.array(z.string()),
+  matchCount: z.number().int().nonnegative(),
+  omittedMatches: z.number().int().nonnegative(),
+});
+
 const inspectionRequired = [
   "workflowName",
   "phases",
@@ -336,6 +387,7 @@ const inspectionRequired = [
 const terminalStatuses = ["paused", "completed", "failed", "aborted"] as const;
 const nonterminalStatuses = ["pending", "running"] as const;
 const commonOutputFields = ["runId", "status", "scriptUri", "limits", "replayEligibility"] as const;
+const runOutputRequired = ["runId", "status", "scriptUri"] as const;
 const executionDetailFields = [
   "result",
   "tokenUsage",
@@ -353,6 +405,14 @@ const inspectionFields = [
   "reason",
   "errorCode",
 ] as const;
+const discoveryOutputFields = [
+  "action",
+  "ok",
+  "validation",
+  "harnessOptions",
+  "omittedHarnesses",
+  "models",
+] as const;
 const variantOutputFields = [
   ...executionDetailFields,
   "scriptSource",
@@ -361,6 +421,7 @@ const variantOutputFields = [
   "outcome",
   "stopped",
   "alreadyTerminal",
+  ...discoveryOutputFields,
 ] as const;
 
 const forbidsRequired = (...fields: string[]) => ({
@@ -370,6 +431,12 @@ const forbidsRequired = (...fields: string[]) => ({
 function forbidsOutside(allowed: readonly string[]) {
   const allowedFields = new Set(allowed);
   return forbidsRequired(...new Set(variantOutputFields.filter((field) => !allowedFields.has(field))));
+}
+
+function hasOnlyExactFields(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const allowedFields = new Set<string>(allowed);
+  return Object.entries(value).every(([field, fieldValue]) =>
+    fieldValue === undefined || allowedFields.has(field));
 }
 
 function hasOnlyFields(value: Record<string, unknown>, allowed: readonly string[]): boolean {
@@ -385,11 +452,17 @@ function hasOnlyFields(value: Record<string, unknown>, allowed: readonly string[
  */
 export const workflowToolOutputShape = z
   .object({
-    runId: z.string(),
-    status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
+    action: z.enum(["run", "config"]).optional(),
+    ok: z.boolean().optional(),
+    validation: validationSummarySchema.optional(),
+    harnessOptions: z.array(harnessDiagnosticSchema).optional(),
+    omittedHarnesses: z.number().int().nonnegative().optional(),
+    models: z.array(configModelDiagnosticSchema).optional(),
+    runId: z.string().optional(),
+    status: z.enum(["rejected", "pending", "running", "paused", "completed", "failed", "aborted"]).optional(),
     ...executionDetailsShape,
     scriptSource: scriptSourceSchema.optional(),
-    scriptUri: z.string(),
+    scriptUri: z.string().optional(),
     lineage: inspectionScriptResourceShape.lineage.optional(),
     workflowName: runStatusShape.workflowName.optional(),
     phases: runStatusShape.phases.optional(),
@@ -407,14 +480,28 @@ export const workflowToolOutputShape = z
   .superRefine((value, context) => {
     const has = (field: keyof typeof value) => value[field] !== undefined;
     const inspectionComplete = inspectionRequired.every((field) => has(field));
+    const runCommonComplete = has("runId") && has("status") && has("scriptUri");
     const terminal = terminalStatuses.includes(value.status as typeof terminalStatuses[number]);
     let valid: boolean;
-    if (has("scriptSource")) {
-      valid = has("limits") && (value.status === "running"
+    if (value.action === "config") {
+      valid =
+        has("ok") &&
+        has("harnessOptions") &&
+        has("omittedHarnesses") &&
+        has("models") &&
+        hasOnlyExactFields(value, ["action", "ok", "harnessOptions", "omittedHarnesses", "models"]);
+    } else if (value.action === "run") {
+      valid =
+        value.status === "rejected" &&
+        has("validation") &&
+        hasOnlyExactFields(value, ["action", "status", "validation"]);
+    } else if (has("scriptSource")) {
+      valid = runCommonComplete && has("limits") && (value.status === "running"
         ? hasOnlyFields(value, ["scriptSource"])
         : terminal && hasOnlyFields(value, ["scriptSource", ...executionDetailFields]));
     } else if (has("stopped") || has("alreadyTerminal")) {
       valid =
+        runCommonComplete &&
         inspectionComplete &&
         has("stopped") &&
         has("alreadyTerminal") &&
@@ -422,11 +509,12 @@ export const workflowToolOutputShape = z
         hasOnlyFields(value, [...inspectionFields, "stopped", "alreadyTerminal"]);
     } else if (has("wait")) {
       valid =
+        runCommonComplete &&
         inspectionComplete &&
         hasOnlyFields(value, [...inspectionFields, "wait", "tokenUsage", "outcome"]) &&
         (terminal ? has("outcome") : !has("outcome"));
     } else {
-      valid = inspectionComplete && hasOnlyFields(value, inspectionFields);
+      valid = runCommonComplete && inspectionComplete && hasOnlyFields(value, inspectionFields);
     }
     if (!valid) {
       context.addIssue({ code: "custom", message: "output does not match a workflow result variant" });
@@ -435,25 +523,63 @@ export const workflowToolOutputShape = z
   .meta({
     oneOf: [
       {
+        title: "Workflow config discovery",
+        required: ["action", "ok", "harnessOptions", "omittedHarnesses", "models"],
+        properties: { action: { const: "config" } },
+        ...forbidsRequired(
+          "validation",
+          "runId",
+          "status",
+          "scriptUri",
+          "scriptSource",
+          ...executionDetailFields,
+          ...inspectionFields,
+          "wait",
+          "outcome",
+          "stopped",
+          "alreadyTerminal",
+        ),
+      },
+      {
+        title: "Workflow validation rejection",
+        required: ["action", "status", "validation"],
+        properties: { action: { const: "run" }, status: { const: "rejected" } },
+        ...forbidsRequired(
+          "ok",
+          "harnessOptions",
+          "omittedHarnesses",
+          "models",
+          "runId",
+          "scriptUri",
+          "scriptSource",
+          ...executionDetailFields,
+          ...inspectionFields,
+          "wait",
+          "outcome",
+          "stopped",
+          "alreadyTerminal",
+        ),
+      },
+      {
         title: "Workflow execution",
-        required: ["scriptSource", "limits"],
+        required: [...runOutputRequired, "scriptSource", "limits"],
         properties: { status: { enum: terminalStatuses } },
         ...forbidsOutside(["scriptSource", ...executionDetailFields]),
       },
       {
         title: "Workflow background admission",
-        required: ["scriptSource", "limits"],
+        required: [...runOutputRequired, "scriptSource", "limits"],
         properties: { status: { const: "running" } },
         ...forbidsOutside(["scriptSource"]),
       },
       {
         title: "Workflow inspection",
-        required: [...inspectionRequired],
+        required: [...runOutputRequired, ...inspectionRequired],
         ...forbidsOutside(inspectionFields),
       },
       {
         title: "Workflow await",
-        required: [...inspectionRequired, "wait"],
+        required: [...runOutputRequired, ...inspectionRequired, "wait"],
         ...forbidsOutside([...inspectionFields, "wait", "tokenUsage", "outcome"]),
         anyOf: [
           {
@@ -468,7 +594,7 @@ export const workflowToolOutputShape = z
       },
       {
         title: "Workflow stop acknowledgement",
-        required: [...inspectionRequired, "stopped", "alreadyTerminal"],
+        required: [...runOutputRequired, ...inspectionRequired, "stopped", "alreadyTerminal"],
         properties: { status: { enum: ["completed", "failed", "aborted"] } },
         ...forbidsOutside([...inspectionFields, "stopped", "alreadyTerminal"]),
       },
@@ -556,6 +682,24 @@ export interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus, 
   outcome?: WorkflowExecutionOutcome<T>;
 }
 
+export interface WorkflowConfigToolResult {
+  action: "config";
+  ok: boolean;
+  harnessOptions: Array<Record<string, unknown>>;
+  omittedHarnesses: number;
+  models: Array<Record<string, unknown>>;
+}
+
+export interface WorkflowValidationRejected {
+  action: "run";
+  status: "rejected";
+  validation: {
+    ok: false;
+    exitCode: 1 | 2;
+    [key: string]: unknown;
+  };
+}
+
 export interface WorkflowStopResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
   status: "completed" | "failed" | "aborted";
   stopped: boolean;
@@ -563,6 +707,8 @@ export interface WorkflowStopResult extends WorkflowRunStatus, WorkflowScriptRes
 }
 
 export type WorkflowToolResult<T = unknown> =
+  | WorkflowConfigToolResult
+  | WorkflowValidationRejected
   | WorkflowExecutionToolResult<T>
   | WorkflowBackgroundAccepted
   | WorkflowInspectionToolResult

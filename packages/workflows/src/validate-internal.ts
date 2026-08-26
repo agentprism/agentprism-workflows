@@ -7,9 +7,16 @@ import {
 export interface ValidateProbeRunner {
   probeConfigOptions(
     spec?: string,
-    opts?: { cwd?: string; selectModel?: boolean },
+    opts?: { cwd?: string; selectModel?: boolean; backends?: Record<string, CustomBackendConfig>; signal?: AbortSignal },
   ): Promise<ProbedConfigOptions>;
-  dispose(): Promise<void>;
+  /** Every host-routable backend name. Used by protocol-native discovery. */
+  listBackends?(): string[];
+  /** Host-registered custom names, including deliberate built-in shadows. */
+  listCustomBackends?(): string[];
+  /** The host's backend selected when a workflow omits model. */
+  defaultBackendId?(): string;
+  /** Present on owned probe runners; shared host runners are never disposed by validation. */
+  dispose?(): Promise<void>;
 }
 
 export type ValidateProbeFactory = (

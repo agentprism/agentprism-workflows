@@ -16,12 +16,12 @@ export const AUTHORING_PROMPT_NAME = "author-workflow";
 export function buildAuthoringPromptText(task?: string): string {
   const trimmed = task?.trim();
   const discover =
-    "When the script pins models, efforts, or configOptions, read the live catalog first with " +
-    "`npx @automatalabs/workflows config [harness ...]` if a shell is available — never guess ids " +
-    "or probe with a throwaway workflow.";
+    "When the script pins a model, mode, or configOptions, call the `workflow` tool with " +
+    '`action:"config"` first; use `modelSpecs` after choosing a model to read its exact option domain. The `run` action performs ' +
+    "static validation, a mocked dry run, and routed config checks automatically before admission.";
   const closing = trimmed
-    ? `## Your task\n\nAuthor a workflow script that accomplishes the following, validate it if the validator is available, then run it with the \`workflow\` tool. ${discover}\n\n${trimmed}`
-    : `## Next step\n\nAuthor the workflow script the user asks for (its first statement must be \`export const meta\`), validate it if the validator is available, then run it with the \`workflow\` tool. ${discover}`;
+    ? `## Your task\n\nAuthor a workflow script that accomplishes the following, then run it with the \`workflow\` tool. ${discover}\n\n${trimmed}`
+    : `## Next step\n\nAuthor the workflow script the user asks for (its first statement must be \`export const meta\`), then run it with the \`workflow\` tool. ${discover}`;
   return `${AUTHORING_PROMPT_CONTENT}\n\n---\n\n${closing}\n`;
 }
 

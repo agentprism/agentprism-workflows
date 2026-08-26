@@ -160,6 +160,10 @@ export interface ProbeConfigOptionsOptions {
   cwd?: string;
   /** Apply the routed model selection before returning the echoed catalog. Default false. */
   selectModel?: boolean;
+  /** Approved run-scoped backends used only for this probe. Host-registered names still win. */
+  backends?: Record<string, CustomBackendConfig>;
+  /** Abort backend startup/session opening/model selection while the no-prompt probe is in flight. */
+  signal?: AbortSignal;
 }
 
 interface LifecycleRoutingOptions {
@@ -476,16 +480,20 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
    *  advertised config-option catalog verbatim. */
   async probeConfigOptions(spec?: string, opts: ProbeConfigOptionsOptions = {}): Promise<ProbedConfigOptions> {
     if (this.disposed) throw new Error("ACP agent runner is disposed");
+    opts.signal?.throwIfAborted();
     const cwd = opts.cwd ?? process.cwd();
     const prepared = this.prepareSession({ model: spec }, {
       cwd,
       schema: undefined,
-      registry: this.backends,
+      registry: registryWithRunBackends(this.backends, opts.backends),
+      signal: opts.signal,
     });
     let session: SessionHandle | undefined;
     try {
       session = await this.pool.acquire(prepared.backend, prepared.sessionOptions);
+      opts.signal?.throwIfAborted();
       if (opts.selectModel) await applyModelSelection(session, prepared.modelSpec, {});
+      opts.signal?.throwIfAborted();
       return {
         backendId: prepared.backend.id,
         options: session.advertisedConfigOptions,
@@ -563,6 +571,11 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     const ids = new Set<string>(BUILTIN_BACKEND_IDS);
     for (const name of this.backends.keys()) ids.add(name);
     return [...ids];
+  }
+
+  /** Names of host-registered custom backends, including deliberate built-in shadows. */
+  listCustomBackends(): string[] {
+    return [...this.backends.keys()];
   }
 
   /** The configured DEFAULT backend id — the registry's own routing for

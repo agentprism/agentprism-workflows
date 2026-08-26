@@ -31,7 +31,7 @@ test("input shape: args is OPTIONAL and accepts an arbitrary JSON value", () => 
   assert.equal(Schema.parse({ script: "x", args: 7 }).args, 7);
 });
 
-test("input shape: one tool advertises the exact run, inspect, await, and stop field superset", () => {
+test("input shape: one tool advertises the exact config, run, inspect, await, and stop field superset", () => {
   assert.ok(!("startInBackground" in workflowToolInputShape), "startInBackground must not be a tool input");
   assert.deepEqual(
     Object.keys(workflowToolInputShape).sort(),
@@ -44,10 +44,14 @@ test("input shape: one tool advertises the exact run, inspect, await, and stop f
       "callIndex",
       "checkpointReplies",
       "concurrency",
+      "harnesses",
       "labelGlob",
       "lastN",
       "logLines",
       "maxAgents",
+      "modelFilter",
+      "modelSpecs",
+      "probeTimeoutMs",
       "projectDir",
       "resumeFromRunId",
       "resumePolicy",
@@ -56,7 +60,7 @@ test("input shape: one tool advertises the exact run, inspect, await, and stop f
       "scriptPath",
       "waitMs",
     ],
-    "the exact run/inspect/await/stop wire fields",
+    "the exact config/run/inspect/await/stop wire fields",
   );
 });
 
@@ -119,6 +123,46 @@ test("script and scriptPath are an absolute-path XOR for every run and resume", 
       () => parseWorkflowToolInput(Schema.parse(input)),
       /exactly one of script or scriptPath is required/,
     );
+  }
+});
+
+test("config accepts only bounded discovery fields and requires projectDir in daemon mode", () => {
+  assert.deepEqual(
+    parseWorkflowToolInput(
+      Schema.parse({
+        action: "config",
+        projectDir: "/tmp/project",
+        harnesses: ["claude", "team.agent"],
+        modelFilter: "opus",
+        modelSpecs: ["claude/opus"],
+        probeTimeoutMs: 5_000,
+      }),
+    ),
+    {
+      action: "config",
+      projectDir: "/tmp/project",
+      harnesses: ["claude", "team.agent"],
+      modelFilter: "opus",
+      modelSpecs: ["claude/opus"],
+      probeTimeoutMs: 5_000,
+    },
+  );
+  assert.throws(
+    () => parseWorkflowToolInput(Schema.parse({ action: "config" }), { requireProjectDir: true }),
+    /config requires projectDir/,
+  );
+  for (const input of [
+    { action: "config", script: "x" },
+    { action: "config", runId: "a-b" },
+    { action: "config", args: {} },
+    { action: "config", background: true },
+    { action: "config", harnesses: [] },
+    { action: "config", harnesses: ["bad/name"] },
+    { action: "config", modelFilter: "" },
+    { action: "config", modelSpecs: [] },
+    { action: "config", probeTimeoutMs: 0 },
+  ]) {
+    assert.throws(() => parseWorkflowToolInput(Schema.parse(input)));
   }
 });
 
@@ -237,6 +281,8 @@ test("the discriminator rejects every missing or mixed run/inspect/await branch"
     { action: "run", script: "x", lastN: 1 },
     { action: "run", script: "x", labelGlob: "*" },
     { action: "run", script: "x", logLines: 0 },
+    { action: "run", script: "x", harnesses: ["claude"] },
+    { action: "inspect", runId: "a-b", modelFilter: "opus" },
   ]) {
     const primitive = Schema.parse(input);
     assert.throws(
