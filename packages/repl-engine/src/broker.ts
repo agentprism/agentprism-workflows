@@ -4091,8 +4091,16 @@ this.evalBreakArmed = false;
     }
     const admissionSequence = ++this.admissionSequence;
     const admittedAtMs = now();
-    this.recordDispatch(callId, 'queue', rawPromptDetail(payloadJson), payloadJson, sessionId, null, admissionSequence, admittedAtMs);
-    this.callStore.recordQueued(callId, admittedAtMs);
+    try {
+      this.recordDispatch(callId, 'queue', rawPromptDetail(payloadJson), payloadJson, sessionId, null, admissionSequence, admittedAtMs);
+      this.callStore.recordQueued(callId, admittedAtMs);
+    } catch (cause) {
+      const failure = persistenceFailure(cause);
+      this.markPersistenceFatal(sessionId, failure);
+      call.reject(failure);
+      this.syncSettled.push(callId);
+      return;
+    }
     let payload: { prompt: string; promptMeta?: Record<string, unknown> };
     try {
       payload = this.parseTurnPayload(payloadJson, 'queue');
@@ -4656,7 +4664,7 @@ this.evalBreakArmed = false;
               ? undefined
               : {
                   promptMeta: this.queuePromptMeta(queuedTurn.promptMeta, queuedTurn.callId),
-                  onHandoff: () => this.callStore.recordHandoff(queuedTurn.callId, now()),
+                  onHandoff: () => this.recordQueueHandoff(queuedTurn.sessionId, queuedTurn.callId),
                 },
           );
         } finally {
@@ -4738,6 +4746,19 @@ this.evalBreakArmed = false;
     }
   }
 
+  private recordQueueHandoff(sessionId: string, callId: string): void {
+    try {
+      this.callStore.recordHandoff(callId, now());
+    } catch (cause) {
+      const failure = persistenceFailure(cause);
+      this.markPersistenceFatal(sessionId, failure);
+      throw new WorkflowError(failure.message, CODE.PERSISTENCE_ERROR, {
+        recoverable: false,
+        details: { reason: 'queue_persistence_failed' },
+      });
+    }
+  }
+
   private queuePromptMeta(
     promptMeta: Record<string, unknown> | undefined,
     callId: string,
@@ -4794,7 +4815,7 @@ this.evalBreakArmed = false;
         promptTurn = await entry.session.prompt(turn.prompt, {
           promptMeta: this.queuePromptMeta(turn.promptMeta, turn.callId),
           onHandoff: () => {
-            this.callStore.recordHandoff(turn.callId, now());
+            this.recordQueueHandoff(turn.sessionId, turn.callId);
           },
         });
       } finally {
