@@ -1,5 +1,18 @@
 # @automatalabs/workflows
 
+## 0.52.0
+
+### Minor Changes
+
+- de4e704: Make the workflow MCP surface self-contained: add protocol-native live backend/config discovery, automatically run zero-token static and mocked validation before admission, return bounded structured rejection diagnostics without creating a run, and publish compact DSL guidance directly in the tool description and bundled authoring prompt. Reuse the server's live ACP runner for probes, including approved run-scoped backend definitions, without disposing host-owned runners.
+
+### Patch Changes
+
+- Updated dependencies [de4e704]
+  - @automatalabs/acp-agents@0.40.0
+  - @automatalabs/workflow-engine@0.37.0
+  - @automatalabs/repl-engine@0.4.1
+
 ## 0.51.0
 
 ### Minor Changes
