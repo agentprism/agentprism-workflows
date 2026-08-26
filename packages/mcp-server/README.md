@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-An **[MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, safe inspection, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tool surface is **two tools**: **`workflow`**, with run/resume/inspect/await/stop branches, and **`repl`** — a persistent QuickJS-in-WASM JavaScript REPL for live, stateful subagent orchestration (see [The `repl` tool](#the-repl-tool)) — plus an app-only `workflow-events` poller that feeds the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enters the model's tool loop. Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes (`resumeFromRunId`) after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
+An **[MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, safe inspection, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tool surface is **two tools**: **`workflow`**, with config/run/resume/inspect/await/stop branches, and **`repl`** — a persistent QuickJS-in-WASM JavaScript REPL for live, stateful subagent orchestration (see [The `repl` tool](#the-repl-tool)) — plus an app-only `workflow-events` poller that feeds the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enters the model's tool loop. The `workflow` tool discovers its live backend catalog with `action:"config"` and automatically validates every script before admission. Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes (`resumeFromRunId`) after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
 This package is a **thin MCP adapter**. The `workflow` tool's real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, and resume — lives in **[`@automatalabs/workflows`](../workflows)**; the `repl` tool's real work — the persistent QuickJS-in-WASM VM, the subagent broker, the CDP-style previewer, and the enveloped-snapshot store — lives in **[`@automatalabs/repl-engine`](../repl-engine)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool over a per-project `WorkflowManager` and the `repl` tool over a per-project QuickJS VM, and serves them over stdin/stdout.
 
@@ -171,15 +171,19 @@ After your host reloads, the `workflow` and `repl` tools appear in its tool list
 
 ### Input parameters
 
-The tool uses a run/inspect/await/stop union. Execution resource maxima remain runtime clamps;
+The tool uses a config/run/inspect/await/stop union. `config` performs zero-token, no-prompt discovery, and every run performs static validation, a mocked dry run, and routed model/config checks before admission. Invalid scripts return bounded `status:"rejected"` diagnostics without creating a run ID or reserving background capacity. Execution resource maxima remain runtime clamps;
 inspection/await limits are contract bounds and invalid values are MCP Invalid Params (`-32602`).
 
 | Param | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `action` | `"run" \| "inspect" \| "await" \| "stop"` | no | run | Omit for execution. `"inspect"` reads immediately; `"await"` waits only for terminal lifecycle state; `"stop"` aborts the run unless `callIndex` selects one in-flight agent. |
+| `action` | `"config" \| "run" \| "inspect" \| "await" \| "stop"` | no | run | `"config"` discovers live backend/model/mode/config options without starting a workflow. Omit or use `"run"` for automatic validation followed by execution. The remaining actions operate on an admitted `runId`. |
 | `script` | string (non-empty) | run XOR | — | Raw JavaScript workflow script (no Markdown fences). Exactly one of `script`/`scriptPath` is required for run. The first statement **must** be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/stop. |
 | `scriptPath` | absolute path string | run XOR | — | Absolute path on the **server's filesystem**. Read once as UTF-8 before admission; the content is snapshotted, and later file edits do not change that run. Relative paths and unreadable files are Invalid Params. Forbidden for inspect/await/stop. |
-| `projectDir` | absolute path string | run (daemon) | in-process: the server's own project | Absolute project directory: selects the project-scoped run store (where the runId, journal, and resume state live) and the run's default execution cwd. **Required for run on the shared workflow daemon** — one registration serves every project. Forbidden for inspect/await/stop: a runId locates its project store automatically. |
+| `projectDir` | absolute path string | config/run (daemon) | in-process: the server's own project | Project cwd for discovery and the run store/default execution cwd for execution. Required for config and run on the shared daemon. Forbidden for inspect/await/stop. |
+| `harnesses` | backend-name array (1–16) | config only | every registered backend | Limit no-prompt discovery to these backends. |
+| `modelSpecs` | model-spec array (1–16) | config only | — | Select these exact routed models before reading their model-specific mode and config-option catalogs. |
+| `modelFilter` | string (1–128) | config only | provider/group summaries | Case-insensitive substring or `/regular expression/` used to return bounded matching model ids. |
+| `probeTimeoutMs` | integer 1–120,000 | config only | `60,000` | Per-backend no-prompt discovery timeout. |
 | `background` | boolean | run only | `false` | Acknowledge after admission and execute in this server process. |
 | `args` | any JSON value | no | — | Optional value exposed to the script as the global `args`. |
 | `maxAgents` | integer > 0 | no | `1000` | Max agents allowed in this run (engine cap `MAX_AGENTS_PER_RUN`). Values below 1 are clamped up to 1. |
@@ -204,7 +208,15 @@ recycled after sibling sessions drain. With no finite run-level ceiling, per-cal
 or omission is uncapped. Resume requests resolve their own limits, so pass the intended
 timeout/retry/concurrency values again.
 
-Example call arguments:
+Discover a backend's live catalog before pinning model, mode, or `configOptions`:
+
+```json
+{ "action": "config", "projectDir": "/absolute/project", "harnesses": ["claude"], "modelFilter": "opus" }
+```
+
+After choosing a model, inspect its exact option domain with `{ "action": "config", "projectDir": "/absolute/project", "modelSpecs": ["claude/opus[1m]"] }`. No workflow is started and no prompt is sent. If `model` is omitted, or only a backend name is used, discovery is optional.
+
+Example run arguments (validation is automatic):
 
 ```json
 {
@@ -300,7 +312,24 @@ call-index/label pairs.
 
 ### Output
 
-The tool returns both machine-readable `structuredContent` and a human-readable text block. The structured shape pins the durable core of the engine's run result:
+The tool returns both machine-readable `structuredContent` and a human-readable text block. Discovery and pre-admission rejection have no run ID:
+
+```ts
+interface WorkflowConfigToolResult {
+  action: "config";
+  ok: boolean;
+  harnessOptions: Array<{ backendId: string; probed: boolean; options: unknown[]; error?: string }>;
+  models: Array<{ backendId: string; hasModelOption: boolean; matches: string[] }>;
+}
+
+interface WorkflowValidationRejected {
+  action: "run";
+  status: "rejected";
+  validation: { ok: false; exitCode: 1 | 2; parse: object; dryRun?: object; warnings: string[] };
+}
+```
+
+A rejected run has `isError:true`, bounded diagnostics, and no `runId`, `scriptUri`, or persistence record. Admitted executions retain the durable engine result shape:
 
 ```ts
 interface WorkflowExecutionToolResult {
@@ -773,7 +802,7 @@ Workspaces follow the daemon's project model exactly: **one VM per `projectDir`*
 
 The server also exposes one [MCP prompt](https://modelcontextprotocol.io/docs/concepts/prompts): **`author-workflow`**. Prompts are a *user-controlled* primitive — prompt-capable hosts surface them for explicit invocation (Claude Code renders it as the `/mcp__<server>__author-workflow` slash command) — so this adds nothing to the model-facing tool list (`workflow` and `repl`) — the prompt registers no tool of its own.
 
-Invoking it injects the complete, self-contained workflow-authoring guide (the same content as the published `agentprism-workflow-authoring` skill: the authoring guide, the exhaustive DSL reference tables, and a complete validated example script), always version-matched to the engine this server runs. Pass the optional **`task`** argument to have the guide close with "author a workflow that accomplishes: …, then run it with the `workflow` tool".
+Invoking it injects the complete, self-contained protocol-native edition of the published `agentprism-workflow-authoring` guide: the authoring guide, exhaustive DSL reference tables, and a complete validated example script, with terminal-only installation and command guidance omitted. It is always version-matched to the engine this server runs. Pass the optional **`task`** argument to have the guide close with "author a workflow that accomplishes: …, then run it with the `workflow` tool".
 
 Hosts without prompt support (Codex CLI, at the time of writing) simply never see it — install the [authoring skill](https://github.com/agentprism/agentprism-workflows/tree/main/skills/agentprism-workflow-authoring) there instead.
 

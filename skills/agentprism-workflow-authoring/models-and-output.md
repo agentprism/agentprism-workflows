@@ -12,12 +12,7 @@ The built-in names (`claude`, `codex`, `opencode`, `pi`) come from the runtime b
 
 The published examples use ids verified against live harness catalogs: `claude/opus[1m]`, `codex/gpt-5.6-sol`, and `opencode/zai/glm-5.2`. For Pi, `pi/openrouter/vendor/model-id` strips only `pi/`; Pi then splits provider `openrouter` from model id `vendor/model-id`. Prefer backend-only forms when the desired model is configured inside the harness.
 
-Never guess model ids, effort values, or option names from memory — read the live catalog first:
-
-```bash
-npx @automatalabs/workflows config                # every routable harness (claude, codex, opencode, pi + registered customs)
-npx @automatalabs/workflows config codex --json   # one harness, machine-readable
-```
+Never guess model ids, effort values, or option names from memory. With MCP, call the `workflow` tool using `action:"config"` and optional `harnesses` / `modelFilter`; it returns the live catalog without starting a workflow.
 
 One no-prompt session per harness, zero tokens: the table lists every negotiable session option — model ids (including bracket variants like `opus[1m]`), effort levels, modes — exactly as the installed harness advertises them. One caveat: the bare `config` probe reads each harness with its **default model** selected, and option domains are **model-specific**. An option can appear only after a particular model is selected. Ceilings differ per model. Provider-served variants of the same model can advertise different domains. The authoritative per-model probe is the validator run on your real script: it selects each authored `{ backend, model }` pair first and echoes that pair's advertised table. Confirm every pinned model against its own echoed table; do not read package internals to discover options.
 
@@ -27,7 +22,7 @@ const impl   = await agent(implPrompt(plan),     { label: "implement", model: "c
 const review = await agent(reviewPrompt(impl),   { label: "review",    model: "claude/opus[1m]", schema: REVIEW });
 ```
 
-Use `configOptions` only for exact ACP session options advertised by that routed harness. Read the per-harness advertised-options table first — `npx @automatalabs/workflows config <harness>`, or the same table in every validator report — before choosing ids or select values; catalogs vary by harness version, login, and machine.
+Use `configOptions` only for exact ACP session options advertised by that routed harness. With MCP, read the selected harness's `action:"config"` result before choosing ids or select values; catalogs vary by harness version, login, and machine.
 
 ```js
 const impl = await agent(implPrompt(plan), {

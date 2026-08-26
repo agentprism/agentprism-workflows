@@ -57,12 +57,12 @@ Run scripts through the MCP server's `workflow` tool — registration, the run/a
 - [ ] Every `parallel` element is a **thunk**; results are `.filter(Boolean)`-ed or null-checked.
 - [ ] Every prompt is self-contained: prior results are interpolated in, and every file path a prompt references was written by an earlier call, supplied through `args`, or created by that prompt's own instructions.
 - [ ] Schemas: object root, `additionalProperties: false`, everything `required`, a `description` on every field.
-- [ ] Model ids, effort values, and `configOptions` come from `npx @automatalabs/workflows config` or a validator report, never from memory. `mode` only on calls with a pinned `model`.
+- [ ] When using MCP, pinned model ids, modes, effort values, and `configOptions` come from `workflow` action `config`, never from memory. `mode` only on calls with a pinned `model`.
 - [ ] Worktree-isolated agents return their work as data — their edits are discarded when the call ends.
 - [ ] Replay is intentional: completed calls with matching identity and input fingerprints replay. Change a hashed field (normally the prompt) when a completed call must run again.
 - [ ] Loops terminate on bounds the script controls; caps and drops are `log()`-ed, not silent.
 - [ ] `checkpoint()` guards irreversible actions, with a sane headless `default` or an intentional `headless: "pause"`.
 - [ ] `return` a compact, structured result — it is the run's `result`, not a transcript.
-- [ ] `npx @automatalabs/workflows validate <file> --args '<json>'` exits 0 with no surprising warnings.
+- [ ] The MCP `workflow` run preflight succeeds with no surprising warnings before admission.
 
 For the complete `agent()` option table, model-routing grammar, checkpoint options, error codes, `meta.backends` config fields, and the MCP tool input shapes, read [`reference.md`](reference.md).

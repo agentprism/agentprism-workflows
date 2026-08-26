@@ -14,7 +14,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `model` | `string` | Model spec: optional registered harness prefix plus a verbatim id, or a backend-only name. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
 | `tier` | `"small" \| "medium" \| "big"` | Coarse tier resolved from host config; beats phase/meta model, loses to explicit `model`. Part of the resume hash. |
 | `mode` | `string` | ACP session mode id advertised by the selected backend. **Strict**: unsupported/unadvertised ids fail the call (never silently unconfined). Ids are backend-specific and drift with harness versions — read the advertised `mode` select from the config probe or a validator report (Codex-family examples: `read-only`, `agent`, `agent-full-access`; Claude-family advertises permission modes such as `plan`, `acceptEdits`, and `dontAsk`). Part of the resume hash when set. |
-| `configOptions` | `Record<string, string \| boolean>` | Exact ACP session option ids and authored values. Applied in ascending id order after model and before the prompt, with no aliases or coercion. `"model"` is reserved for the dedicated `model` field. Part of the resume hash only when non-empty, with sorted keys. Read the advertised-options table first (`agentprism-workflows config <harness>`, or any validate report) before choosing values. |
+| `configOptions` | `Record<string, string \| boolean>` | Exact ACP session option ids and authored values. Applied in ascending id order after model and before the prompt, with no aliases or coercion. `"model"` is reserved for the dedicated `model` field. Part of the resume hash only when non-empty, with sorted keys. With MCP, read the advertised-options table from `workflow` action `config` before choosing values. |
 | `agentType` | `string` | Bind a named subagent definition (tools allow/deny, model, isolation, role prompt). See [agentType definitions](#agenttype-definitions). Part of the resume hash. |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree branched from the run cwd. **Always removed (worktree + branch) when the call ends** — edits are discarded; return work as data. Degrades to the shared tree outside a git repo (logged). |
 | `resume` | `{ filesystem: "read-only" }` | Deprecated compatibility annotation. It is recorded as legacy diagnostic provenance, is not sent to the runner or hashed, and has no effect on replay. New scripts should omit it. |
@@ -200,9 +200,7 @@ The body is prepended to the agent's task as role guidance. An unknown `agentTyp
 
 ## How hosts run scripts (what authors can assume)
 
-The MCP route (`npx @automatalabs/mcp-server`, tool name `workflow`) is the canonical way an agent
-runs an authored script; registration and the per-action contracts are in the Running workflows
-guide section. The `workflow` tool is the server's whole *workflow* surface: run/resume/inspect/await/stop
+The connected MCP `workflow` tool is the canonical way an agent runs an authored script; the per-action contracts are in the Running workflows guide section. The tool is self-contained: `config` discovers live backend options and `run` validates automatically before admission. The `workflow` tool is the server's whole *workflow* surface: config/run/resume/inspect/await/stop
 are action branches, not separate tools, and this input does not resolve a saved workflow name.
 (The server also registers a second, separate model-facing tool, `repl`, for interactive REPL
 orchestration — outside this authoring guide's scope.) A
@@ -227,6 +225,15 @@ below are the `workflow` tool's MCP surface, which is what script authors intera
 Exact MCP tool input/output types:
 
 ```ts
+interface WorkflowConfigToolInput {
+  action: "config";
+  projectDir?: string;
+  harnesses?: string[];
+  modelSpecs?: string[];
+  modelFilter?: string;
+  probeTimeoutMs?: number;
+}
+
 interface WorkflowExecuteToolInputBase {
   action?: "run";
   args?: unknown;
@@ -246,7 +253,7 @@ type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase & (
 );
 // WorkflowExecuteToolInputBase also carries projectDir?: string — the absolute project
 // directory selecting the project-scoped run store and default execution cwd. REQUIRED for
-// run on the shared workflow daemon (one registration serves every project); optional on a
+// config/run on the shared workflow daemon (one registration serves every project); optional on a
 // single-project (--in-process) server. inspect/await/stop never take it: a runId locates
 // its project store automatically.
 
@@ -257,6 +264,19 @@ interface WorkflowAwaitToolInput {
   lastN?: number;       // default 20; integer 1..50
   labelGlob?: string;   // same whole-label glob as inspect
   logLines?: number;    // default 20; integer 0..50
+}
+
+interface WorkflowConfigToolResult {
+  action: "config";
+  ok: boolean;
+  harnessOptions: Array<{ backendId: string; model?: string; probed: boolean; options?: unknown[]; error?: string }>;
+  models: Array<{ backendId: string; hasModelOption: boolean; matches: string[] }>;
+}
+
+interface WorkflowValidationRejected {
+  action: "run";
+  status: "rejected";
+  validation: { ok: false; exitCode: 1 | 2; parse: object; dryRun?: object; warnings: string[] };
 }
 
 interface WorkflowBackgroundAccepted {
