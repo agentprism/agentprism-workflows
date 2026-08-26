@@ -14,7 +14,7 @@ import {
 } from "@automatalabs/workflows";
 
 const MAX_STRUCTURED_BYTES = 24_576;
-const MAX_HARNESSES = 16;
+const MAX_HARNESSES = 32;
 const MAX_OPTIONS_PER_HARNESS = 48;
 const MAX_MODEL_MATCHES = 100;
 const MAX_AGENT_CALLS = 64;
