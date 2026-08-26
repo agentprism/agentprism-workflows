@@ -138,6 +138,9 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     assert.match(tool.description ?? "", /registry built-ins—currently Claude, Codex, OpenCode, and pi/);
     assert.match(tool.description ?? "", /action:\"config\"/);
     assert.match(tool.description ?? "", /automatically performs static validation, a mocked dry run, and routed config checks/);
+    assert.match(tool.description ?? "", /Every parallel entry must be a thunk/);
+    assert.match(tool.description ?? "", /Minimal script:/);
+    assert.match(tool.description ?? "", /configOptions, schema, cwd, timeoutMs, retries/);
     assert.doesNotMatch(tool.description ?? "", /npx|CLI|shell out/i);
 
     assert.deepEqual(tool.inputSchema.required, undefined, "the raw shape leaves branch requirements to the discriminator");
