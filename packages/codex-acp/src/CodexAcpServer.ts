@@ -1293,27 +1293,23 @@ export class CodexAcpServer {
      *
      * Every session gets its own {@link SteeringQueue}: the request is enqueued
      * and awaited, so concurrent steers for one session run strictly one at a
-     * time, in arrival order, and can never race to inject into — or start —
-     * rival turns. Steers for different sessions use different queues and run
+     * time, in arrival order, and can never cross an active-turn boundary.
+     * Steers for different sessions use different queues and run
      * concurrently. Once the queue drains to idle it is removed from the map,
      * so no per-session entry leaks after the session goes quiet (the identity
      * check guards against deleting a queue a later request has since reused).
      *
      * @param params The target session id and the prompt to steer with.
-     * @returns Whether the prompt joined the active turn ("injected"), started a
-     *     new one ("startedNewTurn"), or could not be applied ("failed"); see
-     *     {@link performSteeringRequest}.
+     * @returns Whether the prompt joined the active turn or needs an explicit
+     *     session prompt because no turn was running.
      */
     async executeOrQueueSteeringRequest(params: SessionSteerRequest): Promise<SessionSteeringResponse> {
         const queue = this.getSteeringQueue(params.sessionId);
         try {
             return await queue.enqueue(params);
         } catch (error) {
-            if (error instanceof RequestError) {
-                throw error;
-            }
             logger.error(`Steering request for session ${params.sessionId} failed`, error);
-            return {outcome: "failed"};
+            throw error;
         } finally {
             if (queue.isIdle && this.steeringQueues.get(params.sessionId) === queue) {
                 this.steeringQueues.delete(params.sessionId);
@@ -1338,12 +1334,11 @@ export class CodexAcpServer {
     }
 
     /**
-     * Delivers a steering prompt to the session: injects it into the live turn
-     * when there is one, otherwise starts a new turn.
+     * Delivers a steering prompt to the session only while a turn is live.
      *
      * @param params The target session id and the prompt to steer with.
-     * @returns "injected" when the prompt joined an existing turn, otherwise the
-     *     outcome of starting a new turn.
+     * @returns "injected" when the prompt joined an existing turn, otherwise
+     *     `promptRequired/noRunningTurn` without starting or queueing a turn.
      */
     private async performSteeringRequest(params: SessionSteerRequest): Promise<SessionSteeringResponse> {
         logger.log("Steering session requested", {
@@ -1351,17 +1346,19 @@ export class CodexAcpServer {
             prompt: params.prompt,
         });
         const sessionState = this.getSessionState(params.sessionId);
-        this.assertSteerInputSupported(params, sessionState);
 
         const turnId = await this.getSteerableTurnId(sessionState);
-        if (turnId) {
-            const injected = await this.injectSteerIntoActiveTurn(params, turnId, sessionState);
-            if (injected) {
-                logger.log("Steering session injected", {sessionId: params.sessionId, turnId});
-                return {outcome: "injected"};
-            }
+        if (!turnId) {
+            return {outcome: "promptRequired", reason: "noRunningTurn"};
         }
-        return await this.startNewTurnFromSteering(params);
+
+        this.assertSteerInputSupported(params, sessionState);
+        const injected = await this.injectSteerIntoActiveTurn(params, turnId, sessionState);
+        if (injected) {
+            logger.log("Steering session injected", {sessionId: params.sessionId, turnId});
+            return {outcome: "injected"};
+        }
+        return {outcome: "promptRequired", reason: "noRunningTurn"};
     }
 
     /**
@@ -1378,13 +1375,12 @@ export class CodexAcpServer {
     /**
      * Attempts to inject the prompt into the given running turn.
      *
-     * A failed injection is fatal only when the turn is still the session's
-     * current turn and Codex reported something other than "no active turn to
-     * steer". Otherwise the turn has already ended underneath us and the caller
-     * should start a new turn instead.
+     * A failed injection is exceptional only when the turn is still the
+     * session's current turn and Codex reported something other than "no active
+     * turn to steer". Otherwise the turn ended underneath us and the caller must
+     * issue an explicit session prompt for any future work.
      *
-     * @returns true when the prompt was injected; false when the caller should
-     *     fall back to starting a new turn.
+     * @returns true when the prompt was injected; false on a settlement race.
      */
     private async injectSteerIntoActiveTurn(
         params: SessionSteerRequest,
@@ -1408,33 +1404,16 @@ export class CodexAcpServer {
         }
     }
 
-    /**
-     * Starts a new turn from a steering prompt when there is no live turn to
-     * inject into, and returns as soon as that turn is running.
-     *
-     * Waits for any previous prompt to drain first, then re-checks that the
-     * session is not closing — the await above is a window during which a close
-     * request can arrive.
-     *
-     * @param params The target session id and the prompt to steer with.
-     * @returns "startedNewTurn" once the turn is running; throws if the prompt
-     *     fails or is cancelled before the turn starts.
-     */
-    private async startNewTurnFromSteering(params: SessionSteerRequest): Promise<SessionSteeringResponse> {
-        await this.startNewTurnFromExternalPrompt(params, "Steering");
-        return {outcome: "startedNewTurn"};
-    }
-
     private async startGoalContinuationIfCurrent(
         sessionState: SessionState,
         sessionGeneration: number,
         goalControlGeneration: number,
         expectedGoal: ThreadGoal,
     ): Promise<void> {
-        await this.startNewTurnFromExternalPrompt({
+        await this.startGoalContinuationTurn({
             sessionId: sessionState.sessionId,
             prompt: GOAL_CONTINUATION_PROMPT,
-        }, "Goal continuation", async () => {
+        }, async () => {
             if (!this.sessionPublishIsCurrent(sessionState, sessionGeneration)
                 || this.goalControlGenerations.get(sessionState.sessionId) !== goalControlGeneration) {
                 return false;
@@ -1447,9 +1426,8 @@ export class CodexAcpServer {
         });
     }
 
-    private async startNewTurnFromExternalPrompt(
+    private async startGoalContinuationTurn(
         params: acp.PromptRequest,
-        source: string,
         canStart: () => Promise<boolean> = async () => true,
     ): Promise<boolean> {
         // A prompt can outlive its turn while post-turn cleanup runs. Starting a
@@ -1468,35 +1446,27 @@ export class CodexAcpServer {
             let turnStarted = false;
             const promptDone = this.prompt(params, undefined, () => {
                 turnStarted = true;
-                logger.log(`${source} started a new turn`, {sessionId: params.sessionId});
-                // The new turn is now running. This is the success path: answer the
-                // steer immediately ("a turn was started") and let prompt() finish the
-                // turn in the background.
+                logger.log("Goal continuation started a new turn", {sessionId: params.sessionId});
+                // Goal control owns this background continuation. Resolve admission as
+                // soon as the turn is running and let prompt() finish it in the background.
                 resolve(true);
             });
             promptDone.then(
                 (response) => {
                     if (!turnStarted && response.stopReason === "cancelled") {
-                        // The prompt ended without the turn ever starting, because it
-                        // was cancelled. The steer never took, so fail the request.
-                        reject(RequestError.invalidRequest(`Session ${params.sessionId} was cancelled before the steering turn started`));
+                        reject(RequestError.invalidRequest(`Session ${params.sessionId} was cancelled before the goal continuation started`));
                     } else {
                         // Either the turn already started (this is a no-op after the
                         // resolve in the callback above), or the prompt finished
                         // without ever starting a turn and was not cancelled (e.g. a
-                        // command-only turn). Both count as a successfully accepted steer.
+                        // command-only turn).
                         resolve(turnStarted);
                     }
                 },
                 (error: unknown) => {
                     if (turnStarted) {
-                        // The turn had already started, so the steer was already
-                        // answered "startedNewTurn". This is a failure of a turn running
-                        // in the background — nothing to return, just log it.
-                        logger.error(`${source} prompt for session ${params.sessionId} failed`, error);
+                        logger.error(`Goal continuation prompt for session ${params.sessionId} failed`, error);
                     } else {
-                        // The prompt failed before the turn started. The steer never
-                        // took, so surface the failure to the caller.
                         reject(error);
                     }
                 },

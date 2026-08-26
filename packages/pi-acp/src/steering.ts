@@ -6,17 +6,15 @@ import {
 
 export const SESSION_STEERING_METHOD = "_session/steering" as const;
 
-export type SteeringOutcome = "injected" | "startedNewTurn" | "failed";
-
 export interface SteeringRequest {
   sessionId: string;
   prompt: ContentBlock[];
   _meta?: PromptRequest["_meta"];
 }
 
-export interface SteeringResponse {
-  outcome: SteeringOutcome;
-}
+export type SteeringResponse =
+  | { outcome: "injected" }
+  | { outcome: "promptRequired"; reason: "noRunningTurn" };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

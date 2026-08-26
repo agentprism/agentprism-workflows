@@ -106,16 +106,16 @@ export type SessionSteerRequest = {
     prompt: ContentBlock[];
 }
 
-export type SessionSteeringResponse = {
-    outcome: "injected" | "startedNewTurn" | "failed";
-}
+export type SessionSteeringResponse =
+    | {outcome: "injected"}
+    | {outcome: "promptRequired", reason: "noRunningTurn"};
 
 export type SessionSteeringExtRequest = {
     method: typeof SESSION_STEERING_METHOD;
     params: SessionSteerRequest;
 }
 
-export async function steerSessionWithFallback(
+export async function steerSession(
     connection: Pick<ClientContext, "request">,
     params: SessionSteerRequest,
 ): Promise<SessionSteeringResponse> {

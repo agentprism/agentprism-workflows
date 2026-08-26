@@ -715,10 +715,7 @@ export class PiAcpAgent {
     return this.requireLive(context.params.sessionId).steer(context.params)
       .catch((error) => {
         if (isRequestError(error)) throw error;
-        // Codex-shaped catch-all: an unexpected internal failure resolves as a failed
-        // steering outcome; only typed adapter errors surface as JSON-RPC errors.
-        console.error("pi-acp steering failed:", error);
-        return { outcome: "failed" as const };
+        throw unexpectedError(error);
       });
   }
 
