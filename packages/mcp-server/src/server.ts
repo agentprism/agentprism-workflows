@@ -1376,14 +1376,14 @@ export function createWorkflowServer(
     title: "Discover, validate, run, inspect, await, stop, or narrow-cancel an agent workflow",
     description:
         "Author and operate JavaScript agent workflows through one project-scoped tool. " +
-        "A script's first statement must be `export const meta = { name, description, phases? }`. " +
+        "A script's first statement must be `export const meta = { name, description, phases? }`. When present, phases must be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings. " +
         "Inside the deterministic script realm use agent(prompt, options?) for one subagent; parallel([thunks]) for a barrier; " +
         "pipeline(items, ...stages) for streaming stages; checkpoint(prompt, options?) for a human gate; phase(title) and log(message) " +
         "for progress; and return the final JSON-serializable value. Top-level await is supported. Imports, require, network APIs, " +
         "Date.now(), and Math.random() are unavailable. Always label agent calls; schema is a plain JSON Schema object for structured results. " +
         "Useful agent options are label, phase, model, tier, mode, configOptions, schema, cwd, timeoutMs, retries, isolation:\"worktree\", agentType, mcpServers, images, meta, promptMeta, and keepSession. " +
         "Every parallel entry must be a thunk: parallel([() => agent(...), () => agent(...)]). " +
-        "Minimal script: `export const meta = { name: \"review\", description: \"Review a target\" }; const report = await agent(\"Review \" + args.target, { label: \"review\" }); return { report };`. " +
+        "Minimal script: `export const meta = { name: \"review\", description: \"Review a target\", phases: [{ title: \"Review\" }] }; phase(\"Review\"); const report = await agent(\"Review \" + args.target, { label: \"review\" }); return { report };`. " +
         "Omit model for the server default, or use a backend name alone to preserve that backend's configured default. " +
         "Before choosing a pinned model, mode, or configOptions, call action:\"config\" with projectDir and optional harnesses/modelFilter; after choosing a model, pass modelSpecs to read its model-specific options. " +
         "It opens no-prompt sessions, spends zero tokens, and starts no workflow. " +

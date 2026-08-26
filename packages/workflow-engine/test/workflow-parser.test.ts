@@ -147,10 +147,20 @@ test("parseWorkflowScript rejects phases that is not an array", () => {
   );
 });
 
-test("parseWorkflowScript rejects phases without title", () => {
+test("parseWorkflowScript rejects invalid phase entries with their exact shape and index", () => {
+  for (const phases of ["['Plan']", "[{ detail: 'x' }]"]) {
+    assert.throws(
+      () => parseWorkflowScript(`export const meta = { name: 'demo', description: 'desc', phases: ${phases} }`),
+      /meta\.phases\[0\] must be an object shaped \{ title: string, detail\?: string, model\?: string \}; phase entries cannot be strings/,
+    );
+  }
   assert.throws(
-    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc', phases: [{ detail: 'x' }] }"),
-    /must have a title string/,
+    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc', phases: [{ title: 'Plan', detail: 1 }] }"),
+    /meta\.phases\[0\]\.detail must be a string/,
+  );
+  assert.throws(
+    () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc', phases: [{ title: 'Plan', model: false }] }"),
+    /meta\.phases\[0\]\.model must be a string/,
   );
 });
 

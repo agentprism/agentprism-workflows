@@ -139,7 +139,8 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     assert.match(tool.description ?? "", /action:\"config\"/);
     assert.match(tool.description ?? "", /automatically performs static validation, a mocked dry run, and routed config checks/);
     assert.match(tool.description ?? "", /Every parallel entry must be a thunk/);
-    assert.match(tool.description ?? "", /Minimal script:/);
+    assert.match(tool.description ?? "", /phases must be an array of objects shaped `\{ title: string, detail\?: string, model\?: string \}`, never an array of strings/);
+    assert.match(tool.description ?? "", /Minimal script:.*phases: \[\{ title: \"Review\" \}\].*phase\(\"Review\"\)/);
     assert.match(tool.description ?? "", /configOptions, schema, cwd, timeoutMs, retries/);
     assert.doesNotMatch(tool.description ?? "", /npx|CLI|shell out/i);
 

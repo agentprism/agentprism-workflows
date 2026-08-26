@@ -3027,9 +3027,17 @@ function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
   if (value.model !== undefined && typeof value.model !== "string") throw new Error("meta.model must be a string");
   if (value.phases !== undefined) {
     if (!Array.isArray(value.phases)) throw new Error("meta.phases must be an array");
-    for (const phase of value.phases) {
+    for (const [index, phase] of value.phases.entries()) {
       if (!phase || typeof phase !== "object" || typeof (phase as WorkflowMetaPhase).title !== "string") {
-        throw new Error("each meta phase must have a title string");
+        throw new Error(
+          `meta.phases[${index}] must be an object shaped { title: string, detail?: string, model?: string }; phase entries cannot be strings`,
+        );
+      }
+      if ((phase as WorkflowMetaPhase).detail !== undefined && typeof (phase as WorkflowMetaPhase).detail !== "string") {
+        throw new Error(`meta.phases[${index}].detail must be a string`);
+      }
+      if ((phase as WorkflowMetaPhase).model !== undefined && typeof (phase as WorkflowMetaPhase).model !== "string") {
+        throw new Error(`meta.phases[${index}].model must be a string`);
       }
     }
   }
