@@ -1069,10 +1069,11 @@ test("§6.1/§6.2: pending notices survive a THROWING eval — they are consumed
       code: 'await new Promise(() => {}); "never"',
       timeoutMs: 10_000,
     });
-    await tick();
-    await tick();
-    const context = registry.getOrCreate(PROJECT);
-    const broker = context.repl?.broker ?? null;
+    let broker = registry.getOrCreate(PROJECT).repl?.broker ?? null;
+    for (let attempt = 0; attempt < 100 && broker === null; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      broker = registry.getOrCreate(PROJECT).repl?.broker ?? null;
+    }
     assert.ok(broker, "the touched project state has a broker");
     const concurrent = await broker.eval("reset()");
     assert.equal(concurrent.result, "undefined", "the concurrent session's reset() ran");
