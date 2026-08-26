@@ -1,5 +1,11 @@
 # @automatalabs/repl-engine
 
+## 0.4.2
+
+### Patch Changes
+
+- @automatalabs/workflows@0.52.1
+
 ## 0.4.1
 
 ### Patch Changes

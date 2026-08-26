@@ -1,5 +1,11 @@
 # @automatalabs/workflow-engine
 
+## 0.37.1
+
+### Patch Changes
+
+- affc0fe: Document the exact `meta.phases` entry shape in the MCP tool-local authoring contract and return indexed, actionable parser diagnostics for invalid phase metadata.
+
 ## 0.37.0
 
 ### Minor Changes
