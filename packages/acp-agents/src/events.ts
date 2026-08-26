@@ -18,7 +18,7 @@ import type {
   SessionNotification,
 } from "@agentclientprotocol/sdk";
 import type { BackendId } from "./backend.js";
-import type { SteeringOutcome } from "./acp-client.js";
+import type { SteeringResponse } from "./acp-client.js";
 
 /** The ACP session/update discriminated union (every real-time update an agent can stream). */
 export type AcpSessionUpdate = SessionNotification["update"];
@@ -91,7 +91,8 @@ export interface AcpRawMessageEvent extends AcpEventContext {
 /** A resolved `_session/steering` response. The originating prompt and request `_meta` are
  *  deliberately excluded: steering is observable without leaking user content or metadata. */
 export interface AcpSteeringEvent extends AcpEventContext {
-  outcome: SteeringOutcome;
+  /** Complete server response; request prompt content and request `_meta` remain private. */
+  response: SteeringResponse;
 }
 
 /** A pooled backend process crashed (not a graceful dispose). The engine retries the run on a
@@ -121,7 +122,7 @@ export type AcpRunnerEventMap = AcpSessionUpdateEvents & {
   elicitation_complete: AcpElicitationCompleteEvent;
   /** A vendor extension notification arrived for a session. */
   raw_message: AcpRawMessageEvent;
-  /** A `_session/steering` request resolved, including the agent's outcome unchanged. */
+  /** A `_session/steering` request resolved, including the complete server response unchanged. */
   steering: AcpSteeringEvent;
   /** A new session was opened on a pooled connection. */
   session_open: AcpEventContext;

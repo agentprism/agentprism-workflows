@@ -101,7 +101,11 @@ test("interactive session drives three prompt turns on one dedicated process", a
   assert.equal((await session.prompt("first")).text, "one");
   assert.equal((await session.prompt([{ type: "text", text: "second" }])).text, "two");
   const third = await session.prompt("third", { images: [image] });
-  assert.deepEqual(third, { stopReason: "end_turn", text: "three!" });
+  assert.deepEqual(third, {
+    stopReason: "end_turn",
+    text: "three!",
+    response: { stopReason: "end_turn" },
+  });
   await session.release();
 
   const log = readLog();
@@ -114,6 +118,35 @@ test("interactive session drives three prompt turns on one dedicated process", a
   assert.ok(newSessions.every((entry) => entry.pid === pid), "session/new used the dedicated process");
   assert.ok(prompts.every((entry) => entry.pid === pid), "all turns used the same process");
   assert.deepEqual(prompts[2]?.params?.prompt, [{ type: "text", text: "third" }, { type: "image", ...image }]);
+});
+
+test("interactive turns expose the complete PromptResponse including arbitrary nested metadata", async () => {
+  const responseMeta = {
+    vendor: {
+      nested: [1, null, { complete: true, future: { value: "untouched" } }],
+    },
+  };
+  const { cwd } = configure({
+    turns: [{
+      text: "done",
+      usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+      responseMeta,
+    }],
+  });
+  const runner = makeRunner();
+  const session = await runner.openSession({ cwd });
+
+  const turn = await session.prompt("work");
+  assert.deepEqual(turn, {
+    stopReason: "end_turn",
+    text: "done",
+    response: {
+      stopReason: "end_turn",
+      usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+      _meta: responseMeta,
+    },
+  });
+  await session.release();
 });
 
 test("interactive prompt maps a structured provider wall with reset metadata", async () => {
@@ -261,7 +294,11 @@ test("a second prompt while one is in flight throws and the active turn can be c
     /InteractiveSession\.prompt\(\) already has a prompt in flight/,
   );
   await session.cancel();
-  assert.deepEqual(await first, { stopReason: "cancelled", text: "" });
+  assert.deepEqual(await first, {
+    stopReason: "cancelled",
+    text: "",
+    response: { stopReason: "cancelled" },
+  });
   await session.release();
 });
 

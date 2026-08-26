@@ -74,14 +74,9 @@ export interface Backend {
    *  initialized agent strictly advertises HTTP MCP support. Native schema channels leave this
    *  unset; custom ACP backends opt in unless their registry entry disables it. */
   readonly injectStructuredOutputTool?: boolean;
-  /** The agentCapabilities._meta namespace this backend's agent advertises under, and the bare
-   *  `_meta` keys gated by same-named boolean flags in that block; undefined = this backend has
-   *  no custom-capability contract (its custom `_meta`, if any, is never gated). */
-  readonly customCapabilities?: { readonly namespace: string; readonly gatedKeys: readonly string[] };
   /** OPTIONAL `initialize.clientCapabilities._meta` this backend adds: the namespaced vendor
-   *  extensions THIS CLIENT implements for that agent, so the agent may turn them on. The mirror
-   *  image of `customCapabilities` (which reads what the AGENT advertised). Backend-scoped on
-   *  purpose — advertising a capability to an agent that does not implement it is noise, and
+   *  extensions THIS CLIENT implements for that agent, so the agent may turn them on. Backend-scoped
+   *  on purpose — advertising a capability to an agent that does not implement it is noise, and
    *  advertising one this client does not consume would be a lie. Undefined for every backend that
    *  negotiates no client-side extension, which keeps its handshake byte-identical.
    *  Folded into the top-level `_meta` alongside the auth layer's own `terminal-auth` key; the two
@@ -111,7 +106,9 @@ export interface Backend {
    *  keys win over the generic user passthrough. `inputs` carries optional per-session extras
    *  (e.g. Codex base/developer instructions); a backend that has no use for them ignores it. */
   sessionMeta(schema: TSchema | undefined, inputs?: SessionMetaInputs): Record<string, unknown> | undefined;
-  /** `_meta` for session/prompt (undefined when this backend carries the schema at session/new). */
+  /** Protocol-critical `_meta` for session/prompt (undefined when this backend carries the schema
+   *  at session/new). These keys win direct collisions with caller prompt metadata; unrelated
+   *  caller keys are transported unchanged. */
   promptMeta(schema: TSchema | undefined): Record<string, unknown> | undefined;
   /** Read this backend's native structured result for the latest turn (unvalidated), or undefined. */
   nativeStructured?(source: StructuredSource): unknown;

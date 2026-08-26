@@ -212,9 +212,9 @@ export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = Object.freeze(
   AUTH_META_MATRIX_ROWS.map((row) => Object.freeze(row)),
 );
 
-/** One executable disposition for a vendor extension that is intentionally absent from the
- *  standard SDK AGENT_METHODS table. `typed-unsupported` means the public wrapper exists and
- *  rejects from initialize negotiation before emitting a wire request. The loaded-turn
+/** One executable advertisement record for a vendor extension that is intentionally absent from
+ *  the standard SDK AGENT_METHODS table. This matrix documents installed/built-in behavior only;
+ *  it never gates or routes runtime extension calls. The loaded-turn
  *  extension (turn-terminal state for loaded sessions) is only served by the two in-repo
  *  servers (pi-acp, codex-acp); claude and opencode do not advertise it — the seam then
  *  classifies the loaded session's founding turn through the OBSERVATION path instead (the
@@ -228,7 +228,7 @@ export const AUTH_META_MATRIX: readonly AuthMetaMatrixRow[] = Object.freeze(
 export interface AcpExtensionSupportMatrixRow {
   readonly agent: string;
   readonly method: typeof SESSION_STEERING_METHOD | typeof LOADED_TURN_QUERY_METHOD;
-  readonly disposition: "supported" | "typed-unsupported" | "not-advertised";
+  readonly disposition: "supported" | "not-advertised";
   /** Installed distributions whose method + initialize advertisement are probed by the protocol
    *  coverage suite. Pi is workspace-owned and covered in its package tests instead. */
   readonly distProbe?: "claude" | "codex";
@@ -250,7 +250,7 @@ const ACP_EXTENSION_SUPPORT_MATRIX_ROWS = [
   {
     agent: "opencode",
     method: SESSION_STEERING_METHOD,
-    disposition: "typed-unsupported",
+    disposition: "not-advertised",
   },
   {
     agent: "pi",

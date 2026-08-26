@@ -113,7 +113,6 @@ import {
   adaptPromptContent,
   describeAuthProviderAdvertisement,
   describeLifecycleAdvertisement,
-  gateCustomMeta,
   isSupportedProtocolVersion,
   negotiateCapabilities,
   unsupportedMcpServer,
@@ -190,19 +189,15 @@ export interface LoadedTurnEndedNotification {
   stopReason?: string;
   error?: { name: string; message: string };
 }
-/** Every outcome an ACP steering agent can resolve with. */
-export type SteeringOutcome = "injected" | "startedNewTurn" | "failed";
-/** Exact `_session/steering` wire request. Optional `_meta` uses the same outgoing custom-meta
- *  gate as other session requests, independently of the initialize steering advertisement. */
+/** Exact `_session/steering` wire request. Extension metadata is transported transparently. */
 export interface SteeringRequest {
   sessionId: string;
   prompt: ContentBlock[];
   _meta?: Record<string, unknown>;
 }
-/** Exact `_session/steering` wire response. */
-export interface SteeringResponse {
-  outcome: SteeringOutcome;
-}
+/** Complete raw `_session/steering` wire response. The owning host validates its shape and fields,
+ *  so even a malformed JSON value is returned unchanged for that layer to classify. */
+export type SteeringResponse = unknown;
 /** Bound the best-effort session/close round-trip so a slow agent can't hang run()'s finally. */
 const CLOSE_SESSION_TIMEOUT_MS = 5_000;
 /** Grace for a cancelled prompt/config lifecycle to settle before close + process quarantine. */
@@ -1242,10 +1237,10 @@ class MultiplexClient {
 
   /** Emit one privacy-safe observation after a steering request resolves. Context comes from the
    *  live session or its teardown tombstone; prompt content and request `_meta` never enter it. */
-  steeringResponse(sessionId: string, outcome: SteeringOutcome): void {
+  steeringResponse(sessionId: string, response: SteeringResponse): void {
     this.onEvent?.("steering", {
       ...this.contextFor(sessionId),
-      outcome,
+      response,
     });
   }
 
@@ -1319,8 +1314,8 @@ function assertSafeRawRequest(method: string): void {
   if (!guidance) return;
   if (method === SESSION_STEERING_METHOD) {
     throw new Error(
-      `Raw ACP request "${method}" is guarded: ${guidance}. The named wrapper enforces the ` +
-        "initialize-response steering capability and emits the privacy-safe session steering event.",
+      `Raw ACP request "${method}" is guarded: ${guidance}. The named wrapper preserves the complete ` +
+        "extension response and emits the privacy-safe session steering event.",
     );
   }
   throw new Error(
@@ -1373,22 +1368,6 @@ function lifecycleCapabilityError(
     : "initialize did not complete";
   return new WorkflowError(
     `ACP agent (${backendId}) does not advertise ${method}; advertised lifecycle capabilities: ${advertised}`,
-    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-    { recoverable: false, agentLabel: label },
-  );
-}
-
-function steeringCapabilityError(
-  backendId: BackendId,
-  capabilities: NegotiatedCapabilities | undefined,
-  label: string | undefined,
-): WorkflowError {
-  const advertised =
-    capabilities === undefined
-      ? "initialize did not complete"
-      : "InitializeResponse._meta.steering.supported was not exactly true";
-  return new WorkflowError(
-    `ACP agent (${backendId}) does not advertise ${SESSION_STEERING_METHOD}; ${advertised}`,
     WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
     { recoverable: false, agentLabel: label },
   );
@@ -1798,12 +1777,6 @@ export class PooledConnection {
     return this.negotiated;
   }
 
-  /** Drop the backend-declared bare `_meta` keys the connected agent did not advertise support
-   *  for (see gateCustomMeta). Applied to BOTH session/new and session/prompt `_meta`. */
-  gateCustomMeta(meta: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-    return gateCustomMeta(meta, this.negotiated?.customMetaSupport, this.negotiated?.gatedKeys);
-  }
-
   private assertSupportedMcpServers(opts: AcpSessionOptions): void {
     const unsupported = this.negotiated
       ? unsupportedMcpServer(opts.mcpServers, this.negotiated.agent, {
@@ -1828,18 +1801,16 @@ export class PooledConnection {
   }
 
   private sessionRequestMeta(opts: AcpSessionOptions): Record<string, unknown> | undefined {
-    return this.gateCustomMeta(
-      stampRunId(
-        layerMeta(
-          this.backend.sessionMetaDefaults?.(),
-          opts.meta,
-          this.backend.sessionMeta(opts.schema, {
-            baseInstructions: opts.baseInstructions,
-            developerInstructions: opts.developerInstructions,
-          }),
-        ),
-        opts.runId,
+    return stampRunId(
+      layerMeta(
+        this.backend.sessionMetaDefaults?.(),
+        opts.meta,
+        this.backend.sessionMeta(opts.schema, {
+          baseInstructions: opts.baseInstructions,
+          developerInstructions: opts.developerInstructions,
+        }),
       ),
+      opts.runId,
     );
   }
 
@@ -2033,7 +2004,7 @@ export class PooledConnection {
         ),
         deadline,
       ]);
-      const negotiated = negotiateCapabilities(response, this.backend.customCapabilities);
+      const negotiated = negotiateCapabilities(response);
       // Version negotiation: the agent replies with the version it chose (our requested version if
       // it supports it, else its own latest). If this client cannot speak it, the ACP spec says
       // CLOSE the connection and inform the user — kill the process (so the pool evicts it) and
@@ -2188,9 +2159,9 @@ export class PooledConnection {
     // session/new `_meta`, layered lowest-to-highest precedence: the backend's static
     // defaults (a custom registry entry's `sessionMeta`), then the generic user passthrough
     // (opts.meta), then the backend's protocol-critical `_meta` (Claude schema channel;
-    // Codex base/developer instructions), then the engine runId correlation stamp. The result
-    // is gated against the agent's advertised custom capabilities (a declared key the agent
-    // said it does not honor is dropped). When no layer survives, no `_meta` is sent.
+    // Codex base/developer instructions), then the engine runId correlation stamp. Direct
+    // collisions are won by the later backend/host-owned protocol-critical layer; every unrelated
+    // caller key is transported unchanged. When no layer is present, no `_meta` is sent.
     const meta = this.sessionRequestMeta(opts);
     const request: NewSessionRequest = {
       cwd: opts.cwd,
@@ -2459,39 +2430,22 @@ export class PooledConnection {
     return this.race(this.connection.agent.request(AGENT_METHODS.session_prompt, request));
   }
 
-  /** Driven `_session/steering` extension request. The top-level initialize advertisement is
-   *  checked before any wire request. rawAgentRequest preserves the response object instead of
-   *  applying an SDK standard-method mapper, and its internal race surfaces process death. */
-  async steerSession(request: SteeringRequest, label?: string): Promise<SteeringResponse> {
+  /** Driven `_session/steering` extension request. Extension ownership belongs to the caller:
+   *  this transport preserves the complete response and does not capability-gate the wire call. */
+  async steerSession(request: SteeringRequest, _label?: string): Promise<SteeringResponse> {
     await this.ready;
-    if (this.negotiated?.supportsSteering !== true) {
-      throw steeringCapabilityError(this.backendId, this.negotiated, label);
-    }
     const response = await this.rawAgentRequest<SteeringResponse, SteeringRequest>(
       SESSION_STEERING_METHOD,
       request,
     );
-    this.client.steeringResponse(request.sessionId, response.outcome);
+    this.client.steeringResponse(request.sessionId, response);
     return response;
   }
 
-  /** Driven `_session/loaded_turn/query` extension request (the re-attach
-   *  arm's authoritative founding-turn classification): asks whether the
-   *  loaded session's founding turn is still running at the backend, or
-   *  ended while the host was down. Strictly capability-gated on the
-   *  initialize `_meta.loadedTurn.supported === true` advertisement — a
-   *  backend without the extension rejects before any wire request (the
-   *  "same gate" the seam's degradation keys on). */
-  async queryLoadedTurn(sessionId: string, label?: string): Promise<LoadedTurnQueryResponse> {
+  /** Driven `_session/loaded_turn/query` request. The extension owner checks the raw initialize
+   *  advertisement before invoking this transport. */
+  async queryLoadedTurn(sessionId: string, _label?: string): Promise<LoadedTurnQueryResponse> {
     await this.ready;
-    if (this.negotiated?.supportsLoadedTurnTerminalState !== true) {
-      throw new WorkflowError(
-        `ACP agent (${this.backendId}) does not advertise ${LOADED_TURN_QUERY_METHOD}; ` +
-          "InitializeResponse._meta.loadedTurn.supported was not exactly true",
-        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-        { recoverable: false, agentLabel: label },
-      );
-    }
     return this.rawAgentRequest<LoadedTurnQueryResponse, LoadedTurnQueryRequest>(LOADED_TURN_QUERY_METHOD, {
       sessionId,
     });
@@ -2863,13 +2817,10 @@ export class SessionHandle implements StructuredSource {
       typeof content === "string"
         ? content
         : adaptPromptContent(content, this.pooled.capabilities?.agent ?? {}, this.pooled.backendId);
-    // Gate the turn `_meta` against the agent's advertised custom capabilities: a declared
-    // turn-level key is dropped when the connected agent said it does not honor it.
-    const gatedMeta = this.pooled.gateCustomMeta(promptMeta);
     const request: PromptRequest = {
       sessionId: this.sessionId,
       prompt: typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt,
-      ...(gatedMeta ? { _meta: gatedMeta } : {}),
+      ...(promptMeta ? { _meta: promptMeta } : {}),
     };
     try {
       const response = await this.pooled.prompt(request);
@@ -2920,28 +2871,26 @@ export class SessionHandle implements StructuredSource {
     });
   }
 
-  /** Inject content into the currently running prompt turn through the negotiated steering
-   *  extension. This deliberately owns no turn state: it does not begin/replace a turn, accumulate
-   *  output, record usage, or retry a late `startedNewTurn` outcome. */
+  /** Inject content into the currently running prompt turn through the steering extension.
+   *  Extension advertisement and response interpretation belong to the host. This deliberately
+   *  owns no turn state: it does not begin/replace a turn, accumulate output, or record usage. */
   async steer(
     content: string | ContentBlock[],
     promptMeta?: Record<string, unknown>,
-  ): Promise<SteeringOutcome> {
+  ): Promise<SteeringResponse> {
     this.opts.signal?.throwIfAborted();
     const prompt =
       typeof content === "string"
         ? [{ type: "text", text: content } satisfies ContentBlock]
         : adaptPromptContent(content, this.pooled.capabilities?.agent ?? {}, this.pooled.backendId);
-    const gatedMeta = this.pooled.gateCustomMeta(promptMeta);
-    const response = await this.pooled.steerSession(
+    return this.pooled.steerSession(
       {
         sessionId: this.sessionId,
         prompt,
-        ...(gatedMeta ? { _meta: gatedMeta } : {}),
+        ...(promptMeta ? { _meta: promptMeta } : {}),
       },
       this.opts.label,
     );
-    return response.outcome;
   }
 
   /** StructuredSource — the latest turn's assistant text. */

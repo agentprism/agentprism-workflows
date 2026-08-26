@@ -10,7 +10,7 @@
 // a whole-turn scan would pick up a progress object instead of the result.
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
-import { CODEX_CUSTOM_CAPABILITY_NAMESPACE, CODEX_META_KEYS, META_KEYS } from "@automatalabs/shared-types";
+import { CODEX_META_KEYS, META_KEYS } from "@automatalabs/shared-types";
 import type { AuthProfile } from "../auth/auth-profile.js";
 import type {
   Backend,
@@ -21,7 +21,6 @@ import type {
   StructuredSource,
 } from "../backend.js";
 import { splitArgs } from "../backend.js";
-import { GATED_CUSTOM_META_KEYS } from "../capabilities.js";
 import { BUILTIN_PROTOCOL_COVERAGE } from "../protocol-coverage.js";
 import { toStrictJsonSchema } from "../schema-strict.js";
 import { parseFinalJson } from "../structured-output.js";
@@ -52,11 +51,6 @@ export class CodexBackend implements Backend {
   readonly id = "codex" as const;
 
   constructor(readonly authProfile: AuthProfile = codexAuthProfile) {}
-
-  readonly customCapabilities = {
-    namespace: CODEX_CUSTOM_CAPABILITY_NAMESPACE,
-    gatedKeys: GATED_CUSTOM_META_KEYS,
-  } as const;
 
   /** Turn on codex-acp's negotiated typed-session-failures extension at `initialize` (see
    *  typed-failures.ts). Truthful: SessionHandle consumes BOTH delivery channels the server opens

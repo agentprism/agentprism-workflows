@@ -30,7 +30,6 @@ test("PiBackend exposes the standard injected structured-output posture", () => 
   assert.equal(backend.id, "pi");
   assert.equal(backend.embedSchemaInPrompt, true);
   assert.equal(backend.injectStructuredOutputTool, true);
-  assert.equal(backend.customCapabilities, undefined);
   assert.equal(backend.nativeStructured, undefined);
 });
 

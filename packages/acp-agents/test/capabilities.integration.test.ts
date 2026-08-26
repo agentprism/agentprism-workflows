@@ -1,9 +1,6 @@
-// End-to-end ACP capability negotiation against a MOCK ACP agent whose initialize response is
-// scripted per test (test/fixtures/fake-acp-agent.mjs honors scenario.initialize). Proves the real
-// fluent client() connection negotiates the handshake and then GATES what it sends on what the agent
-// advertised: the @automatalabs/codex-acp custom `_meta` keys (session/new instruction overrides +
-// the turn-level outputSchema forward), the MCP transports, and the protocol version — while a
-// legacy agent that advertises nothing keeps today's send-everything behavior.
+// End-to-end ACP capability negotiation against a mock ACP agent whose initialize response is
+// scripted per test. Standard MCP/protocol capabilities remain negotiated, while vendor extension
+// metadata is transported transparently regardless of agentCapabilities._meta lookalikes.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
@@ -82,7 +79,7 @@ test("initialize advertises NO client capabilities (we implement no fs/terminal 
   assert.equal(init.params?.protocolVersion, PROTOCOL_VERSION);
 });
 
-// ---- legacy agent: no advertisement => send everything (back-compat) ----------------
+// ---- extension metadata is always transparent --------------------------------------
 
 test("legacy agent (no custom namespace): Codex instruction overrides ride session/new unchanged", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
@@ -106,9 +103,7 @@ test("legacy agent (no custom namespace): the Codex outputSchema forward rides s
   assert.ok(promptMeta(readLog())[META_KEYS.outputSchema], "no advertisement => outputSchema still forwarded");
 });
 
-// ---- advertising agent: gate each key on its flag -----------------------------------
-
-test("advertising agent: drops the un-advertised session/new instruction key, keeps the advertised one", async () => {
+test("agent capability lookalikes do not filter session/new extension metadata", async () => {
   const { cwd, readLog } = configure({
     initialize: forkInitialize({ baseInstructions: true, developerInstructions: false }),
     turns: [{ text: "ok" }],
@@ -121,24 +116,22 @@ test("advertising agent: drops the un-advertised session/new instruction key, ke
   });
 
   const meta = newSessionMeta(readLog());
-  assert.equal(meta[CODEX_META_KEYS.baseInstructions], "BASE", "advertised true => sent");
-  assert.equal(CODEX_META_KEYS.developerInstructions in meta, false, "advertised false => dropped");
+  assert.equal(meta[CODEX_META_KEYS.baseInstructions], "BASE");
+  assert.equal(meta[CODEX_META_KEYS.developerInstructions], "DEV");
 });
 
-test("advertising agent (outputSchema:false): suppresses the turn-level outputSchema forward", async () => {
+test("agent capability lookalikes do not filter prompt extension metadata", async () => {
   const { cwd, readLog } = configure({
     initialize: forkInitialize({ outputSchema: false }),
     turns: [{ text: '{"city":"Oslo","hot":false}' }],
   });
   const out = await makeRunner().run("classify", { model: "codex", cwd, schema: SCHEMA });
 
-  // The run still resolves (the runner's validate/extract ladder reads the final JSON), but the
-  // schema forward the agent said it does not honor never crossed the wire.
   assert.deepEqual(out, { city: "Oslo", hot: false });
-  assert.equal(META_KEYS.outputSchema in promptMeta(readLog()), false, "un-advertised => suppressed");
+  assert.ok(promptMeta(readLog())[META_KEYS.outputSchema]);
 });
 
-test("advertising agent (outputSchema:true): still forwards the turn-level outputSchema", async () => {
+test("an affirmative capability lookalike also leaves prompt extension metadata unchanged", async () => {
   const { cwd, readLog } = configure({
     initialize: forkInitialize({ outputSchema: true }),
     turns: [{ text: '{"city":"Oslo","hot":false}' }],
