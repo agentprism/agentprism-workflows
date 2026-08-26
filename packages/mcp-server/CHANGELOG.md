@@ -1,5 +1,13 @@
 # @automatalabs/mcp-server
 
+## 0.32.1
+
+### Patch Changes
+
+- affc0fe: Document the exact `meta.phases` entry shape in the MCP tool-local authoring contract and return indexed, actionable parser diagnostics for invalid phase metadata.
+  - @automatalabs/workflows@0.52.1
+  - @automatalabs/repl-engine@0.4.2
+
 ## 0.32.0
 
 ### Minor Changes

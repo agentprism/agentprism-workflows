@@ -1,5 +1,13 @@
 # @automatalabs/workflows
 
+## 0.52.1
+
+### Patch Changes
+
+- Updated dependencies [affc0fe]
+  - @automatalabs/workflow-engine@0.37.1
+  - @automatalabs/repl-engine@0.4.2
+
 ## 0.52.0
 
 ### Minor Changes
