@@ -32,7 +32,7 @@ const rounds = [];
 for (let i = 0; i < maxRounds; i += 1) {
   rounds.push(await agent(\`Review round \${i + 1}: inspect the repository and report unresolved release blockers.\`, { label: \`review:\${i + 1}\`, phase: 'Review', resume: { filesystem: 'read-only' } }));
 }
-if (maxRounds < 8) throw new Error(\`review cap \${maxRounds} reached before 8 rounds\`);
+if (maxRounds < 8) await checkpoint(\`review cap \${maxRounds} reached before 8 rounds\`, { headless: 'abort' });
 return { rounds };`;
 
 test("resumeFromRunId loads the persisted journal and REPLAYS it (runner is not re-invoked)", async () => {

@@ -25,8 +25,11 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
 import {
+  buildModelFilter,
   parseWorkflowScript,
+  probeHarnessConfig,
   redactText,
+  validateWorkflowScript,
   truncateUtf8,
   WorkflowError,
   WorkflowErrorCode,
@@ -85,6 +88,13 @@ import { registerReplTool } from "./repl-tool.js";
 import { ReplPresenceLedger } from "./repl-presence.js";
 import { createReplProjectState, DEFAULT_REPL_EVAL_TIMEOUT_MS } from "./repl-project.js";
 import { REPL_DRAIN_BOUND_MS } from "./daemon/constants.js";
+import {
+  configSummary,
+  configText,
+  validationSummary,
+  validationText,
+  workflowProbeRunner,
+} from "./workflow-preflight.js";
 import type { WorkflowServerControl } from "./lifecycle.js";
 import {
   WorkflowScriptResources,
@@ -121,8 +131,10 @@ export const SERVER_INSTRUCTIONS = [
     "by absolute scriptPath) that fans out agent() subagents and optional checkpoint() gates; it " +
     "runs to completion in the foreground, or background:true returns a durable runId for bounded " +
     "action:\"await\"/\"inspect\"/\"stop\" calls, with journaling, replay, and resumeFromRunId. Reach " +
-    "for it when the orchestration is known up front and you want it repeatable and resumable. The " +
-    "user-invocable author-workflow prompt helps write scripts.",
+    "for it when the orchestration is known up front and you want it repeatable and resumable. " +
+    "action:\"config\" discovers the live backend/model option catalog without starting a run, and " +
+    "every run is statically checked, mock-executed, and config-probed before admission. The " +
+    "user-invocable author-workflow prompt provides the exhaustive authoring reference.",
   "• repl — INTERACTIVE STATEFUL orchestration. A persistent per-project JavaScript VM you drive " +
     "incrementally with action:\"eval\"; named bindings, pending subagent calls, raised checkpoints, " +
     "and `_` (the previous eval's completion value) persist between calls and survive daemon restarts. " +
@@ -1340,6 +1352,7 @@ export function createWorkflowServer(
   };
 
   registerAuthoringPrompt(mcp);
+  const probeRunner = workflowProbeRunner(runner);
 
   // The REPL tool (roadmap doc's Surface section; phase D wiring): one
   // persistent VM per project context, restored from the daemon's
@@ -1360,14 +1373,25 @@ export function createWorkflowServer(
   });
 
   const workflowToolConfig = {
-    title: "Run, inspect, await, stop, or narrow-cancel a dynamic agent workflow",
+    title: "Discover, validate, run, inspect, await, stop, or narrow-cancel an agent workflow",
     description:
-        "Run, resume, inspect, await, or stop a JavaScript agent workflow through one project-scoped tool. The " +
+        "Author and operate JavaScript agent workflows through one project-scoped tool. " +
+        "A script's first statement must be `export const meta = { name, description, phases? }`. " +
+        "Inside the deterministic script realm use agent(prompt, options?) for one subagent; parallel([thunks]) for a barrier; " +
+        "pipeline(items, ...stages) for streaming stages; checkpoint(prompt, options?) for a human gate; phase(title) and log(message) " +
+        "for progress; and return the final JSON-serializable value. Top-level await is supported. Imports, require, network APIs, " +
+        "Date.now(), and Math.random() are unavailable. Always label agent calls; add schema for structured results. " +
+        "Omit model for the server default, or use a backend name alone to preserve that backend's configured default. " +
+        "Before choosing a pinned model, mode, or configOptions, call action:\"config\" with projectDir and optional harnesses/modelFilter; after choosing a model, pass modelSpecs to read its model-specific options. " +
+        "It opens no-prompt sessions, spends zero tokens, and starts no workflow. " +
+        "action:\"run\" automatically performs static validation, a mocked dry run, and routed config checks before admission. " +
+        "Invalid scripts return bounded diagnostics with status:\"rejected\" and create no run ID, reserve no background slot, and spend no tokens. " +
+        "Run, resume, inspect, await, or stop an admitted workflow through the same tool. The " +
         "script orchestrates agent() subagents (and optional checkpoint() gates) over registry built-ins—currently Claude, Codex, OpenCode, and pi—" +
         "ACP backends, plus registered custom agents. Supply exactly one of inline script or absolute scriptPath; path content is " +
         "read once and snapshotted at admission. " +
         (requireProjectDir
-          ? "run REQUIRES projectDir (absolute): it selects the project-scoped run store and the run's default execution cwd. "
+          ? "config and run REQUIRE projectDir (absolute): it is the discovery cwd and selects the project-scoped run store/default execution cwd. "
           : "run optionally takes projectDir (absolute) to select the project-scoped run store; default is this server's own project. ") +
         "inspect/await/stop take only a runId — it locates its project store automatically. " +
         "Foreground is the default and streams progress; background:true returns " +
@@ -1397,6 +1421,50 @@ export function createWorkflowServer(
         );
       }
       const parsedInput = parseWorkflowToolInput(args, { requireProjectDir });
+      if (parsedInput.action === "config") {
+        let cwd = defaultContext?.projectDir;
+        if (parsedInput.projectDir !== undefined) {
+          const resolution = resolveProjectDir(parsedInput.projectDir);
+          if (!resolution.ok) {
+            throw new McpError(ErrorCode.InvalidParams, `Invalid workflow tool input: ${resolution.message}`);
+          }
+          cwd = resolution.projectDir;
+        }
+        if (cwd === undefined) {
+          throw new McpError(ErrorCode.InvalidParams, "Invalid workflow tool input: config requires projectDir on this server");
+        }
+        if (parsedInput.modelFilter !== undefined) {
+          try {
+            buildModelFilter(parsedInput.modelFilter);
+          } catch (error) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              `Invalid workflow tool input: modelFilter is invalid — ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+        const report = await probeHarnessConfig({
+          harnesses: parsedInput.harnesses,
+          modelSpecs: parsedInput.modelSpecs,
+          cwd,
+          timeoutMs: parsedInput.probeTimeoutMs,
+          probeRunner,
+        });
+        let projected;
+        try {
+          projected = configSummary(report, parsedInput.modelFilter);
+        } catch (error) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `Invalid workflow tool input: modelFilter is invalid — ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        return {
+          structuredContent: projected,
+          content: [{ type: "text", text: configText(report, parsedInput.modelFilter) }],
+          isError: false,
+        };
+      }
       const context = resolveContext(parsedInput);
       if (context === undefined) {
         // Only reachable for runId actions whose run exists in no known project store.
@@ -1750,22 +1818,23 @@ export function createWorkflowServer(
       let elicitationController: AbortController | undefined;
       let cancelElicitationFromRequest: (() => void) | undefined;
       let foregroundRunId: string | undefined;
-      if (input.background) {
-        if (!backgroundRuns.reserve()) {
+      let preflightWarningText = "";
+      try {
+        // Static validation is the first admission boundary: malformed scripts never reserve a
+        // background slot, create a run ID, write run state, open a backend, or spend tokens.
+        const staticValidation = await validateWorkflowScript(admittedScript, {
+          args: input.args,
+          dryRun: false,
+        });
+        if (!staticValidation.ok) {
+          const validation = validationSummary(staticValidation);
           return {
-            content: [
-              {
-                type: "text",
-                text: "Background workflow limit reached (4 active or starting runs). Await an existing run and retry.",
-              },
-            ],
+            structuredContent: { action: "run" as const, status: "rejected" as const, validation },
+            content: [{ type: "text", text: validationText(staticValidation) }],
             isError: true,
           };
         }
-        backgroundReservation = true;
-      }
 
-      try {
         // Trust gate for script-declared meta.backends — BEFORE any run exists. A refusal is an
         // informative tool error (never a silent drop, never a hang on a non-eliciting client).
         const backendsGate = await resolveScriptBackends(mcp.server, admittedScript, backendApprovals);
@@ -1774,6 +1843,53 @@ export function createWorkflowServer(
             content: [{ type: "text", text: backendsGate.message }],
             isError: true,
           };
+        }
+
+        // Full zero-token preflight: execute control flow against the mock runner, resolve
+        // host-served nested workflows, then probe each routed backend/model without prompting.
+        // Invalid scripts are diagnostics, not failed runs: admission has not started yet.
+        const preflight = await validateWorkflowScript(admittedScript, {
+          args: input.args,
+          cwd: context.projectDir,
+          maxAgents: input.maxAgents,
+          timeoutMs: 30_000,
+          probeTimeoutMs: 60_000,
+          probeRunner,
+          loadSavedWorkflow: (name) => context.manager.resolveSavedWorkflow(name),
+        });
+        if (!preflight.ok) {
+          const validation = validationSummary(preflight);
+          return {
+            structuredContent: { action: "run" as const, status: "rejected" as const, validation },
+            content: [{ type: "text", text: validationText(preflight) }],
+            isError: true,
+          };
+        }
+        if (preflight.warnings.length > 0) {
+          const lines = preflight.warnings.slice(0, 20).map((warning) => `- ${warning}`);
+          if (preflight.warnings.length > lines.length) {
+            lines.push(`- … ${preflight.warnings.length - lines.length} more warning(s) omitted`);
+          }
+          preflightWarningText = truncateUtf8(
+            `\nPreflight warnings (the run was admitted):\n${lines.join("\n")}`,
+            4_096,
+            "…[preflight warnings truncated]",
+          );
+        }
+
+        if (input.background) {
+          if (!backgroundRuns.reserve()) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "Background workflow limit reached (4 active or starting runs). Await an existing run and retry.",
+                },
+              ],
+              isError: true,
+            };
+          }
+          backgroundReservation = true;
         }
 
         const exec: ExecOptions = {
@@ -1856,6 +1972,7 @@ export function createWorkflowServer(
                 text:
                   `Workflow "${workflowName}" started in the background.\n` +
                   `runId: ${started.runId}\n` +
+                  (preflightWarningText ? `${preflightWarningText.trimStart()}\n` : "") +
                   (admittedRun.replayEligibility
                     ? `${formatResumeSummary(admittedRun.replayEligibility)}\n`
                     : "") +
@@ -1896,7 +2013,7 @@ export function createWorkflowServer(
         return {
           structuredContent: { ...structuredContent },
           content: [
-            { type: "text", text: formatRunSummary(run) },
+            { type: "text", text: `${formatRunSummary(run)}${preflightWarningText}` },
             ...scriptResources.links([{ runId: run.runId, uri: scriptUri, available: true }]),
           ],
           isError,

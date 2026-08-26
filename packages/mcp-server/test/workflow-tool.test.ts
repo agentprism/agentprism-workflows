@@ -98,13 +98,31 @@ function outputVariantFixtures() {
     ...terminalOutcomeFixture,
     scriptSource: "inline" as const,
   };
-  return { execution, background, inspection, terminalAwait, nonterminalAwait, stop };
+  const config = {
+    action: "config" as const,
+    ok: true,
+    harnessOptions: [],
+    omittedHarnesses: 0,
+    models: [],
+  };
+  const rejected = {
+    action: "run" as const,
+    status: "rejected" as const,
+    validation: {
+      ok: false as const,
+      exitCode: 1 as const,
+      parse: { ok: false, error: "bad script" },
+      warnings: [],
+      omittedWarnings: 0,
+    },
+  };
+  return { config, rejected, execution, background, inspection, terminalAwait, nonterminalAwait, stop };
 }
 
 // Engine-owned run id shape (run-persistence.generateRunId): `${base36ts}-${base36rand}`.
 const RUN_ID = /^[a-z0-9]+-[a-z0-9]+$/;
 
-test("tool registration: one `workflow` tool advertises the run/inspect/await union", async () => {
+test("tool registration: one `workflow` tool advertises config plus the run lifecycle union", async () => {
   const { client, dispose } = await connect(okRunner(), { listTools: true });
   try {
     const { tools } = await client.listTools();
@@ -118,6 +136,9 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
     const tool = tools.find((candidate) => candidate.name === "workflow");
     assert.ok(tool, "the workflow tool is registered");
     assert.match(tool.description ?? "", /registry built-ins—currently Claude, Codex, OpenCode, and pi/);
+    assert.match(tool.description ?? "", /action:\"config\"/);
+    assert.match(tool.description ?? "", /automatically performs static validation, a mocked dry run, and routed config checks/);
+    assert.doesNotMatch(tool.description ?? "", /npx|CLI|shell out/i);
 
     assert.deepEqual(tool.inputSchema.required, undefined, "the raw shape leaves branch requirements to the discriminator");
     const inputProps = Object.keys(tool.inputSchema.properties ?? {});
@@ -129,6 +150,7 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
     assert.ok(inputProps.includes("lastN") && inputProps.includes("labelGlob") && inputProps.includes("logLines"));
     assert.ok(inputProps.includes("checkpointReplies"), "durable checkpoint reply channel is advertised");
     assert.ok(inputProps.includes("concurrency") && inputProps.includes("agentRetries"));
+    assert.ok(inputProps.includes("harnesses") && inputProps.includes("modelSpecs") && inputProps.includes("modelFilter") && inputProps.includes("probeTimeoutMs"));
 
     // The machine-readable output core includes structured pause contexts.
     assert.ok(tool.outputSchema, "an output schema is declared");
@@ -154,18 +176,27 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
       "truncation",
       "wait",
       "outcome",
+      "action",
+      "validation",
+      "harnessOptions",
+      "models",
     ]) {
       assert.ok(outProps.includes(k), `output schema exposes ${k}`);
     }
-    assert.deepEqual(field(tool.outputSchema, "required"), ["runId", "status", "scriptUri"]);
+    assert.deepEqual(field(tool.outputSchema, "required"), undefined);
     const variants = field(tool.outputSchema, "oneOf") as Array<Record<string, unknown>>;
-    assert.equal(variants.length, 5);
+    assert.equal(variants.length, 7);
     assert.deepEqual(variants.map((variant) => variant.required), [
-      ["scriptSource", "limits"],
-      ["scriptSource", "limits"],
-      ["workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage"],
-      ["workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage", "wait"],
+      ["action", "ok", "harnessOptions", "omittedHarnesses", "models"],
+      ["action", "status", "validation"],
+      ["runId", "status", "scriptUri", "scriptSource", "limits"],
+      ["runId", "status", "scriptUri", "scriptSource", "limits"],
+      ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage"],
+      ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage", "wait"],
       [
+        "runId",
+        "status",
+        "scriptUri",
         "workflowName",
         "phases",
         "logTail",
@@ -184,6 +215,111 @@ test("tool registration: one `workflow` tool advertises the run/inspect/await un
   }
 });
 
+test("action=config discovers the live runner catalog without creating or executing a workflow", async () => {
+  let agentRuns = 0;
+  const probes: Array<{ spec?: string; selectModel?: boolean }> = [];
+  const runner = Object.assign(
+    makeRunner(() => {
+      agentRuns += 1;
+      return "unexpected";
+    }),
+    {
+      listBackends: () => ["claude", "team"],
+      async probeConfigOptions(spec?: string, options?: { selectModel?: boolean }) {
+        probes.push({ spec, selectModel: options?.selectModel });
+        const backendId = spec?.split("/", 1)[0] || "claude";
+        return {
+          backendId,
+          options: [
+            {
+              id: "model",
+              name: "Model",
+              type: "select" as const,
+              currentValue: "opus",
+              options: [
+                { value: "opus", name: "Opus" },
+                { value: "sonnet", name: "Sonnet" },
+              ],
+            },
+            {
+              id: "fast",
+              name: "Fast",
+              type: "boolean" as const,
+              currentValue: false,
+            },
+          ],
+        };
+      },
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const result = await client.callTool({
+      name: "workflow",
+      arguments: { action: "config", harnesses: ["claude"], modelFilter: "son" },
+    });
+    assert.notEqual(result.isError, true);
+    const output = structured(result);
+    assert.equal(output?.action, "config");
+    assert.equal(output?.ok, true);
+    assert.equal((output?.harnessOptions as unknown[]).length, 1);
+    const models = output?.models as Array<Record<string, unknown>>;
+    assert.deepEqual(models[0]?.matches, ["sonnet"]);
+    assert.equal(agentRuns, 0, "config never calls AgentRunner.run");
+    assert.equal(field(output, "runId"), undefined, "config creates no run ID");
+    assert.match(textOf(result), /no workflow was started/);
+
+    const selected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "config", modelSpecs: ["claude/opus"] },
+    });
+    assert.notEqual(selected.isError, true);
+    const selectedHarness = (structured(selected)?.harnessOptions as Array<Record<string, unknown>>)[0];
+    assert.equal(selectedHarness?.model, "claude/opus");
+    assert.deepEqual(probes.at(-1), { spec: "claude/opus", selectModel: true });
+
+    const probesBeforeInvalidFilter = probes.length;
+    const invalidFilter = await client.callTool({
+      name: "workflow",
+      arguments: { action: "config", modelFilter: "/[/" },
+    });
+    assert.equal(invalidFilter.isError, true);
+    assert.equal(probes.length, probesBeforeInvalidFilter, "invalid filters fail before opening probe sessions");
+  } finally {
+    await dispose();
+  }
+});
+
+test("config discovery structured diagnostics stay within 24 KiB", async () => {
+  const huge = "x".repeat(4_000);
+  const runner = Object.assign(okRunner(), {
+    listBackends: () => ["claude"],
+    async probeConfigOptions() {
+      return {
+        backendId: "claude",
+        options: Array.from({ length: 100 }, (_, index) => ({
+          id: `option-${index}`,
+          name: huge,
+          type: "select" as const,
+          currentValue: `value-${index}`,
+          options: Array.from({ length: 30 }, (__, choice) => ({ value: `${huge}-${choice}`, name: huge })),
+        })),
+      };
+    },
+  });
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const result = await client.callTool({ name: "workflow", arguments: { action: "config" } });
+    const output = structured(result);
+    assert.ok(output);
+    assert.ok(Buffer.byteLength(JSON.stringify(output), "utf8") <= 24_576);
+    const harness = (output.harnessOptions as Array<Record<string, unknown>>)[0];
+    assert.ok(Number(harness?.omittedOptions) > 0);
+  } finally {
+    await dispose();
+  }
+});
+
 test("runtime and advertised output schemas enforce exact result branches", async () => {
   const fixtures = outputVariantFixtures();
   for (const [name, fixture] of Object.entries(fixtures)) {
@@ -191,6 +327,12 @@ test("runtime and advertised output schemas enforce exact result branches", asyn
   }
 
   const invalid = {
+    "config with a run id": { ...fixtures.config, runId: "bad-run" },
+    "config without models": (() => {
+      const { models: _models, ...withoutModels } = fixtures.config;
+      return withoutModels;
+    })(),
+    "rejection with a run id": { ...fixtures.rejected, runId: "bad-run" },
     "execution without limits": (() => {
       const { limits: _limits, ...withoutLimits } = fixtures.execution;
       return withoutLimits;
@@ -479,7 +621,13 @@ test("inspection structured content is at most 24 KiB and text is at most 8 KiB"
 test("paused and failed terminal summaries carry redacted final-20 log tails and preserve status guidance", async () => {
   const token = "ghp_abcdefgh12345678";
   const logs = 'for (let i = 1; i <= 25; i++) log(i === 10 ? `line-${i} ghp_abcdefgh12345678` : `line-${i}`);';
-  const { client, dispose } = await connect(okRunner(), { listTools: true });
+  const runner = makeRunner((prompt) => {
+    if (prompt === "fail") {
+      throw new WorkflowError("boom", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, { recoverable: false });
+    }
+    return `ok:${prompt}`;
+  });
+  const { client, dispose } = await connect(runner, { listTools: true });
   try {
     const paused = await client.callTool({
       name: "workflow",
@@ -502,22 +650,24 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     const failed = await client.callTool({
       name: "workflow",
       arguments: {
-        script: `export const meta = { name: "failed-tail", description: "failed" };\n${logs}\nthrow new Error("boom");`,
+        script: `export const meta = { name: "failed-tail", description: "failed" };\n${logs}\nawait agent("fail");`,
       },
     });
     assert.equal(failed.isError, true);
     const failedTail = field(structured(failed)?.logTail, "lines") as string[];
-    assert.equal(failedTail[0], "line-6");
-    assert.match(textOf(failed), /recent run log \(last 20 of 26\):/);
+    assert.equal(failedTail[0], "line-7");
+    assert.match(textOf(failed), /recent run log \(last 20 of 27\):/);
 
     const empty = await client.callTool({
       name: "workflow",
       arguments: {
-        script: 'export const meta = { name: "empty-tail", description: "empty" };\nthrow new Error("boom");',
+        script: 'export const meta = { name: "empty-tail", description: "empty" };\nawait agent("fail");',
       },
     });
-    assert.deepEqual(field(structured(empty)?.logTail, "lines"), [ADMISSION_LOG]);
-    assert.match(textOf(empty), /recent run log \(last 1 of 1\):/);
+    const emptyLines = field(structured(empty)?.logTail, "lines") as string[];
+    assert.equal(emptyLines[0], ADMISSION_LOG);
+    assert.equal(emptyLines.length, 2);
+    assert.match(textOf(empty), /recent run log \(last 2 of 2\):/);
   } finally {
     await dispose();
   }
@@ -635,16 +785,96 @@ test("failed run -> shell does NOT throw: returns isError:true with status 'fail
   }
 });
 
-test("malformed script (no meta export) -> isError:true with the parse message, no structuredContent", async () => {
-  // parseWorkflowScript throws BEFORE a run exists (no runId), so the throw propagates to
-  // the SDK, which surfaces it as a tool error with NO structuredContent.
+test("automatic routed config validation rejects unknown options before the live runner executes", async () => {
+  let realCalls = 0;
+  let probes = 0;
+  const runner = Object.assign(
+    makeRunner(() => {
+      realCalls += 1;
+      return "real";
+    }),
+    {
+      listBackends: () => ["claude"],
+      async probeConfigOptions() {
+        probes += 1;
+        return {
+          backendId: "claude",
+          options: [
+            { id: "fast", name: "Fast", type: "boolean" as const, currentValue: false },
+          ],
+        };
+      },
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const result = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: [
+          'export const meta = { name: "bad-config", description: "must not admit" };',
+          'return await agent("work", { label: "work", model: "claude", configOptions: { invented: true } });',
+        ].join("\n"),
+      },
+    });
+    assert.equal(result.isError, true);
+    const output = structured(result);
+    assert.equal(output?.status, "rejected");
+    assert.equal(field(output?.validation, "exitCode"), 2);
+    assert.equal(output?.runId, undefined);
+    assert.equal(probes, 1);
+    assert.equal(realCalls, 0);
+    assert.match(textOf(result), /invented/);
+    assert.match(textOf(result), /advertised alternatives: option ids "fast"/);
+  } finally {
+    await dispose();
+  }
+});
+
+test("mocked dry-run failure is rejected before real agent execution or background admission", async () => {
+  let realCalls = 0;
+  const { client, dispose } = await connect(makeRunner(() => {
+    realCalls += 1;
+    return "real";
+  }), { listTools: true });
+  try {
+    const result = await client.callTool({
+      name: "workflow",
+      arguments: {
+        background: true,
+        script: [
+          'export const meta = { name: "preflight-failure", description: "must not admit" };',
+          'await agent("mock-only", { label: "mock-only" });',
+          'throw new Error("dry-run boom");',
+        ].join("\n"),
+      },
+    });
+    assert.equal(result.isError, true);
+    const output = structured(result);
+    assert.equal(output?.status, "rejected");
+    assert.equal(output?.runId, undefined);
+    assert.equal(field(output?.validation, "exitCode"), 2);
+    assert.equal(realCalls, 0, "the live AgentRunner is never invoked");
+    assert.match(textOf(result), /dry-run boom/);
+    assert.match(textOf(result), /No run was created/);
+  } finally {
+    await dispose();
+  }
+});
+
+test("malformed script is rejected with structured pre-admission diagnostics and no run ID", async () => {
   const { client, dispose } = await connect(okRunner());
   try {
     const res = await client.callTool({ name: "workflow", arguments: { script: 'await agent("hi");' } });
 
     assert.equal(res.isError, true, "a parse failure is a tool error");
-    assert.equal(res.structuredContent, undefined, "no run -> no structuredContent");
+    const output = structured(res);
+    assert.equal(output?.action, "run");
+    assert.equal(output?.status, "rejected");
+    assert.equal(output?.runId, undefined, "pre-admission rejection creates no run ID");
+    assert.equal(field(output?.validation, "exitCode"), 1);
     assert.match(textOf(res), /must be the first statement in the script/, "the parse error explains the meta requirement");
+    assert.match(textOf(res), /No run was created/);
   } finally {
     await dispose();
   }
@@ -659,7 +889,10 @@ test("malformed script (meta present but invalid) -> isError:true with the valid
     });
 
     assert.equal(res.isError, true);
-    assert.equal(res.structuredContent, undefined);
+    const output = structured(res);
+    assert.equal(output?.status, "rejected");
+    assert.equal(output?.runId, undefined);
+    assert.equal(field(output?.validation, "exitCode"), 1);
     assert.match(textOf(res), /meta\.name must be a non-empty string/, "meta validation rejects a nameless workflow");
   } finally {
     await dispose();

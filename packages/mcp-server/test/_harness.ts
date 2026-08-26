@@ -47,7 +47,15 @@ export function makeRunner(
   impl: (prompt: string, options: RunOptions) => unknown | Promise<unknown>,
 ): AgentRunner {
   const run = async (prompt: string, options?: RunOptions): Promise<unknown> => impl(prompt, options ?? {});
-  return { run } as AgentRunner;
+  return {
+    run,
+    listBackends: () => ["claude", "codex", "opencode", "pi"],
+    async probeConfigOptions(spec?: string) {
+      const first = spec?.split("/", 1)[0]?.toLowerCase();
+      const backendId = first && ["claude", "codex", "opencode", "pi"].includes(first) ? first : "claude";
+      return { backendId, options: [] };
+    },
+  } as AgentRunner;
 }
 
 /** A runner that echoes a deterministic, non-empty text reply for every agent() call. */

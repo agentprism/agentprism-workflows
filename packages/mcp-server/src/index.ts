@@ -23,6 +23,7 @@ export type {
 export { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
 export type {
   WorkflowAwaitToolInput,
+  WorkflowConfigToolInput,
   WorkflowExecuteToolInput,
   WorkflowInspectToolInput,
   WorkflowStopToolInput,
@@ -36,6 +37,7 @@ export {
 export type {
   WorkflowAwaitMetadata,
   WorkflowBackgroundAccepted,
+  WorkflowConfigToolResult,
   WorkflowExecutionOutcome,
   WorkflowExecutionScriptResourceFields,
   WorkflowExecutionToolResult,
@@ -46,6 +48,7 @@ export type {
   WorkflowScriptSource,
   WorkflowStopResult,
   WorkflowToolResult,
+  WorkflowValidationRejected,
 } from "./workflow-tool-output.js";
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
