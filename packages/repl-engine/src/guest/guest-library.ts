@@ -20,7 +20,7 @@
  *     (structured-output schema, cwd, backend config) cross the bridge as
  *     JSON. The returned promise IS the live handle: started-not-awaited
  *     handles come free with top-level await, and the doc's handle methods
- *     ride it — `followUp(prompt, opts?)` / `steer(prompt, opts?)` /
+ *     ride it — `queue(prompt, opts?)` / `steer(prompt, opts?)` /
  *     `cancel()` — each resolving with what actually happened (the host
  *     settles with the steering outcome, mirroring the outcome values
  *     acp-agents surfaces in its steering events). `id` carries the stable
@@ -66,10 +66,10 @@
  * optionsJson, createdAt, sessionId, modelSpec }) lives in the library's
  * closure, so the table of in-flight host calls travels inside the snapshot
  * itself. Every entry records the id the host addresses the call by
- * (`sessionId` — the founding session id for steering calls, the call's own
- * id otherwise), so a pending steer survives a restore with full
- * correlation: the host can settle it by its registry id and re-issue it
- * to the session it steers. The host settles calls by callId — through the
+ * (`sessionId` — the founding session id for queue/control calls, the call's own
+ * id otherwise), so each pending operation survives with full correlation.
+ * Queue work may restore; steering is settled as interrupted and never replayed.
+ * The host settles calls by callId — through the
  * Deferred it returned from a `__host_*` function in a live session, or
  * through the reconciliation surface after a restore. Both routes converge
  * on the same idempotent settlement function; the first settlement wins.
@@ -152,6 +152,11 @@
  *  object too (a top-level lexical 'const globalThis = 7' no longer
  *  blanks every binding's provenance).
  *
+ *  0.5.0 removes `followUp`, makes `steer` strict active-prompt control,
+ *  and adds first-class durable `queue` handles plus distinct host callbacks
+ *  for queue creation, steering, session cancellation, and queue cancellation.
+ *  Snapshot format 3 refuses older guest state before execution.
+ *
  *  HOST GATE: the broker's continuation-lease availability check is
  *  VERSION-GATED on >= 0.3.1 — a restored snapshot carrying the 0.3.0
  *  library (whose lease-setting reaction still runs on the awaited
@@ -160,7 +165,7 @@
  *  instrumentation: no eval-break targeting, honest refusal (phase-E
  *  review rejection round 7: the flag alone re-armed the original
  *  defect on a supported older snapshot). */
-export const GUEST_LIBRARY_VERSION = '0.4.0';
+export const GUEST_LIBRARY_VERSION = '0.5.0';
 
 /** `Symbol.for` key of the reconciliation surface on `globalThis`. */
 export const GUEST_SURFACE_KEY = 'repl.guest';
@@ -537,6 +542,9 @@ export const HOST_AGENT = '__host_agent';
 export const HOST_CHECKPOINT = '__host_checkpoint';
 export const HOST_CONSOLE = '__host_console';
 export const HOST_STEER = '__host_agent_steer';
+export const HOST_QUEUE = '__host_agent_queue';
+export const HOST_SESSION_CANCEL = '__host_agent_cancel';
+export const HOST_QUEUE_CANCEL = '__host_queue_cancel';
 export const HOST_SLEEP = '__host_sleep';
 export const HOST_WORKSPACE = '__host_workspace';
 export const HOST_AGENTS = '__host_agents';
@@ -711,6 +719,7 @@ const GUEST_LIBRARY_SOURCE = `/*
       if (typeof value.stack === 'string') err.stack = value.stack;
       if (value.code !== undefined) err.code = value.code;
       if (value.recoverable !== undefined) err.recoverable = !!value.recoverable;
+      if (value.details !== undefined) err.details = value.details;
       copyErrorAttribution(err, value);
       return err;
     }
@@ -853,7 +862,7 @@ const GUEST_LIBRARY_SOURCE = `/*
       // The id the host addresses this call by: the founding session id for
       // steering calls, this call's own id for everything else. Recorded so
       // the pending-call manifest never omits the correlation the host
-      // needs to settle or re-issue a pending steer after a restore.
+      // needs to settle or restore each pending operation after a restart.
       sessionId: sessionId === undefined ? id : sessionId,
       modelSpec: modelSpec === undefined ? null : modelSpec,
       resolve: resolveFn,
@@ -955,45 +964,80 @@ const GUEST_LIBRARY_SOURCE = `/*
     });
   }
 
-  /**
-   * A steering operation on a live agent handle: mint a registry entry
-   * (kind "steer") and call __host_agent_steer. The returned promise
-   * resolves with what actually happened — the host settles with the
-   * steering outcome (live injection where the backend supports the
-   * _session/steering extension, queued-for-next-turn delivery where it
-   * doesn't), mirroring the outcome values acp-agents surfaces in its
-   * steering events. Nothing is hidden and nothing hard-errors: the
-   * orchestrator can tell urgency delivery from queued delivery and adapt.
-   *
-   * The registry entry is keyed by THIS call's own minted id (the
-   * settlement key), while 'sessionId' records the FOUNDING call id — the
-   * session being steered — so a pending steer is snapshot-reconcilable:
-   * the host sees both ids at dispatch and the pending manifest reports
-   * both, letting it durably settle (by registry id) or re-issue (to the
-   * session) a steer after a restore.
-   */
-  function steerCall(foundingCallId, action, prompt, options) {
+  /** Preserve malformed option bags for host admission. Queue validation
+   *  is host-owned because even a refused queue call must mint an id and
+   *  receive a durable call-store record. */
+  function normalizeTurnOptions(options) {
+    if (options === undefined || options === null) return options;
+    if (typeof options !== 'object') return options;
+    return normalizeAgentOptions(options, 'promptMeta');
+  }
+
+  /** Serialize without preventing ID minting. Even cyclic/BigInt malformed input reaches host
+   *  admission as a durable validation refusal rather than throwing before issueCall(). */
+  function turnPayloadJson(prompt, options) {
     try {
-      var payloadJson;
-      if (action === 'cancel') {
-        payloadJson = null;
-      } else {
-        if (typeof prompt !== 'string') {
-          throw new TypeError('handle.' + action + '(prompt, options?) needs a prompt string');
-        }
-        var normalized = normalizeAgentOptions(options, 'promptMeta');
-        payloadJson = JSON.stringify({ prompt: prompt, options: normalized === undefined ? {} : normalized });
-      }
-      return issueCall('steer', '__host_agent_steer', action, payloadJson, foundingCallId, null, function (hostFn, id) {
-        // The host receives BOTH ids: the operation's own registry id (the
-        // settlement key — the host's live bookkeeping keys by it) and the
-        // founding call id (the session being steered — the dispatch and
-        // post-restore re-issue target).
-        return hostFn(id, foundingCallId, action, payloadJson);
+      var normalized = normalizeTurnOptions(options);
+      return JSON.stringify({ prompt: prompt, options: normalized });
+    } catch (_err) {
+      return JSON.stringify({ prompt: null, options: null, serializationError: true });
+    }
+  }
+
+  /** Mint a queue/steer control call. No semantic validation happens here:
+   *  the host records the dispatch before accepting or refusing it. */
+  function turnCall(kind, hostFnName, foundingCallId, prompt, options) {
+    try {
+      var payloadJson = turnPayloadJson(prompt, options);
+      return issueCall(kind, hostFnName, typeof prompt === 'string' ? prompt : safeString(prompt), payloadJson, foundingCallId, null, function (hostFn, id) {
+        return hostFn(id, foundingCallId, payloadJson);
       }).promise;
     } catch (err) {
       return Promise.reject(err);
     }
+  }
+
+  function cancelSessionCall(foundingCallId) {
+    return issueCall('cancel', '__host_agent_cancel', 'session', null, foundingCallId, null, function (hostFn, id) {
+      return hostFn(id, foundingCallId);
+    }).promise;
+  }
+
+  function cancelQueueCall(queueCallId) {
+    return issueCall('cancel', '__host_queue_cancel', 'queue', null, queueCallId, null, function (hostFn, id) {
+      return hostFn(id, queueCallId);
+    }).promise;
+  }
+
+  function queuedTurnHandle(foundingCallId, prompt, options) {
+    var call = (function () {
+      try {
+        var payloadJson = turnPayloadJson(prompt, options);
+        return issueCall('queue', '__host_agent_queue', typeof prompt === 'string' ? prompt : safeString(prompt), payloadJson, foundingCallId, null, function (hostFn, id) {
+          return hostFn(id, foundingCallId, payloadJson);
+        });
+      } catch (err) {
+        return { id: undefined, promise: PReject(err) };
+      }
+    })();
+    var handle = call.promise;
+    if (call.id !== undefined) {
+      Object.defineProperties(handle, {
+        id: {
+          value: call.id,
+          writable: false,
+          enumerable: false,
+          configurable: false,
+        },
+        cancel: {
+          value: function () { return cancelQueueCall(call.id); },
+          writable: false,
+          enumerable: false,
+          configurable: false,
+        },
+      });
+    }
+    return handle;
   }
 
   /**
@@ -1007,7 +1051,7 @@ const GUEST_LIBRARY_SOURCE = `/*
    *
    * The returned promise IS the live handle: it may sit in a REPL variable
    * across turns (and across snapshot/restore) and be awaited, or driven
-   * with the handle methods followUp/steer/cancel (own, non-enumerable
+   * with the handle methods queue/steer/cancel (own, non-enumerable
    * properties of the promise; 'id' carries the stable call id).
    */
   function agent(modelSpec, task, options) {
@@ -1021,9 +1065,9 @@ const GUEST_LIBRARY_SOURCE = `/*
           enumerable: false,
           configurable: false,
         },
-        followUp: {
+        queue: {
           value: function (nextPrompt, nextOptions) {
-            return steerCall(call.id, 'followUp', nextPrompt, nextOptions);
+            return queuedTurnHandle(call.id, nextPrompt, nextOptions);
           },
           writable: false,
           enumerable: false,
@@ -1031,7 +1075,7 @@ const GUEST_LIBRARY_SOURCE = `/*
         },
         steer: {
           value: function (nextPrompt, nextOptions) {
-            return steerCall(call.id, 'steer', nextPrompt, nextOptions);
+            return turnCall('steer', '__host_agent_steer', call.id, nextPrompt, nextOptions);
           },
           writable: false,
           enumerable: false,
@@ -1039,7 +1083,7 @@ const GUEST_LIBRARY_SOURCE = `/*
         },
         cancel: {
           value: function () {
-            return steerCall(call.id, 'cancel', undefined, undefined);
+            return cancelSessionCall(call.id);
           },
           writable: false,
           enumerable: false,
@@ -1187,8 +1231,8 @@ const GUEST_LIBRARY_SOURCE = `/*
 
   /**
    * The live subagents as a plain value: one { callId, modelSpec, task,
-   * state, supportsSteering, queuedSteers } entry per live agent,
-   * including in-flight followUp/steer turns (each with its own
+   * state, supportsSteering, queuedTurns } entry per live agent,
+   * including every unsettled queued turn (each with its own
    * addressable call id).
    */
   function agents() {
@@ -2052,7 +2096,7 @@ const GUEST_LIBRARY_SOURCE = `/*
     },
     /**
      * JSON-safe manifest of every pending host call, oldest first:
-     * [{ id, kind: "agent" | "checkpoint" | "steer", detail, optionsJson,
+     * [{ id, kind: "agent" | "checkpoint" | "queue" | "steer" | "cancel", detail, optionsJson,
      * createdAt, sessionId, modelSpec }]. 'detail' is the verbatim
      * prompt/question/action, 'optionsJson' the verbatim options string
      * (or null), 'sessionId' the id the host addresses the call by (the

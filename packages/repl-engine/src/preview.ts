@@ -1334,8 +1334,8 @@ function describeManifest(
 }
 
 /** The live-handle call id of a realm value, trap-free: an agent handle
- *  is a promise carrying the library's own non-enumerable `id` (string)
- *  and `followUp` (function) data properties — the shape the harness's
+ *  is a promise carrying the library's own non-enumerable `id` (string),
+ *  `queue` (function), and `steer` (function) data properties — the shape the harness's
  *  manifest detector uses. Own-property-descriptor reads only, never a
  *  [[Get]] (an accessor-rebound property reads as absent — never
  *  invoked); proxies are guarded before any descriptor read. A guest
@@ -1352,13 +1352,21 @@ function agentHandleCallId(vm: ReplVm, handle: JSValueHandle): string | null {
     idHandle?.dispose();
     return null;
   }
-  const followUpHandle = readOwnDataProperty(handle, 'followUp');
-  if (followUpHandle === undefined || !followUpHandle.isFunction) {
+  const queueHandle = readOwnDataProperty(handle, 'queue');
+  const steerHandle = readOwnDataProperty(handle, 'steer');
+  if (
+    queueHandle === undefined ||
+    !queueHandle.isFunction ||
+    steerHandle === undefined ||
+    !steerHandle.isFunction
+  ) {
     idHandle.dispose();
-    followUpHandle?.dispose();
+    queueHandle?.dispose();
+    steerHandle?.dispose();
     return null;
   }
-  followUpHandle.dispose();
+  queueHandle.dispose();
+  steerHandle.dispose();
   try {
     return idHandle.toString();
   } finally {

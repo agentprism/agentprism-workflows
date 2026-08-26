@@ -42,7 +42,10 @@ import {
   HOST_CHECKPOINT,
   HOST_CONSOLE,
   HOST_DEFAULT_BACKEND,
+  HOST_QUEUE,
+  HOST_QUEUE_CANCEL,
   HOST_RESET,
+  HOST_SESSION_CANCEL,
   HOST_SLEEP,
   HOST_STEER,
   HOST_WORKSPACE,
@@ -368,25 +371,19 @@ export interface GuestBridgeHandlers {
     optionsJson: string | null,
     answerJson: string | null,
   ): boolean | void;
-  /**
-   * A steering operation on a live agent handle: `callId` is the
-   * operation's OWN registry id (the settlement key — the host keys its
-   * live bookkeeping by it), `sessionId` the FOUNDING call id of the
-   * session being steered (the dispatch and post-restore re-issue
-   * target), `action` is `"followUp"` | `"steer"` | `"cancel"` and
-   * `payloadJson` the JSON-encoded `{ prompt, options }` bag for
-   * followUp/steer or `null` for cancel. Settle `call` with what actually
-   * happened (the steering outcome — live injection vs queued delivery,
-   * mirroring the outcome values acp-agents surfaces in its steering
-   * events).
-   */
+  /** Create one durable future turn on the founding session. */
+  queue(call: GuestCall, callId: string, sessionId: string, payloadJson: string | null): void;
+  /** Control only the ACP prompt currently in flight on the founding session. */
   steer(
     call: GuestCall,
     callId: string,
     sessionId: string,
-    action: string,
     payloadJson: string | null,
   ): void;
+  /** Cancel the current public turn on a reusable agent/session handle. */
+  cancelSession(call: GuestCall, callId: string, sessionId: string): void;
+  /** Cancel exactly one queued-turn handle. */
+  cancelQueue(call: GuestCall, callId: string, queueCallId: string): void;
   /**
    * A console event (log/info/warn/error/debug): the guest-rendered ONE
    * line per call (see `ConsoleEvent`). A throw becomes a guest error
@@ -410,7 +407,7 @@ export interface GuestBridgeHandlers {
   /**
    * An `agents()` call: return the JSON-encoded array of live-agent
    * entries (`{ callId, modelSpec, task, state, supportsSteering,
-   * queuedSteers }`).
+   * queuedTurns }`).
    */
   agents(): string;
   /**
@@ -478,7 +475,10 @@ function makeCallbacks(vm: ReplVm, handlers: GuestBridgeHandlers): Array<[string
   return [
     [HOST_AGENT, makeAgentHostFunction(vm, handlers)],
     [HOST_CHECKPOINT, makeCheckpointHostFunction(vm, handlers)],
+    [HOST_QUEUE, makeQueueHostFunction(vm, handlers)],
     [HOST_STEER, makeSteerHostFunction(vm, handlers)],
+    [HOST_SESSION_CANCEL, makeSessionCancelHostFunction(vm, handlers)],
+    [HOST_QUEUE_CANCEL, makeQueueCancelHostFunction(vm, handlers)],
     [HOST_CONSOLE, makeConsoleHostFunction(vm, handlers)],
     [HOST_SLEEP, makeSleepHostFunction(vm, handlers)],
     [HOST_WORKSPACE, makeWorkspaceHostFunction(vm, handlers)],
@@ -524,33 +524,66 @@ function makeAgentHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostF
 }
 
 /**
- * The `__host_agent_steer` shape: same pattern as `__host_agent`, with
- * the operation's own call id FIRST (the settlement key) and the founding
- * `sessionId` second (the session being steered), then `action`
- * ("followUp" | "steer" | "cancel") and a JSON-encoded payload (or null
- * for cancel). The guest records both ids in its pending-call registry,
- * so a pending steer is snapshot-reconcilable: the host settles it by
- * call id and re-issues it against the session.
+ * Queue, steer, session-cancel, and queue-cancel are distinct callbacks.
+ * Keeping them separate prevents a state-dependent compatibility handler
+ * from turning steering into a prompt or a cancellation into queue-wide
+ * mutation.
  */
-function makeSteerHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
+function makeSessionPayloadHostFunction(
+  vm: ReplVm,
+  hostName: string,
+  handler: (call: GuestCall, callId: string, sessionId: string, payloadJson: string | null) => void,
+): HostFunction {
   return function (this: JSValueHandle, ...args: JSValueHandle[]): JSValueHandle {
-    const callId = requireString(args[0], HOST_STEER, 'callId');
-    const sessionId = requireString(args[1], HOST_STEER, 'sessionId');
-    const action = requireString(args[2], HOST_STEER, 'action');
-    const payloadJson = optionalString(args[3]);
+    const callId = requireString(args[0], hostName, 'callId');
+    const sessionId = requireString(args[1], hostName, 'sessionId');
+    const payloadJson = optionalString(args[2]);
     const call = new GuestCall(vm);
     try {
-      handlers.steer(call, callId, sessionId, action, payloadJson);
+      handler(call, callId, sessionId, payloadJson);
     } catch (err) {
-      // Same disposal discipline as `__host_agent` (see there): a
-      // throwing steer handler must not strand the raw promise and its
-      // resolving functions.
       call.dispose();
       throw err;
     }
     call.releaseToRealm();
     return guestCallHandle(call);
   };
+}
+
+function makeQueueHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
+  return makeSessionPayloadHostFunction(vm, HOST_QUEUE, handlers.queue.bind(handlers));
+}
+
+function makeSteerHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
+  return makeSessionPayloadHostFunction(vm, HOST_STEER, handlers.steer.bind(handlers));
+}
+
+function makeCancelHostFunction(
+  vm: ReplVm,
+  hostName: string,
+  handler: (call: GuestCall, callId: string, targetId: string) => void,
+): HostFunction {
+  return function (this: JSValueHandle, ...args: JSValueHandle[]): JSValueHandle {
+    const callId = requireString(args[0], hostName, 'callId');
+    const targetId = requireString(args[1], hostName, 'targetId');
+    const call = new GuestCall(vm);
+    try {
+      handler(call, callId, targetId);
+    } catch (err) {
+      call.dispose();
+      throw err;
+    }
+    call.releaseToRealm();
+    return guestCallHandle(call);
+  };
+}
+
+function makeSessionCancelHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
+  return makeCancelHostFunction(vm, HOST_SESSION_CANCEL, handlers.cancelSession.bind(handlers));
+}
+
+function makeQueueCancelHostFunction(vm: ReplVm, handlers: GuestBridgeHandlers): HostFunction {
+  return makeCancelHostFunction(vm, HOST_QUEUE_CANCEL, handlers.cancelQueue.bind(handlers));
 }
 
 /**
@@ -736,7 +769,7 @@ export class GuestLibraryInstallError extends Error {
 /** One entry of the guest's pending-call manifest. */
 export interface GuestSurfaceEntry {
   id: string;
-  /** `"agent"` | `"checkpoint"` | `"steer"`. */
+  /** `"agent"` | `"checkpoint"` | `"queue"` | `"steer"` | `"cancel"`. */
   kind: string;
   /** Verbatim prompt / question / action. */
   detail: string | null;

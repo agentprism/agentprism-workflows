@@ -155,7 +155,6 @@ export {
 export type {
   AcpSessionOptions,
   PooledConnectionDeps,
-  SteeringOutcome,
   SteeringRequest,
   SteeringResponse,
   LoadedTurnQueryRequest,
@@ -186,12 +185,9 @@ export type {
   ClientMethodCoverage,
 } from "./protocol-coverage.js";
 
-// ACP capability negotiation: parse/validate the initialize response and gate what the client
-// sends (custom `_meta` keys, MCP transports) on what the connected agent advertised.
+// ACP standard capability negotiation. Vendor initialize metadata stays raw for extension owners.
 export {
-  GATED_CUSTOM_META_KEYS,
   adaptPromptContent,
-  gateCustomMeta,
   isSupportedProtocolVersion,
   negotiateCapabilities,
   unsupportedMcpServer,

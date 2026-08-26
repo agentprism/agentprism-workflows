@@ -6,14 +6,18 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createAcpRunner, type SteeringOutcome } from "../src/index.js";
+import { createAcpRunner } from "../src/index.js";
 
 const LIVE = process.env.AGENTPRISM_LIVE_E2E === "1";
 const SKIP: string | false = LIVE
   ? false
   : "gated live steering e2e — set AGENTPRISM_LIVE_E2E=1 with Claude and Codex credentials";
 
-const OUTCOMES: readonly SteeringOutcome[] = ["injected", "startedNewTurn", "failed"];
+const OUTCOMES = ["injected", "startedNewTurn", "failed", "promptRequired"] as const;
+
+function isPlainObject(value: unknown): value is Readonly<Record<string, unknown>> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
 
 // The Claude adapter validates `model` against the SESSION's selectable option list — the CLI's
 // model picker for this working directory — not the Anthropic model catalog. Each leg runs in a
@@ -33,11 +37,10 @@ async function steerLiveBackend(backend: "claude" | "codex"): Promise<void> {
   try {
     const session = await runner.openSession({ model: BACKEND_MODEL[backend], cwd });
     try {
-      assert.equal(
-        session.capabilities?.supportsSteering,
-        true,
-        `${backend} must advertise top-level InitializeResponse._meta.steering.supported`,
-      );
+      const initializeMeta = session.capabilities?.initializeMeta;
+      assert.ok(isPlainObject(initializeMeta));
+      assert.ok(isPlainObject(initializeMeta.steering));
+      assert.equal(initializeMeta.steering.supported, true);
 
       let sawProgress = false;
       const offText = session.on("agent_message_chunk", () => { sawProgress = true; });
@@ -52,8 +55,13 @@ async function steerLiveBackend(backend: "claude" | "codex"): Promise<void> {
         }
         assert.equal(sawProgress, true, `${backend} prompt must still stream before steering`);
 
-        const outcome = await session.steer("Keep the answer concise after your current reasoning.");
-        assert.ok(OUTCOMES.includes(outcome), `${backend} returned an unknown steering outcome: ${outcome}`);
+        const response = await session.steer("Keep the answer concise after your current reasoning.");
+        assert.ok(isPlainObject(response), `${backend} returned a non-object steering response`);
+        assert.equal(typeof response.outcome, "string");
+        assert.ok(
+          OUTCOMES.includes(response.outcome as (typeof OUTCOMES)[number]),
+          `${backend} returned an unknown steering outcome: ${String(response.outcome)}`,
+        );
         await prompt;
       } finally {
         offText();

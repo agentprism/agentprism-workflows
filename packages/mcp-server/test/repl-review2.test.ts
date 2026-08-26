@@ -6,7 +6,7 @@
  * live-handle status), the single-flight first touch (concurrent
  * first-touch calls create exactly one VM and broker), the
  * client-presence drain (last-client disconnect drains in-flight turns
- * and closes idle children; the next connect's followUp re-attaches
+ * and closes idle children; the next explicit queued turn re-attaches
  * lazily), and the per-eval deadline (a currently-running runaway eval
  * is always breakable).
  */
@@ -37,9 +37,9 @@ import { workflowProjectPaths } from "@automatalabs/workflows";
 /** The fake held-open ACP session (see repl-tool.test.ts). */
 class FakeSession implements BrokerSession {
   readonly sessionId: string;
-  capabilities: { supportsSteering: boolean } | undefined;
+  initializeMeta: Readonly<Record<string, unknown>> | undefined;
   readonly prompts: Array<{ content: string; resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
-  readonly steers: Array<{ content: string; resolve: (outcome: string) => void; reject: (error: unknown) => void }> = [];
+  readonly steers: Array<{ content: string; resolve: (outcome: unknown) => void; reject: (error: unknown) => void }> = [];
   releases = 0;
   cancelCalls = 0;
   stopReason = "end_turn";
@@ -54,7 +54,7 @@ class FakeSession implements BrokerSession {
 
   constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
     this.sessionId = `fake-session-${FakeSession.nextId++}`;
-    this.capabilities = { supportsSteering: true };
+    this.initializeMeta = { steering: { supported: true } };
   }
 
   static nextId = 0;
@@ -66,7 +66,7 @@ class FakeSession implements BrokerSession {
     });
   }
 
-  steer(content: string): Promise<string> {
+  steer(content: string): Promise<unknown> {
     return new Promise((resolve, reject) => {
       this.steers.push({ content, resolve, reject });
     });
@@ -354,7 +354,7 @@ test("review2: concurrent first touches create exactly ONE VM and broker for a p
   }
 });
 
-test("review2: last-client disconnect drains in-flight turns to completion and closes idle children; the next connect's followUp lazily re-attaches", async () => {
+test("review2: last-client disconnect drains in-flight turns to completion and closes idle children; the next queued turn lazily re-attaches", async () => {
   const PROJECT = freshProject();
   const runner = new FakeRunner();
   const presence = new ReplPresenceLedger(60_000);
@@ -385,8 +385,8 @@ test("review2: last-client disconnect drains in-flight turns to completion and c
     };
     assert.equal(ws.diagnostics.childrenClosed, true, "children closed after the drain");
     // The next connect (a new client) evaluates: the continuation already
-    // fired; a followUp lazily re-attaches the recorded session.
-    const probe = await repl(connected, { action: "eval", projectDir: PROJECT, code: 'p.followUp("again"); "fired"' });
+    // fired; an explicit queued turn lazily re-attaches the recorded session.
+    const probe = await repl(connected, { action: "eval", projectDir: PROJECT, code: 'p.queue("again"); "fired"' });
     assert.ok(!isErrorResult(probe), textOf(probe));
     await tick();
     assert.equal(runner.loadedWith.length, 1, "the recorded session was loaded lazily on the next connect");
@@ -398,7 +398,7 @@ test("review2: last-client disconnect drains in-flight turns to completion and c
     // leaving the reattached child running.
     const reattached = runner.last();
     presence.disconnect("client-A");
-    // The followUp started a NEW turn on the reattached session: the
+    // The queued turn started on the reattached session: the
     // drain waits for it to complete (drain-to-completion is the policy),
     // then closes the reattached child.
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -674,10 +674,10 @@ test("review8: the shutdown drain FAILS BEFORE releasing sessions — the bounde
     assert.ok(elapsed < 2000, `shutdown was bounded: ${elapsed} ms`);
     // The disposal still held the busy session (the drain failed BEFORE
     // its release phase) and issued its wire calls even though it could
-    // not await them (the deadline won the race): one cancel from the
-    // drain's forced stop, one from the disposal — and the release only
-    // from the disposal (the drain's release phase never ran).
-    assert.equal(session.cancelCalls, 2, "the forced stop and the bounded disposal each issued the cancel for the still-registered session");
+    // not await them (the deadline won the race): cancellation is deduplicated
+    // per active turn, and the release comes from disposal because the drain's
+    // release phase never ran.
+    assert.ok(session.cancelCalls <= 1, `the active turn received at most one ACP cancel (got ${session.cancelCalls})`);
     assert.equal(session.releases, 1, "the bounded disposal issued the release for the still-registered session");
     // The state was fully torn down — and the VM actually disposed
     // (the finally-path cleanup).

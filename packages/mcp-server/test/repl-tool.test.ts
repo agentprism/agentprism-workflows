@@ -53,9 +53,9 @@ import { okRunner, textOf, type Connected } from "./_harness.js";
 /** The fake held-open ACP session (the broker's structural seam). */
 class FakeSession implements BrokerSession {
   readonly sessionId: string;
-  capabilities: { supportsSteering: boolean } | undefined;
+  initializeMeta: Readonly<Record<string, unknown>> | undefined;
   readonly prompts: Array<{ content: string; resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
-  readonly steers: Array<{ content: string; resolve: (outcome: string) => void; reject: (error: unknown) => void }> = [];
+  readonly steers: Array<{ content: string; resolve: (outcome: unknown) => void; reject: (error: unknown) => void }> = [];
   releases = 0;
   cancelCalls = 0;
   stopReason = "end_turn";
@@ -65,7 +65,7 @@ class FakeSession implements BrokerSession {
 
   constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
     this.sessionId = `fake-session-${FakeSession.nextId++}`;
-    this.capabilities = { supportsSteering: true };
+    this.initializeMeta = { steering: { supported: true } };
   }
 
   static nextId = 0;
@@ -77,7 +77,7 @@ class FakeSession implements BrokerSession {
     });
   }
 
-  steer(content: string): Promise<string> {
+  steer(content: string): Promise<unknown> {
     return new Promise((resolve, reject) => {
       this.steers.push({ content, resolve, reject });
     });
@@ -226,6 +226,22 @@ async function evalJson(connected: Connected, projectDir: string, expression: st
 }
 
 // ── The surface shapes ────────────────────────────────────────────────
+
+test("the live MCP description teaches strict steer/queue handle retention and contains no followUp guidance", async () => {
+  const connected = await connectWithRepl(new FakeRunner());
+  try {
+    const listed = await connected.client.listTools();
+    const description = listed.tools.find((tool) => tool.name === "repl")?.description ?? "";
+    assert.match(description, /persistent promise-handle/);
+    assert.match(description, /a\.steer\(text\).*only the currently running turn/);
+    assert.match(description, /a\.queue\(text\).*distinct FIFO turn/);
+    assert.match(description, /q\.cancel\(\).*exact turn/);
+    assert.match(description, /Steering while idle returns/);
+    assert.ok(!description.includes("followUp"), description);
+  } finally {
+    await connected.dispose();
+  }
+});
 
 test("eval returns the finished shape { output, result? } mirrored in structuredContent — one newline-joined output string, no v1 metadata fields", async () => {
   const PROJECT = freshProject();
@@ -616,7 +632,7 @@ test("repl eval persists to the daemon's per-project store; a later server resto
   }
 });
 
-test("§9 [C]16 / §10: a pre-redesign format-v1 snapshot auto-resets on first touch, is renamed aside with the loud reason, and the fresh workspace exposes the full v2 guest API", async () => {
+test("format-2 snapshots auto-reset before guest execution and the fresh workspace runs format 3 / guest 0.5", async () => {
   const PROJECT = freshProject();
   const first = await connectWithRepl(new FakeRunner());
   try {
@@ -637,11 +653,10 @@ test("§9 [C]16 / §10: a pre-redesign format-v1 snapshot auto-resets on first t
   const header = JSON.parse(currentEnvelope.subarray(0, newline).toString("utf8")) as Record<string, unknown>;
   assert.equal(header.formatVersion, SNAPSHOT_FORMAT_VERSION, "the seed snapshot starts at the running format");
 
-  // Fabricate the pre-redesign stored workspace without changing its real
-  // serialized VM payload: v1 used this same envelope version, so the
-  // format header is the compatibility boundary that must reject it.
+  // Fabricate the immediately previous format without changing its VM payload.
+  // The envelope version check must refuse it before restoring or executing old guest code.
   const oldEnvelope = Buffer.concat([
-    Buffer.from(`${JSON.stringify({ ...header, formatVersion: 1 })}\n`, "utf8"),
+    Buffer.from(`${JSON.stringify({ ...header, formatVersion: 2 })}\n`, "utf8"),
     currentEnvelope.subarray(newline + 1),
   ]);
   writeFileSync(snapshotPath, oldEnvelope);
@@ -657,12 +672,12 @@ test("§9 [C]16 / §10: a pre-redesign format-v1 snapshot auto-resets on first t
     const touchedShape = structuredOf(touched);
     const output = touchedShape.output as string;
     assert.ok(output.startsWith("REPL workspace auto-reset:"), `the loud notice leads output: ${output}`);
-    assert.ok(output.includes("snapshot carries format version 1"), `the notice names the old format: ${output}`);
+    assert.ok(output.includes("snapshot carries format version 2"), `the notice names the old format: ${output}`);
     assert.ok(
       output.includes(`this engine supports version ${SNAPSHOT_FORMAT_VERSION}`),
       `the notice names the running format: ${output}`,
     );
-    assert.equal(touchedShape.result, "undefined:42", "old bindings are gone and sleep() ran in the fresh v2 guest");
+    assert.equal(touchedShape.result, "undefined:42", "old bindings are gone and sleep() ran in the fresh 0.5 guest");
 
     const entries = readdirSync(replDir);
     const refused = entries.filter((name) => name.startsWith("snapshot.bin.refused-"));
@@ -705,7 +720,7 @@ test("§9 [C]16 / §10: a pre-redesign format-v1 snapshot auto-resets on first t
     });
 
     const afterReset = await repl(second, { action: "eval", projectDir: PROJECT, code: "typeof preRedesignBinding" });
-    assert.equal(structuredOf(afterReset).result, "undefined", "reset() was live and opened another fresh v2 workspace");
+    assert.equal(structuredOf(afterReset).result, "undefined", "reset() was live and opened another fresh format-3 workspace");
     assert.equal(structuredOf(afterReset).output, "", "the refusal notice is emitted exactly once");
     assert.ok(existsSync(join(replDir, refused[0])), "reset() never deletes the renamed-aside snapshot");
   } finally {
@@ -1054,10 +1069,11 @@ test("§6.1/§6.2: pending notices survive a THROWING eval — they are consumed
       code: 'await new Promise(() => {}); "never"',
       timeoutMs: 10_000,
     });
-    await tick();
-    await tick();
-    const context = registry.getOrCreate(PROJECT);
-    const broker = context.repl?.broker ?? null;
+    let broker = registry.getOrCreate(PROJECT).repl?.broker ?? null;
+    for (let attempt = 0; attempt < 100 && broker === null; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      broker = registry.getOrCreate(PROJECT).repl?.broker ?? null;
+    }
     assert.ok(broker, "the touched project state has a broker");
     const concurrent = await broker.eval("reset()");
     assert.equal(concurrent.result, "undefined", "the concurrent session's reset() ran");
@@ -1084,11 +1100,11 @@ test("§6.2 [C]14: a restore that LOST calls leads the next eval's output with t
   const first = await connectWithRepl(runner);
   try {
     await repl(first, { action: "eval", projectDir: PROJECT, code: 'const pi = agent("pi/x", "task"); "started"' });
-    for (let attempt = 0; attempt < 100 && runner.sessions.length === 0; attempt++) {
+    for (let attempt = 0; attempt < 100 && runner.sessions[0]?.prompts.length !== 1; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    // A steer whose wire call is in flight when the daemon dies: its
-    // outcome is unknowable, so the restore settles it `failed` (lost).
+    // A steer whose wire call is in flight when the daemon dies is never replayed;
+    // restore rejects it with steering_interrupted.
     const steered = await repl(first, {
       action: "eval",
       projectDir: PROJECT,
@@ -1110,16 +1126,16 @@ test("§6.2 [C]14: a restore that LOST calls leads the next eval's output with t
       output.startsWith("restore lost 1 call(s) (c2)"),
       `the aggregate loss notice leads the output: ${output.slice(0, 200)}`,
     );
-    // ONLY the aggregate notice rides the output — the per-call
-    // lost-steer line stays in diagnostics (§6.2 [C]14).
-    assert.equal(output.split("\n").length, 1, "exactly the one aggregate notice line");
-    assert.ok(!output.includes("steer c2:"), "no per-call reconcile line rides the output");
+    assert.ok(
+      output.includes("steering_interrupted") || output.includes("interrupted by restart"),
+      `the recovered steering promise rejects explicitly: ${output}`,
+    );
     const notes = (await evalJson(second, PROJECT, "workspace().diagnostics.reconcileNotes")) as Array<{
       level: string;
       line: string;
     }>;
     assert.ok(
-      notes.some((n) => n.level === "warn" && n.line.includes("c2") && n.line.includes("unknowable")),
+      notes.some((n) => n.level === "warn" && n.line.includes("c2") && n.line.includes("not replayed")),
       JSON.stringify(notes),
     );
     assert.equal(structuredOf(r).result, "2", "the eval itself ran normally");

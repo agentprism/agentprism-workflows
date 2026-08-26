@@ -512,10 +512,10 @@ One long-lived ACP process per backend is **pooled** and reused across `agent()`
 
 When an agent returns initialize-response `_meta`, every session ref and session-scoped runner event
 includes it as a stable, recursively frozen `initializeMeta` snapshot. Absent or `null` metadata is
-omitted. The snapshot itself is observational, but exact advertised extension flags can drive their
-own documented negotiation: `_meta.steering.supported === true` enables held-open session steering for
-Claude, Codex, and pi. This is separate from `agentCapabilities._meta`, which gates optional outgoing
-request metadata; neither form changes routing, pooling, retries, or workflow hashes.
+omitted. Extension owners inspect this raw snapshot at their own decision point; `acp-agents` does not
+infer extension support from backend names, versions, or `agentCapabilities._meta`. Request and
+response extension metadata is transported transparently except for documented protocol-critical
+direct-collision winners; metadata never changes routing, pooling, retries, or workflow hashes.
 
 ### Custom backends — run *any* ACP agent
 

@@ -31,12 +31,10 @@ export class CustomAcpBackend implements Backend {
    *  repair ladder can never converge on a contract the model was never shown. */
   readonly embedSchemaInPrompt = true;
   readonly injectStructuredOutputTool: boolean;
-  readonly customCapabilities?: NonNullable<Backend["customCapabilities"]>;
 
   constructor(private readonly config: RegisteredBackend) {
     this.id = config.name;
     this.injectStructuredOutputTool = config.structuredOutputTool ?? true;
-    if (config.customCapabilities) this.customCapabilities = config.customCapabilities;
     const spawnIdentity = JSON.stringify({
       command: config.command,
       args: config.args ?? [],

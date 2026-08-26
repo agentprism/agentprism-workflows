@@ -56,7 +56,7 @@ export const SNAPSHOT_FORMAT = 'repl-snapshot';
  * different version refuses loudly naming both versions instead of
  * attempting a restore.
  */
-export const SNAPSHOT_FORMAT_VERSION = 2;
+export const SNAPSHOT_FORMAT_VERSION = 3;
 
 /** The header is one JSON line; refuse anything longer as not-our-file. */
 const MAX_HEADER_BYTES = 4096;

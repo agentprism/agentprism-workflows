@@ -278,61 +278,43 @@ test("PiSession uses native steer with converted content and leaves the original
     "abort",
   ]);
 
-  // After the cancelled turn settles, the session is idle: a steer starts a
-  // fire-and-forget turn with the content instead of erroring.
+  // After the cancelled turn settles, steering is idle and cannot start work.
   assert.deepEqual(
     await agent.steer(context({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "late" }] })),
-    { outcome: "startedNewTurn" },
+    { outcome: "promptRequired", reason: "noRunningTurn" },
   );
-  assert.equal(setup.controls[0]?.promptCalls[1]?.text, "late");
+  assert.equal(setup.controls[0]?.promptCalls.length, 1);
   await agent.dispose();
 });
 
-test("idle steering starts a fire-and-forget turn that occupies the single turn slot", async () => {
+test("idle steering returns promptRequired and sends no hidden Pi operation", async () => {
   const setup = fakeDeps("wedged");
   const agent = new PiAcpAgent(setup.deps);
   const opened = await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }));
+  const control = setup.controls[0]!;
 
   assert.deepEqual(
     await agent.steer(context({
       sessionId: opened.sessionId,
       prompt: [{ type: "text", text: "start from idle" }],
     })),
-    { outcome: "startedNewTurn" },
-  );
-  const control = setup.controls[0]!;
-  assert.equal(control.promptCalls.length, 1);
-  assert.equal(control.promptCalls[0]?.text, "start from idle");
-
-  // The steer-started turn is a real turn: a concurrent session/prompt is busy,
-  // and a second steer injects into the turn the first one started (codex parity).
-  await assert.rejects(
-    agent.prompt(context({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "concurrent" }] })),
-    (error) => kind(error) === "session_busy",
+    { outcome: "promptRequired", reason: "noRunningTurn" },
   );
   assert.deepEqual(
     await agent.steer(context({
       sessionId: opened.sessionId,
-      prompt: [{ type: "text", text: "follow the new turn" }],
+      prompt: [],
+      _meta: { steering: { idleBehavior: "promptRequired" } },
     })),
-    { outcome: "injected" },
+    { outcome: "promptRequired", reason: "noRunningTurn" },
   );
-  assert.deepEqual(control.steerCalls, [{ text: "follow the new turn", images: [] }]);
+  assert.equal(control.promptCalls.length, 0, "idle steering never calls prompt");
+  assert.equal(control.steerCalls.length, 0, "idle steering never calls native steer");
+  assert.deepEqual(control.operationLog, [], "idle steering never calls followUp or another Pi operation");
   await agent.dispose();
 });
 
-test("idle steering surfaces preflight rejections exactly like prompt()", async () => {
-  const setup = fakeDeps("preflight");
-  const agent = new PiAcpAgent(setup.deps);
-  const opened = await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }));
-  await assert.rejects(
-    agent.steer(context({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "doomed" }] })),
-    (error) => kind(error) === "invalid_model",
-  );
-  await agent.dispose();
-});
-
-test("steering racing an in-progress cancel fails without restarting generation", async () => {
+test("steering racing an in-progress cancel requires a prompt without restarting generation", async () => {
   const setup = fakeDeps("wedged");
   const agent = new PiAcpAgent(setup.deps);
   const opened = await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }));
@@ -348,14 +330,14 @@ test("steering racing an in-progress cancel fails without restarting generation"
     sessionId: opened.sessionId,
     prompt: [{ type: "text", text: "too late" }],
   }));
-  assert.deepEqual(await steer, { outcome: "failed" });
+  assert.deepEqual(await steer, { outcome: "promptRequired", reason: "noRunningTurn" });
   assert.equal(setup.controls[0]?.steerCalls.length, 0, "cancellation wins before the enqueue");
   assert.equal((await prompt).stopReason, "cancelled");
   assert.equal(setup.controls[0]?.promptCalls.length, 1, "no steering-started restart after cancel");
   await agent.dispose();
 });
 
-test("a steer the settling run never consumed is redispatched, not leaked into the next prompt", async () => {
+test("unconsumed native steering is discarded at settlement and never hidden in the next prompt", async () => {
   const setup = fakeDeps("wedged");
   const agent = new PiAcpAgent(setup.deps);
   const opened = await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }));
@@ -379,18 +361,23 @@ test("a steer the settling run never consumed is redispatched, not leaked into t
 
   control.resolvePrompt?.();
   assert.equal((await prompt).stopReason, "end_turn");
+  assert.equal(control.promptCalls.length, 1, "settlement never starts a hidden prompt");
+  assert.deepEqual(control.steeringQueue, [], "settlement removes native queue residue");
+
+  control.retainSteeredMessages = false;
+  const nextPrompt = agent.prompt(context({
+    sessionId: opened.sessionId,
+    prompt: [{ type: "text", text: "explicit next prompt" }],
+  }));
   await eventually(() => assert.equal(control.promptCalls.length, 2));
-  assert.equal(control.promptCalls[1]?.text, "left in queue");
-  assert.deepEqual(
-    (control.promptCalls[1]?.options as { images?: unknown }).images,
-    [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
-    "redispatch preserves the steer's converted images",
-  );
-  assert.deepEqual(control.steeringQueue, [], "nothing remains to leak into the next prompt");
+  assert.equal(control.promptCalls[1]?.text, "explicit next prompt");
+  assert.deepEqual(control.steeringQueue, [], "the next prompt contains no hidden steering input");
+  control.resolvePrompt?.();
+  assert.equal((await nextPrompt).stopReason, "end_turn");
   await agent.dispose();
 });
 
-test("a steer that lands as the run settles is recovered and started as a new turn", async () => {
+test("a steer that lands as the run settles returns promptRequired and starts no hidden turn", async () => {
   const setup = fakeDeps("wedged");
   const agent = new PiAcpAgent(setup.deps);
   const opened = await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }));
@@ -418,14 +405,23 @@ test("a steer that lands as the run settles is recovered and started as a new tu
   assert.equal((await prompt).stopReason, "end_turn");
   enqueueGate.resolve();
 
-  assert.deepEqual(await steer, { outcome: "startedNewTurn" });
-  await eventually(() => assert.equal(control.promptCalls.length, 2));
-  assert.equal(control.promptCalls[1]?.text, "late arrival");
+  assert.deepEqual(await steer, { outcome: "promptRequired", reason: "noRunningTurn" });
+  assert.equal(control.promptCalls.length, 1, "settlement-race steering never calls prompt");
   assert.deepEqual(control.steeringQueue, [], "the recovered message left pi's queue");
+
+  const nextPrompt = agent.prompt(context({
+    sessionId: opened.sessionId,
+    prompt: [{ type: "text", text: "explicit work only" }],
+  }));
+  await eventually(() => assert.equal(control.promptCalls.length, 2));
+  assert.equal(control.promptCalls[1]?.text, "explicit work only");
+  assert.deepEqual(control.steeringQueue, [], "late steering did not leak into the next prompt");
+  control.resolvePrompt?.();
+  assert.equal((await nextPrompt).stopReason, "end_turn");
   await agent.dispose();
 });
 
-test("native steer failures resolve as a failed outcome without settling the prompt", async () => {
+test("native steer failures reject without settling the prompt or starting another", async () => {
   const setup = fakeDeps("wedged");
   const agent = new PiAcpAgent(setup.deps);
   const opened = await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }));
@@ -436,13 +432,12 @@ test("native steer failures resolve as a failed outcome without settling the pro
   await eventually(() => assert.ok(setup.controls[0]?.resolvePrompt));
   const control = setup.controls[0]!;
   control.session.steer = async () => { throw new Error("native steering failure"); };
-  assert.deepEqual(
-    await agent.steer(context({
+  await assert.rejects(
+    agent.steer(context({
       sessionId: opened.sessionId,
       prompt: [{ type: "text", text: "correction" }],
     })),
-    { outcome: "failed" },
-    "an unexpected internal failure is the codex-shaped failed outcome, not an error",
+    (error) => kind(error) === "internal_error",
   );
   control.resolvePrompt?.();
   assert.equal((await prompt).stopReason, "end_turn");
@@ -549,8 +544,29 @@ test("wire server advertises top-level steering, parses the extension, and route
       text: "wire correction",
       images: [],
     }]);
+    setup.controls[0]!.session.steer = async () => { throw new Error("wire steering failure"); };
+    await assert.rejects(
+      connection.agent.request<SteeringResponse, SteeringRequest>(
+        SESSION_STEERING_METHOD,
+        {
+          sessionId: opened.sessionId,
+          prompt: [{ type: "text", text: "wire failure" }],
+        },
+      ),
+      (error) => kind(error) === "internal_error",
+    );
+    assert.equal(setup.controls[0]?.promptCalls.length, 1, "failed wire steering starts no prompt");
     setup.controls[0]?.resolvePrompt?.();
     assert.equal((await prompt).stopReason, "end_turn");
+
+    assert.deepEqual(
+      await connection.agent.request<SteeringResponse, SteeringRequest>(
+        SESSION_STEERING_METHOD,
+        { sessionId: opened.sessionId, prompt: [{ type: "text", text: "idle wire steer" }] },
+      ),
+      { outcome: "promptRequired", reason: "noRunningTurn" },
+    );
+    assert.equal(setup.controls[0]?.promptCalls.length, 1, "idle wire steering starts no prompt");
   } finally {
     connection.close();
     server.connection.close();
@@ -633,12 +649,10 @@ test("real AgentSession keeps steered generation under the original ACP prompt",
   await agent.dispose();
 });
 
-test("real AgentSession idle steering runs a native fire-and-forget turn", async (t) => {
+test("real AgentSession idle steering requires a prompt and performs no native operation", async (t) => {
   const setup = fakeDeps();
   const harness = await installRealSession(t, setup, () => {
-    const stream = createAssistantMessageEventStream();
-    queueMicrotask(() => complete(stream, "steered idle turn"));
-    return stream;
+    throw new Error("idle steering must not start a provider stream");
   });
   const updates: SessionUpdate[] = [];
   const agent = new PiAcpAgent(setup.deps);
@@ -650,13 +664,10 @@ test("real AgentSession idle steering runs a native fire-and-forget turn", async
   assert.deepEqual(await agent.steer(context({
     sessionId: opened.sessionId,
     prompt: [{ type: "text", text: "start now" }],
-  })), { outcome: "startedNewTurn" });
-  assert.equal(harness.nativePromptCalls(), 1, "the idle steer became a native prompt turn");
+  })), { outcome: "promptRequired", reason: "noRunningTurn" });
+  assert.equal(harness.nativePromptCalls(), 0, "idle steering never calls native prompt");
   assert.equal(harness.nativeSteerCalls().length, 0);
-  await eventually(() => assert.ok(updates.some((update) =>
-    update.sessionUpdate === "agent_message_chunk"
-    && update.content.type === "text"
-    && update.content.text === "steered idle turn")));
+  assert.deepEqual(updates, [], "idle steering emits no hidden turn output");
   await agent.dispose();
 });
 

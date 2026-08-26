@@ -9,7 +9,7 @@ interface QueuedSteering {
 /**
  * Serialises steering requests for a single session. Callers add a request via
  * enqueue(); a single consumer loop runs them one at a time, in arrival order,
- * so two concurrent steers can never race to start rival turns.
+ * so two concurrent steers can never cross an active-turn boundary.
  */
 export class SteeringQueue {
     private readonly pending: QueuedSteering[] = [];

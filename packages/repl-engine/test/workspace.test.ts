@@ -108,11 +108,12 @@ test('parking bridge: agents() serves the REAL model spec and task of parked age
   const out = await ws.eval('agents()');
   assert.equal(out.kind, 'value');
   if (out.kind === 'value') {
-    const agents = out.value as Array<{ callId: string; modelSpec: string; task: string; state: string; supportsSteering: boolean; queuedSteers: number }>;
+    const agents = out.value as Array<{ callId: string; modelSpec: string; task: string; state: string; supportsSteering: boolean; queuedTurns: number }>;
     assert.equal(agents.length, 1);
     assert.equal(agents[0].callId, 'c1');
     assert.equal(agents[0].modelSpec, 'pi/deepseek-v4-flash-max', 'the real model spec, never ""');
     assert.equal(agents[0].task, 'research X', 'the real task, never ""');
+    assert.equal(agents[0].queuedTurns, 0);
   }
   ws.dispose();
 });
@@ -270,7 +271,10 @@ test('custom bridge handlers passed to create override the parking bridge', asyn
         call.resolve('custom handled');
       },
       checkpoint: () => undefined,
+      queue: () => undefined,
       steer: () => undefined,
+      cancelSession: () => undefined,
+      cancelQueue: () => undefined,
       console: () => undefined,
       sleep: () => undefined,
       workspace: () => '{}',

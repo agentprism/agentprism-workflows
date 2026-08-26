@@ -72,9 +72,9 @@ type SteeringRequest = {
     prompt: acp.ContentBlock[];
 };
 
-type SteeringResponse = {
-    outcome: "injected" | "startedNewTurn";
-};
+type SteeringResponse =
+    | {outcome: "injected"}
+    | {outcome: "promptRequired", reason: "noRunningTurn"};
 
 type ThreadStatusType = "active" | "idle" | "systemError";
 type StateListener = () => void;
@@ -414,14 +414,11 @@ async function main(): Promise<void> {
                         sessionId: trackedSessionId,
                         prompt: [{type: "text", text: steeringPrompt}],
                     });
-                    if (steeringResponse.outcome !== "injected" && steeringResponse.outcome !== "startedNewTurn") {
-                        throw new Error(`Unexpected steering response: ${JSON.stringify(steeringResponse)}`);
-                    }
                     writeEvent(c.magenta(c.bold(`   outcome: ${steeringResponse.outcome}`)));
                     if (steeringResponse.outcome === "injected") {
                         writeEvent(c.dim("   → injected into the running turn; the agent picks it up at its next step."));
                     } else {
-                        writeEvent(c.dim("   → the turn had already ended, so this started a fresh turn."));
+                        writeEvent(c.dim("   → the turn had already ended; no prompt was started or queued."));
                     }
                 }
 

@@ -116,9 +116,9 @@ async function tick(): Promise<void> {
  *  resolves or rejects the parked seam to drive the outcome). */
 class FakeSession implements BrokerSession {
   readonly sessionId: string;
-  capabilities: { supportsSteering: boolean } | undefined;
+  initializeMeta: Readonly<Record<string, unknown>> | undefined;
   readonly prompts: Array<{ content: string; resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
-  readonly steers: Array<{ content: string; resolve: (outcome: string) => void; reject: (error: unknown) => void }> = [];
+  readonly steers: Array<{ content: string; resolve: (outcome: unknown) => void; reject: (error: unknown) => void }> = [];
   /** The re-attach seam's parked loaded-turn completions (only used when
    *  no scripted outcome is set). */
   readonly loadedTurns: Array<{ resolve: (turn: BrokerTurn) => void; reject: (error: unknown) => void }> = [];
@@ -149,7 +149,7 @@ class FakeSession implements BrokerSession {
 
   constructor(readonly openedWith: BrokerOpenSessionOptions | BrokerLoadSessionOptions) {
     this.sessionId = `fake-session-${FakeSession.nextId++}`;
-    this.capabilities = { supportsSteering: true };
+    this.initializeMeta = { steering: { supported: true } };
   }
 
   static nextId = 0;
@@ -162,7 +162,7 @@ class FakeSession implements BrokerSession {
     });
   }
 
-  steer(content: string): Promise<string> {
+  steer(content: string): Promise<unknown> {
     return new Promise((resolve, reject) => {
       this.steers.push({ content, resolve, reject });
     });
@@ -253,7 +253,7 @@ class FakeSession implements BrokerSession {
   completeSteer(outcome: string): void {
     const pending = this.steers.shift();
     assert.ok(pending, 'a steer wire call must be in flight');
-    pending.resolve(outcome);
+    pending.resolve({ outcome });
   }
 }
 
@@ -294,7 +294,7 @@ class FakeRunner implements BrokerRunner {
       throw new Error('spawn failed');
     }
     const session = new FakeSession(opts);
-    session.capabilities = { supportsSteering: this.supportsSteering };
+    session.initializeMeta = this.supportsSteering ? { steering: { supported: true } } : {};
     this.sessions.push(session);
     this.openedWith.push(opts);
     return session;
@@ -316,7 +316,7 @@ class FakeRunner implements BrokerRunner {
       throw new Error('session not found at the backend');
     }
     const session = new FakeSession(opts);
-    session.capabilities = { supportsSteering: this.supportsSteering };
+    session.initializeMeta = this.supportsSteering ? { steering: { supported: true } } : {};
     session.loadedTurnTextValue = this.loadedTurnText;
     if (this.seamless) {
       // Shadow the prototype method with an own undefined property — the
@@ -679,7 +679,7 @@ test('a pending checkpoint re-surfaces across the restore: listed again, answera
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('a steer whose wire call died with the process resolves the honest failed, demoted to diagnostics (§6.2)', async () => {
+test('a steer whose wire call died with the process rejects steering_interrupted and is never replayed', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-steer-'));
   const storePath = join(dir, 'calls.jsonl');
   const runner = new FakeRunner();
@@ -698,17 +698,18 @@ test('a steer whose wire call died with the process resolves the honest failed, 
   const broker2 = await Broker.attach(ws2, { runner: runner2, store: JsonlCallStore.open(storePath) });
   const report = await broker2.reconcile();
   assert.deepEqual(report.reattached, ['c1'], 'the founding call re-attaches');
-  assert.deepEqual(report.failedLost, ['c2'], 'the in-flight steer settles failed');
+  assert.deepEqual(report.failedLost, ['c2'], 'the in-flight steer rejects without replay');
   const probe = await broker2.eval('"probe"');
-  assert.deepEqual(output(probe), [], 'the lost-steer line demotes to diagnostics — never an eval output line');
+  assert.ok(output(probe).some((line) => line.includes('steering_interrupted') || line.includes('interrupted by restart')), output(probe).join('\n'));
   const notes = await reconcileNotesOf(broker2);
   assert.ok(
-    notes.some((n) => n.level === 'warn' && n.line.includes('c2') && n.line.includes('unknowable')),
+    notes.some((n) => n.level === 'warn' && n.line.includes('c2') && n.line.includes('not replayed')),
     JSON.stringify(notes),
   );
-  // The failed settle is durable: a second restore settles it from the
-  // store (never re-failed, never re-injected).
-  assert.equal(broker2.store().lookup('c2')!.completion!.value, 'failed');
+  // The interrupted rejection is durable: a second restore settles it
+  // from the store and never re-injects it.
+  const interrupted = broker2.store().lookup('c2')!.completion!.value as { details?: { reason?: string } };
+  assert.equal(interrupted.details?.reason, 'steering_interrupted');
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });
@@ -2109,7 +2110,7 @@ test('a NON-re-armable still-running seam rejection settles on a CANCEL as the r
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('a NON-re-armable held call whose SESSION IS RELEASED re-issues through the safe-re-issue class — the backend process died, so nothing is running to duplicate (phase-F review round 3: the wait\'s release branch)', async () => {
+test('a released reattached session is lane-fatal and is never replaced with a blank session', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'repl-restore-nonrearm-release-'));
   const storePath = join(dir, 'calls.jsonl');
   const runner = new FakeRunner();
@@ -2133,19 +2134,17 @@ test('a NON-re-armable held call whose SESSION IS RELEASED re-issues through the
   await tick();
   await tick();
   assert.equal(runner2.sessions[0].loadedTurns.length, 0, 'the seam was NOT re-invoked — no loop');
-  // The loaded session's dedicated process dies: the wait's release
-  // watch fires, and the observably-dead call is re-issued under the
-  // same id (the fresh session's turn settles the SAME guest promise).
+  // The loaded session's dedicated process dies: session/process loss is
+  // lane-fatal. The broker must not continue the conversation on a blank replacement.
   await runner2.sessions[0].release();
   await tick();
-  assert.equal(broker2.store().lookup('c1')!.reissues, 1, 'the released-session re-issue was recorded');
-  assert.equal(runner2.sessions.length, 2, 'the re-issue opened a fresh session');
-  runner2.sessions[1].completeTurn('the re-issued turn completed');
-  await tick();
   await broker2.pump();
-  const probe = await broker2.eval('await p');
-  assert.equal(probe.result, 'the re-issued turn completed');
-  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the continuation settled exactly once');
+  const record = broker2.store().lookup('c1')!;
+  assert.equal(record.reissues, 0, 'session loss never opens a replacement session');
+  assert.equal(runner2.sessions.length, 1, 'no fresh session was opened');
+  assert.equal(record.completion!.outcome, 'reject');
+  assert.equal((record.completion!.value as { details?: { reason?: string } }).details?.reason, 'session_released');
+  assert.deepEqual(broker2.pendingCalls().map((e) => e.id), [], 'the fatal call settled exactly once');
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });
@@ -2200,7 +2199,7 @@ test('a still-running seam rejection during the client-presence drain is STOPPED
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.ok(result?.includes('cancelled by the client-presence drain'), `guest-visible settlement: ${result}`);
+  assert.ok(result?.includes('turn c1 was cancelled'), `guest-visible settlement: ${result}`);
   await broker2.dispose();
   ws2.dispose();
   rmSync(dir, { recursive: true, force: true });

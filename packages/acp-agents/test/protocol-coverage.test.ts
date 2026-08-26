@@ -160,7 +160,7 @@ test("every dist-probed AUTH_META_MATRIX row's capability literal is present in 
   assert.ok(AUTH_META_MATRIX.some((r) => r.agent === "opencode"));
 });
 
-test("the executable ACP extension matrix pins steering support and installed advertisements", () => {
+test("the executable ACP extension matrix documents installed advertisements without runtime gating", () => {
   assert.deepEqual(ACP_EXTENSION_SUPPORT_MATRIX, [
     {
       agent: "claude",
@@ -177,7 +177,7 @@ test("the executable ACP extension matrix pins steering support and installed ad
     {
       agent: "opencode",
       method: "_session/steering",
-      disposition: "typed-unsupported",
+      disposition: "not-advertised",
     },
     {
       agent: "pi",
@@ -216,11 +216,9 @@ test("the executable ACP extension matrix pins steering support and installed ad
           ? CODEX_DIST
           : undefined;
     if (!dist) continue;
-    // A `supported` disposition means the installed distribution implements the method
-    // AND advertises it at initialize. A `not-advertised` disposition means the method
-    // is absent from the distribution (the seam degrades through the honest re-issue
-    // fallback) — the probe asserts the absence so a future dist that grows the
-    // extension must update the matrix.
+    // A `supported` disposition means the installed distribution implements the method AND
+    // advertises it at initialize. `not-advertised` records distribution evidence only; this
+    // matrix is never consulted to gate a runtime extension request.
     if (row.disposition === "supported") {
       assert.ok(dist.includes(row.method), `${row.agent} dist must implement ${row.method}`);
       if (row.method === "_session/steering") {

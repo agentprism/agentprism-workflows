@@ -58,9 +58,13 @@ describe("SteeringQueue", () => {
     });
 
     it("delivers each handler result to its own caller", async () => {
-        const outcomes: SessionSteeringResponse["outcome"][] = ["injected", "startedNewTurn", "injected"];
+        const outcomes: SessionSteeringResponse[] = [
+            {outcome: "injected"},
+            {outcome: "promptRequired", reason: "noRunningTurn"},
+            {outcome: "injected"},
+        ];
         let call = 0;
-        const queue = new SteeringQueue(async () => ({outcome: outcomes[call++]!}));
+        const queue = new SteeringQueue(async () => outcomes[call++]!);
 
         const results = await Promise.all([
             queue.enqueue(request("a")),
@@ -70,7 +74,7 @@ describe("SteeringQueue", () => {
 
         expect(results).toEqual([
             {outcome: "injected"},
-            {outcome: "startedNewTurn"},
+            {outcome: "promptRequired", reason: "noRunningTurn"},
             {outcome: "injected"},
         ]);
     });

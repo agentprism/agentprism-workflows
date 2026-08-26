@@ -22,9 +22,6 @@ export interface CustomBackendConfig {
   /** Static `_meta` sent on every session/new for this backend (backend-level defaults).
    *  Per-call RunOptions.meta merges over these; backend-computed keys win over both. */
   sessionMeta?: Record<string, unknown>;
-  /** agentCapabilities._meta namespace + bare `_meta` keys this custom agent negotiates.
-   *  Undefined means the backend's custom `_meta`, if any, is never gated. */
-  customCapabilities?: { readonly namespace: string; readonly gatedKeys: readonly string[] };
   /** Enable client-hosted StructuredOutput MCP tool injection when schema runs negotiate HTTP MCP.
    *  Default true; set false for custom agents that should use only the generic prompt/_meta path. */
   structuredOutputTool?: boolean;
@@ -117,7 +114,6 @@ function validateEntry(rawName: string, config: unknown, source: string): [strin
   if (c.structuredOutputTool !== undefined && typeof c.structuredOutputTool !== "boolean") {
     throw new Error(`${source}: backend "${rawName}" "structuredOutputTool" must be a boolean`);
   }
-  const customCapabilities = validateCustomCapabilities(c.customCapabilities, source, rawName);
   return [
     name,
     {
@@ -127,38 +123,12 @@ function validateEntry(rawName: string, config: unknown, source: string): [strin
       ...(c.env !== undefined ? { env: c.env as Record<string, string> } : {}),
       ...(c.sessionMeta !== undefined ? { sessionMeta: c.sessionMeta as Record<string, unknown> } : {}),
       ...(c.structuredOutputTool !== undefined ? { structuredOutputTool: c.structuredOutputTool as boolean } : {}),
-      ...(customCapabilities !== undefined ? { customCapabilities } : {}),
     },
   ];
 }
 
 function asciiLowercase(value: string): string {
   return value.replace(/[A-Z]/g, (character) => String.fromCharCode(character.charCodeAt(0) + 32));
-}
-
-function validateCustomCapabilities(
-  value: unknown,
-  source: string,
-  rawName: string,
-): CustomBackendConfig["customCapabilities"] | undefined {
-  if (value === undefined) return undefined;
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${source}: backend "${rawName}" "customCapabilities" must be an object`);
-  }
-  const c = value as Record<string, unknown>;
-  if (typeof c.namespace !== "string" || c.namespace.trim() === "") {
-    throw new Error(`${source}: backend "${rawName}" "customCapabilities.namespace" must be a non-empty string`);
-  }
-  if (
-    !Array.isArray(c.gatedKeys) ||
-    c.gatedKeys.length === 0 ||
-    !c.gatedKeys.every((key) => typeof key === "string" && key.trim() !== "")
-  ) {
-    throw new Error(
-      `${source}: backend "${rawName}" "customCapabilities.gatedKeys" must be a non-empty array of non-empty strings`,
-    );
-  }
-  return { namespace: c.namespace, gatedKeys: [...c.gatedKeys] as string[] };
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {

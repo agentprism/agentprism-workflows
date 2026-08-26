@@ -16,6 +16,9 @@ import {
   HOST_AGENT,
   HOST_CHECKPOINT,
   HOST_CONSOLE,
+  HOST_QUEUE,
+  HOST_QUEUE_CANCEL,
+  HOST_SESSION_CANCEL,
   HOST_STEER,
   GuestLibraryInstallError,
   ReplVm,
@@ -36,7 +39,7 @@ import type { JSValueHandle, QuickJS, HostFunction } from 'quickjs-wasi';
 // Mock host
 // ────────────────────────────────────────────────────────────────────────
 
-/** A scripted agent/steer resolution: resolve with `value` or reject with
+/** A scripted agent/control resolution: resolve with `value` or reject with
  *  `error` (exactly one of the two). */
 type Scripted = { resolveWith?: unknown; rejectWith?: unknown; assertPrompt?: string };
 
@@ -46,8 +49,14 @@ interface MockBridge {
   events: ConsoleEvent[];
   /** Agent calls, in issue order. */
   agentCalls: Array<{ call: GuestCall; callId: string; modelSpec: string; task: string; optionsJson: string | null }>;
-  /** Steer calls, in issue order. */
-  steerCalls: Array<{ call: GuestCall; callId: string; sessionId: string; action: string; payloadJson: string | null }>;
+  /** Durable queued-turn calls, in issue order. */
+  queueCalls: Array<{ call: GuestCall; callId: string; sessionId: string; payloadJson: string | null }>;
+  /** Strict active-turn steering calls, in issue order. */
+  steerCalls: Array<{ call: GuestCall; callId: string; sessionId: string; payloadJson: string | null }>;
+  /** Reusable-session handle cancellation calls, in issue order. */
+  sessionCancelCalls: Array<{ call: GuestCall; callId: string; sessionId: string }>;
+  /** Exact queued-turn cancellation calls, in issue order. */
+  queueCancelCalls: Array<{ call: GuestCall; callId: string; queueCallId: string }>;
   /** Checkpoint questions, keyed by call id (for answer delivery). */
   pendingCheckpoints: Map<string, GuestCall>;
   /** Scripted resolutions for agent/steer calls, consumed in order. */
@@ -73,8 +82,20 @@ function mockBridge(): MockBridge {
         bridge.pendingCheckpoints.set(callId, call!);
         return undefined;
       },
-      steer: (call, callId, sessionId, action, payloadJson) => {
-        bridge.steerCalls.push({ call, callId, sessionId, action, payloadJson });
+      queue: (call, callId, sessionId, payloadJson) => {
+        bridge.queueCalls.push({ call, callId, sessionId, payloadJson });
+        settleScripted(bridge, call);
+      },
+      steer: (call, callId, sessionId, payloadJson) => {
+        bridge.steerCalls.push({ call, callId, sessionId, payloadJson });
+        settleScripted(bridge, call);
+      },
+      cancelSession: (call, callId, sessionId) => {
+        bridge.sessionCancelCalls.push({ call, callId, sessionId });
+        settleScripted(bridge, call);
+      },
+      cancelQueue: (call, callId, queueCallId) => {
+        bridge.queueCancelCalls.push({ call, callId, queueCallId });
         settleScripted(bridge, call);
       },
       console: (event) => {
@@ -96,7 +117,10 @@ function mockBridge(): MockBridge {
     },
     events: [],
     agentCalls: [],
+    queueCalls: [],
     steerCalls: [],
+    sessionCancelCalls: [],
+    queueCancelCalls: [],
     pendingCheckpoints: new Map(),
     script: [],
   };
@@ -127,7 +151,7 @@ async function createGuest(): Promise<{ vm: ReplVm; bridge: MockBridge }> {
  * (the doc's evolution discipline: a host must serve snapshots carrying
  * older library versions than the one it currently injects, and the
  * resident version stays authoritative). The minimal surface is enough
- * for the discipline assertions: agent/steer/checkpoint park (their
+ * for the discipline assertions: agent/queue/steer/cancel/checkpoint park (their
  * registry entries pend), answer mode reports false, console events
  * bridge into the mock's event list.
  */
@@ -148,7 +172,10 @@ async function installGuestLibraryAtVersion(
   const callbacks: Array<[string, (args: Array<string | null>) => JSValueHandle | undefined]> = [
     [HOST_AGENT, () => undefined],
     [HOST_CHECKPOINT, (args) => (args.length >= 4 ? shim.false : undefined)],
+    [HOST_QUEUE, () => undefined],
     [HOST_STEER, () => undefined],
+    [HOST_SESSION_CANCEL, () => undefined],
+    [HOST_QUEUE_CANCEL, () => undefined],
     [
       HOST_CONSOLE,
       (args) => {
@@ -360,7 +387,7 @@ test('handle options omit undefined promptMeta but preserve undefined unknown ke
   const { vm, bridge } = await createGuest();
   bridge.script.push(
     { resolveWith: 'initial result' },
-    { resolveWith: 'follow-up result' },
+    { resolveWith: 'queued result' },
     {
       rejectWith: {
         message: 'steer options: unknown option "bogus"',
@@ -373,18 +400,18 @@ test('handle options omit undefined promptMeta but preserve undefined unknown ke
   const result = value(
     await vm.evalCode(`
       const h = agent("pi/x", "task");
-      const accepted = await h.followUp("next", { promptMeta: undefined });
+      const accepted = await h.queue("next", { promptMeta: undefined });
       const rejected = await h.steer("redirect", { bogus: undefined })
         .then(() => "accepted", (err) => err.code + "|" + err.message);
       ({ accepted, rejected })
     `),
   );
   assert.deepEqual(result, {
-    accepted: 'follow-up result',
+    accepted: 'queued result',
     rejected: 'SCRIPT_VALIDATION_ERROR|steer options: unknown option "bogus"',
   });
   assert.deepEqual(
-    bridge.steerCalls.map((call) => call.payloadJson === null ? null : JSON.parse(call.payloadJson)),
+    [...bridge.queueCalls, ...bridge.steerCalls].map((call) => call.payloadJson === null ? null : JSON.parse(call.payloadJson)),
     [
       { prompt: 'next', options: {} },
       { prompt: 'redirect', options: { bogus: null } },
@@ -427,61 +454,126 @@ test('a host handler that throws synchronously rejects the call (documented refu
   vm.dispose();
 });
 
-test('the handle: agent() returns a promise carrying id, followUp, steer, cancel (non-enumerable)', async () => {
+test('agent and queued-turn handles expose exactly their distinct queue/steer/cancel surfaces', async () => {
   const { vm, bridge } = await createGuest();
-  bridge.script.push({ resolveWith: 'result' });
-  bridge.script.push({ resolveWith: 'injected' });
-  bridge.script.push({ resolveWith: 'startedNewTurn' });
-  bridge.script.push({ resolveWith: 'cancelled' });
+  bridge.script.push(
+    { resolveWith: 'result' },
+    { resolveWith: 'queued answer' },
+    { resolveWith: 'injected' },
+    { resolveWith: 'idle' },
+    { resolveWith: 'cancelled' },
+  );
   const out = value(
     await vm.evalCode(`
       const h = agent("pi/x", "p");
-      const before = h instanceof Promise;
-      const desc = Object.getOwnPropertyDescriptors(h);
-      const [f, s, c] = [await h.followUp("more", { label: "x" }), await h.steer("urgent"), await h.cancel()];
+      const q = h.queue("more", { promptMeta: { label: "x" } });
+      const queueIdBeforeSettlement = q.id;
+      const agentNames = Object.getOwnPropertyNames(h).sort();
+      const queueNames = Object.getOwnPropertyNames(q).sort();
+      const queueShape = {
+        id: q.id,
+        queue: typeof q.queue,
+        steer: typeof q.steer,
+        followUp: typeof q.followUp,
+        cancel: typeof q.cancel,
+      };
+      const [queued, steered, queueCancelled, sessionCancelled] = [
+        await q,
+        await h.steer("urgent"),
+        await q.cancel(),
+        await h.cancel(),
+      ];
       const result = await h;
-      ({ before, result, f, s, c,
-        id: h.id, hasId: "id" in desc, enumerable: desc.id ? desc.id.enumerable : null,
-        keys: Object.keys(h) })
+      ({
+        agentIsPromise: h instanceof Promise,
+        queueIsPromise: q instanceof Promise,
+        result,
+        queued,
+        steered,
+        queueCancelled,
+        sessionCancelled,
+        agentId: h.id,
+        queueIdBeforeSettlement,
+        agentNames,
+        queueNames,
+        queueShape,
+        agentFollowUp: typeof h.followUp,
+        enumerableAgentKeys: Object.keys(h),
+        enumerableQueueKeys: Object.keys(q),
+      })
     `),
   );
   assert.deepEqual(out, {
-    before: true,
+    agentIsPromise: true,
+    queueIsPromise: true,
     result: 'result',
-    f: 'injected',
-    s: 'startedNewTurn',
-    c: 'cancelled',
-    id: 'c1',
-    hasId: true,
-    enumerable: false,
-    keys: [],
+    queued: 'queued answer',
+    steered: 'injected',
+    queueCancelled: 'idle',
+    sessionCancelled: 'cancelled',
+    agentId: 'c1',
+    queueIdBeforeSettlement: 'c2',
+    agentNames: ['cancel', 'id', 'queue', 'steer'],
+    queueNames: ['cancel', 'id'],
+    queueShape: {
+      id: 'c2',
+      queue: 'undefined',
+      steer: 'undefined',
+      followUp: 'undefined',
+      cancel: 'function',
+    },
+    agentFollowUp: 'undefined',
+    enumerableAgentKeys: [],
+    enumerableQueueKeys: [],
   });
-  // The steer calls carried the right action + payload (cancel payload null).
-  assert.equal(bridge.steerCalls.length, 3);
-  assert.deepEqual(bridge.steerCalls.map((c) => c.action), ['followUp', 'steer', 'cancel']);
-  assert.deepEqual(JSON.parse(bridge.steerCalls[0].payloadJson!), { prompt: 'more', options: { label: 'x' } });
-  assert.equal(bridge.steerCalls[2].payloadJson, null);
-  // The host receives BOTH ids: the operation's own registry id (the
-  // settlement key) and the founding session id (the dispatch target).
-  assert.deepEqual(bridge.steerCalls.map((c) => c.callId), ['c2', 'c3', 'c4']);
-  for (const c of bridge.steerCalls) {
-    assert.equal(c.sessionId, 'c1', `steer call ${c.action} addresses session ${c.sessionId}`);
-  }
+  assert.deepEqual(bridge.queueCalls.map(({ callId, sessionId, payloadJson }) => ({ callId, sessionId, payload: JSON.parse(payloadJson!) })), [
+    { callId: 'c2', sessionId: 'c1', payload: { prompt: 'more', options: { promptMeta: { label: 'x' } } } },
+  ]);
+  assert.deepEqual(bridge.steerCalls.map(({ callId, sessionId, payloadJson }) => ({ callId, sessionId, payload: JSON.parse(payloadJson!) })), [
+    { callId: 'c3', sessionId: 'c1', payload: { prompt: 'urgent' } },
+  ]);
+  assert.deepEqual(bridge.queueCancelCalls.map(({ callId, queueCallId }) => ({ callId, queueCallId })), [
+    { callId: 'c4', queueCallId: 'c2' },
+  ]);
+  assert.deepEqual(bridge.sessionCancelCalls.map(({ callId, sessionId }) => ({ callId, sessionId })), [
+    { callId: 'c5', sessionId: 'c1' },
+  ]);
   vm.dispose();
 });
 
-test('handle validation: followUp/steer need a prompt string; cancel takes none', async () => {
+test('queue() exposes its minted id synchronously before the queued turn settles', async () => {
+  const { vm, bridge } = await createGuest();
+  bridge.script.push({ resolveWith: 'founding answer' }, {});
+  const issued = value(
+    await vm.evalCode(`
+      const h = agent("pi/x", "founding");
+      const q = h.queue("later");
+      ({ id: q.id,
+         kind: globalThis[Symbol.for(${JSON.stringify(GUEST_SURFACE_KEY)})].pending().find((entry) => entry.id === q.id).kind })
+    `),
+  );
+  assert.deepEqual(issued, { id: 'c2', kind: 'queue' });
+  assert.equal(bridge.queueCalls.length, 1);
+  bridge.queueCalls[0].call.resolve('queued answer');
+  vm.drainJobs();
+  assert.equal(value(await vm.evalCode('await q')), 'queued answer');
+  vm.dispose();
+});
+
+test('missing followUp is an ordinary guest TypeError and does not alias queue', async () => {
   const { vm, bridge } = await createGuest();
   bridge.script.push({ resolveWith: 'x' });
   const out = value(
     await vm.evalCode(`
       const h = agent("pi/x", "p");
-      const bad = await h.followUp(42).then(() => "no", (err) => err.name);
+      const bad = await (async () => { try { return await h.followUp("next"); } catch (err) { return err.name; } })();
       const badCancel = await (async () => { try { h.cancel("nope"); return "no-throw"; } catch (e) { return e.name; } })();
       ({ bad, badCancel })
     `),
   );
   assert.deepEqual(out, { bad: 'TypeError', badCancel: 'no-throw' });
+  assert.equal(bridge.queueCalls.length, 0, 'missing followUp never dispatches through queue');
+  assert.equal(bridge.steerCalls.length, 0, 'missing followUp never dispatches through steer');
   vm.dispose();
 });
 
@@ -985,7 +1077,7 @@ test('workspace()/agents() round-trip the host JSON into plain sliceable values;
   const vm = await ReplVm.create();
   const bridge = mockBridge();
   bridge.handlers.workspace = () => JSON.stringify({ bindings: [{ name: 'x', type: 'number', sizeBytes: 8, provenance: 'eval 1', task: null }], inFlight: ['c1'], checkpoints: [{ id: 'c2', question: 'why?' }], diagnostics: { reconcile: null, drainError: null, childrenClosed: false } });
-  bridge.handlers.agents = () => JSON.stringify([{ callId: 'c1', modelSpec: 'pi/x', task: 'do it', state: 'running', supportsSteering: true, queuedSteers: 0 }]);
+  bridge.handlers.agents = () => JSON.stringify([{ callId: 'c1', modelSpec: 'pi/x', task: 'do it', state: 'running', supportsSteering: true, queuedTurns: 2 }]);
   await installGuestBridge(vm, bridge.handlers);
   const out = value(
     await vm.evalCode(`
@@ -997,6 +1089,7 @@ test('workspace()/agents() round-trip the host JSON into plain sliceable values;
         question: w.checkpoints[0].question,
         drained: w.diagnostics.childrenClosed,
         agent: a[0].callId,
+        queuedTurns: a[0].queuedTurns,
         slice: a.filter((x) => x.state === 'running').length,
         resetReturn: reset(),
       })
@@ -1008,6 +1101,7 @@ test('workspace()/agents() round-trip the host JSON into plain sliceable values;
     question: 'why?',
     drained: false,
     agent: 'c1',
+    queuedTurns: 2,
     slice: 1,
     resetReturn: undefined,
   });
@@ -1232,9 +1326,8 @@ test('surface.settle validates its outcome argument (host-side pre-validation av
 });
 
 // ────────────────────────────────────────────────────────────────────────
-// Steering reconciliation (the review discipline: a pending steer must be
-// snapshot-reconcilable — registry entry and host channel both carry the
-// operation's own id AND the founding session id)
+// Steering reconciliation (a pending steer remains correlated for durable
+// interruption on restore; the host must never replay its transient payload)
 // ────────────────────────────────────────────────────────────────────────
 
 test('a pending steer is snapshot-reconcilable: the registry entry records both ids and settle works by registry id', async () => {
@@ -1257,16 +1350,16 @@ test('a pending steer is snapshot-reconcilable: the registry entry records both 
     pendingList.map((e) => ({ id: e.id, kind: e.kind, detail: e.detail, sessionId: e.sessionId, modelSpec: e.modelSpec })),
     [
       { id: 'c1', kind: 'agent', detail: 'work', sessionId: 'c1', modelSpec: 'pi/x' },
-      { id: 'c2', kind: 'steer', detail: 'steer', sessionId: 'c1', modelSpec: null },
+      { id: 'c2', kind: 'steer', detail: 'go faster', sessionId: 'c1', modelSpec: null },
     ],
   );
   // The steer's optionsJson carries the verbatim payload (re-issue needs it).
-  assert.deepEqual(JSON.parse(pendingList[1].optionsJson!), { prompt: 'go faster', options: {} });
+  assert.deepEqual(JSON.parse(pendingList[1].optionsJson!), { prompt: 'go faster' });
 
   // Settlement through the reconciliation route works by the registry id.
-  assert.equal(surface.settle('c2', 'resolve', { delivered: 'queued', mode: 'queued' }), true);
+  assert.equal(surface.settle('c2', 'resolve', 'injected'), true);
   vm.drainJobs();
-  assert.deepEqual(value(await vm.evalCode('await steered')), { delivered: 'queued', mode: 'queued' });
+  assert.equal(value(await vm.evalCode('await steered')), 'injected');
   // The founding call is untouched by the steer settlement.
   assert.equal(surface.settle('c1', 'resolve', 'done'), true);
   vm.drainJobs();
@@ -1274,7 +1367,7 @@ test('a pending steer is snapshot-reconcilable: the registry entry records both 
   vm.dispose();
 });
 
-test('a pending steer survives snapshot/restore with full correlation for re-issue', async () => {
+test('a pending steer survives snapshot/restore with correlation for durable refusal, not replay', async () => {
   const { vm, bridge } = await createGuest();
   bridge.script.push({}); // park c1 (founding agent)
   bridge.script.push({}); // park c2 (steer)
@@ -1289,17 +1382,27 @@ test('a pending steer survives snapshot/restore with full correlation for re-iss
   const surface = readGuestSurface(restored)!;
   const pendingList = surface.pending();
   assert.equal(pendingList.length, 2);
-  // The steer entry names its session — the host re-issues to c1's session.
+  // The steer entry names its session so restore can refuse it durably
+  // without replaying the transient steering payload.
   const steerEntry = pendingList.find((e) => e.kind === 'steer')!;
   assert.equal(steerEntry.id, 'c2');
   assert.equal(steerEntry.sessionId, 'c1');
-  assert.equal(steerEntry.detail, 'steer');
-  // Reconcile: settle the steer by its registry id (what the host does
-  // with the outcome recorded in its call store before the crash).
-  assert.equal(surface.settle('c2', 'resolve', { delivered: 'injected' }), true);
+  assert.equal(steerEntry.detail, 'go faster');
+  // Reconcile rejects by the registry id; registering callbacks above
+  // emitted no new steering request.
+  assert.equal(restoredBridge.steerCalls.length, 0);
+  assert.equal(surface.settle('c2', 'reject', {
+    message: 'steering was interrupted by restart',
+    code: 'AGENT_EXECUTION_ERROR',
+    recoverable: true,
+    details: { reason: 'steering_interrupted' },
+  }), true);
   assert.equal(surface.settle('c1', 'resolve', 'done'), true);
   restored.drainJobs();
-  assert.deepEqual(value(await restored.evalCode('await steered')), { delivered: 'injected' });
+  assert.deepEqual(
+    value(await restored.evalCode('await steered.then(() => null, (err) => ({ code: err.code, reason: err.details.reason }))')),
+    { code: 'AGENT_EXECUTION_ERROR', reason: 'steering_interrupted' },
+  );
   assert.equal(value(await restored.evalCode('await h')), 'done');
   restored.dispose();
 });
@@ -1493,7 +1596,7 @@ test('5,000 sequential resolved agent calls leave a 2 MiB VM healthy (no handle 
 });
 
 test('unsettled parked calls do not leak either (promise handles are released after return)', async () => {
-  const vm = await ReplVm.create({ memoryLimit: 8 * 1024 * 1024 });
+  const vm = await ReplVm.create({ memoryLimit: 12 * 1024 * 1024 });
   const bridge = mockBridge();
   await installGuestBridge(vm, bridge.handlers);
   // 5,000 parked calls (never settled): each returned promise handle must
@@ -1504,14 +1607,10 @@ test('unsettled parked calls do not leak either (promise handles are released af
   // have an honest footprint of ~2.09 MB — 99.9% of a 2 MiB limit, a
   // knife-edge where any library-source evolution (even comment growth)
   // tipped the GC/malloc interplay into a hard failure at ~725 calls. The
-  // limit is 8 MiB here: the honest footprint (library source + live
-  // registry entries) grows with the 0.4.0 library (the §4.4 repr, the
-  // eval-plane helpers) and plateaus comfortably under 8 MiB even at
-  // 5,000 parked calls —
-  // while the leak class this test pins (an undisposed promise handle
-  // plus a marshalled value per call, ~400 B/call) is GC-proof: it adds
-  // ~2 MB of PINNED guest memory over 5,000 calls, pushing the plateau to
-  // ~5.1 MB, and cannot hide in the headroom (the OOM surfaces mid-loop).
+  // limit is 12 MiB here: the honest footprint (library source + live
+  // registry entries) grows with the 0.5.0 four-callback queue/control
+  // surface. This remains a deterministic high-volume health check;
+  // the separate 30,000-refusal test below is the tighter leak detector.
   for (let i = 0; i < 5000; i++) {
     const out = await vm.evalCode(`agent("pi/x", "task ${i}"); "started"`);
     assert.equal(out.kind, 'value');
@@ -1528,8 +1627,8 @@ test('30,000 synchronous host refusals leave a 2 MiB VM healthy (throwing handle
   // guest memory (promise + 2 resolvers + heap boxes). After 30,000
   // rejected calls the 2 MiB VM was saturated and the next NORMAL agent
   // call failed with `Error: null`. Every throwing-handler path (agent,
-  // steer, checkpoint question mode) now disposes all owned parts before
-  // re-throwing.
+  // queue, steer, both cancellation callbacks, and checkpoint question
+  // mode) now disposes all owned parts before re-throwing.
   //
   // The regression is pinned TWO ways, both deterministic: the guest
   // runtime's own memory usage after the refusals (qjs_compute_memory_
@@ -1541,23 +1640,35 @@ test('30,000 synchronous host refusals leave a 2 MiB VM healthy (throwing handle
   bridge.handlers.agent = () => {
     throw new Error('refused at dispatch');
   };
+  bridge.handlers.queue = () => {
+    throw new Error('refused at dispatch');
+  };
   bridge.handlers.steer = () => {
+    throw new Error('refused at dispatch');
+  };
+  bridge.handlers.cancelSession = () => {
+    throw new Error('refused at dispatch');
+  };
+  bridge.handlers.cancelQueue = () => {
     throw new Error('refused at dispatch');
   };
   bridge.handlers.checkpoint = () => {
     throw new Error('refused at dispatch');
   };
   await installGuestBridge(vm, bridge.handlers);
-  // 30,000 refused calls across all three host-callback kinds (100 evals
-  // × 100 iterations × 3 calls), every promise rejection handled in-eval.
-  for (let i = 0; i < 100; i++) {
+  // 30,000 refused calls across all six host-callback kinds (50 evals
+  // × 100 iterations × 6 calls), every promise rejection handled in-eval.
+  for (let i = 0; i < 50; i++) {
     const out = await vm.evalCode(`
       (async () => {
         for (let k = 0; k < 100; k++) {
           const h = agent("pi/x", "t" + k);
+          const queued = h.queue("later");
           const s = h.steer("go");
+          const sc = h.cancel();
+          const qc = queued.cancel();
           const q = checkpoint("q?");
-          await Promise.all([h, s, q].map((p) => p.then(() => "no", (e) => e.message)));
+          await Promise.all([h, queued, s, sc, qc, q].map((p) => p.then(() => "no", (e) => e.message)));
         }
       })()
     `);

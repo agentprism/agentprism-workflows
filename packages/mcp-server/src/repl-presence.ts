@@ -6,8 +6,8 @@
  * presence). On last-client disconnect, in-flight subagent turns drain
  * to completion — their results settle into the VM and each settlement
  * boundary snapshots — and then idle children close. On the next client
- * connect, the workspace is live (or restores from snapshot) and
- * `followUp` re-attaches the subagent session lazily."
+ * connect, the workspace is live (or restores from snapshot) and an
+ * eligible queue head re-attaches its recorded subagent session lazily.
  *
  * One ledger per daemon. `touch(state, clientId)` marks an MCP session
  * as present on a project's workspace (every `repl` tool call from that
@@ -23,8 +23,8 @@
  * decision: the bound REUSES the daemon's existing TTL knob rather than
  * inventing a new one — in-flight turns already run under the runner's
  * own runaway protections; the TTL is the outer ceiling). The workspace
- * and broker stay alive; the next client's followUp/steer/cancel
- * lazily re-attaches the recorded backend sessions (the broker's
+ * and broker stay alive; the next eligible queued turn lazily
+ * re-attaches its recorded backend session (the broker's
  * capability-gated lazy re-attach), and a client reconnecting MID-drain
  * ABORTS the drain — the broker consults the project's client set every
  * iteration and before every destructive phase, so the children stay

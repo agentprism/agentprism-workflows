@@ -1,378 +1,39 @@
 /**
- * The REPL orchestrator's broker — the host-side brain that wires a
- * workspace's guest bridge to real ACP subagent sessions through
- * `@automatalabs/acp-agents` (the roadmap doc's phase C: broker + call
- * store + eval semantics).
+ * Persistent REPL broker.
  *
- * `Broker.attach(workspace, options)` takes over a workspace's four
- * `__host_*` callbacks (the same by-name re-registration the snapshot-
- * restore path uses; the guest library and its pending-call registry are
- * untouched) and implements the doc's broker contract:
+ * The broker owns two deliberately separate control planes for each reusable ACP session:
  *
- * - **`agent(modelSpec, task, opts)` dispatches a held-open ACP session**
- *   via the runner's `openSession` (the routing grammar, model spec and
- *   per-call cwd are the runner's own; the broker passes the guest's
- *   options through — `schema` is validated by acp-agents' own
- *   structured-output ladder, see "The guest options surface" below).
- *   Sessions stay open while any MCP client is connected to the project;
- *   on last-client disconnect the daemon drives the client-presence
- *   DRAIN (`drainForDisconnect` — the doc's policy: in-flight turns
- *   drain to completion, each settlement boundary snapshots, then idle
- *   children close; the concrete bound reuses the daemon's
- *   session-eviction TTL), and a later followUp/steer/cancel on a
- *   settled handle RE-ATTACHES the subagent session lazily via the
- *   capability matrix (`canLazyReattach`/`lazyReattach` — the doc's
- *   "followUp re-attaches the subagent session lazily").
- *   They are opened with `keepSession: true`, so the ACP session persists
- *   on the backend for the restore path's lazy re-attach; the moment a
- *   session opens, its backend session id AND resolved backend id are
- *   recorded in the call store
- *   (`recordAttached` — BEFORE the prompt is sent), so a crash with a
- *   turn in flight leaves a restore able to re-attach the session
- *   instead of re-issuing a call whose turn may still be running
- *   (duplicated work).
- * - **Six concurrent subagents per workspace** (the doc-settled cap).
- *   The cap counts live work: unsettled agent calls plus sessions
- *   running a follow-up turn (a queued-steer delivery turn or a §4.2
- *   followUp turn on a settled handle — a subagent is working even on a
- *   follow-up turn). The cap is ABSOLUTE for turn starts, not just
- *   dispatches: a dispatch over the cap QUEUES in dispatch order for
- *   the next free slot (§4.1 — never a rejection, matching the workflow
- *   engine's semantics), and a followUp/steer on an idle session whose
- *   start would exceed the cap queues on the same durable delivery
- *   queue (never a seventh concurrent turn, never a hard error).
- *   Queued delivery turns likewise start only while a slot is free; the
- *   kick (`kickQueuedDeliveries`) runs whenever a slot frees.
- *   `maxConcurrentAgents` is configurable (server configuration,
- *   invisible to the guest).
- * - **Steering resolves with what actually happened** (the doc's
- *   "nothing is hidden, nothing hard-errors", redesigned per §4.2):
- *   followUp/steer on a SETTLED or IDLE session mint a NEW turn with its
- *   own call id (visible in `agents()`/`liveAgents()`, targetable by
- *   `interrupt`) and resolve with the TURN'S ANSWER — the SAME value
- *   semantics as `agent()` (the founding handle's schema drives the
- *   schema-validated object; a schema-less handle resolves the final
- *   text), never the bare
- *   `startedNewTurn` token, never a discarded turn (idle-session `steer`
- *   is the followUp alias). A MID-TURN steer keeps the delivery-outcome
- *   vocabulary: `injected` where the backend advertises
- *   `_session/steering` (a backend `startedNewTurn` maps to `queued`),
- *   `queued` where it does not (next-turn delivery), `failed` on wire
- *   failure (see the steering mechanism table below).
- *   Queued-for-next-turn delivery is DURABLE: the steer's payload and
- *   founding session id live in the call store, and the store records
- *   each delivery turn's start (the `delivered` marker — recorded in
- *   the session's handoff acknowledgment, i.e. only once the prompt has
- *   passed every preflight AND the underlying ACP session/prompt
- *   request has actually been invoked: a crash before the
- *   acknowledgment — or an async pre-handoff rejection: released
- *   session, aborted signal, prompt-in-flight — leaves the steer
- *   undelivered-in-the-store, so reconcile re-queues it instead of
- *   skipping it forever) and each
- *   drop (`dropped`), so a crash between enqueue and delivery loses
- *   nothing and a restored broker replays undelivered steers without
- *   duplicating delivered ones (`reconcile()`'s queue rebuild arm).
- *   Steering calls NEVER hard-error: every backend/wire failure resolves
- *   `failed`; the only rejections are guest protocol violations.
- * - **The append-only call store** (`store.ts`): every call's outcome is
- *   recorded by call id BEFORE it is settled into the guest (transfer
- *   lesson 1 — exactly-once settlement across crashes). The pump's
- *   delivery loop is record → settle → consume; both sides are first-wins
- *   idempotent, so a crash between the store write and the guest
- *   settlement is healed by the next delivery attempt (and, across a
- *   restore, by `reconcile()`'s store arm).
- * - **The restore path's three-way reconciliation** (transfer lesson 1,
- *   phase D): `reconcile()` reads the in-VM pending-call registry and
- *   settles every outstanding call exactly one way — completed while
- *   down → settle from the store; still resumable at the backend →
- *   re-attach via `runner.loadSession` (the capability gate is the
- *   runner's own, per acp-agents' `supportsLoadSession`; a custom
- *   backend that omits it degrades through the same gate, surfaced
- *   guest-visibly); lost → re-issue under the same call id (bumping the
- *   store's reissues counter, never duplicating the guest promise). The
- *   re-attach decision keys on the backend session id the store
- *   recorded at session open; a re-attached call's completion is the
- *   loaded session's founding turn (`awaitCurrentTurn`), delivered
- *   through the same record → settle → consume pump as a live call.
- *   Pending checkpoints re-surface (answering works across a restore)
- *   and pending steers whose wire call died with the process resolve
- *   the honest `failed` (their outcome is unknowable; re-injecting
- *   would duplicate). See "The restore path" below.
- * - **The eval tool-result shape** (`Broker.eval`): output lines (the
- *   guest-rendered §4.4 one-line console reprs, raised-checkpoint lines,
- *   and the §4.6 uncaught-error renderings — NO output caps, the §7
- *   deletion), the repr'd completion value when the eval resolved (the
- *   depth-limited repr: direct strings whole, objects/arrays to depth 2,
- *   20 entries per level, nested strings head-limited at 200 chars), the
- *   pending call ids when it suspended (no fabricated value), the raised
- *   checkpoints (previewed questions), and the call ids this operation
- *   settled. Eval errors render with the error name and message, the
- *   guest stack's top frames with line numbers in the submitted code,
- *   and — for subagent-call errors — the call id and the resolved
- *   backend. Every completion value crossing into the tool result is
- *   rendered trap-free (transfer lesson 2): the result line is repr'd
- *   from the live completion handle through the previewer's own
- *   own-descriptor machinery — no guest getter is ever executed while
- *   rendering. The `_` result-history global is set after every eval
- *   that resolved with a value (§4.4; the `$N` capture globals are
- *   deleted).
- * - **Suspended-eval semantics** (transfer lesson 3, as pinned by the
- *   harness's R69 work): top-level `await` is accepted; an eval whose
- *   completion resolves within its drain reports the previewed value; one
- *   that suspends returns immediately with no fabricated value, listing
- *   the pending call ids; the continuation resumes at settlement like a
- *   `.then` (its output lands in the next tool result); a late uncaught
- *   rejection of a suspended completion surfaces as an error-level
- *   console line in the next tool result (the VM's rejection bridge,
- *   armed by the broker's `rejectionBridge` eval option); top-level
- *   `return` stays a syntax error (the VM layer's parser).
- * - **Checkpoints** (transfer lesson 4, §4.3): `checkpoint(question)`
- *   parks a promise and records the dispatch in the call store; the
- *   raise surfaces as a `checkpoint c9: <question>` line in the eval's
- *   output (the question as PLAIN head+tail metadata text — the
- *   double-JSON-quote fix) and in `workspace()`; `checkpoint.answer(id,
- *   value)` in a later eval records the answer and settles the parked
- *   promise within that eval — root-mediated by construction, first-
- *   wins, and never delivered to anything but the matching pending
- *   checkpoint.
+ * - strict `steer()` is transient control of the ACP prompt currently in flight. It parses only
+ *   raw `initializeMeta.steering.supported === true`, serializes control requests per lane, sends
+ *   `idleBehavior: "promptRequired"`, and never starts or queues a prompt. Idle/unadvertised
+ *   steering resolves `idle`/`unsupported`; malformed or `startedNewTurn` responses are fatal
+ *   protocol violations.
+ * - `queue()` creates a first-class future public turn with its own call id, durable store record,
+ *   promise, cancellation target, answer/schema repair, and workspace admission sequence. Queue
+ *   heads run FIFO per session through ordinary `session/prompt`; no backend-native queue or
+ *   steering extension implements them.
  *
- * ## The restore path (phase D, spec-owed decisions)
+ * A session lane explicitly tracks its active turn, prompt-in-flight boundary, queued turns,
+ * steering-control FIFO, cancellation fence, and usable/fatal/released lifecycle. Founding calls
+ * and queued turns share the global concurrency scheduler; the oldest eligible admission wins and
+ * ineligible work never blocks another session. Steering and cancellation consume no extra slot.
  *
- * The roadmap doc's restore path — restore the VM, re-register host
- * callbacks by name, read the in-VM pending-call registry, and reconcile
- * each outstanding call three ways — is implemented here in full:
+ * The append-only call store records before guest settlement. Queue admission, handoff and
+ * cancellation markers make restore bounded and explicit: unhanded queue work remains eligible;
+ * handed-off work is never blindly resent and requires authoritative loaded-turn evidence;
+ * unresolved steering rejects `steering_interrupted` and is never replayed. Format-2 snapshots are
+ * refused by the format-3 envelope before guest execution and the daemon's existing auto-reset path
+ * renames them aside and clears their ledger.
  *
- * 1. **Completed while down → settle from the store.** A pending call
- *    whose store record carries a completion settles from the store
- *    (the guest's idempotent settle-by-id makes a double delivery a
- *    no-op), whatever its kind.
- * 2. **Still resumable at the backend → re-attach.** A pending AGENT
- *    call with a recorded backend session id is re-attached via
- *    `runner.loadSession({ sessionId, model, cwd, … })` — the same
- *    open options the founding dispatch used, recovered from the
- *    registry entry (modelSpec + verbatim optionsJson). The
- *    capability gate is the runner's own, exactly as in acp-agents
- *    (`negotiateCapabilities().supportsLoadSession`; all four built-in
- *    backends advertise `loadSession: true` per docs/api.md, and a
- *    custom backend that omits it rejects the load before any wire
- *    request). The load routes by the store's RECORDED backend id (a
- *    backend id doubles as a model routing spec — never the current
- *    configured default; phase-D review round 2). On success the call's
- *    completion is the loaded session's founding turn, observed through
- *    `awaitCurrentTurn` — a REAL seam on the acp-agents adapter (phase-D
- *    review: the seam used to be absent from `InteractiveSession`, so
- *    every built-in backend loaded, released, and re-issued). Its
- *    completion evidence is the `_session/loaded_turn` vendor extension
- *    (phase-D review round 3 — the AUTHORITATIVE terminal channel the
- *    orchestrator required after rejecting both the quiet-grace
- *    heuristic, which durably settled an assistant PARTIAL as a
- *    completed-while-down turn when the next live chunk arrived later,
- *    and the blind re-issue, which duplicated a still-running backend
- *    turn): `session/load` obliges the agent to replay the entire
- *    persisted conversation and only then resolve the load; the runner
- *    marks the LOAD BOUNDARY at the response, and the seam asks
- *    `_session/loaded_turn/query` whether the founding turn is still
- *    running RIGHT NOW. `completed` — the turn observably ended while
- *    the daemon was down: the replay's trailing assistant message is
- *    its FINAL message, and the seam resolves immediately (the real
- *    accumulated text; `stopReason` synthesized as `end_turn` — the
- *    protocol's replay carries none, and the broker's own
- *    result-shaping gates still apply). `interrupted` — it ended
- *    without a terminal message and no turn is running: the SAFE-
- *    RE-ISSUE rejection class. `running` — the turn is still executing:
- *    the seam KEEPS THE LOADED SESSION ATTACHED and waits for the
- *    authoritative `_session/loaded_turn/ended` notification (a quiet
- *    gap is only a progress-stream gap, never terminal evidence),
- *    bounded by the max-wait backstop. A backend WITHOUT the extension
- *    (the built-in claude and opencode backends today) is classified by
- *    the seam's OBSERVATION path instead (phase-F review round 2 — the
- *    old degradation released the loaded session and re-issued the
- *    call, which can duplicate a still-running backend turn; re-issue
- *    is now reserved for the observably-dead classes): the post-load
- *    continuation watch (any CONTENT update after the load boundary is
- *    live continuation — the authoritative still-running signal, which
- *    flips the classification to the keep-attached wait) plus the
- *    replay probe under the CONNECTION-DEATH CONTRACT — the built-in
- *    ACP servers terminate in-flight turns when the client connection
- *    closes (live-verified) and their persisted transcripts hold only
- *    completed messages, so at restore the founding turn is never still
- *    running and the replay's trailing content is authoritative: an
- *    assistant message is the turn's terminal message (completed-while-
- *    down), anything else means it died mid-way (safe re-issue —
- *    nothing running, no duplication possible). A query failure on an
- *    extension backend falls through to the same observation path. The
- *    seam degrades to a
- *    rejection on: a transcript with no user message (the recorded
- *    session never received its prompt — safe re-issue), a
- *    released/dead session (safe re-issue — the process died with the
- *    turn), `interrupted` (safe re-issue), a load failure (capability
- *    absent, session deleted, wire failure), an unmarked handle (the
- *    boundary was never recorded), a `running` turn
- *    past the max-wait bound (re-armable `LoadedTurnStillRunningError`
- *    — the broker re-arms the seam on the still-attached session so a
- *    later notification or cancel still settles the call; the
- *    NON-re-armable form from a third-party seam (it can NEVER observe
- *    the terminal state) is NOT re-invoked — an immediate recursive
- *    re-arm would spin in an unbounded microtask/warning loop,
- *    starving cancellation, drain, and every other task — the broker
- *    instead waits for the terminal state from the session's own ended
- *    notification, the call's cancel, the session's release, or the
- *    drain's forced stop (phase-F review round 2: a possibly-running
- *    call is never re-issued), or a turn
- *    that failed at the backend
- *    (`LoadedTurnFailedError` — a definite outcome, settled as an
- *    ordinary rejection, never re-issued). While the broker is
- *    draining/disposing even safe-re-issue rejections resolve `hold` (a
- *    fresh child must never open and run after the last client
- *    disconnected — the drain's forced stop settles every still-pending
- *    call DURABLY at its bound, so a drained call is never left
- *    pending; a disposed broker's state is being torn down).
- *    A third-party `BrokerSession` adapter WITHOUT the seam degrades
- *    through the SAME re-issue fallback (the seam absence is a
- *    capability omission — re-attachment itself is unavailable there). The outcome is
- *    delivered through the SAME record → settle → consume pump as a
- *    live call — exactly once, first-wins on both sides (a held call's
- *    `hold` outcome drops the pump entry without recording or
- *    settling — the only `hold`s left are the drain/disposal fences,
- *    where the call was already settled durably by the drain's forced
- *    stop or the owning state is being torn down). A re-attached call
- *    holds a concurrency token until it settles, like any other live
- *    call.
- * 3. **Lost → re-issue.** A pending agent call with no recorded session
- *    (its session never opened, or a foreign snapshot), or whose
- *    re-attach failed, is re-issued under the SAME call id: the store
- *    records the reissue (`recordReissued` — the reissues counter
- *    bumps), a fresh session opens through the ordinary dispatch path,
- *    and the outcome settles the existing guest promise via the
- *    reconciliation surface. The re-issue is surfaced guest-visibly
- *    (a warn line naming the reason); a store-unknown entry (foreign
- *    snapshot / wiped store) is adopted first so the replay ledger
- *    stays complete. Re-issues respect the concurrency cap: an over-cap
- *    re-issue is refused with the recoverable `ConcurrencyLimitError`,
- *    recorded and settled exactly like a dispatch-time refusal.
+ * Cancellation targets one selected public turn. Pending queue cancellation sends no ACP request;
+ * active cancellation fences late output, sends at most one cancel, and keeps the lane blocked until
+ * the prompt settles or the 5-second fatal escalation fires. Turn-local failures allow later queue
+ * items; session/process loss, reattach failure, persistence failure, cancellation timeout, and
+ * steering protocol violations reject the whole lane without opening a blank replacement session.
  *
- * Everything else a restore finds in the registry:
- *
- * - **Pending checkpoints re-surface**: the broker re-registers them in
- *   its checkpoint table (the question + options travel inside the
- *   snapshot), so the tool result lists them again and
- *   `checkpoint.answer` settles them across the restore — through the
- *   reconciliation surface (a restored checkpoint has no live
- *   `GuestCall`; `PendingCheckpoint.call` is null on that path).
- * - **Pending steers whose wire call died with the process** (an
- *   injected steer, a delivery turn, or a cancel in flight at the
- *   crash) resolve the honest `failed` with a warn line: their outcome
- *   is unknowable, and re-issuing an injected steer would duplicate the
- *   injection. Queued-but-undelivered steers are the one deliberate
- *   exception — their payload is in the store, so the queue rebuild
- *   re-queues them exactly once (the phase-C durable-delivery arm).
- * - **Idempotence**: a call this broker already tracks (a repeated
- *   reconcile, a live in-flight task) is never re-attached or re-issued
- *   a second time — the report lists it as re-attached and the
- *   registry's first-wins settle makes any replay a no-op.
- *
- * ## The state-changing-boundary sink (phase D)
- *
- * The doc's snapshot cadence — a snapshot after each eval and after
- * each settlement drain that changed VM state — is delivered as
- * `BrokerOptions.snapshotSink`: `boundary(kind)` fires after every eval
- * and after every settlement drain that changed VM state, and
- * `flush()` fires at the end of each serialized broker operation — the
- * burst boundary. A sink that debounces (the daemon's snapshot writer,
- * `ReplWorkspaceStore.snapshotWriter`) therefore coalesces the
- * boundaries of one drain burst (a broker eval first pumps settled
- * calls and drains, then drains the eval itself — two boundaries in
- * one operation) into a single write, taken before the operation's
- * promise resolves. The debounced gap is always covered: settlements
- * are recorded in the call store BEFORE they settle, so a restore
- * replays them from the store arm; the eval itself is only visible
- * after the write. A drain that changed nothing fires nothing.
- *
- * ## The steering mechanism table (spec-owed decision)
- *
- * The roadmap doc's per-backend steering *mechanism* table is decided
- * here. The CURRENT per-backend inventory (the doc's owed decision,
- * sourced from the live capability probes in acp-agents —
- * `ACP_EXTENSION_SUPPORT_MATRIX` in `src/protocol-coverage.ts`, probed
- * by the protocol-coverage suite against the installed Claude/Codex
- * distributions, plus the live-verified initialize matrix in
- * `docs/api.md`):
- *
- * | Backend | `_session/steering` | Steering mechanism |
- * |---|---|---|
- * | claude | advertised (`_meta.steering.supported` probe, live-verified) | live injection via `session.steer()` |
- * | codex | advertised (same probe, live-verified) | live injection via `session.steer()` |
- * | pi | advertised (same probe; workspace-owned package tested in its own suite) | live injection via `session.steer()` |
- * | opencode | NOT advertised (`typed-unsupported` in the extension matrix — no safe driven wrapper) | queued-for-next-turn delivery |
- * | custom backend | whatever the agent's initialize response advertises (capability-gated per session) | live injection when advertised, queued delivery otherwise |
- *
- * The per-session capability is read ONCE at session open
- * (`session.capabilities.supportsSteering`); the mechanism table for one
- * session (§4.2):
- *
- * | Case | Mechanism | Outcome the handle resolves with |
- * |---|---|---|
- * | backend advertises `_session/steering`, turn in flight | `session.steer(content)` — live injection | `injected` (live injection); a backend `startedNewTurn` — the injection raced the turn's end and the backend started a new turn with the content — maps to `queued` (accepted for next-turn delivery; the v1 bare token never reaches the guest) |
- * | backend does NOT advertise steering, turn in flight | content enqueued for next-turn delivery | `queued` (immediately — accepted for next-turn delivery; if the call is later cancelled the queue is dropped, and a delivery-turn failure surfaces as a warn-level line in the next tool result — both documented) |
- * | ANY backend, session SETTLED or IDLE | `session.prompt(content)` — a NEW TURN with its own call id | the TURN'S ANSWER (the founding handle's schema drives the schema-validated object; a schema-less handle resolves the final text — the §4.2 semantics; a turn failure rejects the call with the §4.6 attribution) |
- * | ANY backend, session idle, but the workspace cap is exhausted | content enqueued for the next free slot (the same durable queue); the steer's promise stays pending | the TURN'S ANSWER once the delivery runs (a follow-up turn IS the subagent working — the six-agent ceiling is absolute) |
- * | any backend/wire failure on the steering path | — | `failed` (never a hard rejection) |
- * | the founding call is still OPENING (its session does not exist yet —
- *   a steer in the same eval as the dispatch) | content queued for the
- *   call's next-turn boundary | `queued` |
- * | no live session for the founding call at all (never opened, or lost) | — | `failed` (nothing was steered) |
- * | `cancel()` with a turn in flight | ACP `session/cancel` | `cancelled` (the cancelled call itself rejects with the recoverable `CancelledError`) |
- * | `cancel()` with the session idle | no-op — the agent is already stopped | `idle` |
- * | `cancel()` while the call is still opening | the opening call is fenced + settled durably as cancelled (a late child is closed without prompting) | `cancelled` (the call rejects with the recoverable `AGENT_CANCELLED`) |
- *
- * A MID-TURN steer resolves EXACTLY the delivery-outcome vocabulary
- * (`injected` / `queued` / `failed` — the backend's `startedNewTurn` maps
- * to `queued`, never the bare v1 token), with the cancel vocabulary
- * (`cancelled` / `idle`) for `cancel()`; IDLE-session followUp/steer
- * resolve with the turn's answer instead — the orchestrator can always
- * tell urgency delivery (injected) from next-turn delivery (queued),
- * which is the doc's stated requirement.
- *
- * ## The guest options surface (§4.1)
- *
- * `agent(modelSpec, task, opts)` accepts EXACTLY this option bag (any
- * other key rejects the call SYNCHRONOUSLY with an error that lists the
- * valid keys — an unknown option is a guest bug, never silently
- * ignored):
- *
- * - `schema` — a JSON Schema object; acp-agents validates per call (its
- *   own convert/check + re-prompt ladder, driven by the broker over the
- *   session). The schema reaches the backend through acp-agents' native
- *   channels exactly like `run()`: the broker passes it into session
- *   creation (`openSession({ schema })` folds it into session/new
- *   `_meta` where the backend carries it there — Claude), and
- *   acp-agents' `InteractiveSession.prompt` merges the backend-computed
- *   turn meta (the Codex `outputSchema` forward) and embeds the
- *   contract in the prompt text for backends that ignore the `_meta`
- *   forward (pi, custom). The one divergence from `run()` stays: the
- *   client-hosted StructuredOutput MCP capture tool is not injected on
- *   the interactive path; the native + prose-extraction channels are
- *   the same ladder.
- * - `cwd` — absolute working directory for the ACP session; defaults to
- *   the workspace's project directory.
- * - `configOptions` — ACP session config options (record of string |
- *   boolean, applied in sorted option-id order by the runner). Keys
- *   validate AT ADMISSION against the resolved backend's known option
- *   vocabulary where it is knowable (the runner's `knownConfigOptionIds`
- *   seam); where the vocabulary is genuinely dynamic, the [C]5 fallback
- *   guarantees the late error names the offending key.
- * - `mode` — the agent-advertised ACP session mode id (strict
- *   confinement lever).
- *
- * The §4.1 admission validation also resolves the model spec's backend
- * segment against the registry (built-ins plus registered custom
- * agents): an unknown segment rejects synchronously naming the segment
- * and enumerating the known backends — never a silent route to the
- * default backend. The guest's reserved `'default'` sentinel
- * (verify/judgePanel reviewers/graders) is host-routed.
- *
- * Steering payloads (`followUp`/`steer` options) accept exactly
- * `{ promptMeta }`.
+ * Unrelated REPL semantics remain unchanged: persistent QuickJS bindings, top-level await,
+ * checkpoint delivery, trap-free rendering, continuation-targeted eval break, provenance,
+ * boundary snapshots, client-presence drain, and record -> settle -> consume idempotence.
  */
 
 import type { JSValueHandle } from 'quickjs-wasi';
@@ -404,7 +65,8 @@ import type { EvalErrorInfo } from './errors.js';
 // ────────────────────────────────────────────────────────────────────────
 
 /** The outcome surface steering operations settle with (see module docs). */
-export type SteeringOutcomeValue = 'injected' | 'queued' | 'cancelled' | 'idle' | 'failed';
+export type SteeringOutcomeValue = 'injected' | 'idle' | 'unsupported';
+export type CancelOutcomeValue = 'cancelled' | 'idle';
 
 /** Options for opening one subagent session (the broker's structural
  *  subset of the runner's `InteractiveSessionOptions`). */
@@ -455,7 +117,7 @@ export interface BrokerPromptOptions {
    *  prompt has passed every preflight check (released session, aborted
    *  signal, prompt-in-flight) and is being handed to the underlying ACP
    *  session/prompt — the point of no return. The broker records its
-   *  queued-steer `delivered` marker inside this callback: a marker
+   *  queued-turn `delivered` marker inside this callback: a marker
    *  recorded here can never precede the backend handoff (review
    *  regression: the marker used to be recorded when the prompt promise
    *  was CREATED, so an async pre-handoff rejection — released session,
@@ -470,6 +132,7 @@ export interface BrokerPromptOptions {
 export interface BrokerTurn {
   readonly stopReason: string;
   readonly text: string;
+  readonly response?: unknown;
 }
 
 /** Options for re-attaching an existing backend session (the restore
@@ -493,13 +156,13 @@ export interface BrokerSession {
    *  persisted backendId stays null and routing falls back to the
    *  persisted model spec. */
   readonly backendId?: string;
-  /** The negotiated initialize capabilities; `undefined` degrades to
-   *  "no steering" (the capability-gated honest fallback). */
-  readonly capabilities?: { supportsSteering?: boolean };
+  /** Complete initialize response metadata. Extension support is parsed
+   *  strictly by the REPL at the point of use. */
+  readonly initializeMeta?: Readonly<Record<string, unknown>>;
   /** Send one prompt turn. Only one turn may be in flight at a time. */
   prompt(content: string, opts?: BrokerPromptOptions): Promise<BrokerTurn>;
   /** Inject content into the in-flight turn via `_session/steering`. */
-  steer(content: string, opts?: BrokerPromptOptions): Promise<string>;
+  steer(content: string, opts?: BrokerPromptOptions): Promise<unknown>;
   /** Cancel the active turn (ACP `session/cancel`). */
   cancel(): Promise<void>;
   /** Release the ACP session and close its dedicated process (the
@@ -696,16 +359,9 @@ export interface LiveAgentInfo {
   callId: string;
   modelSpec: string;
   task: string;
-  /** `opening` — session being opened, or a followUp turn whose
-   *  founding session is still being re-attached (listed from mint
-   *  time); `running` — initial turn in
-   *  flight; `delivering` — a queued-steer turn in flight; `queued` —
-   *  a followUp turn waiting for a free concurrency slot (visible and
-   *  targetable before its delivery starts); `idle` — call settled, no
-   *  turn running. */
-  state: 'opening' | 'running' | 'delivering' | 'queued' | 'idle';
+  state: 'opening' | 'running' | 'queued' | 'idle';
   supportsSteering: boolean;
-  queuedSteers: number;
+  queuedTurns: number;
 }
 
 /** What the store-arm reconciliation did with each pending guest call. */
@@ -833,10 +489,10 @@ export interface BrokerOptions {
   store?: CallStore;
   /** The concurrency cap: max concurrent subagents per workspace
    *  (doc-settled default 6). Counts unsettled agent calls plus sessions
-   *  running a follow-up turn (a queued-steer delivery or a §4.2
-   *  followUp turn on a settled handle). The cap gates turn starts as
+   *  running a queued turn (a queued-turn delivery or a §4.2
+   *  queued turn turn on a settled handle). The cap gates turn starts as
    *  well as dispatches: a dispatch above it queues in dispatch order
-   *  (§4.1 — never a rejection), and an idle-session follow-up that
+   *  (§4.1 — never a rejection), and an idle-session queued that
    *  would exceed it queues for the next free slot (its promise stays
    *  pending until the delivery runs). Validated as an
    *  integer in
@@ -899,9 +555,9 @@ export interface BrokerOptions {
 interface InFlightTask {
   callId: string;
   /** `agent` tasks release their session's concurrency token and start
-   *  queued-steer delivery when the pump delivers them; `steer` tasks
+   *  queued-turn delivery when the pump delivers them; `steer` tasks
    *  do not. */
-  kind: 'agent' | 'steer';
+  kind: 'agent' | 'queue' | 'steer' | 'cancel';
   /** `resolve`/`reject` deliver a record → settle → consume outcome;
    *  `hold` (the re-attach arm's unobservable-turn degradation) deletes
    *  the in-flight entry WITHOUT recording or settling — the call stays
@@ -912,6 +568,17 @@ interface InFlightTask {
 }
 
 /** The broker's per-session state. */
+interface SessionLaneState {
+  activeTurnId: string | null;
+  promptInFlight: boolean;
+  queuedTurnIds: string[];
+  steeringControlIds: string[];
+  steeringInFlight: boolean;
+  laneState: 'opening' | 'usable' | 'fatal' | 'released';
+  cancellingTurnId: string | null;
+  cancellationTimer: ReturnType<typeof setTimeout> | null;
+}
+
 interface SessionEntry {
   session: BrokerSession;
   /** The founding call id (the session's steering address). */
@@ -920,59 +587,38 @@ interface SessionEntry {
   task: string;
   /** The RESOLVED backend id (the session's own when it advertises one,
    *  else the admission-validated model-spec segment) — the §4.6 error
-   *  attribution for followUp turns on this session. */
+   *  attribution for queued turn turns on this session. */
   backendId: string;
-  supportsSteering: boolean;
-  /** True while a turn runs on this session (initial call turn or a
-   *  queued-steer delivery turn). */
-  busy: boolean;
-  /** True while the busy turn is a queued-steer delivery turn. */
-  delivering: boolean;
+  initializeMeta: Readonly<Record<string, unknown>> | undefined;
   /** True once the founding call settled (resolved or rejected). */
   callSettled: boolean;
-  /** True when the founding call was cancelled — the queue is dropped. */
+  /** True when the founding/current public turn was explicitly cancelled. */
   callCancelled: boolean;
   /** Waiters woken when the entry's cancel flag flips (the
    *  non-re-armable settlement wait's cancel signal — see
    *  `markCancelled`). One-shot listeners, removed on fire. */
   readonly cancelWaiters: Set<() => void>;
-  /** Queued followUp/steer payloads (no-extension backends with a turn
-   *  in flight, and cap-pressure queues on idle sessions), in order. */
-  queue: Array<QueuedDelivery>;
 }
 
-/** One queued delivery (a mid-turn no-extension steer, or a cap-pressure
- *  followUp/steer on an idle session). `answer: true` marks the §4.2
- *  followUp semantics: the steer's guest call stays PENDING until the
- *  delivery turn runs and settles with the TURN'S ANSWER (its own call
- *  id — the addressable turn); `answer: false` items already resolved
- *  `queued` at enqueue (the delivery-outcome vocabulary for mid-turn
- *  steers) and their delivery folds into the session's next turn. */
-interface QueuedDelivery {
+/** One first-class future public turn. */
+interface QueuedTurn {
   callId: string;
+  sessionId: string;
   prompt: string;
   promptMeta?: Record<string, unknown>;
-  /** The GuestCall to settle with the turn's answer (answer mode only;
-   *  null for delivery-outcome items). */
   call: GuestCall | null;
-  /** True for the §4.2 followUp-answer semantics; false for the
-   *  delivery-outcome semantics. */
-  answer: boolean;
+  admissionSequence: number;
+  state: 'pending' | 'active' | 'cancelling' | 'settled';
+  cancelRequested: boolean;
 }
 
-/** A steer that arrived before its session existed (the founding call
- *  was still opening), delivered at the call's next-turn boundary. The
- *  guest call already resolved `queued` at enqueue (the delivery-
- *  outcome vocabulary — the founding turn has not even started). */
-interface PendingSteer {
+interface SteeringControl {
   callId: string;
+  sessionId: string;
+  targetTurnId: string;
   prompt: string;
   promptMeta?: Record<string, unknown>;
-  /** Answer-mode items (a cap-pressure followUp whose guest call is
-   *  still pending — the §4.2 turn-answer semantics) keep their mode
-   *  through a re-home into `pendingSteers` (the re-issue/drain path);
-   *  delivery-outcome items (already settled `queued`) carry false. */
-  answer: boolean;
+  call: GuestCall | null;
 }
 
 /** A pending checkpoint as the broker tracks it (the GuestCall is the
@@ -1005,6 +651,9 @@ const AGENT_OPTION_KEYS_TEXT = 'schema, cwd, configOptions, mode';
 
 /** The exact option keys a steering payload may carry. */
 const STEER_OPTION_KEYS = new Set(['promptMeta']);
+
+/** Active prompt cancellation must terminate or quarantine the lane. */
+const CANCELLATION_SETTLEMENT_BOUND_MS = 5_000;
 
 /** Default per-workspace concurrency cap (the doc-settled limit). */
 export const DEFAULT_MAX_CONCURRENT_AGENTS = 6;
@@ -1066,10 +715,9 @@ export class Broker {
   private readonly sink: SnapshotSink | undefined;
   private readonly consoleBuffer: Array<{ level: string; line: string }> = [];
   private readonly sessions = new Map<string, SessionEntry>();
-  /** Steers that arrived before their session existed (the founding call
-   *  was still opening) — merged into the session's queue at open. */
-  private readonly pendingSteers = new Map<string, PendingSteer[]>();
-  /** Lazy re-attaches in flight (a settled handle's followUp/steer/cancel
+  /** Explicit lane state exists from founding-call admission through release. */
+  private readonly lanes = new Map<string, SessionLaneState>();
+  /** Lazy re-attaches in flight (a settled handle's queued turn/steer/cancel
    *  loading its recorded backend session) — deduped per founding call id
    *  so concurrent steers share one load. */
   private readonly pendingReattaches = new Map<string, Promise<SessionEntry | undefined>>();
@@ -1096,6 +744,7 @@ export class Broker {
         task: string;
         optionsJson: string | null;
         parsed: ParsedAgentOptions;
+        admissionSequence: number;
       }
     | {
         kind: 'reissue';
@@ -1107,42 +756,9 @@ export class Broker {
   > = [];
   /** The cached known-backend vocabulary (see `knownBackends`). */
   private knownBackendsCache: string[] | undefined;
-  /** In-flight FOLLOW-UP turns (an idle/settled session's followUp/
-   *  steer), keyed by the turn's OWN call id — the §4.2 addressable
-   *  turn: visible in `agents()`/`liveAgents()`, targetable by
-   *  `interrupt`. `queued` marks a minted turn whose delivery is
-   *  waiting for a free concurrency slot (enrolled at mint time — the
-   *  turn is visible and interruptable BEFORE it starts). `entry` is
-   *  undefined while the turn's founding session is still being
-   *  re-attached (a followUp on a drained settled handle mid-load, or
-   *  a restored queued turn whose founding session is not attached
-   *  yet) — the turn is REGISTERED from mint time either way (the
-   *  review defect: the lazy-load turn used to be registered only once
-   *  `loadSession` finished, hiding the minted call from `agents()`
-   *  and `interrupt` during a delayed load). `cancelRequested` marks
-   *  an interrupt that landed during that load: the load's completion
-   *  settles the steer with the recoverable AGENT_CANCELLED instead of
-   *  starting the turn. */
-  private readonly followUpTurns = new Map<
-    string,
-    {
-      entry: SessionEntry | undefined;
-      /** The founding call id (the session key) — always known, even
-       *  while the session itself is being re-attached. */
-      sessionId: string;
-      prompt: string;
-      queued: boolean;
-      /** The resolved backend id for the §4.6 attribution (the
-       *  founding session's own when attached, else the founding
-       *  store record's) — carried so cancelling a not-yet-attached
-       *  turn still names the backend. */
-      backendId?: string;
-      /** An interrupt landed while the lazy re-attach load was in
-       *  flight: the load's completion must settle the steer with the
-       *  recoverable AGENT_CANCELLED — never start the turn. */
-      cancelRequested?: boolean;
-    }
-  >();
+  private readonly queuedTurns = new Map<string, QueuedTurn>();
+  private readonly steeringControls = new Map<string, SteeringControl>();
+  private admissionSequence = 0;
   /** Live `sleep(ms)` calls, keyed by host-minted tracking ids (not
    *  guest call ids — sleeps never enter the guest registry or the call
    *  store). */
@@ -1196,10 +812,8 @@ export class Broker {
     string,
     { kind: 'value' | 'error'; result?: string }
   >();
-  /** Sessions running a follow-up turn (a queued-steer delivery turn or
-   *  a §4.2 followUp turn on a settled handle) — one concurrency token
-   *  each (a subagent is working even on a follow-up turn). */
-  private readonly deliverySlots = new Set<string>();
+  /** Active queued public turns — one concurrency token each. */
+  private readonly queueSlots = new Set<string>();
   /** Call ids settled synchronously at dispatch (refusals) since the
    *  last eval result — reported in that eval's `completed`. */
   private readonly syncSettled: string[] = [];
@@ -1316,7 +930,7 @@ export class Broker {
   private iterableLeaseCapabilityCached: boolean | undefined;
   /** True once the client-presence drain released every child (see
    *  `drainForDisconnect`): the workspace stays live, and later
-   *  followUp/steer/cancel on a settled handle lazily re-attach the
+   *  queued turn/steer/cancel on a settled handle lazily re-attach the
    *  recorded backend session. */
   private drained = false;
   /** True while a client-presence drain or a dispose is in progress (and
@@ -1411,8 +1025,17 @@ export class Broker {
       checkpoint: (call, callId, question, optionsJson, answerJson) => {
         return this.onCheckpoint(call, callId, question, optionsJson, answerJson);
       },
-      steer: (call, callId, sessionId, action, payloadJson) => {
-        this.onSteer(call, callId, sessionId, action, payloadJson);
+      queue: (call, callId, sessionId, payloadJson) => {
+        this.onQueue(call, callId, sessionId, payloadJson);
+      },
+      steer: (call, callId, sessionId, payloadJson) => {
+        this.onSteer(call, callId, sessionId, payloadJson);
+      },
+      cancelSession: (call, callId, sessionId) => {
+        this.onSessionCancel(call, callId, sessionId);
+      },
+      cancelQueue: (call, callId, queueCallId) => {
+        this.onQueueCancel(call, callId, queueCallId);
       },
       console: (event) => {
         this.consoleBuffer.push(event);
@@ -1643,14 +1266,13 @@ export class Broker {
    * - still resumable at the backend → re-attach via `runner.loadSession`
    *   (capability-gated per acp-agents; see the module docs' "The
    *   restore path" section),
-   * - lost → re-issue under the same call id (or, for a steer whose wire
-   *   call died with the process, the honest `failed`).
+   * - observably lost founding work may re-issue under the same call id;
+   *   unresolved steering rejects `steering_interrupted` without replay.
    *
-   * Pending checkpoints re-surface into the broker's checkpoint table
-   * (answering works across a restore) and the queued-for-next-turn
-   * delivery queues rebuild from the store (undelivered steers re-queued
-   * exactly once; delivered/dropped never replayed — the markers are
-   * first-wins). Drains once when any guest settlement happened, so
+   * Pending checkpoints re-surface into the broker's checkpoint table.
+   * First-class queue records rebuild independently: unhanded turns remain
+   * eligible and handed-off turns require authoritative classification.
+   * Drains once when any guest settlement happened, so
    * snapshot-carried continuations fire before this returns — and the
    * drain's state change fires the settlement boundary.
    */
@@ -1693,23 +1315,25 @@ export class Broker {
           report.requeuedCheckpoints.push(entry.id);
           continue;
         }
+        if (entry.kind === 'queue') {
+          // First-class queues rebuild after every pending registry entry
+          // has been inspected. A queue is never interpreted as steering.
+          continue;
+        }
         if (entry.kind === 'steer') {
-          // A §4.2 followUp QUEUED for delivery (queuedAtMs marker, no
-          // completion): nothing was delivered — the queue rebuild below
-          // re-queues it against its founding session (the answer
-          // semantics: the registry entry stays pending and the rebuilt
-          // delivery settles it with the turn's answer).
-          if (record?.queuedAtMs !== null && record?.queuedAtMs !== undefined && record.deliveredAtMs === null && record.droppedAtMs === null) {
-            continue;
-          }
-          // The steer's wire call died with the process: its outcome is
-          // unknowable, and re-issuing an injected steer would duplicate
-          // the injection. The honest `failed`, durably recorded and
-          // surfaced guest-visibly. (Queued-but-undelivered steers are
-          // handled by the queue rebuild below, NOT here.)
-          if (this.settleSteerLost(entry)) {
+          if (this.settleSteerInterrupted(entry)) {
             changedVm = true;
           }
+          report.failedLost.push(entry.id);
+          continue;
+        }
+        if (entry.kind === 'cancel') {
+          if (this.refuseReconciled(
+            entry,
+            'cancel',
+            executionError('cancellation operation was interrupted by restart', 'cancellation_interrupted', true),
+            `cancel ${entry.id}: interrupted by restart`,
+          )) changedVm = true;
           report.failedLost.push(entry.id);
           continue;
         }
@@ -1739,7 +1363,7 @@ export class Broker {
         }
         report.failedLost.push(entry.id);
       }
-      report.reQueuedUndelivered = this.rebuildUndeliveredQueues();
+      report.reQueuedUndelivered = this.rebuildQueuedTurns();
       if (changedVm) {
         // The settlement drain fires snapshot-carried continuations. The
         // state-changing boundary is the doc's cadence (after each
@@ -1803,185 +1427,36 @@ export class Broker {
    * path; this is the belt-and-braces check for a crash between the
    * cancel and the drop record). Returns the re-queued steer call ids.
    */
-  private rebuildUndeliveredQueues(): string[] {
-    const reQueued: string[] = [];
-    const records = this.callStore.all();
-    for (const record of records) {
-      if (record.kind !== 'steer') continue;
-      const completion = record.completion;
-      // TWO undelivered-at-crash shapes re-queue: (a) the delivery-
-      // outcome shape — a completion of `queued` and no delivered/
-      // dropped marker (v1's durable queue); (b) the §4.2 followUp-
-      // answer shape — a queuedAtMs marker and NO completion (the
-      // promise stays pending until the delivery runs; the store's
-      // first completion is the answer the turn will settle).
-      const queuedAnswer = record.queuedAtMs !== null;
-      const queuedOutcome = completion !== null && completion !== undefined && completion.value === 'queued';
-      if (!queuedAnswer && !queuedOutcome) continue;
-      if (record.deliveredAtMs !== null || record.droppedAtMs !== null) continue;
-      if (record.sessionId === null) continue;
-      if (this.isCancelledFoundingCall(record.sessionId)) continue;
-      const sessionId = record.sessionId;
-      const payload = parseSteerPayload(record.optionsJson);
-      if (payload === null) continue;
-      const entry = this.sessions.get(sessionId);
-      if (entry !== undefined) {
-        if (entry.queue.some((item) => item.callId === record.callId)) continue;
-        entry.queue.push({ callId: record.callId, ...payload, call: null, answer: queuedAnswer });
-        // A restored QUEUED followUp turn re-enters the turn registry
-        // at rebuild (visible in `agents()`, targetable by `interrupt`
-        // — the §4.2 addressability survives the restore).
-        if (queuedAnswer) {
-          this.followUpTurns.set(record.callId, {
-            entry,
-            sessionId: entry.callId,
-            prompt: payload.prompt,
-            queued: true,
-            backendId: entry.backendId,
-          });
-        }
-        reQueued.push(record.callId);
-      } else {
-        const pending = this.pendingSteers.get(sessionId) ?? [];
-        if (pending.some((item) => item.callId === record.callId)) continue;
-        pending.push({ callId: record.callId, ...payload, answer: queuedAnswer });
-        this.pendingSteers.set(sessionId, pending);
-        if (queuedAnswer) {
-          // A restored QUEUED followUp turn whose founding session is
-          // NOT attached (the crash happened with the handle settled
-          // and drained): the turn is registered NOW — visible in
-          // `agents()` and targetable by `interrupt` from rebuild time
-          // (the review defect: the item was parked in `pendingSteers`
-          // with no turn registered, no re-attach scheduled and no
-          // delivery scheduled — `agents()` omitted it, `interrupt`
-          // returned `none`, and it stayed pending after capacity
-          // freed) — and its delivery is scheduled through the
-          // founding handle's lazy re-attach: the load merges the
-          // pending steers into the rebuilt session and the global
-          // kick starts the turn as slots free. A load that fails
-          // settles the queued followUp with the honest `failed`
-          // (recorded durably first — never a discarded turn).
-          const founding = this.callStore.lookup(sessionId);
-          this.followUpTurns.set(record.callId, {
-            entry: undefined,
-            sessionId,
-            prompt: payload.prompt,
-            queued: true,
-            backendId:
-              founding?.backendId ??
-              (founding?.modelSpec !== null && founding?.modelSpec !== undefined && founding.modelSpec !== ''
-                ? backendSegment(founding.modelSpec)
-                : undefined),
-          });
-          this.scheduleRestoredQueuedDelivery(sessionId, record.callId);
-        }
-        reQueued.push(record.callId);
+  private rebuildQueuedTurns(): string[] {
+    const restored: string[] = [];
+    for (const record of this.callStore.all()) {
+      if (record.kind !== 'queue' || record.completion !== null) continue;
+      const sessionId = record.foundingCallId;
+      const payload = parseTurnPayload(record.optionsJson);
+      if (sessionId === null || payload === null || this.queuedTurns.has(record.callId)) continue;
+      const lane = this.lanes.get(sessionId) ?? this.newLane(
+        this.callStore.lookup(sessionId)?.completion === null ? 'opening' : 'released',
+      );
+      this.lanes.set(sessionId, lane);
+      if (!lane.queuedTurnIds.includes(record.callId) && lane.activeTurnId !== record.callId) {
+        lane.queuedTurnIds.push(record.callId);
       }
+      this.queuedTurns.set(record.callId, {
+        callId: record.callId,
+        sessionId,
+        prompt: payload.prompt,
+        promptMeta: payload.promptMeta,
+        call: null,
+        admissionSequence: record.admissionSequence,
+        state: record.handoffAtMs === null ? 'pending' : 'active',
+        cancelRequested: false,
+      });
+      restored.push(record.callId);
+      if (record.handoffAtMs !== null) this.restoreHandedOffQueue(record.callId);
+      else if (lane.laneState === 'released') this.scheduleQueueReattach(sessionId);
     }
-    return reQueued;
-  }
-
-  /** Find a QUEUED (cap-pressure) followUp item by its steer call id —
-   *  the interrupt tool's cancel-by-id target for undelivered followUps
-   *  (§4.2: the queued turn is addressable before it starts). */
-  private findQueuedSteer(callId: string): { entry: SessionEntry } | undefined {
-    for (const entry of this.sessions.values()) {
-      if (entry.queue.some((item) => item.callId === callId && item.answer)) {
-        return { entry };
-      }
-    }
-    return undefined;
-  }
-
-  /** Settle a QUEUED (not-yet-started) followUp turn's cancellation:
-   *  the item is already removed from its queue (the caller removed it
-   *  from the session's queue or its re-homed pending steers); record
-   *  the durable drop, reject the guest call recoverable with the §4.6
-   *  attribution, and release the turn registry entry. One settlement
-   *  drain fires the guest reactions (mirrors the pump's per-call
-   *  drain); a failed drain is honest output, never a cancel failure. */
-  private settleQueuedFollowUpCancellation(callId: string, backendId: string | undefined): void {
-    this.callStore.recordDelivery(callId, 'dropped', now());
-    const value = toRejectionValue(
-      new WorkflowError(`followUp ${callId} was cancelled while queued for delivery`, CODE.AGENT_CANCELLED, {
-        recoverable: true,
-      }),
-    );
-    // The §4.6 attribution: the followUp's resolved backend (the
-    // founding session's recorded backend id).
-    if (backendId !== undefined) (value as { replBackend?: string }).replBackend = backendId;
-    this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
-    try {
-      this.settleIntoGuest(callId, 'reject', value);
-      this.drain();
-      this.provenancePass('settlement', [callId]);
-      this.sink?.boundary('settlement');
-    } catch (error) {
-      if (error instanceof DrainJobError) {
-        // §6.2: the drain failure DEMOTES to workspace().diagnostics
-        // (retained) — the settlement landed and the boundary below
-        // persists it, so nothing was lost and the failure never rides
-        // the eval output surface.
-        this.retainedDrainError = {
-          name: error.info.name,
-          message: error.info.message,
-          atMs: now(),
-        };
-        this.sink?.boundary('settlement');
-      } else throw error;
-    }
-    this.followUpTurns.delete(callId);
-    this.kickQueuedDeliveries();
-  }
-
-  /** Schedule the delivery of a restored QUEUED answer-mode followUp
-   *  whose founding session is NOT attached (see
-   *  `rebuildUndeliveredQueues`): lazily re-attach the founding
-   *  session — deduped per founding call id, capability-gated exactly
-   *  like every load — and let the global kick start the queued
-   *  delivery (the turn settles with its answer through the ordinary
-   *  record → settle → consume pump). A failed load settles the queued
-   *  followUp with the honest `failed`, recorded durably FIRST (the
-   *  dropped marker — a restore never re-queues a settled item). The
-   *  task runs OUTSIDE the serialized chain (the load is a runner
-   *  wire call, like every lazy re-attach); its outcome travels the
-   *  pump like any steer. */
-  private scheduleRestoredQueuedDelivery(sessionId: string, steerCallId: string): void {
-    const task = this.lazyReattach(sessionId).then(
-      (entry): { outcome: 'resolve' | 'reject' | 'hold'; value: unknown } => {
-        if (this.disposed) {
-          // The broker is being torn down: the guest calls are gone
-          // with the workspace — nothing to settle.
-          this.followUpTurns.delete(steerCallId);
-          return { outcome: 'hold', value: undefined };
-        }
-        if (entry === undefined) {
-          this.followUpTurns.delete(steerCallId);
-          this.callStore.recordDelivery(steerCallId, 'dropped', now());
-          this.reconcileNote(
-            'warn',
-            `followUp ${steerCallId} (on ${sessionId}): the founding session could not be re-attached — failed`, // eslint-disable-line max-len
-          );
-          return { outcome: 'resolve', value: 'failed' };
-        }
-        // The load merged the pending steers into the rebuilt session's
-        // queue; the global kick starts the delivery as slots free (the
-        // turn settles with its answer through the pump).
-        this.kickQueuedDeliveries();
-        return { outcome: 'hold', value: undefined };
-      },
-    );
-    this.trackInFlight(steerCallId, 'steer', task);
-  }
-
-  /** Did this founding call end in an orchestrator-driven cancel (the
-   *  only settlement that drops its delivery queue)? */
-  private isCancelledFoundingCall(callId: string): boolean {
-    const record = this.callStore.lookup(callId);
-    const completion = record?.completion;
-    if (completion === null || completion === undefined || completion.outcome !== 'reject') return false;
-    const value = completion.value as { code?: unknown } | null | undefined;
-    return value !== null && typeof value === 'object' && value.code === CODE.AGENT_CANCELLED;
+    this.scheduleAdmissions();
+    return restored;
   }
 
   // ── The restore path: re-attach / re-issue arms ──────────────────────
@@ -2249,25 +1724,20 @@ export class Broker {
       callId: entry.id,
       modelSpec: entry.modelSpec ?? '',
       task: entry.detail ?? '',
-      supportsSteering: session.capabilities?.supportsSteering === true,
-      busy: true,
-      delivering: false,
+      initializeMeta: initializeMetaOf(session),
       callSettled: false,
       callCancelled: false,
       backendId: session.backendId ?? backendSegment(entry.modelSpec ?? ''),
       cancelWaiters: new Set(),
-      queue: (this.pendingSteers.get(entry.id) ?? []).map((steer) => ({
-        callId: steer.callId,
-        prompt: steer.prompt,
-        promptMeta: steer.promptMeta,
-        call: null,
-        answer: steer.answer,
-      })),
     };
-    this.pendingSteers.delete(entry.id);
+    const lane = this.lanes.get(entry.id) ?? this.newLane('usable');
+    lane.laneState = 'usable';
+    lane.activeTurnId = entry.id;
+    lane.promptInFlight = true;
+    this.lanes.set(entry.id, lane);
     this.sessions.set(entry.id, sessionEntry);
+    this.watchSessionRelease(sessionEntry);
     this.agentSlots.add(entry.id);
-    this.registerQueuedTurns(sessionEntry);
     this.drained = false; // children are warm again
     this.reconcileNote('info', `call ${entry.id}: re-attached to backend session ${session.sessionId}`);
     const taskPromise = this.runReattachedTask(entry.id, sessionEntry, parsed);
@@ -2315,7 +1785,7 @@ export class Broker {
     entry: SessionEntry,
     parsed: ParsedAgentOptions,
   ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
-    return (async () => {
+    return (async (): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> => {
       let turn: BrokerTurn;
       const awaitTurn = entry.session.awaitCurrentTurn;
       if (awaitTurn === undefined) {
@@ -2404,7 +1874,10 @@ export class Broker {
       } catch (error) {
         return { outcome: 'reject', value: toRejectionValue(error) };
       }
-    })();
+    })().finally(() => {
+      const lane = this.lanes.get(callId);
+      if (lane !== undefined && lane.activeTurnId === callId) lane.promptInFlight = false;
+    });
   }
 
   /** The NON-RE-ARMABLE still-running settlement wait (see
@@ -2429,9 +1902,7 @@ export class Broker {
    *    live call);
    *  - a cancel of the call: settled as the recoverable `AGENT_CANCELLED`
    *    (the interrupt tool works on a held call);
-   *  - the session's release: its dedicated process died — the backend
-   *    turn died with it — the safe-re-issue class (fenced by
-   *    `reissueReattached`);
+   *  - the session's release: its dedicated process died, which is lane-fatal;
    *  - the client-presence drain: the forced stop settles every
    *    still-pending call DURABLY at the bound (recorded `AGENT_CANCELLED`,
    *    guest-settled); while draining/disposed, the wait holds — the
@@ -2469,18 +1940,13 @@ export class Broker {
         return { outcome: 'hold', value: undefined };
       }
       if (released) {
-        // The loaded session's dedicated process died (or was
-        // disposed): the backend turn died with it — observably dead —
-        // the safe-re-issue class (fenced by `reissueReattached`).
-        return this.reissueReattached(
-          callId,
-          entry,
-          parsed,
-          new Error(
-            'the held loaded session was released while awaiting its founding turn — the backend process ' +
-              'died; re-issue is the honest fallback',
-          ),
+        const error = executionError(
+          `session ${callId}: ACP session was released while awaiting the loaded turn`,
+          'session_released',
+          false,
         );
+        this.markLaneFatal(callId, error);
+        return { outcome: 'hold', value: undefined };
       }
       if (entry.callCancelled) {
         // A cancel landed on the held call: settle it as the recoverable
@@ -2578,6 +2044,8 @@ export class Broker {
     error: unknown,
   ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
     const generation = this.generation;
+    const releasingLane = this.lanes.get(callId);
+    if (releasingLane !== undefined) releasingLane.laneState = 'released';
     await Promise.resolve(entry.session.release()).catch(() => undefined);
     // The fence RE-CHECK after the awaited release (see above): the
     // release may have parked past the drain's bound, during which the
@@ -2585,6 +2053,9 @@ export class Broker {
     // drained, or past a disposal's generation bump. Re-issuing now
     // would open a fresh child after the last client disconnected (or
     // on a torn-down broker) — the call stays as the drain left it.
+    if (this.lanes.get(callId)?.laneState === 'fatal') {
+      return { outcome: 'hold', value: undefined };
+    }
     if (this.draining || this.disposed || this.generation !== generation) {
       this.reconcileNote(
         'warn',
@@ -2594,11 +2065,8 @@ export class Broker {
       );
       return { outcome: 'hold', value: undefined };
     }
-    if (entry.queue.length > 0) {
-      const pending = this.pendingSteers.get(callId) ?? [];
-      this.pendingSteers.set(callId, [...pending, ...entry.queue]);
-      entry.queue = [];
-    }
+    const lane = this.lanes.get(callId);
+    if (lane !== undefined) lane.laneState = 'opening';
     this.callStore.recordReissued(callId, now());
     this.reconcileNote(
       'warn',
@@ -2723,24 +2191,17 @@ export class Broker {
         callId: sessionId,
         modelSpec: record.modelSpec ?? '',
         task: record.detail,
-        supportsSteering: session.capabilities?.supportsSteering === true,
-        busy: false,
-        delivering: false,
+        initializeMeta: initializeMetaOf(session),
         callSettled: true,
         callCancelled: false,
         backendId: session.backendId ?? backendSegment(record.modelSpec ?? ''),
         cancelWaiters: new Set(),
-        queue: (this.pendingSteers.get(sessionId) ?? []).map((steer) => ({
-          callId: steer.callId,
-          prompt: steer.prompt,
-          promptMeta: steer.promptMeta,
-          call: null,
-          answer: steer.answer,
-        })),
       };
-      this.pendingSteers.delete(sessionId);
+      const lane = this.lanes.get(sessionId) ?? this.newLane('usable');
+      lane.laneState = 'usable';
+      this.lanes.set(sessionId, lane);
       this.sessions.set(sessionId, entry);
-      this.registerQueuedTurns(entry);
+      this.watchSessionRelease(entry);
       this.drained = false; // children are warm again
       this.warnLine('info', `call ${sessionId}: lazily re-attached to backend session ${session.sessionId}`);
       return entry;
@@ -2748,99 +2209,10 @@ export class Broker {
       this.warnLine(
         'warn',
         `call ${sessionId}: lazy re-attach of backend session ${record.sessionId} failed ` +
-          `(${toRejectionValue(error).message}) — nothing was steered`, // eslint-disable-line max-len
+          `(${toRejectionValue(error).message})`,
       );
       return undefined;
     }
-  }
-
-  /**
-   * One steer's lazy-re-attach task: re-attach the settled handle's
-   * recorded session, then deliver the steering operation per the
-   * mechanism table against the loaded session (idle → new turn, busy →
-   * live injection or queued, cancel → cancel or the honest `idle`).
-   * The load runs OUTSIDE the broker's serialized ops (it is a runner
-   * wire call); the session registration and the delivery are ordered by
-   * the shared re-attach promise, and the outcome travels the same
-   * record → settle → consume pump as any steer.
-   */
-  private runLazyReattachSteerTask(
-    callId: string,
-    sessionId: string,
-    action: string,
-    prompt: string,
-    promptMeta: Record<string, unknown> | undefined,
-  ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
-    return (async () => {
-      const entry = await this.lazyReattach(sessionId);
-      // An interrupt landed while the load was in flight (the turn was
-      // minted and targetable from the start — §4.2): the turn must
-      // NEVER start. Drop it durably (the dropped marker — a restore
-      // never re-queues it) and settle the steer with the recoverable
-      // AGENT_CANCELLED; the pump records the completion and settles
-      // the guest promise. The cancel wins over a failed load too (the
-      // interrupt reported `cancelled` — the settlement must match).
-      const minted = this.followUpTurns.get(callId);
-      if (minted?.cancelRequested === true) {
-        if (entry !== undefined) {
-          entry.queue = entry.queue.filter((item) => item.callId !== callId);
-        }
-        this.callStore.recordDelivery(callId, 'dropped', now());
-        this.followUpTurns.delete(callId);
-        const value = toRejectionValue(
-          new WorkflowError(`followUp ${callId} was cancelled`, CODE.AGENT_CANCELLED, {
-            recoverable: true,
-          }),
-        );
-        (value as { replBackend?: string }).replBackend = entry?.backendId ?? minted.backendId;
-        return { outcome: 'reject', value };
-      }
-      if (entry === undefined) {
-        // Nothing was steered (the load failed through the capability
-        // gate or the session is lost) — the minted turn registry
-        // entry (if any) is released with the honest `failed`.
-        this.followUpTurns.delete(callId);
-        return { outcome: 'resolve', value: 'failed' };
-      }
-      if (action === 'cancel') {
-        if (!entry.busy) return { outcome: 'resolve', value: 'idle' };
-        return this.runCancelTask(callId, entry);
-      }
-      if (action !== 'followUp' && action !== 'steer') {
-        this.followUpTurns.delete(callId);
-        return { outcome: 'resolve', value: 'failed' };
-      }
-      if (entry.busy) {
-        // Mid-turn semantics (the delivery-outcome vocabulary — no
-        // separate turn to answer): release the minted registry entry.
-        this.followUpTurns.delete(callId);
-        if (entry.supportsSteering) {
-          return this.runInjectTask(callId, entry, prompt, promptMeta);
-        }
-        entry.queue.push({ callId, prompt, promptMeta, call: null, answer: false });
-        return { outcome: 'resolve', value: 'queued' };
-      }
-      // The session is idle: followUp/steer mint a NEW turn with its own
-      // call id and resolve with the TURN'S ANSWER (§4.2 — the same
-      // semantics as the live idle path in `onSteer`). Cap pressure
-      // queues the delivery with the pending promise (answer mode).
-      if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
-        this.recordQueuedDelivery(callId);
-        entry.queue.push({ callId, prompt, promptMeta, call: null, answer: true });
-        // Minted at enqueue like the live idle path: the queued turn is
-        // visible in `agents()` and targetable before its delivery
-        // starts.
-        this.followUpTurns.set(callId, {
-          entry,
-          sessionId: entry.callId,
-          prompt,
-          queued: true,
-          backendId: entry.backendId,
-        });
-        return { outcome: 'hold', value: undefined };
-      }
-      return this.runFollowUpTask(callId, entry, prompt, promptMeta);
-    })();
   }
 
   /** Re-issue a lost call under the SAME call id: the store records the
@@ -2863,12 +2235,9 @@ export class Broker {
     report: ReconcileReport,
   ): boolean {
     if (this.callStore.lookup(entry.id) === undefined) this.adoptEntry(entry, 'agent');
-    if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
-      this.dispatchQueue.push({ kind: 'reissue', entry, parsed, reason, report });
-      report.reissued.push(entry.id);
-      return false;
-    }
-    this.startReissue(entry, parsed, reason, report);
+    this.dispatchQueue.push({ kind: 'reissue', entry, parsed, reason, report });
+    report.reissued.push(entry.id);
+    this.scheduleAdmissions();
     return false;
   }
 
@@ -2882,6 +2251,10 @@ export class Broker {
     reason: string,
     report: ReconcileReport,
   ): void {
+    const lane = this.lanes.get(entry.id) ?? this.newLane('opening');
+    lane.laneState = 'opening';
+    lane.activeTurnId = entry.id;
+    this.lanes.set(entry.id, lane);
     this.callStore.recordReissued(entry.id, now());
     this.agentSlots.add(entry.id);
     this.reconcileNote('warn', `call ${entry.id}: ${reason} — re-issued`);
@@ -2896,7 +2269,7 @@ export class Broker {
       this.recordedBackendId(entry.id),
     );
     this.trackInFlight(entry.id, 'agent', taskPromise);
-    report.reissued.push(entry.id);
+    void report;
   }
 
   /** A reconcile-time dispatch refusal (invalid registry options, or an
@@ -2907,7 +2280,7 @@ export class Broker {
    *  VM and its caller must propagate the change into the changed-VM
    *  drain and its settlement boundary). (§4.1: over-cap re-issues are
    *  NOT refused — they queue via `reissueCall`.) */
-  private refuseReconciled(entry: GuestSurfaceEntry, kind: 'agent' | 'steer', error: unknown, warn: string): boolean {
+  private refuseReconciled(entry: GuestSurfaceEntry, kind: 'agent' | 'queue' | 'steer' | 'cancel', error: unknown, warn: string): boolean {
     if (this.callStore.lookup(entry.id) === undefined) this.adoptEntry(entry, kind);
     const value = toRejectionValue(error);
     this.recordCompletion(entry.id, { outcome: 'reject', value, completedAtMs: now() });
@@ -2916,21 +2289,27 @@ export class Broker {
     return newlySettled;
   }
 
-  /** A pending steer whose wire call died with the process: settle the
-   *  honest `failed` (recorded durably first, then into the guest — a
-   *  subsequent restore settles it from the store), with a warn line.
-   *  Returns whether the guest entry was newly settled. */
-  private settleSteerLost(entry: GuestSurfaceEntry): boolean {
+  /** A steering request is never replayed after restore: its target
+   * turn boundary is gone, so the only honest result is the recoverable
+   * steering_interrupted rejection. */
+  private settleSteerInterrupted(entry: GuestSurfaceEntry): boolean {
     if (this.callStore.lookup(entry.id) === undefined) this.adoptEntry(entry, 'steer');
+    const value = toRejectionValue(
+      executionError(
+        `steer ${entry.id}: operation was interrupted by restart and was not replayed`,
+        'steering_interrupted',
+        true,
+      ),
+    );
     this.recordCompletion(entry.id, {
-      outcome: 'resolve',
-      value: 'failed',
+      outcome: 'reject',
+      value,
       completedAtMs: now(),
     });
-    const newlySettled = this.settleIntoGuest(entry.id, 'resolve', 'failed');
+    const newlySettled = this.settleIntoGuest(entry.id, 'reject', value);
     this.reconcileNote(
       'warn',
-      `steer ${entry.id}: was in flight when the process died; its outcome is unknowable — failed`,
+      `steer ${entry.id}: was interrupted by restart and was not replayed`,
     );
     return newlySettled;
   }
@@ -2968,7 +2347,8 @@ export class Broker {
    *  + optionsJson (+ modelSpec — the re-attach routing source), so the
    *  replay ledger stays complete (completions, re-issues and attachment
    *  records can all be written against it). */
-  private adoptEntry(entry: GuestSurfaceEntry, kind: 'agent' | 'checkpoint' | 'steer'): void {
+  private adoptEntry(entry: GuestSurfaceEntry, kind: 'agent' | 'checkpoint' | 'queue' | 'steer' | 'cancel'): void {
+    const admittedAtMs = now();
     this.callStore.recordDispatched({
       callId: entry.id,
       kind,
@@ -2976,13 +2356,16 @@ export class Broker {
       optionsJson: entry.optionsJson,
       modelSpec: kind === 'agent' ? entry.modelSpec : null,
       backendId: null,
-      dispatchedAtMs: now(),
+      foundingCallId: kind === 'queue' || kind === 'steer' || kind === 'cancel' ? entry.sessionId : null,
+      admittedAtMs,
+      admissionSequence: ++this.admissionSequence,
+      dispatchedAtMs: admittedAtMs,
       reissues: 0,
       completion: null,
-      sessionId: kind === 'steer' ? entry.sessionId : null,
-      deliveredAtMs: null,
-      droppedAtMs: null,
+      sessionId: null,
       queuedAtMs: null,
+      handoffAtMs: null,
+      cancelledAtMs: null,
     });
   }
 
@@ -2990,7 +2373,13 @@ export class Broker {
    *  a live session, or a live deferred)? The reconcile arms' idempotence
    *  guard: a tracked call is never re-attached or re-issued twice. */
   private isTracked(callId: string): boolean {
-    return this.inFlight.has(callId) || this.sessions.has(callId) || this.deferreds.has(callId);
+    return (
+      this.inFlight.has(callId) ||
+      this.sessions.has(callId) ||
+      this.deferreds.has(callId) ||
+      this.queuedTurns.has(callId) ||
+      this.steeringControls.has(callId)
+    );
   }
 
   /** A broker-authored console line (live-operation surfacing):
@@ -3009,126 +2398,6 @@ export class Broker {
     this.reconcileNotes.push({ level, line: message, atMs: now() });
   }
 
-  /** Cancel a dispatch QUEUED above the concurrency cap (§4.1's
-   *  dispatch-order queue — a fresh dispatch, or a queued restore-time
-   *  re-issue): remove it from the queue (it never starts — a freed
-   *  slot must never dispatch a cancelled call) and settle it durably
-   *  as the recoverable AGENT_CANCELLED, recorded FIRST (a restore
-   *  settles it from the store, never re-issues it). The rejection
-   *  carries the §4.6 backend attribution when the call's backend
-   *  resolved. `drain` is true for the interrupt tool's id path (its
-   *  own serialized op — one settlement drain fires the guest
-   *  reactions within the operation) and false for the guest handle's
-   *  `cancel()` (it runs INSIDE the eval's code phase, where a drain
-   *  would be a reentrant VM operation — the eval's own drain phase
-   *  runs the queued reactions, and the eval's provenance pass and
-   *  state-changing boundary cover the settlement). Returns whether
-   *  the call was found queued. Runs under the serialized chain (its
-   *  callers hold it) — the shared body of the interrupt tool's id
-   *  path and the guest handle's `cancel()` (the review defect:
-   *  `h.cancel()` on a queued founding dispatch fell through to
-   *  `failed` while the dispatch later opened and prompted). */
-  private cancelQueuedDispatch(callId: string, source: string, drain: boolean): boolean {
-    const queueIndex = this.dispatchQueue.findIndex((queued) =>
-      queued.kind === 'dispatch' ? queued.callId === callId : queued.entry.id === callId,
-    );
-    if (queueIndex < 0) return false;
-    const [queued] = this.dispatchQueue.splice(queueIndex, 1);
-    const isReissue = queued.kind === 'reissue';
-    const detail = isReissue ? (queued.entry.detail ?? '') : queued.task;
-    const optionsJson = isReissue ? queued.entry.optionsJson : queued.optionsJson;
-    const modelSpec = isReissue ? (queued.entry.modelSpec ?? '') : queued.modelSpec;
-    const value = toRejectionValue(
-      new WorkflowError(
-        isReissue
-          ? `call ${callId} was cancelled (${source}) while queued for re-issue (the concurrency cap)`
-          : `call ${callId} was cancelled (${source}) while queued for dispatch (the concurrency cap)`,
-        CODE.AGENT_CANCELLED,
-        { recoverable: true },
-      ),
-    );
-    // The §4.6 attribution: the resolved backend (the recorded
-    // backend id when the store has one — a queued re-issue pins
-    // the original backend — else the admission-validated segment).
-    const backend =
-      this.recordedBackendId(callId) ?? (modelSpec !== '' ? backendSegment(modelSpec) : undefined);
-    if (backend !== undefined && this.knownBackends().includes(backend)) {
-      (value as { replBackend?: string }).replBackend = backend;
-    }
-    this.recordDispatch(callId, 'agent', detail, optionsJson, null, modelSpec !== '' ? modelSpec : null);
-    this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
-    if (drain) {
-      try {
-        this.settleIntoGuest(callId, 'reject', value);
-        this.drain();
-        this.provenancePass('settlement', [callId]);
-        this.sink?.boundary('settlement');
-      } catch (error) {
-        if (error instanceof DrainJobError) {
-          // §6.2: the drain failure DEMOTES to workspace().diagnostics
-          // (retained) — the settlement landed and the boundary below
-          // persists it, so nothing was lost and the failure never rides
-          // the eval output surface.
-          this.retainedDrainError = {
-            name: error.info.name,
-            message: error.info.message,
-            atMs: now(),
-          };
-          this.sink?.boundary('settlement');
-        } else throw error;
-      }
-    } else {
-      // Inside the eval's code phase (the handle-cancel path): no
-      // drain, no settlement pass here — the eval's own drain runs the
-      // queued reactions and its provenance/boundary cover the
-      // settlement.
-      this.settleIntoGuest(callId, 'reject', value);
-    }
-    return true;
-  }
-
-  /** Fence + durably settle an opening call as cancelled — the
-   *  `interrupt` tool's id path (and the guest handle's `cancel()`) on
-   *  a call whose `openSession` is still pending (phase-E review
-   *  rejection round 7: the old `cancelCall` decision skipped opening
-   *  calls entirely — it returned `none`, and the eventual open
-   *  resolved into a PROMPTED, supposedly-interrupted call). Mirrors
-   *  the client-presence drain's bound force-stop exactly: the
-   *  completion is recorded FIRST (durable — a kill after this returns
-   *  settles the call from the store on restore), the guest settles
-   *  first-wins, the concurrency token is released (with the global
-   *  queued-delivery kick — the freed slot starts any cap-pressure
-   *  follow-up immediately), and the
-   *  `stoppedOpens` fence is set so an eventual late landing closes the
-   *  child immediately WITHOUT prompting (its reject is a first-wins
-   *  no-op against the recorded completion). Returns whether the call
-   *  was still opening (false — already open, settled, or unknown —
-   *  leaves everything untouched). */
-  private stopOpeningCall(callId: string, source: string): boolean {
-    if (!this.openingCalls.has(callId)) return false;
-    this.stoppedOpens.add(callId);
-    const value = toRejectionValue(
-      new WorkflowError(
-        `call ${callId} was cancelled by ${source} while its session was still opening — the call is ` +
-          `settled, and a late child, if any, is closed without prompting`,
-        CODE.AGENT_CANCELLED,
-        { recoverable: true },
-      ),
-    );
-    this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
-    this.settleIntoGuest(callId, 'reject', value);
-    // The freed concurrency token starts any queued steers through the
-    // GLOBAL kick — the cancelled opening call's slot release is a
-    // slot-free transition like any other (phase-E review rejection: the
-    // release used to skip the kick, so a cap-pressure follow-up queued
-    // on an idle session stayed stuck even though capacity had become
-    // available).
-    this.agentSlots.delete(callId);
-    this.kickQueuedDeliveries();
-    this.warnLine('warn', `call ${callId}: ${value.message}`);
-    return true;
-  }
-
   /**
    * Cancel one subagent call by its founding call id — the `interrupt`
    * tool's engine-side path (the guest handle's `cancel()` funnels
@@ -3140,195 +2409,36 @@ export class Broker {
    * fenced and settled DURABLY as cancelled right here (see
    * `stopOpeningCall`). After the client-presence drain released every
    * child, a SETTLED handle's recorded backend session is re-attached
-   * lazily (the doc: followUp/steer/cancel re-attach the subagent
+   * lazily (the doc: queued turn/steer/cancel re-attach the subagent
    * session lazily via the capability matrix) and cancelled if a turn
    * is running there; an idle loaded session is the honest no-op.
    * Returns the outcome the tool renders: `cancelled` | `idle` |
    * `failed` | `none` (no session to act on).
    */
   async cancelCall(callId: string): Promise<'cancelled' | 'idle' | 'failed' | 'none'> {
-    // Phase 1 — the DECISION under the serialized chain (no runner wire
-    // calls): the live entry, the still-opening call, the lazy
-    // re-attach path, or nothing to act on. The wire work then runs
-    // OUTSIDE the chain (phase-D review round 5: the lazy
-    // `loadSession` used to run inside it, so a hung backend load held
-    // the operation chain — `drainForDisconnect` queues behind the
-    // chain and its deadline only starts when it enters, making the
-    // documented outer drain bound ineffective).
     const decision = await this.serialized(async () => {
       this.assertAlive();
-      // §4.1: a QUEUED dispatch — a fresh call above the cap or a
-      // queued restore-time RE-ISSUE — the interrupt removes it from
-      // the queue and settles it as cancelled (recorded first, durable:
-      // a restore never re-issues it). The rejection carries the §4.6
-      // backend attribution when the call's backend resolved.
-      if (this.cancelQueuedDispatch(callId, 'interrupt', true)) {
-        return { kind: 'opening-cancelled' as const };
+      const queued = this.queuedTurns.get(callId);
+      if (queued !== undefined && queued.state !== 'settled') {
+        return { kind: 'turn' as const, sessionId: queued.sessionId, turnId: callId };
       }
-      // §4.2: a QUEUED followUp delivery (cap pressure on an idle
-      // session) — remove it from its session's queue, drop it durably,
-      // and settle the pending steer with the recoverable
-      // AGENT_CANCELLED (the interrupt's cancel-by-id contract).
-      const queuedSteer = this.findQueuedSteer(callId);
-      if (queuedSteer !== undefined) {
-        queuedSteer.entry.queue = queuedSteer.entry.queue.filter((item) => item.callId !== callId);
-        this.settleQueuedFollowUpCancellation(callId, queuedSteer.entry.backendId);
-        return { kind: 'opening-cancelled' as const };
+      const lane = this.lanes.get(callId);
+      if (lane === undefined) return { kind: 'none' as const };
+      if (lane.laneState === 'opening' && !lane.promptInFlight) {
+        return { kind: 'founding-opening' as const };
       }
-      const entry = this.sessions.get(callId);
-      if (entry !== undefined) {
-        if (!entry.busy) return { kind: 'idle' as const };
-        return { kind: 'cancel-live' as const, entry };
-      }
-      // §4.2: an in-flight FOLLOW-UP TURN (its own addressable call id)
-      // — cancel the underlying session turn; the turn task settles the
-      // steer call with the recoverable AGENT_CANCELLED. The turn id
-      // rides the decision so phase 3 verifies against the TURN
-      // registry, not the session map (the turn id is not a session
-      // key).
-      const turn = this.followUpTurns.get(callId);
-      if (turn !== undefined) {
-        if (turn.entry === undefined) {
-          // The turn's delivery still waits on the founding session's
-          // lazy re-attach load. TWO homes, both settled durably: a
-          // restored queue rebuild's item waits in `pendingSteers`
-          // (remove it there and settle the cancellation NOW), and a
-          // live followUp's load is in flight (mark it cancelled — the
-          // load's completion settles the steer with the recoverable
-          // AGENT_CANCELLED instead of starting the turn). Either way
-          // the turn is addressable from mint time, never `none`.
-          const pending = this.pendingSteers.get(turn.sessionId);
-          if (pending !== undefined && pending.some((item) => item.callId === callId)) {
-            const remaining = pending.filter((item) => item.callId !== callId);
-            if (remaining.length > 0) this.pendingSteers.set(turn.sessionId, remaining);
-            else this.pendingSteers.delete(turn.sessionId);
-            this.settleQueuedFollowUpCancellation(callId, turn.backendId);
-            return { kind: 'opening-cancelled' as const };
-          }
-          turn.cancelRequested = true;
-          return { kind: 'opening-cancelled' as const };
-        }
-        if (turn.queued) {
-          // A QUEUED turn whose delivery item is NOT in the founding
-          // session's queue (it was re-homed into the session's pending
-          // steers — the re-issue/drain path): remove it there and
-          // settle the same durable cancellation (the queued turn is
-          // addressable everywhere it waits).
-          const pending = this.pendingSteers.get(turn.sessionId);
-          if (pending !== undefined) {
-            const remaining = pending.filter((item) => item.callId !== callId);
-            if (remaining.length > 0) this.pendingSteers.set(turn.sessionId, remaining);
-            else this.pendingSteers.delete(turn.sessionId);
-          }
-          this.settleQueuedFollowUpCancellation(callId, turn.backendId ?? turn.entry.backendId);
-          return { kind: 'opening-cancelled' as const };
-        }
-        return { kind: 'cancel-live' as const, entry: turn.entry, turnId: callId };
-      }
-      // A call whose session is still OPENING (its `openSession` has
-      // not resolved — the phase-E review rejection round 7 defect:
-      // the decision used to skip it, return `none`, and let the
-      // eventual open prompt a supposedly-interrupted call): fence +
-      // settle it durably as cancelled — under the chain, exactly like
-      // the drain's bound force-stop. The guest promise rejects now;
-      // the late landing (if any) closes the child without prompting.
-      // ONE drain fires the settlement's guest reactions (the registry
-      // bookkeeping — the same post-settle drain the pump runs per
-      // settled call), so a subsequent status read reports the call
-      // settled, not still pending. A failed continuation drain is
-      // honest output, never a cancel failure.
-      if (this.openingCalls.has(callId)) {
-        this.stopOpeningCall(callId, 'interrupt');
-        try {
-          this.drain();
-          // The opening-cancel is a settlement drain that changed VM
-          // state: it fires the SAME per-settlement provenance pass and
-          // state-changing boundary as the pump (phase-E review
-          // rejection: the cancelled opening call's settlement used to
-          // skip both — the manifest missed the settlement's
-          // provenance, and the daemon's sink never marked the
-          // workspace dirty, so a kill immediately after the interrupt
-          // restored the PRE-settlement snapshot with the call still
-          // pending; the round-8 daemon regression masked the defect by
-          // performing another eval and wait before the restart).
-          this.provenancePass('settlement', [callId]);
-          this.sink?.boundary('settlement');
-        } catch (error) {
-          if (error instanceof DrainJobError) {
-            // §6.2: the drain failure DEMOTES to workspace().diagnostics
-            // (retained) — the settlement landed even though the
-            // continuation drain failed; the boundary still fires
-            // (mirrors the pump's drain-failure arm) so the
-            // operation-end flush persists the changed VM. Nothing was
-            // lost, so the failure never rides the eval output surface.
-            this.retainedDrainError = {
-              name: error.info.name,
-              message: error.info.message,
-              atMs: now(),
-            };
-            this.sink?.boundary('settlement');
-          } else throw error;
-        }
-        return { kind: 'opening-cancelled' as const };
-      }
-      // No live entry: a drained broker (or a handle whose session never
-      // opened). A settled call with a recorded backend session is
-      // re-attached lazily; anything else has nothing to cancel.
-      if (!this.canLazyReattach(callId)) return { kind: 'none' as const };
-      return { kind: 'lazy' as const };
+      if (lane.activeTurnId === null) return { kind: 'idle' as const };
+      return { kind: 'turn' as const, sessionId: callId, turnId: lane.activeTurnId };
     });
-    if (decision.kind === 'none' || decision.kind === 'idle') return decision.kind;
-    // The opening-cancel settled everything under the chain: no wire
-    // phase, no re-check — the outcome is `cancelled` as reported.
-    if (decision.kind === 'opening-cancelled') return 'cancelled';
-    // Phase 2 — the wire phase (outside the chain): the lazy re-attach
-    // (the doc: followUp/steer/cancel re-attach the subagent session
-    // lazily via the capability matrix) and the ACP session/cancel. A
-    // released/dead session makes the adapter's cancel the idempotent
-    // no-op, so racing a concurrent drain is harmless.
-    const entry =
-      decision.kind === 'cancel-live' ? decision.entry : await this.lazyReattach(callId);
-    if (entry === undefined) return 'failed';
-    const turnId = decision.kind === 'cancel-live' ? decision.turnId : undefined;
-    await this.cancelSession(entry);
-    // Phase 3 — CONSUME under the chain: the call may have settled (or
-    // the session been released) while the wire cancel was in flight. A
-    // turn that settled is a settled turn: the cancel-no-op must not
-    // report `cancelled`, and the cancellation marker set by phase 2 is
-    // rolled back on an idle entry — marking an idle session cancelled
-    // would drop its queued steers. (The rollback window is one chain
-    // hop; the marker is only read by settlement/delivery bookkeeping,
-    // never by the guest.)
-    return this.serialized(async () => {
-      this.assertAlive();
-      // The §4.2 followUp-turn verify: the addressable id keys the TURN
-      // registry, not the session map — a turn that settled while the
-      // wire cancel was in flight reports idle (the settled turn's
-      // answer already shipped), exactly like the founding-call path.
-      if (turnId !== undefined) {
-        // The turn may have ended while the wire cancel was in flight.
-        // A turn that settled NATURALLY (its task resolved with the
-        // answer) reports idle — the answer shipped, the cancel was a
-        // no-op; anything else (the cancel ended it, or it is still
-        // running) reports cancelled — the pump settles the steer call
-        // with the recoverable AGENT_CANCELLED.
-        const task = this.inFlight.get(turnId);
-        if (task !== undefined && task.done) {
-          const result = await task.promise;
-          if (result.outcome === 'resolve') return 'idle';
-        }
-        return 'cancelled';
-      }
-      const current = this.sessions.get(callId);
-      if (current !== entry) return 'idle';
-      if (!current.busy) {
-        current.callCancelled = false;
-        return 'idle';
-      }
-      current.callCancelled = true;
-      for (const wake of current.cancelWaiters) wake();
-      return 'cancelled';
-    });
+    if (decision.kind === 'none') return 'none';
+    if (decision.kind === 'idle') return 'idle';
+    if (decision.kind === 'founding-opening') {
+      return this.serialized(async () =>
+        this.cancelFoundingBeforeSession(callId, 'interrupt', true) ? 'cancelled' : 'none',
+      );
+    }
+    const outcome = await this.requestTurnCancellation(decision.sessionId, decision.turnId);
+    return outcome.outcome === 'resolve' ? outcome.value as 'cancelled' | 'idle' : 'failed';
   }
 
   /** Every pending guest call (the registry manifest) — the `status`
@@ -3716,48 +2826,43 @@ this.evalBreakArmed = false;
    *  task string through `structuredContent` while only the text
    *  content was capped). */
   liveAgents(): LiveAgentInfo[] {
-    const entries: LiveAgentInfo[] = [...this.sessions.values()].map((entry) => ({
-      callId: entry.callId,
+    const entries: LiveAgentInfo[] = [...this.lanes.entries()].flatMap(([callId, lane]) => {
+      const entry = this.sessions.get(callId);
+      const record = this.callStore.lookup(callId);
+      if (
+        record?.kind !== 'agent' ||
+        (lane.laneState === 'fatal' && entry === undefined && lane.queuedTurnIds.length === 0)
+      ) return [];
+      return [{
+      callId,
       // The modelSpec ships VERBATIM (§7: the engine retains 200-char
       // metadata formatting ONLY for manifest tokens, checkpoint
       // questions and task previews — `agents()` is the §4.5
       // guest-visible plain data, and the full spec must stay
       // recoverable; the review defect capped it at 200 chars). The
       // task preview keeps its 200-char bound (a retained preview).
-      modelSpec: entry.modelSpec,
-      task: entry.task.length > 200 ? headTail(entry.task, 200) : entry.task,
-      state: !entry.callSettled
-        ? entry.busy
+      modelSpec: entry?.modelSpec ?? record.modelSpec ?? '',
+      task: (entry?.task ?? record.detail).length > 200 ? headTail(entry?.task ?? record.detail, 200) : (entry?.task ?? record.detail),
+      state: lane.laneState === 'opening'
+        ? 'opening'
+        : lane.activeTurnId !== null
           ? 'running'
-          : 'opening'
-        : entry.delivering
-          ? 'delivering'
           : 'idle',
-      supportsSteering: entry.supportsSteering,
-      queuedSteers: entry.queue.length,
-    }));
-    // The §4.2 addressable followUp turns: each minted turn gets its
-    // own entry with its OWN call id (targetable by interrupt) — the
-    // session entry alone would hide the turn behind the founding call.
-    // A QUEUED turn (minted but waiting for a free concurrency slot) is
-    // listed too, in the honest `queued` state — it is addressable
-    // before its delivery starts (the review probe: a cap-queued turn
-    // must be visible in `agents()` while pending).
-    for (const [callId, turn] of this.followUpTurns) {
-      // A turn whose founding session is still being re-attached (a
-      // drained settled handle's lazy load, or a restore whose queue
-      // rebuild re-attaches the founding session) renders the honest
-      // `opening` state from the founding store record — the turn is
-      // listed from MINT time (the review defect: a delayed load hid
-      // the minted call from `agents()`). The modelSpec is the
-      // founding session's, VERBATIM like the session entries.
+      supportsSteering: advertisesSteering(entry?.initializeMeta),
+      queuedTurns: lane.queuedTurnIds.filter((id) => this.queuedTurns.get(id)?.state === 'pending').length,
+      } satisfies LiveAgentInfo];
+    });
+    for (const [callId, turn] of this.queuedTurns) {
+      if (turn.state === 'settled') continue;
+      const entry = this.sessions.get(turn.sessionId);
+      const founding = this.callStore.lookup(turn.sessionId);
       entries.push({
         callId,
-        modelSpec: turn.entry?.modelSpec ?? this.callStore.lookup(turn.sessionId)?.modelSpec ?? '',
+        modelSpec: entry?.modelSpec ?? founding?.modelSpec ?? '',
         task: turn.prompt.length > 200 ? headTail(turn.prompt, 200) : turn.prompt,
-        state: turn.entry === undefined ? 'opening' : turn.queued ? 'queued' : 'running',
-        supportsSteering: turn.entry?.supportsSteering ?? false,
-        queuedSteers: turn.entry?.queue.length ?? 0,
+        state: turn.state === 'active' || turn.state === 'cancelling' ? 'running' : 'queued',
+        supportsSteering: advertisesSteering(entry?.initializeMeta),
+        queuedTurns: 0,
       });
     }
     return entries;
@@ -3807,7 +2912,7 @@ this.evalBreakArmed = false;
 
   /** The `agents()` guest handler's JSON (§4.5): the live-agent entries
    *  as plain data (v1's liveAgents entries — including the addressable
-   *  followUp turns). */
+   *  queued turn turns). */
   private agentsJson(): string {
     return JSON.stringify(this.liveAgents());
   }
@@ -3828,7 +2933,7 @@ this.evalBreakArmed = false;
 
   /** True once the client-presence drain released every child (see
    *  `drainForDisconnect`): the workspace stays live, and later
-   *  followUp/steer/cancel on a settled handle lazily re-attaches the
+   *  queued turn/steer/cancel on a settled handle lazily re-attaches the
    *  recorded backend session. */
   get isDrained(): boolean {
     return this.drained;
@@ -3849,8 +2954,8 @@ this.evalBreakArmed = false;
    *  probe). */
   busySessionCount(): number {
     let count = 0;
-    for (const entry of this.sessions.values()) {
-      if (entry.busy) count++;
+    for (const lane of this.lanes.values()) {
+      if (lane.activeTurnId !== null || lane.promptInFlight) count++;
     }
     return count;
   }
@@ -4099,7 +3204,7 @@ this.evalBreakArmed = false;
    * the runner's runaway protections, so the bound is the outer ceiling),
    * and then every idle child CLOSES (sessions released — `keepSession`
    * keeps the backend sessions re-openable). The workspace and broker
-   * stay alive; on the next client connect `followUp` re-attaches the
+   * stay alive; on the next client connect `queued turn` re-attaches the
    * subagent session lazily via the capability matrix (see
    * `canLazyReattach`/`lazyReattach`). Queued-but-undelivered steers are
    * re-queued durably against their founding session ids (the same
@@ -4291,9 +3396,12 @@ this.evalBreakArmed = false;
         this.generation++;
         for (const callId of [...this.openingCalls]) this.stoppedOpens.add(callId);
         const cancels: Promise<unknown>[] = [];
-        for (const entry of this.sessions.values()) {
-          if (entry.busy) {
-            cancels.push(Promise.resolve(this.cancelSession(entry)).catch(() => undefined));
+        for (const [sessionId, entry] of this.sessions) {
+          const lane = this.lanes.get(sessionId);
+          if (lane?.activeTurnId !== null && lane?.activeTurnId !== undefined) {
+            cancels.push(this.requestTurnCancellation(sessionId, lane.activeTurnId));
+          } else if (lane?.promptInFlight) {
+            cancels.push(Promise.resolve(entry.session.cancel()).catch(() => undefined));
           }
         }
         await boundedAll(cancels, deadline);
@@ -4364,32 +3472,18 @@ this.evalBreakArmed = false;
             this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
             if (this.settleIntoGuest(callId, 'reject', value)) settledIds.push(callId);
             entry.callSettled = true;
-            entry.busy = false;
             this.warnLine('warn', `call ${callId}: ${value.message}`);
           }
           for (const task of stoppedSteers) {
-            // The deliver() discipline: the store write first, and when
-            // the store ALREADY holds a first completion the guest
-            // settles with the STORE's completion (the store's first
-            // completion is the authority — the guest must never see a
-            // different value than the store records). A QUEUED
-            // answer-mode followUp (its store record carries the
-            // queued marker — a restored queue rebuild's delivery
-            // scheduler, or a cap-queued lazy re-attach) also gains the
-            // durable DROPPED marker: the cut-off turn settled `failed`
-            // here, and a restore must never re-queue it for a
-            // spurious second delivery turn.
-            const queuedRecord = this.callStore.lookup(task.callId);
-            if (
-              queuedRecord?.queuedAtMs !== null &&
-              queuedRecord?.queuedAtMs !== undefined &&
-              queuedRecord.deliveredAtMs === null &&
-              queuedRecord.droppedAtMs === null
-            ) {
-              this.callStore.recordDelivery(task.callId, 'dropped', now());
-            }
-            if (this.recordCompletion(task.callId, { outcome: 'resolve', value: 'failed', completedAtMs: now() })) {
-              if (this.settleIntoGuest(task.callId, 'resolve', 'failed')) settledIds.push(task.callId);
+            const value = toRejectionValue(
+              executionError(
+                `steer ${task.callId}: cut off by the client-presence drain`,
+                'steering_interrupted',
+                true,
+              ),
+            );
+            if (this.recordCompletion(task.callId, { outcome: 'reject', value, completedAtMs: now() })) {
+              if (this.settleIntoGuest(task.callId, 'reject', value)) settledIds.push(task.callId);
             } else {
               const record = this.callStore.lookup(task.callId);
               const completion = record?.completion;
@@ -4454,22 +3548,20 @@ this.evalBreakArmed = false;
             if (registryEntry.kind === 'steer') {
               // The deliver() discipline: the store write first; a
               // store that already holds a first completion stays the
-              // authority. A QUEUED answer-mode followUp (the store
+              // authority. A QUEUED answer-mode queued turn (the store
               // record carries the queued marker) also gains the
               // durable DROPPED marker — the cut-off turn settled
               // `failed` here, and a restore must never re-queue it
               // for a spurious second delivery turn.
-              const queuedRecord = this.callStore.lookup(registryEntry.id);
-              if (
-                queuedRecord?.queuedAtMs !== null &&
-                queuedRecord?.queuedAtMs !== undefined &&
-                queuedRecord.deliveredAtMs === null &&
-                queuedRecord.droppedAtMs === null
-              ) {
-                this.callStore.recordDelivery(registryEntry.id, 'dropped', now());
-              }
-              if (this.recordCompletion(registryEntry.id, { outcome: 'resolve', value: 'failed', completedAtMs: now() })) {
-                if (this.settleIntoGuest(registryEntry.id, 'resolve', 'failed')) settledIds.push(registryEntry.id);
+              const value = toRejectionValue(
+                executionError(
+                  `steer ${registryEntry.id}: cut off by the client-presence drain`,
+                  'steering_interrupted',
+                  true,
+                ),
+              );
+              if (this.recordCompletion(registryEntry.id, { outcome: 'reject', value, completedAtMs: now() })) {
+                if (this.settleIntoGuest(registryEntry.id, 'reject', value)) settledIds.push(registryEntry.id);
               } else {
                 const completion = this.callStore.lookup(registryEntry.id)?.completion;
                 if (completion === null || completion === undefined) {
@@ -4527,18 +3619,15 @@ this.evalBreakArmed = false;
         this.draining = false;
         return false;
       }
-      // Release phase: every session's child closes (keepSession keeps
-      // the backend session re-openable). Queued-but-undelivered steers
-      // are re-queued against their founding session ids FIRST — the
-      // next lazy re-attach merges them into the fresh entry's queue.
+      // Release phase: every child closes while broker-owned future
+      // turns remain in their lane FIFO for later lazy reattachment.
       const sessions = [...this.sessions.values()];
       for (const entry of sessions) {
-        const pending = this.pendingSteers.get(entry.callId) ?? [];
-        if (entry.queue.length > 0) {
-          this.pendingSteers.set(entry.callId, [...pending, ...entry.queue]);
-          entry.queue = [];
-        } else if (pending.length === 0) {
-          this.pendingSteers.delete(entry.callId);
+        const lane = this.lanes.get(entry.callId);
+        if (lane !== undefined && lane.laneState !== 'fatal') {
+          lane.laneState = 'released';
+          lane.activeTurnId = null;
+          lane.promptInFlight = false;
         }
       }
       const releases = sessions.map((entry) =>
@@ -4547,7 +3636,7 @@ this.evalBreakArmed = false;
       await boundedAll(releases, deadline);
       this.sessions.clear();
       this.agentSlots.clear();
-      this.deliverySlots.clear();
+      this.queueSlots.clear();
       this.pendingReattaches.clear();
       this.drained = true;
       return drainedWithinBound;
@@ -4692,7 +3781,10 @@ this.evalBreakArmed = false;
       const cancels: Promise<unknown>[] = [];
       const sessions = [...this.sessions.values()];
       for (const entry of sessions) {
-        if (entry.busy) cancels.push(Promise.resolve(this.cancelSession(entry)).catch(() => undefined));
+        const lane = this.lanes.get(entry.callId);
+        if (lane?.promptInFlight) {
+          cancels.push(Promise.resolve(entry.session.cancel()).catch(() => undefined));
+        }
       }
       await boundedAll(cancels, deadline);
       const releases: Promise<unknown>[] = sessions.map((entry) =>
@@ -4700,22 +3792,26 @@ this.evalBreakArmed = false;
       );
       await boundedAll(releases, deadline);
       this.sessions.clear();
-      this.pendingSteers.clear();
       this.pendingReattaches.clear();
       this.checkpoints.clear();
       this.deferreds.clear();
       this.inFlight.clear();
       this.agentSlots.clear();
-      this.deliverySlots.clear();
+      this.queueSlots.clear();
       this.openingCalls.clear();
       this.stoppedOpens.clear();
-      // The eval-plane additions: queued dispatches, addressable
-      // followUp turns, and live sleep timers are dropped with the
+      for (const lane of this.lanes.values()) {
+        if (lane.cancellationTimer !== null) clearTimeout(lane.cancellationTimer);
+      }
+      this.lanes.clear();
+      // The eval-plane additions: queued dispatches, first-class future
+      // turns, steering controls, and live sleep timers are dropped with the
       // broker (their guest calls are gone with the workspace). The
       // owed-but-unconsumed reset() teardown dies with the broker (a
       // disposed broker owns no children to tear down).
       this.dispatchQueue.length = 0;
-      this.followUpTurns.clear();
+      this.queuedTurns.clear();
+      this.steeringControls.clear();
       this.sleepCalls.clear();
       this.resetDue = false;
       this.resetRequested = false;
@@ -4765,6 +3861,11 @@ this.evalBreakArmed = false;
    * semantics; `parallel(items.map(...))` must not lose work).
    */
   private onAgent(call: GuestCall, callId: string, modelSpec: string, task: string, optionsJson: string | null): void {
+    if (this.drained) {
+      this.draining = false;
+      this.drained = false;
+    }
+    const admissionSequence = ++this.admissionSequence;
     let parsed: ParsedAgentOptions;
     try {
       parsed = this.parseAgentOptions(optionsJson);
@@ -4777,17 +3878,16 @@ this.evalBreakArmed = false;
       this.refuseAdmitted(call, callId, task, optionsJson, modelSpec, admissionError);
       return;
     }
-    if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
-      // §4.1: queue-above-cap — the dispatch waits for the next free
-      // slot, in dispatch order. The guest call stays pending until the
-      // dispatch runs; the kick (see `kickDispatchQueue`) starts it the
-      // moment a slot frees. A snapshot taken while queued carries the
-      // call in the guest registry; a restore re-issues it through the
-      // ordinary reconcile arm.
-      this.dispatchQueue.push({ kind: 'dispatch', call, callId, modelSpec, task, optionsJson, parsed });
-      return;
-    }
-    this.startDispatch(call, callId, modelSpec, task, optionsJson, parsed);
+    this.recordDispatch(callId, 'agent', task, optionsJson, null, modelSpec, admissionSequence);
+    this.deferreds.set(callId, call);
+    const lane = this.newLane('opening');
+    lane.activeTurnId = callId;
+    this.lanes.set(callId, lane);
+    // Founding dispatches and queued-turn heads share one admission
+    // arbiter. Enrolling first preserves the workspace-wide sequence
+    // order even when capacity is currently free.
+    this.dispatchQueue.push({ kind: 'dispatch', call, callId, modelSpec, task, optionsJson, parsed, admissionSequence });
+    this.scheduleAdmissions();
   }
 
   /**
@@ -4871,29 +3971,6 @@ this.evalBreakArmed = false;
     this.refuse(call, callId, 'agent', task, optionsJson, error);
   }
 
-  /** Register QUEUED answer-mode items (cap-pressure followUp turns
-   *  re-homed into a session's delivery queue — a restore's queue
-   *  rebuild or a re-issue/drain re-home) in the turn registry, so they
-   *  stay visible in `agents()` and targetable by `interrupt` before
-   *  their delivery starts. Idempotent per turn id. */
-  private registerQueuedTurns(entry: SessionEntry): void {
-    for (const item of entry.queue) {
-      if (!item.answer) continue;
-      // Unconditional: a turn registered BEFORE the session existed (a
-      // restore's queue rebuild whose lazy re-attach just landed, or a
-      // re-issued founding call's re-homed items) gains its entry here
-      // — the turn was addressable while the session was absent and
-      // stays addressable now that it is attached.
-      this.followUpTurns.set(item.callId, {
-        entry,
-        sessionId: entry.callId,
-        prompt: item.prompt,
-        queued: true,
-        backendId: entry.backendId,
-      });
-    }
-  }
-
   /** The dispatch body (shared by the live path and the queued path):
    *  record the dispatch, register the deferred and the concurrency
    *  token, and start the async task. */
@@ -4908,6 +3985,10 @@ this.evalBreakArmed = false;
     this.recordDispatch(callId, 'agent', task, optionsJson, null, modelSpec);
     this.deferreds.set(callId, call);
     this.agentSlots.add(callId);
+    const lane = this.lanes.get(callId) ?? this.newLane('opening');
+    lane.laneState = 'opening';
+    lane.activeTurnId = callId;
+    this.lanes.set(callId, lane);
     // The opening-call registry (the client-presence drain's in-flight
     // probe): the session does not exist yet — the drain must wait for it
     // exactly like a busy session (a call blocked in openSession is still
@@ -5003,220 +4084,118 @@ this.evalBreakArmed = false;
    * actually happened — never a hard error. The session's cancel path
    * also settles the CANCELLED call itself through its own task.
    */
-  private onSteer(call: GuestCall, callId: string, sessionId: string, action: string, payloadJson: string | null): void {
-    let payload: { prompt?: unknown; options?: unknown } | null = null;
+  private onQueue(call: GuestCall, callId: string, sessionId: string, payloadJson: string | null): void {
+    if (this.drained) {
+      this.draining = false;
+      this.drained = false;
+    }
+    const admissionSequence = ++this.admissionSequence;
+    const admittedAtMs = now();
     try {
-      if (payloadJson !== null) {
-        const parsed: unknown = JSON.parse(payloadJson);
-        if (typeof parsed !== 'object' || parsed === null) throw new Error('steer payload must be an object');
-        payload = parsed as { prompt?: unknown; options?: unknown };
-      }
-    } catch (error) {
-      this.refuse(call, callId, 'steer', action, payloadJson, error);
+      this.recordDispatch(callId, 'queue', rawPromptDetail(payloadJson), payloadJson, sessionId, null, admissionSequence, admittedAtMs);
+      this.callStore.recordQueued(callId, admittedAtMs);
+    } catch (cause) {
+      const failure = persistenceFailure(cause);
+      this.markPersistenceFatal(sessionId, failure);
+      call.reject(failure);
+      this.syncSettled.push(callId);
       return;
     }
-    this.recordDispatch(callId, 'steer', action, payloadJson, sessionId);
-
-    const entry = this.sessions.get(sessionId);
-    if (entry === undefined) {
-      if (action === 'cancel' && this.openingCalls.has(sessionId)) {
-        // The founding call's session is still OPENING: the handle's
-        // cancel() is the same cancellation as the interrupt tool's id
-        // path (phase-E review rejection round 7: it used to fall
-        // through to `failed` — "nothing was steered" — while the
-        // eventual open went on to prompt a supposedly-cancelled
-        // call). Fence + settle the call durably as cancelled, and the
-        // steer resolves with what actually happened: `cancelled`.
-        this.stopOpeningCall(sessionId, 'handle cancel');
-        this.settleSteerSync(call, callId, 'cancelled');
-        return;
-      }
-      // §4.1/§4.2: a founding dispatch QUEUED above the concurrency
-      // cap is neither opening nor open — it waits in the dispatch
-      // queue, invisible to `openingCalls`/`agentSlots`. The handle's
-      // cancel() must reach it there (the review defect: the cancel
-      // fell through to `failed` while the supposedly-cancelled queued
-      // dispatch later opened and prompted when a slot freed). The
-      // same durable AGENT_CANCELLED settlement as the interrupt
-      // tool's id path; the steer resolves with what actually
-      // happened: `cancelled`.
-      if (action === 'cancel' && this.cancelQueuedDispatch(sessionId, 'handle cancel', false)) {
-        this.settleSteerSync(call, callId, 'cancelled');
-        return;
-      }
-      if (this.agentSlots.has(sessionId) && action !== 'cancel') {
-        // The founding call is still opening (its session does not exist
-        // yet — a steer in the same eval as the dispatch lands here).
-        // Queue it for the call's next-turn boundary; the delivery is
-        // the honest `queued` outcome.
-        let prompt: string;
-        let options: Record<string, unknown> | undefined;
-        try {
-          if (typeof payload?.prompt !== 'string') {
-            throw new TypeError(`handle.${action}(prompt, options?) needs a prompt string`);
-          }
-          prompt = payload.prompt;
-          options = payload.options === undefined ? undefined : this.parseSteerOptions(payload.options);
-        } catch (error) {
-          this.refuse(call, callId, 'steer', action, payloadJson, error);
-          return;
-        }
-        const promptMeta = (options?.promptMeta as Record<string, unknown> | undefined) ?? undefined;
-        const pending = this.pendingSteers.get(sessionId) ?? [];
-        pending.push({ callId, prompt, promptMeta, answer: false });
-        this.pendingSteers.set(sessionId, pending);
-        this.settleSteerSync(call, callId, 'queued');
-        return;
-      }
-      if (this.canLazyReattach(sessionId)) {
-        // The doc's lazy re-attach: a SETTLED handle whose session was
-        // released (the client-presence drain, or a restore that left the
-        // settled call un-attached) re-attaches its recorded backend
-        // session on demand — `followUp re-attaches the subagent session
-        // lazily via the capability matrix above`. The load is
-        // capability-gated through the runner's own `loadSession`; a
-        // failure (no `session/load` on a custom backend, a lost
-        // session) degrades to the honest `failed` with a warn line —
-        // nothing was steered.
-        let prompt: string;
-        let promptMeta: Record<string, unknown> | undefined;
-        try {
-          if (action === 'cancel') {
-            prompt = '';
-          } else {
-            if (typeof payload?.prompt !== 'string') {
-              throw new TypeError(`handle.${action}(prompt, options?) needs a prompt string`);
-            }
-            prompt = payload.prompt;
-            const options =
-              payload.options === undefined ? undefined : this.parseSteerOptions(payload.options);
-            promptMeta = (options?.promptMeta as Record<string, unknown> | undefined) ?? undefined;
-          }
-        } catch (error) {
-          this.refuse(call, callId, 'steer', action, payloadJson, error);
-          return;
-        }
-        // §4.2 addressability FROM MINT TIME: the followUp/steer turn
-        // is REGISTERED before the lazy load starts — visible in
-        // `agents()` and targetable by `interrupt` while the session
-        // is still being re-attached (the review defect: the turn was
-        // registered only once `loadSession` finished, so a delayed
-        // load hid the minted call and `interrupt` returned `none`).
-        // A cancel needs no turn (its outcome is the delivery
-        // vocabulary's `idle`/`cancelled`).
-        if (action === 'followUp' || action === 'steer') {
-          const founding = this.callStore.lookup(sessionId);
-          this.followUpTurns.set(callId, {
-            entry: undefined,
-            sessionId,
-            prompt,
-            queued: false,
-            backendId:
-              this.recordedBackendId(sessionId) ??
-              (founding?.modelSpec !== null && founding?.modelSpec !== undefined && founding.modelSpec !== ''
-                ? backendSegment(founding.modelSpec)
-                : undefined),
-          });
-        }
-        const task = this.runLazyReattachSteerTask(callId, sessionId, action, prompt, promptMeta);
-        this.deferreds.set(callId, call);
-        this.trackInFlight(callId, 'steer', task);
-        return;
-      }
-      // No live session for the founding call (never opened, or lost
-      // with the process): nothing was steered.
-      this.settleSteerSync(call, callId, 'failed');
-      return;
-    }
-
-    if (action === 'cancel') {
-      if (!entry.busy) {
-        // Nothing is running — the agent is already stopped.
-        this.settleSteerSync(call, callId, 'idle');
-        return;
-      }
-      const task = this.runCancelTask(callId, entry);
-      this.deferreds.set(callId, call);
-      this.trackInFlight(callId, 'steer', task);
-      return;
-    }
-
-    // followUp / steer.
-    if (action !== 'followUp' && action !== 'steer') {
-      this.settleSteerSync(call, callId, 'failed');
-      return;
-    }
-    let prompt: string;
-    let options: Record<string, unknown> | undefined;
+    let payload: { prompt: string; promptMeta?: Record<string, unknown> };
     try {
-      if (typeof payload?.prompt !== 'string') {
-        throw new TypeError(`handle.${action}(prompt, options?) needs a prompt string`);
-      }
-      prompt = payload.prompt;
-      options = payload.options === undefined ? undefined : this.parseSteerOptions(payload.options);
+      payload = this.parseTurnPayload(payloadJson, 'queue');
     } catch (error) {
-      this.refuse(call, callId, 'steer', action, payloadJson, error);
+      this.refuseRecorded(call, callId, error);
       return;
     }
-    const promptMeta = (options?.promptMeta as Record<string, unknown> | undefined) ?? undefined;
-
-    if (entry.busy) {
-      if (entry.supportsSteering) {
-        // Live injection into the in-flight turn.
-        const task = this.runInjectTask(callId, entry, prompt, promptMeta);
-        this.deferreds.set(callId, call);
-        this.trackInFlight(callId, 'steer', task);
-      } else {
-        // Queued for next-turn delivery — the honest immediate outcome
-        // (the MID-TURN delivery-outcome vocabulary, §4.2).
-        entry.queue.push({ callId, prompt, promptMeta, call: null, answer: false });
-        this.settleSteerSync(call, callId, 'queued');
-      }
+    const founding = this.callStore.lookup(sessionId);
+    if (founding?.kind !== 'agent') {
+      this.refuseRecorded(call, callId, executionError(`queue ${callId}: founding session ${sessionId} does not exist`, 'session_not_found', false));
       return;
     }
-
-    // The session is idle: followUp/steer mint a NEW TURN with its own
-    // call id and resolve with the TURN'S ANSWER (§4.2 — idle-session
-    // steer is the followUp alias; never the bare 'startedNewTurn'
-    // token, never a discarded turn). UNLESS the workspace cap is
-    // exhausted (a follow-up turn IS the subagent working; the
-    // six-agent ceiling is absolute): the steer queues on the durable
-    // delivery queue — its promise stays PENDING until the delivery
-    // turn runs and settles with the answer; `kickQueuedDeliveries`
-    // starts it the moment a slot frees (review regression: idle-handle
-    // follow-ups used to start without checking the cap, so a
-    // maxConcurrentAgents=1 workspace could run two subagent turns
-    // concurrently).
-    if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) {
-      this.recordQueuedDelivery(callId);
-      this.deferreds.set(callId, call);
-      entry.queue.push({ callId, prompt, promptMeta, call, answer: true });
-      // The turn is MINTED at enqueue (the §4.2 addressable turn): it
-      // is visible in `agents()`/`liveAgents()` and targetable by
-      // `interrupt` while it waits for a free slot — never hidden
-      // behind the cap until its delivery starts.
-      this.followUpTurns.set(callId, {
-        entry,
-        sessionId: entry.callId,
-        prompt,
-        queued: true,
-        backendId: entry.backendId,
-      });
+    const lane = this.lanes.get(sessionId) ?? this.newLane(founding.completion === null ? 'opening' : 'released');
+    this.lanes.set(sessionId, lane);
+    if (lane.laneState === 'fatal') {
+      this.refuseRecorded(
+        call,
+        callId,
+        executionError(`queue ${callId}: founding session ${sessionId} is fatally unavailable`, 'session_unusable', false),
+      );
       return;
     }
-    const task = this.runFollowUpTask(callId, entry, prompt, promptMeta);
+    const turn: QueuedTurn = {
+      callId,
+      sessionId,
+      prompt: payload.prompt,
+      promptMeta: payload.promptMeta,
+      call,
+      admissionSequence,
+      state: 'pending',
+      cancelRequested: false,
+    };
+    this.queuedTurns.set(callId, turn);
+    lane.queuedTurnIds.push(callId);
     this.deferreds.set(callId, call);
-    this.trackInFlight(callId, 'steer', task);
+    if (lane.laneState === 'released') this.scheduleQueueReattach(sessionId);
+    this.scheduleAdmissions();
   }
 
-  /** The durable QUEUED marker for a cap-pressure followUp (§4.2): the
-   *  steer's store record gains `queuedAtMs` so a restore's queue
-   *  rebuild re-queues it for delivery exactly once (the completion is
-   *  deliberately NOT recorded — the promise resolves with the turn's
-   *  ANSWER when the delivery runs, and the store's first completion is
-   *  the settlement authority). */
-  private recordQueuedDelivery(callId: string): void {
-    this.callStore.recordQueued(callId, now());
+  private onSteer(call: GuestCall, callId: string, sessionId: string, payloadJson: string | null): void {
+    this.recordDispatch(callId, 'steer', 'steer', payloadJson, sessionId, null);
+    let payload: { prompt: string; promptMeta?: Record<string, unknown> };
+    try {
+      payload = this.parseTurnPayload(payloadJson, 'steer');
+    } catch (error) {
+      this.refuseRecorded(call, callId, error);
+      return;
+    }
+    const lane = this.lanes.get(sessionId);
+    const targetTurnId = lane?.promptInFlight === true ? lane.activeTurnId : null;
+    if (lane === undefined || targetTurnId === null) {
+      this.settleControlSync(call, callId, 'idle');
+      return;
+    }
+    const entry = this.sessions.get(sessionId);
+    if (entry === undefined) {
+      this.settleControlSync(call, callId, 'idle');
+      return;
+    }
+    if (!advertisesSteering(entry.initializeMeta)) {
+      this.settleControlSync(call, callId, 'unsupported');
+      return;
+    }
+    this.deferreds.set(callId, call);
+    this.steeringControls.set(callId, { callId, sessionId, targetTurnId, ...payload, call });
+    lane.steeringControlIds.push(callId);
+    this.processSteeringControls(sessionId);
+  }
+
+  private onSessionCancel(call: GuestCall, callId: string, sessionId: string): void {
+    this.recordDispatch(callId, 'cancel', 'session', null, sessionId, null);
+    const lane = this.lanes.get(sessionId);
+    if (lane === undefined || lane.activeTurnId === null) {
+      this.settleControlSync(call, callId, 'idle');
+      this.scheduleAdmissions();
+      return;
+    }
+    if (lane.laneState === 'opening' && !lane.promptInFlight) {
+      const cancelled = this.cancelFoundingBeforeSession(sessionId, 'handle cancel', false);
+      this.settleControlSync(call, callId, cancelled ? 'cancelled' : 'idle');
+      return;
+    }
+    this.deferreds.set(callId, call);
+    this.trackInFlight(callId, 'cancel', this.requestTurnCancellation(sessionId, lane.activeTurnId));
+  }
+
+  private onQueueCancel(call: GuestCall, callId: string, queueCallId: string): void {
+    const turn = this.queuedTurns.get(queueCallId);
+    this.recordDispatch(callId, 'cancel', 'queue', null, turn?.sessionId ?? queueCallId, null);
+    if (turn === undefined || turn.state === 'settled') {
+      this.settleControlSync(call, callId, 'idle');
+      return;
+    }
+    this.deferreds.set(callId, call);
+    this.trackInFlight(callId, 'cancel', this.requestTurnCancellation(turn.sessionId, queueCallId));
   }
 
   /** `__host_console`: buffer the event; the next tool result renders it
@@ -5253,11 +4232,13 @@ this.evalBreakArmed = false;
    *  current default backend, phase-D review round 2). */
   private recordDispatch(
     callId: string,
-    kind: 'agent' | 'checkpoint' | 'steer',
+    kind: 'agent' | 'checkpoint' | 'queue' | 'steer' | 'cancel',
     detail: string,
     optionsJson: string | null,
-    sessionId: string | null = null,
+    foundingCallId: string | null = null,
     modelSpec: string | null = null,
+    admissionSequence: number = ++this.admissionSequence,
+    admittedAtMs: number = now(),
   ): void {
     this.callStore.recordDispatched({
       callId,
@@ -5266,13 +4247,16 @@ this.evalBreakArmed = false;
       optionsJson,
       modelSpec,
       backendId: null,
-      dispatchedAtMs: now(),
+      foundingCallId,
+      admittedAtMs,
+      admissionSequence,
+      dispatchedAtMs: admittedAtMs,
       reissues: 0,
       completion: null,
-      sessionId,
-      deliveredAtMs: null,
-      droppedAtMs: null,
+      sessionId: null,
       queuedAtMs: null,
+      handoffAtMs: null,
+      cancelledAtMs: null,
     });
   }
 
@@ -5283,13 +4267,19 @@ this.evalBreakArmed = false;
   private recordCompletion(callId: string, outcome: CallOutcome): boolean {
     if (outcome.outcome === 'reject' && typeof outcome.value === 'object' && outcome.value !== null) {
       const record = this.callStore.lookup(callId);
-      if (record?.kind === 'agent') {
+      if (record?.kind === 'agent' || record?.kind === 'queue') {
+        const founding = record.kind === 'queue' && record.foundingCallId !== null
+          ? this.callStore.lookup(record.foundingCallId)
+          : record;
         const modelSegment =
-          record.modelSpec !== null && record.modelSpec !== ''
-            ? backendSegment(record.modelSpec)
+          founding?.modelSpec !== null && founding?.modelSpec !== undefined && founding.modelSpec !== ''
+            ? backendSegment(founding.modelSpec)
             : undefined;
         const segment =
-          record.backendId ??
+          (record.kind === 'queue' && record.foundingCallId !== null
+            ? this.sessions.get(record.foundingCallId)?.backendId
+            : undefined) ??
+          founding?.backendId ??
           (modelSegment !== undefined && this.knownBackends().includes(modelSegment)
             ? modelSegment
             : undefined);
@@ -5305,9 +4295,22 @@ this.evalBreakArmed = false;
   /** A dispatch-time refusal: record dispatched + rejected FIRST (a
    *  refused call must never be re-issued after a restore), then settle
    *  the guest call with the recoverable/non-recoverable error. */
-  private refuse(call: GuestCall, callId: string, kind: 'agent' | 'steer', detail: string, optionsJson: string | null, error: unknown): void {
+  private refuse(call: GuestCall, callId: string, kind: 'agent' | 'queue' | 'steer' | 'cancel', detail: string, optionsJson: string | null, error: unknown): void {
     this.recordDispatch(callId, kind, detail, optionsJson);
     const value = toRejectionValue(error);
+    this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
+    call.reject(value);
+    this.syncSettled.push(callId);
+  }
+
+  private refuseRecorded(call: GuestCall, callId: string, error: unknown): void {
+    const value = toRejectionValue(
+      isWorkflowError(error)
+        ? error
+        : new WorkflowError(toRejectionValue(error).message, CODE.SCRIPT_VALIDATION_ERROR, {
+            recoverable: false,
+          }),
+    );
     this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
     call.reject(value);
     this.syncSettled.push(callId);
@@ -5316,7 +4319,7 @@ this.evalBreakArmed = false;
   /** A synchronous steering settlement (no session, idle cancel, queued
    *  delivery, bad action): recorded then settled, like every other
    *  settlement. */
-  private settleSteerSync(call: GuestCall, callId: string, outcome: SteeringOutcomeValue): void {
+  private settleControlSync(call: GuestCall, callId: string, outcome: SteeringOutcomeValue | CancelOutcomeValue): void {
     this.recordCompletion(callId, { outcome: 'resolve', value: outcome, completedAtMs: now() });
     call.resolve(outcome);
     this.syncSettled.push(callId);
@@ -5325,7 +4328,7 @@ this.evalBreakArmed = false;
   /** Track an in-flight host task with the poll-shaped readiness flag. */
   private trackInFlight(
     callId: string,
-    kind: 'agent' | 'steer',
+    kind: 'agent' | 'queue' | 'steer' | 'cancel',
     promise: Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }>,
   ): void {
     const entry: InFlightTask = { callId, kind, promise, done: false };
@@ -5397,9 +4400,13 @@ this.evalBreakArmed = false;
         // normally.
         this.stoppedOpens.delete(callId);
         this.openingCalls.delete(callId);
-        this.dropPendingSteers(
+        this.failQueuedTurns(
           callId,
-          new Error('the client-presence drain stopped this call while its session was still opening'),
+          executionError(
+            `session ${callId}: founding turn was stopped before a reusable session was established`,
+            'founding_turn_cancelled_before_session',
+            false,
+          ),
         );
         // Detached, never awaited: the drain already settled the call at
         // its bound, and a hung release must not park the stopped task
@@ -5424,23 +4431,17 @@ this.evalBreakArmed = false;
         modelSpec,
         task,
         backendId: session.backendId ?? backendSegment(modelSpec),
-        supportsSteering: session.capabilities?.supportsSteering === true,
-        busy: false,
-        delivering: false,
+        initializeMeta: initializeMetaOf(session),
         callSettled: false,
         callCancelled: false,
         cancelWaiters: new Set(),
-        queue: (this.pendingSteers.get(callId) ?? []).map((steer) => ({
-          callId: steer.callId,
-          prompt: steer.prompt,
-          promptMeta: steer.promptMeta,
-          call: null,
-          answer: steer.answer,
-        })),
       };
-      this.pendingSteers.delete(callId);
       this.sessions.set(callId, entry);
-      this.registerQueuedTurns(entry);
+      const lane = this.lanes.get(callId) ?? this.newLane('usable');
+      lane.laneState = 'usable';
+      lane.activeTurnId = callId;
+      this.lanes.set(callId, lane);
+      this.watchSessionRelease(entry);
       // Durable re-attach key (phase D): record the backend session id
       // (and the RESOLVED backend id — the re-attach routing pin) the
       // moment the session opens — BEFORE the prompt is sent — so a
@@ -5452,8 +4453,13 @@ this.evalBreakArmed = false;
       // is a host-side failure: the call rejects (the session stays open
       // and tracked, so dispose releases it).
       this.callStore.recordAttached(callId, session.sessionId, now(), session.backendId ?? null);
-      entry.busy = true;
-      const turn = await session.prompt(task);
+      lane.promptInFlight = true;
+      let turn: BrokerTurn;
+      try {
+        turn = await session.prompt(task);
+      } finally {
+        lane.promptInFlight = false;
+      }
       this.assertNormalStopReason(turn.stopReason, callId);
       const value =
         parsed.schema !== undefined
@@ -5462,14 +4468,15 @@ this.evalBreakArmed = false;
       return { outcome: 'resolve', value };
     } catch (error) {
       if (openedSession === undefined) {
-        // The founding session never opened: same-eval steers queued
-        // against this call (their promises already resolved `queued`)
-        // can never be delivered. Nothing is hidden — each gets the
-        // documented delivery warning in the next tool result — and the
-        // undelivered state is recorded durably (dropped marker) so a
-        // restore never resurrects a dead queue.
         this.openingCalls.delete(callId);
-        this.dropPendingSteers(callId, error);
+        this.failQueuedTurns(
+          callId,
+          executionError(
+            `founding session ${callId} failed to open: ${toRejectionValue(error).message}`,
+            'session_open_failed',
+            false,
+          ),
+        );
       }
       // The §4.6 attribution: the rejecting call names its resolved
       // backend. The session's own backend id when it opened, else the
@@ -5630,43 +4637,43 @@ this.evalBreakArmed = false;
     }
   }
 
-  /** The founding session failed to open: every steer queued against the
-   *  still-opening call is dropped — recorded in the store (first-wins
-   *  `dropped` marker; the guest promises already resolved `queued`) and
-   *  surfaced as a warn-level line per steer. */
-  private dropPendingSteers(callId: string, error: unknown): void {
-    const pending = this.pendingSteers.get(callId);
-    this.pendingSteers.delete(callId);
-    if (pending === undefined) return;
-    for (const steer of pending) {
-      try {
-        this.callStore.recordDelivery(steer.callId, 'dropped', now());
-      } catch (recordError) {
-        // A failing store must not silence the visible warning.
-        this.consoleBuffer.push({
-          level: 'warn',
-          line: `steer ${steer.callId} (on ${callId}): queued delivery dropped, but its drop could not be recorded: ${toRejectionValue(recordError).message}`,
-        });
-      }
-      this.warnDeliveryFailure(steer.callId, callId, error);
-    }
-  }
-
   /** The schema ladder, driven by acp-agents' own resolver over the
    *  session (the same convert/check + re-prompt machinery `run()` uses;
    *  the one divergence is documented in the module docs). */
   private async resolveStructuredOutput(
     entry: SessionEntry,
     parsed: ParsedAgentOptions,
+    queuedTurn?: QueuedTurn,
   ): Promise<unknown> {
     const session = entry.session;
     const structuredSession: StructuredSession = {
       prompt: async (repromptText: string) => {
-        const turn = await session.prompt(repromptText);
+        if (queuedTurn?.cancelRequested) {
+          throw new WorkflowError(`queued turn ${queuedTurn.callId} was cancelled`, CODE.AGENT_CANCELLED, {
+            recoverable: true,
+            agentLabel: `repl:${queuedTurn.callId}`,
+          });
+        }
+        const lane = this.lanes.get(entry.callId);
+        if (lane !== undefined) lane.promptInFlight = true;
+        let turn: BrokerTurn;
+        try {
+          turn = await session.prompt(
+            repromptText,
+            queuedTurn === undefined
+              ? undefined
+              : {
+                  promptMeta: this.queuePromptMeta(queuedTurn.promptMeta, queuedTurn.callId),
+                  onHandoff: () => this.recordQueueHandoff(queuedTurn.sessionId, queuedTurn.callId),
+                },
+          );
+        } finally {
+          if (lane !== undefined) lane.promptInFlight = false;
+        }
         // A repair turn that refuses / truncates / cancels must surface
         // distinctly instead of silently continuing the ladder (the
         // runner's own ladder does the same).
-        this.assertNormalStopReason(turn.stopReason, entry.callId);
+        this.assertNormalStopReason(turn.stopReason, queuedTurn?.callId ?? entry.callId);
       },
       // Final message only, matching the runner: prose extraction over
       // the whole turn would resurrect the first-JSON-wins bug.
@@ -5674,7 +4681,7 @@ this.evalBreakArmed = false;
       tryNative: () => session.rawStructuredOutput() ?? parseFinalJson(session.finalMessageText()),
     };
     return resolveStructuredOutput(structuredSession, parsed.schema as never, {
-      label: `repl:${entry.callId}`,
+      label: `repl:${queuedTurn?.callId ?? entry.callId}`,
     });
   }
 
@@ -5739,234 +4746,534 @@ this.evalBreakArmed = false;
     }
   }
 
-  /** The steering wire call for a supported backend with a turn in
-   *  flight. */
-  private async runInjectTask(
-    callId: string,
-    entry: SessionEntry,
-    prompt: string,
-    promptMeta: Record<string, unknown> | undefined,
-  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
+  private recordQueueHandoff(sessionId: string, callId: string): void {
     try {
-      const outcome = await entry.session.steer(prompt, { promptMeta });
-      // §4.2: a MID-TURN steer resolves EXACTLY the delivery-outcome
-      // vocabulary (`injected` / `queued` / `failed`). A backend
-      // `startedNewTurn` — the injection raced the turn's end and the
-      // backend started a new turn with the content — maps to `queued`
-      // (accepted for next-turn delivery); the v1 bare token never
-      // reaches the guest.
-      if (outcome === 'startedNewTurn') {
-        this.warnLine(
-          'info',
-          `steer ${callId} (on ${entry.callId}): the in-flight turn ended before the injection — ` +
-            `the backend started a new turn with the content (queued)`, // eslint-disable-line max-len
+      this.callStore.recordHandoff(callId, now());
+    } catch (cause) {
+      const failure = persistenceFailure(cause);
+      this.markPersistenceFatal(sessionId, failure);
+      throw new WorkflowError(failure.message, CODE.PERSISTENCE_ERROR, {
+        recoverable: false,
+        details: { reason: 'queue_persistence_failed' },
+      });
+    }
+  }
+
+  private queuePromptMeta(
+    promptMeta: Record<string, unknown> | undefined,
+    callId: string,
+  ): Record<string, unknown> {
+    const ownedNamespace = promptMeta?.['@automatalabs/agentprism'];
+    return {
+      ...promptMeta,
+      '@automatalabs/agentprism': {
+        ...(isPlainObject(ownedNamespace) ? ownedNamespace : {}),
+        replCallId: callId,
+      },
+    };
+  }
+
+  private strictSteeringMeta(promptMeta: Record<string, unknown> | undefined): Record<string, unknown> {
+    const steering = promptMeta?.steering;
+    return {
+      ...promptMeta,
+      steering: {
+        ...(isPlainObject(steering) ? steering : {}),
+        idleBehavior: 'promptRequired',
+      },
+    };
+  }
+
+  private foundingOptions(sessionId: string): ParsedAgentOptions {
+    const record = this.callStore.lookup(sessionId);
+    if (record?.optionsJson === null || record?.optionsJson === undefined) return {};
+    return this.parseAgentOptions(record.optionsJson);
+  }
+
+  private async runQueuedTurnTask(
+    turn: QueuedTurn,
+    entry: SessionEntry,
+  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
+    const lane = this.lanes.get(turn.sessionId);
+    try {
+      if (turn.cancelRequested || turn.state === 'settled') {
+        throw new WorkflowError(`queued turn ${turn.callId} was cancelled`, CODE.AGENT_CANCELLED, {
+          recoverable: true,
+          agentLabel: `repl:${turn.callId}`,
+        });
+      }
+      if (lane === undefined || lane.laneState !== 'usable' || lane.activeTurnId !== turn.callId) {
+        throw executionError(
+          `queued turn ${turn.callId}: its session lane is not usable`,
+          'session_unusable',
+          false,
         );
-        return { outcome: 'resolve', value: 'queued' };
       }
-      if (outcome === 'injected' || outcome === 'queued' || outcome === 'failed') {
-        return { outcome: 'resolve', value: outcome };
+      lane.promptInFlight = true;
+      let promptTurn: BrokerTurn;
+      try {
+        promptTurn = await entry.session.prompt(turn.prompt, {
+          promptMeta: this.queuePromptMeta(turn.promptMeta, turn.callId),
+          onHandoff: () => {
+            this.recordQueueHandoff(turn.sessionId, turn.callId);
+          },
+        });
+      } finally {
+        lane.promptInFlight = false;
       }
-      // An outcome OUTSIDE the vocabulary (a third-party adapter's own
-      // value): the engine constrains mid-turn outcomes to exactly
-      // `injected` / `queued` / `failed` — never a passthrough. The
-      // steer wire call did not reject, so the content was accepted;
-      // without proof of live injection the honest vocabulary value is
-      // `queued` (accepted for delivery on the backend's own terms).
-      this.warnLine(
-        'warn',
-        `steer ${callId} (on ${entry.callId}): the backend resolved an unrecognized steering outcome ` +
-          `${JSON.stringify(outcome)} — constrained to the delivery-outcome vocabulary (queued)`, // eslint-disable-line max-len
-      );
-      return { outcome: 'resolve', value: 'queued' };
-    } catch {
-      // Nothing hard-errors: a wire failure resolves `failed`.
-      return { outcome: 'resolve', value: 'failed' };
-    }
-  }
-
-  /** The delivery turn for a DELIVERY-OUTCOME item (a mid-turn no-
-   *  extension steer whose guest call already resolved `queued` at
-   *  enqueue, and the still-opening-call boundary deliveries): the
-   *  content folds into the session's next turn; the turn's own result
-   *  has no separate addressable call (its promise settled at enqueue —
-   *  the §4.2 delivery-outcome vocabulary). The delivered marker rides
-   *  the session's handoff acknowledgment exactly as before. */
-  private async runPromptTask(
-    callId: string,
-    entry: SessionEntry,
-    prompt: string,
-    promptMeta: Record<string, unknown> | undefined,
-  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
-    try {
-      entry.busy = true;
-      entry.delivering = entry.callSettled;
-      if (entry.delivering) this.deliverySlots.add(entry.callId);
-      // Invoke the prompt FIRST — the hand-off to the backend — and
-      // record the `delivered` marker only in the session's handoff
-      // acknowledgment, which fires only once the prompt has passed
-      // every preflight check (released session, aborted signal,
-      // prompt-in-flight) AND the underlying ACP session/prompt request
-      // has actually been invoked — the wire send happens synchronously
-      // inside the invocation, so a marker recorded in the acknowledgment
-      // can never precede the hand-off (review regression: the marker
-      // used to be recorded right after the prompt promise was CREATED,
-      // before the backend prompt was invoked — a crash in that interval,
-      // or an ASYNC pre-handoff rejection, produced a non-null marker
-      // for a steer the backend never saw, and reconcile then skipped
-      // that never-delivered steer permanently). A crash before the
-      // acknowledgment leaves the steer undelivered-in-the-store, so a
-      // restore re-queues it; after it, the payload is on the wire and
-      // replay would duplicate — the at-least-once direction is preserved
-      // on both sides. The marker applies only to QUEUED steers (their
-      // store completion is `queued`); a direct steer's completion is
-      // recorded by the pump when its turn settles, which is its own
-      // authority. A failing marker record aborts the turn as a delivery
-      // failure (the payload was already handed off; re-delivery after a
-      // restore is preferrable to loss).
-      const turnPromise = entry.session.prompt(prompt, {
-        promptMeta,
-        onHandoff: () => {
-          const record = this.callStore.lookup(callId);
-          if (record?.completion?.value === 'queued') {
-            this.callStore.recordDelivery(callId, 'delivered', now());
-          }
-        },
-      });
-      const turn = await turnPromise;
-      this.assertNormalStopReason(turn.stopReason, callId);
-      return { outcome: 'resolve', value: 'queued' };
+      this.assertNormalStopReason(promptTurn.stopReason, turn.callId);
+      if (turn.cancelRequested) {
+        throw new WorkflowError(`queued turn ${turn.callId} was cancelled`, CODE.AGENT_CANCELLED, {
+          recoverable: true,
+          agentLabel: `repl:${turn.callId}`,
+        });
+      }
+      const parsed = this.foundingOptions(turn.sessionId);
+      const value = parsed.schema !== undefined
+        ? await this.resolveStructuredOutput(entry, parsed, turn)
+        : this.finalTextOf(this.finalTurnText(entry.session), turn.callId);
+      return { outcome: 'resolve', value };
     } catch (error) {
-      if (isCancellation(error)) {
-        // The turn was cancelled mid-delivery — the remaining queue is
-        // dropped (the turn stream it was queued onto is gone).
-        this.dropQueue(entry);
-        return { outcome: 'resolve', value: 'failed' };
-      }
-      this.warnDeliveryFailure(callId, entry.callId, error);
-      return { outcome: 'resolve', value: 'failed' };
-    } finally {
-      this.endDeliveryTurn(entry);
+      const value = toRejectionValue(error);
+      value.replBackend = entry.backendId;
+      return { outcome: 'reject', value };
     }
   }
 
-  /**
-   * The §4.2 FOLLOW-UP TURN: a followUp/steer on a settled or idle
-   * session mints a NEW turn with its own call id (this steer call's
-   * own id — the addressable turn, visible in `agents()`/`liveAgents()`
-   * and targetable by `interrupt`) and its promise resolves with the
-   * TURN'S ANSWER — the SAME value semantics as `agent()`: the
-   * schema-validated object when the founding handle was created with
-   * `schema` (its recorded options bag drives the ladder), the final
-   * assistant text otherwise (never the bare `startedNewTurn` token,
-   * never a discarded turn). A turn failure rejects the call with the
-   * attributed error (the §4.6 call-id + backend attribution), and a
-   * cancellation rejects with the recoverable `AGENT_CANCELLED` family.
-   */
-  private async runFollowUpTask(
-    callId: string,
+  private async runRestoredQueuedTurnTask(
+    turn: QueuedTurn,
     entry: SessionEntry,
-    prompt: string,
-    promptMeta: Record<string, unknown> | undefined,
   ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
-    this.followUpTurns.set(callId, {
-      entry,
-      sessionId: entry.callId,
-      prompt,
-      queued: false,
-      backendId: entry.backendId,
-    });
+    const awaitTurn = entry.session.awaitCurrentTurn;
+    if (awaitTurn === undefined) {
+      const error = executionError(
+        `queued turn ${turn.callId}: the handed-off turn cannot be classified after restore`,
+        'queued_turn_indeterminate',
+        false,
+      );
+      this.markLaneFatal(turn.sessionId, error);
+      return { outcome: 'reject', value: toRejectionValue(error) };
+    }
     try {
-      entry.busy = true;
-      entry.delivering = entry.callSettled;
-      if (entry.delivering) this.deliverySlots.add(entry.callId);
-      const turnPromise = entry.session.prompt(prompt, {
-        promptMeta,
-        onHandoff: () => {
-          // The delivered marker for a QUEUED followUp (its store record
-          // carries the queued marker, no completion — see
-          // `recordQueuedDelivery`): once handed to the backend the
-          // payload is on the wire; a restore must not re-queue it.
-          const record = this.callStore.lookup(callId);
-          if (record !== undefined && record.queuedAtMs !== null && record.deliveredAtMs === null) {
-            this.callStore.recordDelivery(callId, 'delivered', now());
-          }
-        },
+      const promptTurn = await awaitTurn.call(entry.session);
+      this.assertNormalStopReason(promptTurn.stopReason, turn.callId);
+      const parsed = this.foundingOptions(turn.sessionId);
+      const value = parsed.schema !== undefined
+        ? await this.resolveStructuredOutput(entry, parsed, turn)
+        : this.finalTextOf(promptTurn.text || this.finalTurnText(entry.session), turn.callId);
+      return { outcome: 'resolve', value };
+    } catch (cause) {
+      if (turn.cancelRequested || isCancellation(cause)) {
+        return {
+          outcome: 'reject',
+          value: toRejectionValue(
+            new WorkflowError(`queued turn ${turn.callId} was cancelled`, CODE.AGENT_CANCELLED, {
+              recoverable: true,
+              agentLabel: `repl:${turn.callId}`,
+            }),
+          ),
+        };
+      }
+      const error = executionError(
+        `queued turn ${turn.callId}: handed-off turn recovery failed: ${toRejectionValue(cause).message}`,
+        'queued_turn_indeterminate',
+        false,
+      );
+      this.markLaneFatal(turn.sessionId, error);
+      return { outcome: 'reject', value: toRejectionValue(error) };
+    }
+  }
+
+  private async runSteeringTask(
+    control: SteeringControl,
+    entry: SessionEntry,
+  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
+    try {
+      const response = await entry.session.steer(control.prompt, {
+        promptMeta: this.strictSteeringMeta(control.promptMeta),
       });
-      const turn = await turnPromise;
-      this.assertNormalStopReason(turn.stopReason, callId);
-      // The turn's answer, with the SAME value semantics as agent()
-      // (§4.2): the founding handle's schema — its recorded options bag
-      // — drives the schema-validated object; a schema-less handle
-      // resolves the latest turn's assistant text (the empty-output
-      // gate included). A corrupt founding record degrades to the
-      // text answer.
-      const founding = this.callStore.lookup(entry.callId);
-      let foundingParsed: ParsedAgentOptions | undefined;
-      if (founding !== undefined && founding.optionsJson !== null) {
-        try {
-          foundingParsed = this.parseAgentOptions(founding.optionsJson);
-        } catch {
-          foundingParsed = undefined;
+      if (!isPlainObject(response) || typeof response.outcome !== 'string') {
+        const error = executionError(
+          `steer ${control.callId}: backend returned an invalid steering response`,
+          'invalid_steering_response',
+          false,
+        );
+        void Promise.resolve(entry.session.cancel()).catch(() => undefined);
+        this.markLaneFatal(control.sessionId, error);
+        return { outcome: 'reject', value: toRejectionValue(error) };
+      }
+      switch (response.outcome) {
+        case 'injected':
+          return { outcome: 'resolve', value: 'injected' };
+        case 'promptRequired':
+          return { outcome: 'resolve', value: 'idle' };
+        case 'failed':
+          return {
+            outcome: 'reject',
+            value: toRejectionValue(
+              executionError(`steer ${control.callId}: backend rejected steering`, 'steering_failed', true),
+            ),
+          };
+        case 'startedNewTurn': {
+          const error = executionError(
+            `steer ${control.callId}: backend violated strict steering by starting a new turn`,
+            'steering_started_new_turn',
+            false,
+          );
+          void Promise.resolve(entry.session.cancel()).catch(() => undefined);
+          this.markLaneFatal(control.sessionId, error);
+          return { outcome: 'reject', value: toRejectionValue(error) };
+        }
+        default: {
+          const error = executionError(
+            `steer ${control.callId}: backend returned unknown outcome ${JSON.stringify(response.outcome)}`,
+            'invalid_steering_response',
+            false,
+          );
+          void Promise.resolve(entry.session.cancel()).catch(() => undefined);
+          this.markLaneFatal(control.sessionId, error);
+          return { outcome: 'reject', value: toRejectionValue(error) };
         }
       }
-      if (foundingParsed?.schema !== undefined) {
-        return { outcome: 'resolve', value: await this.resolveStructuredOutput(entry, foundingParsed) };
+    } catch (cause) {
+      const shaped = toRejectionValue(cause);
+      const methodMissing =
+        (cause as { code?: unknown } | null)?.code === -32601 ||
+        /method\s+not\s+found/i.test(shaped.message);
+      if (methodMissing) {
+        return {
+          outcome: 'reject',
+          value: toRejectionValue(
+            executionError(
+              `steer ${control.callId}: ${shaped.message}`,
+              'advertised_steering_missing',
+              false,
+            ),
+          ),
+        };
       }
-      return { outcome: 'resolve', value: this.finalText(entry) };
-    } catch (error) {
-      if (isCancellation(error)) {
-        // The follow-up turn was cancelled (the interrupt tool's id
-        // path, or the founding handle's cancel) — the remaining queue
-        // is dropped (the turn stream it was queued onto is gone) and
-        // the call rejects recoverable, the AGENT_CANCELLED family.
-        this.dropQueue(entry);
-        const value = toRejectionValue(
-          new WorkflowError(`followUp ${callId} was cancelled`, CODE.AGENT_CANCELLED, {
-            recoverable: true,
-            agentLabel: `repl:${callId}`,
-          }),
+      return {
+        outcome: 'reject',
+        value: {
+          ...shaped,
+          code: shaped.code ?? CODE.AGENT_EXECUTION_ERROR,
+          recoverable: shaped.recoverable ?? true,
+          details: { reason: 'steering_request_failed' },
+        },
+      };
+    }
+  }
+
+  private processSteeringControls(sessionId: string): void {
+    const lane = this.lanes.get(sessionId);
+    if (lane === undefined || lane.steeringInFlight || lane.laneState === 'fatal') return;
+    for (;;) {
+      const callId = lane.steeringControlIds[0];
+      if (callId === undefined) {
+        this.scheduleAdmissions();
+        return;
+      }
+      const control = this.steeringControls.get(callId);
+      if (control === undefined) {
+        lane.steeringControlIds.shift();
+        continue;
+      }
+      lane.steeringInFlight = true;
+      const entry = this.sessions.get(sessionId);
+      const task =
+        entry === undefined ||
+        lane.activeTurnId !== control.targetTurnId ||
+        !lane.promptInFlight
+          ? Promise.resolve({ outcome: 'resolve' as const, value: 'idle' })
+          : this.runSteeringTask(control, entry);
+      this.trackInFlight(callId, 'steer', task);
+      return;
+    }
+  }
+
+  private startQueuedTurn(turn: QueuedTurn, entry: SessionEntry, lane: SessionLaneState): void {
+    turn.state = 'active';
+    lane.activeTurnId = turn.callId;
+    this.queueSlots.add(turn.callId);
+    this.trackInFlight(turn.callId, 'queue', this.runQueuedTurnTask(turn, entry));
+  }
+
+  /** Fill free workspace slots with the oldest eligible founding
+   * dispatch or per-session queue head. Ineligible older work does not
+   * block a newer eligible candidate. */
+  private scheduleAdmissions(): void {
+    if (this.disposed || this.draining) return;
+    for (;;) {
+      if (this.agentSlots.size + this.queueSlots.size >= this.maxConcurrentAgents) return;
+      let bestSequence = Number.POSITIVE_INFINITY;
+      let dispatchIndex = -1;
+      for (let index = 0; index < this.dispatchQueue.length; index++) {
+        const item = this.dispatchQueue[index];
+        const sequence = item.kind === 'dispatch'
+          ? item.admissionSequence
+          : (this.callStore.lookup(item.entry.id)?.admissionSequence ?? Number.POSITIVE_INFINITY);
+        if (sequence < bestSequence) {
+          bestSequence = sequence;
+          dispatchIndex = index;
+        }
+      }
+      let queueCandidate: { turn: QueuedTurn; entry: SessionEntry; lane: SessionLaneState } | undefined;
+      for (const [sessionId, lane] of this.lanes) {
+        if (lane.laneState === 'released' && lane.queuedTurnIds.length > 0) {
+          this.scheduleQueueReattach(sessionId);
+          continue;
+        }
+        if (
+          lane.laneState !== 'usable' ||
+          lane.activeTurnId !== null ||
+          lane.promptInFlight ||
+          lane.steeringInFlight ||
+          lane.steeringControlIds.length > 0 ||
+          lane.cancellingTurnId !== null
+        ) continue;
+        const headId = lane.queuedTurnIds[0];
+        const turn = headId === undefined ? undefined : this.queuedTurns.get(headId);
+        const entry = this.sessions.get(sessionId);
+        if (turn === undefined || turn.state !== 'pending' || turn.cancelRequested || entry === undefined) continue;
+        if (turn.admissionSequence < bestSequence) {
+          bestSequence = turn.admissionSequence;
+          dispatchIndex = -1;
+          queueCandidate = { turn, entry, lane };
+        }
+      }
+      if (queueCandidate !== undefined) {
+        this.startQueuedTurn(queueCandidate.turn, queueCandidate.entry, queueCandidate.lane);
+        continue;
+      }
+      if (dispatchIndex < 0) return;
+      const [dispatch] = this.dispatchQueue.splice(dispatchIndex, 1);
+      if (dispatch.kind === 'dispatch') {
+        this.startDispatch(
+          dispatch.call,
+          dispatch.callId,
+          dispatch.modelSpec,
+          dispatch.task,
+          dispatch.optionsJson,
+          dispatch.parsed,
         );
-        // The §4.6 attribution covers the cancellation path too: the
-        // rejecting followUp names its call id (the guest library
-        // stamps it on settlement) AND its resolved backend (stamped
-        // here — the review probe: the uncaught rendering showed the
-        // call id but no backend).
-        (value as { replBackend?: string }).replBackend = entry.backendId;
-        return { outcome: 'reject', value };
+      } else {
+        this.startReissue(dispatch.entry, dispatch.parsed, dispatch.reason, dispatch.report);
       }
-      // The §4.6 attribution: the rejecting followUp names its call id
-      // (the guest library stamps it on settlement) and its resolved
-      // backend (stamped here).
-      const value = toRejectionValue(error);
-      (value as { replBackend?: string }).replBackend = entry.backendId;
-      return { outcome: 'reject', value };
-    } finally {
-      this.followUpTurns.delete(callId);
-      this.endDeliveryTurn(entry);
     }
   }
 
-  /** The cancel operation on a busy session. */
-  private async runCancelTask(
-    callId: string,
-    entry: SessionEntry,
-  ): Promise<{ outcome: 'resolve' | 'reject'; value: unknown }> {
-    try {
-      await this.cancelSession(entry);
+  private scheduleQueueReattach(sessionId: string): void {
+    const lane = this.lanes.get(sessionId);
+    if (
+      lane === undefined ||
+      lane.laneState !== 'released' ||
+      lane.queuedTurnIds.length === 0 ||
+      this.pendingReattaches.has(sessionId) ||
+      this.disposed ||
+      this.draining
+    ) return;
+    if (!this.canLazyReattach(sessionId)) {
+      this.markLaneFatal(
+        sessionId,
+        executionError(`session ${sessionId}: queued turn reattachment is unavailable`, 'session_reattach_failed', false),
+      );
+      return;
+    }
+    void this.lazyReattach(sessionId).then((entry) => {
+      if (entry === undefined) {
+        this.markLaneFatal(
+          sessionId,
+          executionError(`session ${sessionId}: queued turn reattachment failed`, 'session_reattach_failed', false),
+        );
+        return;
+      }
+      const current = this.lanes.get(sessionId);
+      if (current !== undefined && current.laneState !== 'fatal') current.laneState = 'usable';
+      this.watchSessionRelease(entry);
+      this.scheduleAdmissions();
+    });
+  }
+
+  private restoreHandedOffQueue(callId: string): void {
+    const turn = this.queuedTurns.get(callId);
+    if (turn === undefined || this.inFlight.has(callId) || this.queueSlots.has(callId)) return;
+    const lane = this.lanes.get(turn.sessionId);
+    if (lane === undefined) return;
+    lane.activeTurnId = callId;
+    turn.state = 'active';
+    this.queueSlots.add(callId);
+    void this.lazyReattach(turn.sessionId).then((entry) => {
+      if (entry === undefined) {
+        this.markLaneFatal(
+          turn.sessionId,
+          executionError(
+            `queued turn ${callId}: its handed-off session could not be reattached`,
+            'session_reattach_failed',
+            false,
+          ),
+        );
+        return;
+      }
+      const current = this.lanes.get(turn.sessionId);
+      if (current !== undefined && current.laneState !== 'fatal') current.laneState = 'usable';
+      this.watchSessionRelease(entry);
+      this.trackInFlight(callId, 'queue', this.runRestoredQueuedTurnTask(turn, entry));
+    });
+  }
+
+  private cancelledTurnValue(callId: string): ReturnType<typeof toRejectionValue> {
+    return toRejectionValue(
+      new WorkflowError(`turn ${callId} was cancelled`, CODE.AGENT_CANCELLED, {
+        recoverable: true,
+        agentLabel: `repl:${callId}`,
+      }),
+    );
+  }
+
+  private settleStored(callId: string, outcome: 'resolve' | 'reject', value: unknown): void {
+    const newlyRecorded = this.recordCompletion(callId, { outcome, value, completedAtMs: now() });
+    const completion = newlyRecorded
+      ? { outcome, value }
+      : this.callStore.lookup(callId)?.completion;
+    if (completion !== null && completion !== undefined) {
+      this.settleIntoGuest(callId, completion.outcome, completion.value);
+    }
+  }
+
+  private async requestTurnCancellation(
+    sessionId: string,
+    turnId: string,
+  ): Promise<{ outcome: 'resolve' | 'reject' | 'hold'; value: unknown }> {
+    if (this.disposed) return { outcome: 'resolve', value: 'idle' };
+    const lane = this.lanes.get(sessionId);
+    const record = this.callStore.lookup(turnId);
+    if (lane === undefined || record?.completion !== null || lane.laneState === 'fatal') {
+      return { outcome: 'resolve', value: 'idle' };
+    }
+    const queued = this.queuedTurns.get(turnId);
+    if (queued !== undefined && queued.state === 'pending') {
+      queued.cancelRequested = true;
+      queued.state = 'settled';
+      try {
+        this.callStore.recordCancelled(turnId, now());
+        this.settleStored(turnId, 'reject', this.cancelledTurnValue(turnId));
+      } catch (error) {
+        const failure = persistenceFailure(error);
+        this.markPersistenceFatal(sessionId, failure);
+        return { outcome: 'reject', value: failure };
+      }
+      lane.queuedTurnIds = lane.queuedTurnIds.filter((id) => id !== turnId);
+      this.scheduleAdmissions();
       return { outcome: 'resolve', value: 'cancelled' };
-    } catch {
-      return { outcome: 'resolve', value: 'failed' };
     }
+    if (lane.activeTurnId !== turnId) return { outcome: 'resolve', value: 'idle' };
+    if (lane.cancellingTurnId === turnId) return { outcome: 'resolve', value: 'cancelled' };
+
+    if (queued !== undefined) {
+      queued.cancelRequested = true;
+      queued.state = 'cancelling';
+    }
+    const entry = this.sessions.get(sessionId);
+    if (turnId === sessionId && entry !== undefined) this.markCancelled(entry);
+    try {
+      this.callStore.recordCancelled(turnId, now());
+      this.settleStored(turnId, 'reject', this.cancelledTurnValue(turnId));
+    } catch (error) {
+      const failure = persistenceFailure(error);
+      this.markPersistenceFatal(sessionId, failure);
+      return { outcome: 'reject', value: failure };
+    }
+    lane.cancellingTurnId = turnId;
+
+    if (lane.promptInFlight && entry !== undefined) {
+      lane.cancellationTimer = setTimeout(() => {
+        const current = this.lanes.get(sessionId);
+        if (
+          current?.cancellingTurnId === turnId &&
+          current.activeTurnId === turnId &&
+          current.promptInFlight
+        ) {
+          this.markLaneFatal(
+            sessionId,
+            executionError(
+              `turn ${turnId}: backend did not honor cancellation within ${CANCELLATION_SETTLEMENT_BOUND_MS}ms`,
+              'cancellation_not_honored',
+              false,
+            ),
+          );
+        }
+      }, CANCELLATION_SETTLEMENT_BOUND_MS);
+      try {
+        await entry.session.cancel();
+      } catch (error) {
+        this.warnLine('warn', `turn ${turnId}: ACP cancellation attempt failed: ${toRejectionValue(error).message}`);
+      }
+    }
+    return { outcome: 'resolve', value: 'cancelled' };
   }
 
-  /** Cancel the session's active turn (ACP `session/cancel`); the turn's
-   *  owning task (the call or a delivery) observes the cancellation and
-   *  settles accordingly. Best-effort: a cancel that cannot be delivered
-   *  resolves `failed` on the steer side and leaves the call task to its
-   *  own fate. */
-  private async cancelSession(entry: SessionEntry): Promise<void> {
-    await entry.session.cancel();
-    this.markCancelled(entry);
+  private cancelFoundingBeforeSession(callId: string, source: string, drain: boolean): boolean {
+    const lane = this.lanes.get(callId);
+    const record = this.callStore.lookup(callId);
+    if (
+      lane === undefined ||
+      lane.laneState !== 'opening' ||
+      lane.promptInFlight ||
+      record?.kind !== 'agent' ||
+      record.completion !== null
+    ) return false;
+
+    const dispatchIndex = this.dispatchQueue.findIndex((item) =>
+      item.kind === 'dispatch' ? item.callId === callId : item.entry.id === callId,
+    );
+    if (dispatchIndex >= 0) this.dispatchQueue.splice(dispatchIndex, 1);
+    if (this.openingCalls.has(callId)) this.stoppedOpens.add(callId);
+    this.callStore.recordCancelled(callId, now());
+    this.settleStored(callId, 'reject', this.cancelledTurnValue(callId));
+    this.agentSlots.delete(callId);
+    lane.activeTurnId = null;
+    lane.laneState = 'fatal';
+    this.failQueuedTurns(
+      callId,
+      executionError(
+        `session ${callId}: founding turn was cancelled by ${source} before a reusable session was established`,
+        'founding_turn_cancelled_before_session',
+        false,
+      ),
+    );
+    this.scheduleAdmissions();
+    if (drain) {
+      try {
+        this.drain();
+        this.provenancePass('settlement', [callId]);
+        this.sink?.boundary('settlement');
+      } catch (error) {
+        if (!(error instanceof DrainJobError)) throw error;
+        this.retainedDrainError = { name: error.info.name, message: error.info.message, atMs: now() };
+        this.sink?.boundary('settlement');
+      }
+    }
+    return true;
+  }
+
+  private watchSessionRelease(entry: SessionEntry): void {
+    const released = entry.session.released?.();
+    if (released === undefined) return;
+    void released.then(() => {
+      const lane = this.lanes.get(entry.callId);
+      if (
+        lane === undefined ||
+        lane.laneState === 'released' ||
+        lane.laneState === 'fatal' ||
+        this.sessions.get(entry.callId) !== entry ||
+        this.draining ||
+        this.disposed
+      ) return;
+      this.markLaneFatal(
+        entry.callId,
+        executionError(`session ${entry.callId}: ACP session was released`, 'session_released', false),
+      );
+    });
   }
 
   /** Set the entry's cancel flag and wake its waiters (the
@@ -5983,151 +5290,91 @@ this.evalBreakArmed = false;
     }
   }
 
-  /** Drop a cancelled/failed call's queued steers. Delivery-outcome
-   *  items already resolved `queued` at enqueue — the cancellation is
-   *  the visible reason delivery never happens. Every dropped steer is
-   *  recorded DURABLY (first-wins `dropped` marker) before the
-   *  in-memory queue is cleared: a restore must never resurrect a
-   *  dropped delivery. A failing record propagates (host-side failure)
-   *  and the queue is left untouched for the next attempt. An
-   *  ANSWER-MODE item is a minted §4.2 turn: dropping it never
-   *  discards the turn — its guest promise settles with an explicit
-   *  recoverable AGENT_CANCELLED rejection and its completion is
-   *  recorded (the review defect: a cancelled in-flight followUp's
-   *  dropQueue deleted its queued answer-mode siblings from
-   *  `agents()` with NO completion recorded and their guest promises
-   *  pending forever). */
-  private dropQueue(entry: SessionEntry): void {
-    for (const item of entry.queue) {
-      this.callStore.recordDelivery(item.callId, 'dropped', now());
-      if (item.answer) {
-        this.settleDroppedQueuedFollowUp(item.callId, entry);
+  private failQueuedTurns(sessionId: string, error: unknown): void {
+    const lane = this.lanes.get(sessionId);
+    if (lane === undefined) return;
+    lane.laneState = 'fatal';
+    const value = toRejectionValue(error);
+    for (const callId of [...lane.queuedTurnIds]) {
+      const turn = this.queuedTurns.get(callId);
+      if (turn === undefined || turn.state === 'settled') continue;
+      turn.state = 'settled';
+      turn.cancelRequested = true;
+      this.queueSlots.delete(callId);
+      this.settleStored(callId, 'reject', value);
+    }
+    lane.queuedTurnIds = [];
+    if (lane.activeTurnId !== null && this.queuedTurns.has(lane.activeTurnId)) {
+      lane.activeTurnId = null;
+      lane.promptInFlight = false;
+    }
+  }
+
+  /** Fatal containment when the mandatory store itself cannot record settlements. */
+  private markPersistenceFatal(sessionId: string, failure: unknown): void {
+    const lane = this.lanes.get(sessionId);
+    if (lane === undefined) return;
+    lane.laneState = 'fatal';
+    if (lane.cancellationTimer !== null) clearTimeout(lane.cancellationTimer);
+    lane.cancellationTimer = null;
+    const ids = [
+      ...(lane.activeTurnId !== null ? [lane.activeTurnId] : []),
+      ...lane.queuedTurnIds,
+      ...lane.steeringControlIds,
+    ];
+    for (const callId of ids) {
+      try { this.settleIntoGuest(callId, 'reject', failure); } catch { /* store is already unusable */ }
+      const queued = this.queuedTurns.get(callId);
+      if (queued !== undefined) queued.state = 'settled';
+      this.agentSlots.delete(callId);
+      this.queueSlots.delete(callId);
+    }
+    lane.activeTurnId = null;
+    lane.promptInFlight = false;
+    lane.queuedTurnIds = [];
+    lane.steeringControlIds = [];
+    const entry = this.sessions.get(sessionId);
+    this.sessions.delete(sessionId);
+    if (entry !== undefined) void Promise.resolve(entry.session.release()).catch(() => undefined);
+  }
+
+  private markLaneFatal(sessionId: string, error: unknown): void {
+    if (this.disposed) return;
+    const existing = this.lanes.get(sessionId);
+    if (existing?.laneState === 'fatal') return;
+    const lane = existing ?? this.newLane('usable');
+    lane.laneState = 'fatal';
+    if (lane.cancellationTimer !== null) clearTimeout(lane.cancellationTimer);
+    lane.cancellationTimer = null;
+    lane.cancellingTurnId = null;
+    this.lanes.set(sessionId, lane);
+    const value = toRejectionValue(error);
+    const activeTurnId = lane.activeTurnId;
+    if (activeTurnId !== null && this.callStore.lookup(activeTurnId)?.completion === null) {
+      this.settleStored(activeTurnId, 'reject', value);
+    }
+    if (activeTurnId !== null) {
+      this.agentSlots.delete(activeTurnId);
+      this.queueSlots.delete(activeTurnId);
+      const activeQueue = this.queuedTurns.get(activeTurnId);
+      if (activeQueue !== undefined) activeQueue.state = 'settled';
+    }
+    for (const controlId of lane.steeringControlIds) {
+      if (this.callStore.lookup(controlId)?.completion === null) {
+        this.settleStored(controlId, 'reject', value);
       }
     }
-    entry.queue = [];
-  }
-
-  /** One dropped QUEUED answer-mode followUp (see `dropQueue`): record
-   *  the reject completion (first-wins) and settle the guest promise —
-   *  the settlement reactions fire at the next execution (the drop
-   *  runs inside a task body, outside the serialized chain, so no
-   *  drain here — a drain would race the operation; the completion and
-   *  the dropped marker are already durable, so a restore settles the
-   *  item from the store exactly once). */
-  private settleDroppedQueuedFollowUp(callId: string, entry: SessionEntry): void {
-    this.followUpTurns.delete(callId);
-    const value = toRejectionValue(
-      new WorkflowError(
-        `followUp ${callId} was dropped with the cancelled queue — the turn never ran`,
-        CODE.AGENT_CANCELLED,
-        { recoverable: true },
-      ),
-    );
-    // The §4.6 attribution: the followUp's resolved backend (the
-    // founding session's own).
-    (value as { replBackend?: string }).replBackend = entry.backendId;
-    this.recordCompletion(callId, { outcome: 'reject', value, completedAtMs: now() });
-    try {
-      this.settleIntoGuest(callId, 'reject', value);
-    } catch (error) {
-      // A failing settlement must not mask the drop (the completion is
-      // already durable — a restore settles from the store).
-      this.warnLine(
-        'warn',
-        `followUp ${callId}: the dropped queued turn's settlement into the guest failed: ${toRejectionValue(error).message}`, // eslint-disable-line max-len
-      );
+    lane.steeringControlIds = [];
+    lane.steeringInFlight = false;
+    this.failQueuedTurns(sessionId, error);
+    lane.activeTurnId = null;
+    lane.promptInFlight = false;
+    const entry = this.sessions.get(sessionId);
+    if (entry !== undefined) {
+      this.sessions.delete(sessionId);
+      void Promise.resolve(entry.session.release()).catch(() => undefined);
     }
-  }
-
-  /** A delivery turn failed (a queued steer's delivery or a direct
-   *  follow-up's prompt): surface a warn-level line in the next tool
-   *  result (nothing is hidden — a queued steer's own promise already
-   *  resolved `queued`; a direct steer resolves `failed`). */
-  private warnDeliveryFailure(steerCallId: string, sessionCallId: string, error: unknown): void {
-    const message = toRejectionValue(error).message;
-    this.consoleBuffer.push({
-      level: 'warn',
-      line: `steer ${steerCallId} (on ${sessionCallId}): delivery failed: ${message}`,
-    });
-  }
-
-  /** Start one queued steer's delivery turn. The `delivered` marker is
-   *  NOT recorded here — `runPromptTask` records it inside the session's
-   *  handoff acknowledgment, i.e. only once the prompt has passed every
-   *  preflight and has actually been handed to the backend (see there):
-   *  a marker recorded before that would make a crash — or an async
-   *  pre-handoff rejection — leave a never-delivered steer marked
-   *  delivered, skipped by reconcile forever (review regression). The
-   *  absolute cap guard stays here too: a delivery turn is subagent work
-   *  and never starts while the cap is exhausted (kickQueuedDeliveries is
-   *  the scheduler; this guard makes the ceiling unconditional). */
-  private startQueuedDelivery(entry: SessionEntry): void {
-    if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) return;
-    const next = entry.queue[0];
-    if (next === undefined) return;
-    entry.queue.shift();
-    // The §4.2 split: an answer-mode item is a followUp/steer whose
-    // guest call is still pending — the delivery turn settles it with
-    // the TURN'S ANSWER (runFollowUpTask); a delivery-outcome item
-    // already resolved `queued` at enqueue and its delivery folds into
-    // the session's next turn (runPromptTask).
-    if (next.answer) {
-      const task = this.runFollowUpTask(next.callId, entry, next.prompt, next.promptMeta);
-      if (next.call !== null) this.deferreds.set(next.callId, next.call);
-      this.trackInFlight(next.callId, 'steer', task);
-      return;
-    }
-    void this.runPromptTask(next.callId, entry, next.prompt, next.promptMeta);
-  }
-
-  /** Start as many queued delivery turns as the cap allows, sessions in
-   *  open order (called whenever a concurrency slot frees — an agent
-   *  call settling or a follow-up turn ending). This is the ONLY
-   *  scheduler for queued payloads, including cap-pressure queues on
-   *  idle sessions: without the global pass, a steer queued on an idle
-   *  session would wait forever for its own session's turn to end. The
-   *  §4.1 queued DISPATCHES run first (in dispatch order — an agent
-   *  dispatch queueing never loses its place to a later steering
-   *  delivery). */
-  private kickQueuedDeliveries(): void {
-    for (;;) {
-      if (this.agentSlots.size + this.deliverySlots.size >= this.maxConcurrentAgents) return;
-      // §4.1: queued dispatches first, FIFO (a queued re-issue keeps its
-      // dispatch-order place alongside fresh dispatches).
-      const queued = this.dispatchQueue.shift();
-      if (queued !== undefined) {
-        if (queued.kind === 'dispatch') {
-          this.startDispatch(queued.call, queued.callId, queued.modelSpec, queued.task, queued.optionsJson, queued.parsed);
-        } else {
-          this.startReissue(queued.entry, queued.parsed, queued.reason, queued.report);
-        }
-        continue;
-      }
-      let candidate: SessionEntry | undefined;
-      for (const entry of this.sessions.values()) {
-        if (!entry.busy && !entry.callCancelled && entry.queue.length > 0) {
-          candidate = entry;
-          break;
-        }
-      }
-      if (candidate === undefined) return;
-      this.startQueuedDelivery(candidate);
-    }
-  }
-
-  /** A delivery turn ended (settled or cancelled): the session is idle;
-   *  any queued steers (its own or any other session's) start through
-   *  the global kick as slots allow. */
-  private endDeliveryTurn(entry: SessionEntry): void {
-    entry.busy = false;
-    entry.delivering = false;
-    this.deliverySlots.delete(entry.callId);
-    if (entry.callCancelled) {
-      this.dropQueue(entry);
-      this.kickQueuedDeliveries();
-      return;
-    }
-    this.kickQueuedDeliveries();
+    this.scheduleAdmissions();
   }
 
   // ── The settlement pump ───────────────────────────────────────────────
@@ -6178,7 +5425,7 @@ this.evalBreakArmed = false;
           // the broker was disposed and the state owning the call is being
           // torn down. The condition was surfaced guest-visibly by the
           // task. ALSO the queue-scheduler shape (a restored queued
-          // followUp's delivery scheduler and the lazy re-attach arm's
+          // queued turn's delivery scheduler and the lazy re-attach arm's
           // cap-queue): the hold entry's call id is REUSED by the
           // delivery task that starts once a slot frees — the drop must
           // only remove the map entry when it still holds THIS task (the
@@ -6204,7 +5451,11 @@ this.evalBreakArmed = false;
           throw error;
         }
         this.inFlight.delete(entry.callId);
-        if (entry.kind === 'agent') this.onCallSettled(entry.callId);
+        if (entry.kind === 'agent' || entry.kind === 'queue') {
+          this.onPublicTurnSettled(entry.callId, entry.kind);
+        } else if (entry.kind === 'steer') {
+          this.onSteeringSettled(entry.callId);
+        }
         settled.push(entry.callId);
         // ONE drain + ONE provenance pass PER SETTLED CALL (phase-D
         // review round 5: the pump used to deliver every simultaneously
@@ -6261,26 +5512,42 @@ this.evalBreakArmed = false;
     return { settled };
   }
 
-  /** An agent call's settlement transition: the session is idle (its
-   *  concurrency token is released — UNCONDITIONALLY, so an agent call
-   *  whose session never opened (openSession failure) still frees its
-   *  slot; review regression: a failed open used to leak the token and
-   *  refuse every later dispatch under a tight cap) and queued steers
-   *  start their delivery turns through the global kick; a cancelled
-   *  call's queue is dropped. */
-  private onCallSettled(callId: string): void {
-    this.agentSlots.delete(callId);
-    const entry = this.sessions.get(callId);
-    if (entry !== undefined) {
-      entry.callSettled = true;
-      entry.busy = false;
-      if (entry.callCancelled) {
-        this.dropQueue(entry);
-        this.kickQueuedDeliveries();
-        return;
-      }
+  private onPublicTurnSettled(callId: string, kind: 'agent' | 'queue'): void {
+    const queued = kind === 'queue' ? this.queuedTurns.get(callId) : undefined;
+    const sessionId = queued?.sessionId ?? callId;
+    const lane = this.lanes.get(sessionId);
+    const entry = this.sessions.get(sessionId);
+    if (kind === 'agent') {
+      this.agentSlots.delete(callId);
+      if (entry !== undefined) entry.callSettled = true;
+    } else {
+      this.queueSlots.delete(callId);
+      if (queued !== undefined) queued.state = 'settled';
+      if (lane !== undefined) lane.queuedTurnIds = lane.queuedTurnIds.filter((id) => id !== callId);
     }
-    this.kickQueuedDeliveries();
+    if (lane !== undefined) {
+      lane.promptInFlight = false;
+      if (lane.activeTurnId === callId) lane.activeTurnId = null;
+      if (lane.cancellingTurnId === callId) lane.cancellingTurnId = null;
+      if (lane.cancellationTimer !== null) clearTimeout(lane.cancellationTimer);
+      lane.cancellationTimer = null;
+    }
+    if (entry !== undefined) entry.callCancelled = false;
+    this.processSteeringControls(sessionId);
+    this.scheduleAdmissions();
+  }
+
+  private onSteeringSettled(callId: string): void {
+    const control = this.steeringControls.get(callId);
+    if (control === undefined) return;
+    const lane = this.lanes.get(control.sessionId);
+    if (lane !== undefined) {
+      lane.steeringControlIds = lane.steeringControlIds.filter((id) => id !== callId);
+      lane.steeringInFlight = false;
+    }
+    this.steeringControls.delete(callId);
+    this.processSteeringControls(control.sessionId);
+    this.scheduleAdmissions();
   }
 
   /** Record → settle → consume for one ready outcome (the exactly-once
@@ -6776,6 +6043,57 @@ this.evalBreakArmed = false;
     return opts;
   }
 
+  private parseTurnPayload(
+    payloadJson: string | null,
+    kind: 'queue' | 'steer',
+  ): { prompt: string; promptMeta?: Record<string, unknown> } {
+    if (payloadJson === null) {
+      throw new WorkflowError(`${kind} payload is missing`, CODE.SCRIPT_VALIDATION_ERROR, {
+        recoverable: false,
+      });
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(payloadJson);
+    } catch (error) {
+      throw new WorkflowError(`${kind} payload is not valid JSON: ${(error as Error).message}`, CODE.SCRIPT_VALIDATION_ERROR, {
+        recoverable: false,
+      });
+    }
+    if (!isPlainObject(payload)) {
+      throw new WorkflowError(`${kind} payload must be an object`, CODE.SCRIPT_VALIDATION_ERROR, {
+        recoverable: false,
+      });
+    }
+    if (typeof payload.prompt !== 'string') {
+      throw new WorkflowError(`${kind}(prompt, options?) requires a string prompt`, CODE.SCRIPT_VALIDATION_ERROR, {
+        recoverable: false,
+      });
+    }
+    const options = payload.options;
+    if (options === undefined || options === null) return { prompt: payload.prompt };
+    const parsedOptions = this.parseSteerOptions(options);
+    return {
+      prompt: payload.prompt,
+      ...(parsedOptions.promptMeta !== undefined
+        ? { promptMeta: parsedOptions.promptMeta as Record<string, unknown> }
+        : {}),
+    };
+  }
+
+  private newLane(laneState: SessionLaneState['laneState']): SessionLaneState {
+    return {
+      activeTurnId: null,
+      promptInFlight: false,
+      queuedTurnIds: [],
+      steeringControlIds: [],
+      steeringInFlight: false,
+      laneState,
+      cancellingTurnId: null,
+      cancellationTimer: null,
+    };
+  }
+
   // ── Misc ──────────────────────────────────────────────────────────────
 
   /** Serialize async broker operations (eval/pump/reconcile/dispose) —
@@ -7065,6 +6383,84 @@ function now(): number {
   return Date.now();
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** Read only the raw initialize metadata surface. The capabilities
+ * fallback is the current InteractiveSession carrier for that same raw
+ * initialize response; no derived capability boolean is consulted. */
+function initializeMetaOf(session: BrokerSession): Readonly<Record<string, unknown>> | undefined {
+  if (isPlainObject(session.initializeMeta)) return session.initializeMeta;
+  const capabilities = (session as BrokerSession & { capabilities?: unknown }).capabilities;
+  if (!isPlainObject(capabilities)) return undefined;
+  return isPlainObject(capabilities.initializeMeta) ? capabilities.initializeMeta : undefined;
+}
+
+/** Exact raw steering advertisement parser. */
+function advertisesSteering(initializeMeta: unknown): boolean {
+  return (
+    isPlainObject(initializeMeta) &&
+    isPlainObject(initializeMeta.steering) &&
+    initializeMeta.steering.supported === true
+  );
+}
+
+function persistenceFailure(cause: unknown): ReturnType<typeof toRejectionValue> {
+  return toRejectionValue(
+    new WorkflowError(
+      `mandatory queue persistence failed: ${toRejectionValue(cause).message}`,
+      CODE.PERSISTENCE_ERROR,
+      { recoverable: false, details: { reason: 'queue_persistence_failed' } },
+    ),
+  );
+}
+
+function executionError(
+  message: string,
+  reason: string,
+  recoverable: boolean,
+): WorkflowError {
+  return new WorkflowError(message, CODE.AGENT_EXECUTION_ERROR, {
+    recoverable,
+    details: { reason },
+  });
+}
+
+function rawPromptDetail(payloadJson: string | null): string {
+  if (payloadJson === null) return '';
+  try {
+    const payload: unknown = JSON.parse(payloadJson);
+    return isPlainObject(payload) && typeof payload.prompt === 'string' ? payload.prompt : '';
+  } catch {
+    return '';
+  }
+}
+
+/** Restore-only parser. Live admissions use the throwing class method;
+ * corrupt durable rows are ignored rather than resurrected. */
+function parseTurnPayload(
+  payloadJson: string | null,
+): { prompt: string; promptMeta?: Record<string, unknown> } | null {
+  if (payloadJson === null) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(payloadJson);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(payload) || typeof payload.prompt !== 'string') return null;
+  const options = payload.options;
+  if (options === undefined || options === null) return { prompt: payload.prompt };
+  if (!isPlainObject(options)) return null;
+  if (Object.keys(options).some((key) => !STEER_OPTION_KEYS.has(key))) return null;
+  if (options.promptMeta === undefined) return { prompt: payload.prompt };
+  if (!isPlainObject(options.promptMeta)) return null;
+  return { prompt: payload.prompt, promptMeta: options.promptMeta };
+}
+
 /** Await a batch of best-effort teardown promises (cancels, releases)
  *  ONLY until the drain deadline — the doc's outer drain bound (phase-D
  *  review round 3: a hung cancel/release used to block disconnect/
@@ -7187,12 +6583,12 @@ function requireStringArray(value: unknown, what: string): string[] {
  *  and recoverable flag; plain errors are recoverable by default; a
  *  plain rejection-shaped object (the broker's own refusals) passes
  *  through with its name/recoverable. */
-function toRejectionValue(error: unknown): { name: string; message: string; code?: string; recoverable?: boolean; replBackend?: string } {
+function toRejectionValue(error: unknown): { name: string; message: string; code?: string; recoverable?: boolean; details?: unknown; replBackend?: string } {
   // The §4.6 backend stamp passes THROUGH the conversion (an error
   // pre-stamped with `replBackend` — an admission refusal whose segment
   // resolved — keeps it on the rejection value the guest sees).
   const backend = (error as { replBackend?: unknown } | null | undefined)?.replBackend;
-  const stamped = (value: { name: string; message: string; code?: string; recoverable?: boolean; replBackend?: string }): typeof value => {
+  const stamped = (value: { name: string; message: string; code?: string; recoverable?: boolean; details?: unknown; replBackend?: string }): typeof value => {
     if (typeof backend === 'string') value.replBackend = backend;
     return value;
   };
@@ -7202,18 +6598,20 @@ function toRejectionValue(error: unknown): { name: string; message: string; code
       message: error.message,
       code: error.code,
       recoverable: error.recoverable,
+      ...(error.details !== undefined ? { details: error.details } : {}),
     });
   }
   if (error instanceof Error) {
     return stamped({ name: error.name || 'Error', message: error.message });
   }
   if (typeof error === 'object' && error !== null && typeof (error as { message?: unknown }).message === 'string') {
-    const value = error as { name?: unknown; message: string; code?: unknown; recoverable?: unknown };
+    const value = error as { name?: unknown; message: string; code?: unknown; recoverable?: unknown; details?: unknown };
     return stamped({
       name: typeof value.name === 'string' ? value.name : 'Error',
       message: value.message,
       ...(typeof value.code === 'string' ? { code: value.code } : {}),
       ...(typeof value.recoverable === 'boolean' ? { recoverable: value.recoverable } : {}),
+      ...(value.details !== undefined ? { details: value.details } : {}),
     });
   }
   return { name: 'Error', message: String(error) };
@@ -7271,32 +6669,4 @@ function replStackFrames(stack: string | undefined): string[] {
 function backendSegment(modelSpec: string): string {
   const slash = modelSpec.indexOf('/');
   return (slash >= 0 ? modelSpec.slice(0, slash) : modelSpec).toLowerCase();
-}
-
-/** Recover a queued steer's payload from its store record (the verbatim
- *  `{ prompt, options }` bag recorded at dispatch — the queue rebuild's
- *  crash-durable source). Returns null for a record whose payload is
- *  malformed (a corrupt log line must not resurrect a bogus delivery). */
-function parseSteerPayload(
-  optionsJson: string | null,
-): { prompt: string; promptMeta?: Record<string, unknown> } | null {
-  if (optionsJson === null) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(optionsJson);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== 'object' || parsed === null) return null;
-  const payload = parsed as { prompt?: unknown; options?: unknown };
-  if (typeof payload.prompt !== 'string') return null;
-  const result: { prompt: string; promptMeta?: Record<string, unknown> } = { prompt: payload.prompt };
-  if (payload.options !== undefined && payload.options !== null && typeof payload.options === 'object') {
-    const options = payload.options as Record<string, unknown>;
-    const promptMeta = options.promptMeta;
-    if (promptMeta !== undefined && typeof promptMeta === 'object' && promptMeta !== null) {
-      result.promptMeta = promptMeta as Record<string, unknown>;
-    }
-  }
-  return result;
 }

@@ -8,6 +8,7 @@ import type {
   AgentRequestParamsByMethod,
   AgentRequestResponsesByMethod,
   ContentBlock,
+  PromptResponse,
   SendRequestOptions,
   SessionModeState,
   StopReason,
@@ -24,7 +25,7 @@ import {
   type LoadedTurnStatus,
   type PooledConnection,
   type SessionHandle,
-  type SteeringOutcome,
+  type SteeringResponse,
 } from "./acp-client.js";
 import type { AcpEventListener, AcpEventName } from "./events.js";
 import { mapThrownError } from "./errors-map.js";
@@ -99,10 +100,14 @@ export interface InteractiveSessionOptions {
 
 /** One completed interactive prompt turn. `text` is the assistant text from THIS turn only:
  *  it is read from SessionHandle.currentTurnText(), the same turn-segmented accessor run() uses
- *  for structured-output repair turns. */
+ *  for structured-output repair turns. A live `prompt()` result also carries the complete ACP
+ *  `PromptResponse`; typed-session failures remain exceptions and therefore produce no turn. */
 export interface InteractiveTurn {
   readonly stopReason: StopReason;
   readonly text: string;
+  /** Complete terminal ACP response, including extension `_meta`. Absent only when a loaded-turn
+   *  completion is reconstructed from persisted transcript state and no PromptResponse exists. */
+  readonly response?: PromptResponse;
 }
 
 type Subscribe = <K extends AcpEventName>(name: K, listener: AcpEventListener<K>) => () => void;
@@ -280,8 +285,8 @@ export class InteractiveSession {
     try {
       // Same request shaping as run(): a schema-bearing generic backend whose agent may
       // ignore the `_meta` forward gets the contract stated in-band; the backend-computed
-      // turn meta (e.g. Codex's outputSchema forward) merges UNDER the user meta so the
-      // schema channel is never clobbered.
+      // turn meta (e.g. Codex's outputSchema forward) wins only direct key collisions with
+      // user metadata so the schema channel cannot be clobbered; unrelated keys pass through.
       const shaped =
         typeof content === "string" && this.schema !== undefined && this.backend.embedSchemaInPrompt
           ? buildRunPrompt(content, {}, this.schema, this.backend)
@@ -309,6 +314,7 @@ export class InteractiveSession {
       return {
         stopReason: response.stopReason,
         text: this.session.currentTurnText(),
+        response,
       };
     } catch (error) {
       if (this.signal?.aborted) throw error;
@@ -324,13 +330,14 @@ export class InteractiveSession {
     }
   }
 
-  /** Inject a follow-up into the prompt currently in flight. Idle callers must use prompt():
-   *  steering has no client-owned turn, output, usage, or retry path. Concurrent steer calls are
-   *  sent independently and left to the backend's ordering semantics. */
+  /** Inject content into the prompt currently in flight. Idle callers must use prompt(): steering
+   *  has no client-owned turn, output, usage, or retry path. The complete raw response is returned
+   *  for the host to validate; this layer does not gate on a parsed vendor capability. Concurrent
+   *  steer calls are sent independently and left to the backend's ordering semantics. */
   async steer(
     content: string | ContentBlock[],
     opts: { images?: readonly PromptImage[]; promptMeta?: Record<string, unknown> } = {},
-  ): Promise<SteeringOutcome> {
+  ): Promise<SteeringResponse> {
     if (this.releasePromise) throw new Error("InteractiveSession has been released");
     this.signal?.throwIfAborted();
     if (!this.promptInFlight) {
@@ -342,8 +349,7 @@ export class InteractiveSession {
 
     try {
       const steeringContent = appendPromptImages(content, opts.images);
-      const promptMeta = mergeTurnMeta(opts.promptMeta, this.backend.promptMeta(undefined));
-      return await this.session.steer(steeringContent, promptMeta);
+      return await this.session.steer(steeringContent, opts.promptMeta);
     } catch (error) {
       if (this.signal?.aborted) throw error;
       throw mapThrownError(error, {
@@ -459,7 +465,7 @@ export class InteractiveSession {
    *      broker re-issues under the same call id — no duplication
    *      possible).
    *
-   *    A QUERY FAILURE (the capability gate or a wire error) is NOT the
+   *    A QUERY FAILURE (a wire or server error) is NOT the
    *    missing extension: the seam falls THROUGH to the observation path
    *    below instead of classifying unobservable (phase-F review round
    *    2 — the loaded session may still be executing, and a
@@ -545,8 +551,14 @@ export class InteractiveSession {
           "(its outcome is unobservable; re-issue is the honest fallback)",
       );
     }
-    const capabilities = this.connection.capabilities;
-    if (capabilities?.supportsLoadedTurnTerminalState === true) {
+    // The extension choice is deliberately made HERE from the raw initialize metadata. Do not
+    // cache or recreate a connection-level boolean: this is the sole owner of loaded-turn parsing.
+    const initializeMeta = this.connection.capabilities?.initializeMeta;
+    if (
+      isPlainObject(initializeMeta) &&
+      isPlainObject(initializeMeta.loadedTurn) &&
+      initializeMeta.loadedTurn.supported === true
+    ) {
       // Subscribe to the ended channel BEFORE the query: a turn that ends
       // between the query response and this wait must not be missed (the
       // notification is recorded on the session state, first-wins).
@@ -554,7 +566,7 @@ export class InteractiveSession {
       try {
         status = (await this.connection.queryLoadedTurn(this.sessionId, this.label)).status;
       } catch (error) {
-        // The wire query failed (the capability gate or a wire error):
+        // The wire query failed:
         // the authoritative answer is unavailable, so the terminal state
         // is classified by the OBSERVATION path instead (the same path a
         // seam-less backend takes — the post-load continuation watch plus
@@ -1080,6 +1092,10 @@ export function isLoadedTurnFailedError(error: unknown): error is LoadedTurnFail
       error !== null &&
       (error as { loadedTurnFailed?: unknown }).loadedTurnFailed === true)
   );
+}
+
+function isPlainObject(value: unknown): value is Readonly<Record<string, unknown>> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /** Normalize any thrown value into a message (the query-failure arm of

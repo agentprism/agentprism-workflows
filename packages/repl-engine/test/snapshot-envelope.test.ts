@@ -134,20 +134,21 @@ test('serializeSnapshot rejects a malformed wasm hash (identity must be trustwor
 // Version-bump and format refusals
 // ────────────────────────────────────────────────────────────────────────
 
-test('version-bump refusal: an envelope carrying a newer format version refuses naming BOTH versions', () => {
+test('format 3 refuses the previous format-2 envelope before decoding its guest payload', () => {
+  assert.equal(SNAPSHOT_FORMAT_VERSION, 3);
   const envelope = serializeSnapshot(tinySnapshot(), 'a'.repeat(64));
   const nl = envelope.indexOf(0x0a);
   const header = JSON.parse(Buffer.from(envelope.subarray(0, nl)).toString('utf8'));
-  const bumped = Buffer.concat([
-    Buffer.from(JSON.stringify({ ...header, formatVersion: 999 }) + '\n'),
-    envelope.subarray(nl + 1),
+  const old = Buffer.concat([
+    Buffer.from(JSON.stringify({ ...header, formatVersion: 2 }) + '\n'),
+    Buffer.from('old guest bytes must not be decoded or executed'),
   ]);
-  const error = captureThrows(() => deserializeSnapshot(bumped));
+  const error = captureThrows(() => deserializeSnapshot(old));
   assert.ok(error instanceof SnapshotEnvelopeError, error.message);
   assert.equal(error.code, 'VERSION_MISMATCH');
-  assert.ok(error.message.includes('999'), `names the recorded version: ${error.message}`);
+  assert.ok(error.message.includes('2'), `names the recorded version: ${error.message}`);
   assert.ok(error.message.includes(String(SNAPSHOT_FORMAT_VERSION)), `names the supported version: ${error.message}`);
-  assert.equal(error.recorded, '999');
+  assert.equal(error.recorded, '2');
   assert.equal(error.expected, String(SNAPSHOT_FORMAT_VERSION));
 });
 

@@ -143,7 +143,7 @@ import type {
   WorkflowAgentActivityBase,
   WorkflowAgentEventSink,
   WorkflowAgentEventSource,
-  SteeringOutcome,
+  SteeringResponse,
   MockAnswers,
   MockAnswerSequence,
   ValidatedMockAnswerUse,
@@ -241,8 +241,7 @@ type Assert<T extends true> = T;
 type IsNever<T> = [T] extends [never] ? true : false;
 
 type _SessionUpdateExcluded = Assert<IsNever<Extract<WorkflowAgentEventName, "session_update">>>;
-type _SteeringOutcomeExported = Assert<SteeringOutcome extends "injected" | "startedNewTurn" | "failed" ? true : false>;
-type _SteeringEventExported = Assert<AcpSteeringEvent["outcome"] extends SteeringOutcome ? true : false>;
+type _SteeringResponseExported = Assert<AcpSteeringEvent["response"] extends SteeringResponse ? true : false>;
 type _AgentEventNamesComplete = Assert<IsNever<Exclude<Exclude<AcpEventName, "session_update">, WorkflowAgentEventName>>>;
 type _AgentEventNamesExact = Assert<IsNever<Exclude<WorkflowAgentEventName, Exclude<AcpEventName, "session_update">>>>;
 type _SpecializedRunEvent = Assert<WorkflowAgentEvent extends Extract<WorkflowRunEvent, { type: "agentEvent" }> ? true : false>;

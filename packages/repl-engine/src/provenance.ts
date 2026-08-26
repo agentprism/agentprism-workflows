@@ -245,7 +245,10 @@ async function computeLexicalBaseline(wasm: WasmInput): Promise<string[]> {
 const NOOP_HANDLERS: GuestBridgeHandlers = {
   agent: () => undefined,
   checkpoint: () => undefined,
+  queue: () => undefined,
   steer: () => undefined,
+  cancelSession: () => undefined,
+  cancelQueue: () => undefined,
   console: () => undefined,
   sleep: () => undefined,
   workspace: () => '{}',
