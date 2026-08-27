@@ -1,5 +1,15 @@
 # @automatalabs/acp-agents
 
+## 0.41.0
+
+### Minor Changes
+
+- ea0b68c: Make agent configuration fail closed and fully discoverable. Config probes now return effective ACP session modes, including config-option fallback normalization and explicit `null` for unsupported modes; workflow preflight rejects guessed or unadvertised modes before admission. Workflow `agent()` rejects unknown option keys before allocation, while REPL rejects reserved `configOptions.model` with modelSpec-native guidance and preserves independent mode failures instead of falsely blaming carried config keys. Static external MCP resources now accept subscribe/unsubscribe as no-ops.
+
+### Patch Changes
+
+- ea0b68c: Refresh the wrapped Claude Agent SDK runtime from 0.3.246 to 0.3.247. The upstream release adds ambient background-task metadata and spinner-tip configuration plus internal CLI fixes; the ACP-integrated structured-output, stop-reason, and usage contracts remain unchanged.
+
 ## 0.40.0
 
 ### Minor Changes

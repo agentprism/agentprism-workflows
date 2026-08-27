@@ -1,5 +1,16 @@
 # @automatalabs/repl-engine
 
+## 0.4.3
+
+### Patch Changes
+
+- ea0b68c: Make agent configuration fail closed and fully discoverable. Config probes now return effective ACP session modes, including config-option fallback normalization and explicit `null` for unsupported modes; workflow preflight rejects guessed or unadvertised modes before admission. Workflow `agent()` rejects unknown option keys before allocation, while REPL rejects reserved `configOptions.model` with modelSpec-native guidance and preserves independent mode failures instead of falsely blaming carried config keys. Static external MCP resources now accept subscribe/unsubscribe as no-ops.
+- Updated dependencies [ea0b68c]
+- Updated dependencies [ea0b68c]
+- Updated dependencies [ea0b68c]
+  - @automatalabs/acp-agents@0.41.0
+  - @automatalabs/workflows@0.53.0
+
 ## 0.4.2
 
 ### Patch Changes

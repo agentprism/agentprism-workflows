@@ -1,5 +1,20 @@
 # @automatalabs/workflows
 
+## 0.53.0
+
+### Minor Changes
+
+- ea0b68c: Add a model-facing `docs` tool that returns version-matched workflow and REPL authoring documentation one bounded topic at a time as an embedded MCP resource, with byte-identical static resources and a compact index. Decouple the server from the optional authoring skill and replace the giant `author-workflow` prompt injection with selective topic guidance.
+- ea0b68c: Make agent configuration fail closed and fully discoverable. Config probes now return effective ACP session modes, including config-option fallback normalization and explicit `null` for unsupported modes; workflow preflight rejects guessed or unadvertised modes before admission. Workflow `agent()` rejects unknown option keys before allocation, while REPL rejects reserved `configOptions.model` with modelSpec-native guidance and preserves independent mode failures instead of falsely blaming carried config keys. Static external MCP resources now accept subscribe/unsubscribe as no-ops.
+
+### Patch Changes
+
+- Updated dependencies [ea0b68c]
+- Updated dependencies [ea0b68c]
+  - @automatalabs/acp-agents@0.41.0
+  - @automatalabs/workflow-engine@0.37.2
+  - @automatalabs/repl-engine@0.4.3
+
 ## 0.52.1
 
 ### Patch Changes
