@@ -80,6 +80,11 @@
       "sha": "50f69e57ca761ccafd2ca29de7fb591068277516",
       "imported": "2026-08-25",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (feat: expose permission mode kinds (#430))"
+    },
+    {
+      "sha": "2b48e9822330fc09f3a94a81563e5c4bb779601a",
+      "imported": "2026-08-27",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (chore(main): release 1.7.0 (#420))"
     }
   ]
 }
