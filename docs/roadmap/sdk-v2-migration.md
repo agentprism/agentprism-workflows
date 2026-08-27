@@ -1,6 +1,6 @@
 # MCP TypeScript SDK v2 migration — staged path
 
-**Status:** Stage 0 released and post-release Apps negotiation audited; Stages A–C remain gated and unstarted · **Updated:** 2026-08-27
+**Status:** Stage 0 released and Apps negotiation audited; Stage A is ready but unstarted; Stages B–C remain technically gated · **Updated:** 2026-08-27
 
 **Provenance.** Owner directives: (2026-08-07) "I don't consider us to be spec conformant if
 we're behind on the mcp sdk version. We need a path to upgrade to the latest one"; (2026-08-27)
@@ -44,8 +44,11 @@ before starting any stage.
   unresolved upstream (ext-apps#702, two competing draft PRs #719/#720). The Inspector pairs
   ext-apps with v2 only via casts and a Proxy shim it labels temporary. **Our exposure is
   confirmed direct**: `packages/mcp-server/src/app-ui.ts:69,81` and `src/server.ts:54` call
-  `registerAppTool`/`registerAppResource` with our server instance — exactly the
-  v1-object/v2-object boundary that does not cross (nominal types; removed `zod-compat`).
+  `registerAppTool`/`registerAppResource` with our server instance. This is an official migration-
+  guide constraint, not a repository authorization policy: v1 and v2 objects must not flow across
+  the boundary; where a dependency compiles against the host's v1 SDK, the host files that construct
+  or hand it SDK objects must remain on v1 and be excluded from the codemod until that dependency
+  migrates. A type cast does not change that runtime/package boundary.
 - **Our SDK footprint** (repo sweep at 4346f87): `packages/mcp-server` 13 files (core);
   `packages/pi-acp` 3 files; `packages/acp-agents` 1; `packages/workflows` 1. Heaviest
   coupling is `sdk/types.js` type imports (11 sites), then the `server/mcp.js` McpServer API
@@ -120,9 +123,11 @@ not run while another workstream is editing the same files (§5).
   dual-role boundaries); header reads via `.get()`; eager-capability re-baselining (declaring
   a capability now advertises `listChanged: true` and answers empty lists instead of -32601);
   unknown-tool calls reject instead of `isError`; `pi-acp`'s 3 SDK files.
-- **GATE: ext-apps#702 shipped a v2-compatible release** — OR an explicit owner decision to
-  adopt Inspector-style shims (cast boundary + `setNotificationHandler` Proxy) as a
-  consciously temporary measure. Without one of these, Stage B does not start.
+- **Official boundary condition:** ext-apps#702 ships a v2-compatible release, or Stage B is
+  redesigned so no SDK object crosses between v1 ext-apps code and v2 server code. The official
+  migration guide says dependencies compiled against the host's v1 SDK keep their interfacing host
+  files on v1 and outside the codemod until the dependency migrates. Inspector-style casts/proxies
+  may demonstrate compatibility but do not satisfy that documented boundary rule.
 - Acceptance: full gates + live e2e; Apps panel verified working end-to-end in an
   Apps-capable host; no wire change.
 
@@ -143,8 +148,9 @@ not run while another workstream is editing the same files (§5).
 ## 3. Explicit non-goals until their stage
 
 No v2 packages before Stage A. No `createMcpHandler`/`serveStdio`/`versionNegotiation:'auto'`
-before Stage C. No ext-apps shimming unless the Stage B gate is consciously taken. No
-protocol-era changes to the ACP packages (different protocol; out of scope throughout).
+before Stage C. No direct flow of SDK objects between v1 ext-apps code and v2 server code; casts
+are not treated as migration. No protocol-era changes to the ACP packages (different protocol;
+out of scope throughout).
 
 ## 4. Gate ledger — re-verify before each stage
 
