@@ -1305,9 +1305,9 @@ export function createWorkflowServer(
   });
 
   // registerCapabilities is illegal after a transport attaches. Merge the complete resources
-  // capability — and the MCP Apps extension declaration required by the extensions
-  // negotiation spec (servers advertise `capabilities.extensions` in the initialize
-  // response) — before handler registration and before createWorkflowServer returns.
+  // capability and advertise this server's Apps support before handler registration and before
+  // createWorkflowServer returns. The current legacy era carries server extensions in initialize;
+  // the separately gated modern era moves that advertisement to server/discover.
   mcp.server.registerCapabilities({
     resources: { subscribe: true, listChanged: true },
     extensions: { [EXTENSION_ID]: {} },
@@ -2053,7 +2053,9 @@ export function createWorkflowServer(
   mcp.server.oninitialized = () => {
     previousOnInitialized?.();
     const uiCap = getUiCapability(mcp.server.getClientCapabilities());
-    if (uiCap?.mimeTypes?.includes(RESOURCE_MIME_TYPE) !== true) return;
+    // getUiCapability locates the official extension key but intentionally casts its settings;
+    // validate the REQUIRED array at runtime so malformed string/object values cannot enable UI.
+    if (!Array.isArray(uiCap?.mimeTypes) || !uiCap.mimeTypes.includes(RESOURCE_MIME_TYPE)) return;
     registerWorkflowAppUi(mcp, {
       readEventsPage: (request) => scriptResources.readEventsPage(request),
       registerResourceReader: (uri, read) => scriptResources.registerExternalResourceReader(uri, read),

@@ -43,12 +43,15 @@ the server emits goes to `stderr`.
 ## Run monitor (MCP Apps)
 
 The `workflow` tool declares a UI resource per the
-[MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview), and the server
-advertises `io.modelcontextprotocol/ui` in its capabilities. Hosts that render MCP Apps show a
-live run-monitor panel for `workflow` calls — a phase/agent graph with per-node log drill-in
+[MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview). The server
+advertises `io.modelcontextprotocol/ui`; on the current legacy MCP wire, a client opts in through
+`capabilities.extensions["io.modelcontextprotocol/ui"]` with
+`mimeTypes: ["text/html;profile=mcp-app"]`. Only that exact, well-formed declaration adds the
+UI metadata and app-only surface. Supporting hosts show a live run-monitor panel for `workflow`
+calls — a phase/agent graph with per-node log drill-in
 (including expandable per-tool results), live token/cost totals, and a Stop control. The panel
 keeps itself current by polling the app-only `workflow-events` tool, so no model tokens are
-spent while it is visible; hosts without MCP Apps support ignore the UI metadata and get the
+spent while it is visible; hosts without MCP Apps support receive no UI metadata and get the
 same text/structured output as always.
 
 <p align="center">
@@ -58,7 +61,8 @@ same text/structured output as always.
 
 To try it locally against the [ext-apps](https://github.com/modelcontextprotocol/ext-apps)
 reference host, run `node scripts/dev-app-host.mjs` from this package (see the script header
-for the basic-host setup; `AGENTPRISM_DEV_CWD=<project dir>` serves an existing run store).
+for the basic-host setup and its explicit Apps capability declaration;
+`AGENTPRISM_DEV_CWD=<project dir>` serves an existing run store).
 
 ---
 

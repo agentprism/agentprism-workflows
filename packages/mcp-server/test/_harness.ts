@@ -90,17 +90,31 @@ export interface Connected {
   dispose: () => Promise<void>;
 }
 
-export type UiCapabilityMode = "matching" | "absent" | "nonmatching";
+export type UiCapabilityMode =
+  | "matching"
+  | "absent"
+  | "nonmatching"
+  | "missing-mime-types"
+  | "experimental-only"
+  | "malformed-string";
 
 export function uiClientCapabilities(mode: UiCapabilityMode): Record<string, unknown> {
   if (mode === "absent") return {};
-  return {
-    extensions: {
-      [EXTENSION_ID]: {
-        mimeTypes: mode === "matching" ? [RESOURCE_MIME_TYPE] : ["text/html"],
-      },
-    },
+  if (mode === "missing-mime-types") {
+    return { extensions: { [EXTENSION_ID]: {} } };
+  }
+  const settings = {
+    mimeTypes:
+      mode === "malformed-string"
+        ? RESOURCE_MIME_TYPE
+        : mode === "matching" || mode === "experimental-only"
+          ? [RESOURCE_MIME_TYPE]
+          : ["text/html"],
   };
+  if (mode === "experimental-only") {
+    return { experimental: { [EXTENSION_ID]: settings } };
+  }
+  return { extensions: { [EXTENSION_ID]: settings } };
 }
 
 /**

@@ -7,8 +7,12 @@
 //   pnpm --filter @automatalabs/mcp-server build && node scripts/dev-app-host.mjs
 //   # then in a clone of github.com/modelcontextprotocol/ext-apps:
 //   cd examples/basic-host && npm install
+//   # The generic basic-host does not currently advertise Apps in its core MCP Client. In
+//   # src/implementation.ts, pass this as Client's second constructor argument in both calls:
+//   #   { capabilities: { extensions: { "io.modelcontextprotocol/ui": {
+//   #       mimeTypes: ["text/html;profile=mcp-app"] } } } }
 //   SERVERS='["http://localhost:3001/mcp"]' npm run start   # open http://localhost:8080
-//   # call workflow-monitor with the printed runId to render the panel
+//   # call workflow with { action: "inspect", runId: "<printed id>" } to render the panel
 //
 // The stub runner needs no agent backends or credentials; set AGENTPRISM_DEV_LIVE=1 to use
 // the real ACP runner instead (requires logged-in backends).
