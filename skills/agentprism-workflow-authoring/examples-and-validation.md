@@ -55,7 +55,7 @@ const outcome = await gate(
 return { implemented: outcome.ok, attempts: outcome.attempts, reviewVerdict: outcome.verdict, plan };
 ```
 
-(The planner would ideally run read-only, but mode ids are backend-specific — this call routes to OpenCode, so it leaves `mode` unset rather than guessing; a Claude-routed planner could safely say `mode: "plan"`.)
+(The planner would ideally run read-only, but mode ids are backend/model-specific, so this call leaves `mode` unset rather than guessing. Add one only after `action:"config"` explicitly lists the exact id in `modes.availableModes`; `modes:null` means keep it omitted.)
 
 ## Worked example — fully backend-agnostic audit
 

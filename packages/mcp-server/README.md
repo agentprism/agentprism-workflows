@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-An **[MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, safe inspection, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tool surface is **two tools**: **`workflow`**, with config/run/resume/inspect/await/stop branches, and **`repl`** — a persistent QuickJS-in-WASM JavaScript REPL for live, stateful subagent orchestration (see [The `repl` tool](#the-repl-tool)) — plus an app-only `workflow-events` poller that feeds the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enters the model's tool loop. The `workflow` tool discovers its live backend catalog with `action:"config"` and automatically validates every script before admission. Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes (`resumeFromRunId`) after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
+An **[MCP](https://modelcontextprotocol.io) server** for foreground/background execution, bounded await, safe inspection, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tool surface is **three tools**: **`docs`** for selective version-matched workflow/REPL documentation, **`workflow`** for config/run/resume/inspect/await/stop, and **`repl`** for persistent interactive orchestration — plus an app-only `workflow-events` poller that feeds the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enters the model's tool loop. The `workflow` tool discovers its live backend catalog with `action:"config"` and automatically validates every script before admission. Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes (`resumeFromRunId`) after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
 This package is a **thin MCP adapter**. The `workflow` tool's real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, and resume — lives in **[`@automatalabs/workflows`](../workflows)**; the `repl` tool's real work — the persistent QuickJS-in-WASM VM, the subagent broker, the CDP-style previewer, and the enveloped-snapshot store — lives in **[`@automatalabs/repl-engine`](../repl-engine)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool over a per-project `WorkflowManager` and the `repl` tool over a per-project QuickJS VM, and serves them over stdin/stdout.
 
@@ -167,6 +167,14 @@ After your host reloads, the `workflow` and `repl` tools appear in its tool list
 
 ---
 
+## The `docs` tool
+
+`docs` is the agent-controlled, progressive-disclosure reference surface. Omit `topic` or use `"index"` to receive only the bounded catalog, then request exactly one `workflow/*` or `repl/*` topic. Every result contains structured metadata plus one embedded `text/markdown` MCP resource; the same byte-identical document is directly readable at `agentprism://docs/<topic>` and appears in `resources/list`.
+
+The topic vocabulary is closed and advertised in the input schema. Calls require no `projectDir`, open no backend session, execute no workflow or REPL code, persist nothing, and spend no model tokens. The index is capped at 8 KiB and each content topic at 16 KiB. Workflow and REPL references stay separate because their `agent()` signatures and lifecycle semantics differ.
+
+Canonical MCP topic sources live under `docs/authoring/` in the repository and are bundled into the published server. The optional authoring skill is no longer read or embedded by the server.
+
 ## The `workflow` tool
 
 ### Input parameters
@@ -214,7 +222,7 @@ Discover a backend's live catalog before pinning model, mode, or `configOptions`
 { "action": "config", "projectDir": "/absolute/project", "harnesses": ["claude"], "modelFilter": "opus" }
 ```
 
-After choosing a model, inspect its exact option domain with `{ "action": "config", "projectDir": "/absolute/project", "modelSpecs": ["claude/opus[1m]"] }`. No workflow is started and no prompt is sent. If `model` is omitted, or only a backend name is used, discovery is optional.
+After choosing a model, inspect its exact option domain with `{ "action": "config", "projectDir": "/absolute/project", "modelSpecs": ["claude/opus[1m]"] }`. Every successful harness entry reports `modes` explicitly: copy a mode only from `modes.availableModes`; `modes:null` means the backend/model supports none, so omit `mode`. Never infer a generic `"default"`. No workflow is started and no prompt is sent. If `model` is omitted, or only a backend name is used, discovery is optional.
 
 Example run arguments (validation is automatic):
 
@@ -318,7 +326,14 @@ The tool returns both machine-readable `structuredContent` and a human-readable 
 interface WorkflowConfigToolResult {
   action: "config";
   ok: boolean;
-  harnessOptions: Array<{ backendId: string; probed: boolean; options: unknown[]; error?: string }>;
+  harnessOptions: Array<{
+    backendId: string;
+    model?: string;
+    probed: boolean;
+    modes?: { currentModeId: string; availableModes: Array<{ id: string; name: string }> } | null;
+    options: unknown[];
+    error?: string;
+  }>;
   models: Array<{ backendId: string; hasModelOption: boolean; matches: string[] }>;
 }
 
@@ -641,7 +656,7 @@ client `resources` capability to gate these server-offered primitives.
 
 ## The `repl` tool
 
-The second model-facing tool is **`repl`**: one persistent **QuickJS-in-WASM JavaScript VM per project**, exposed as a live REPL with **one verb — `eval`** (plus the out-of-band `interrupt`). Where `workflow` runs a *deterministic script to completion*, `repl` is the *interactive* orchestration plane: the client's own agent writes JavaScript that spawns subagents, and workspace state (bindings, pending subagent calls, raised checkpoints, logged values) **persists in the VM between tool calls** — a later `eval` sees the same bindings and awaits the same promises; nothing lives in the transcript. Subagents are ACP sessions run through [`acp-agents`](../acp-agents) — the same backends `workflow` drives — **6 concurrent per workspace**, with dispatches above the cap **queued** for the next free slot (never rejected).
+The interactive model-facing tool is **`repl`**: one persistent **QuickJS-in-WASM JavaScript VM per project**, exposed as a live REPL with **one verb — `eval`** (plus the out-of-band `interrupt`). Where `workflow` runs a *deterministic script to completion*, `repl` is the *interactive* orchestration plane: the client's own agent writes JavaScript that spawns subagents, and workspace state (bindings, pending subagent calls, raised checkpoints, logged values) **persists in the VM between tool calls** — a later `eval` sees the same bindings and awaits the same promises; nothing lives in the transcript. Subagents are ACP sessions run through [`acp-agents`](../acp-agents) — the same backends `workflow` drives — **6 concurrent per workspace**, with dispatches above the cap **queued** for the next free slot (never rejected).
 
 The VM is capability-free: no filesystem, no network, no timers beyond the `sleep(ms)` guest helper. Its entire effect surface is the host bridge — `agent(modelSpec, task, opts?)`, `checkpoint()` / `checkpoint.answer()`, `console`, and the agent-handle methods `steer` / `queue` / `cancel`. Everything else this repo's workflow authors already know — `parallel`, `pipeline`, `verify`, `judgePanel`, `gate`, `retry`, `loopUntilDry` — is pure JavaScript layered on `agent()`, injected as the in-VM guest library. The full guest surface (and the engine internals) live in the engine package, [`@automatalabs/repl-engine`](../repl-engine#the-guest-library-and-the-bridge-phase-b).
 
@@ -777,7 +792,7 @@ interface ReplErrorResult {         // isError: true — a missing project conte
 
 ### The guest API, printing, and checkpoints
 
-`agent(modelSpec, task, opts?)` spawns an ACP subagent on a registry built-in (currently **Claude, Codex, OpenCode, and pi**) or a registered custom agent. The spec is `"backend/model"` — a bare `"backend"` runs its default model — and an unknown backend segment rejects the call **synchronously**, naming the segment and enumerating the known backends (a spec with no known-backend prefix is an error, never a silent route to the default backend). The option keys are `schema` (a structured-output JSON schema, validated per call), `cwd`, `configOptions` (backend-specific knobs, validated at admission — a typo'd key fails in milliseconds naming the valid alternatives), and `mode` — e.g. `agent("pi/deepseek-v4-flash-max", "research X and report the top 3 findings", { cwd: "/repo", mode: "plan" })`. An unknown option key rejects synchronously too. Retain the promise-handle before awaiting it. `steer` is transient active-turn control only; `queue` creates a durable, independently awaitable FIFO turn on the same session; `cancel` targets the current public turn, while a queued handle's `cancel` targets that exact queued turn.
+`agent(modelSpec, task, opts?)` spawns an ACP subagent on a registry built-in (currently **Claude, Codex, OpenCode, and pi**) or a registered custom agent. The spec is `"backend/model"` — a bare `"backend"` runs its default model — and an unknown backend segment rejects the call **synchronously**, naming the segment and enumerating the known backends (a spec with no known-backend prefix is an error, never a silent route to the default backend). The option keys are `schema` (a structured-output JSON schema, validated per call), `cwd`, `configOptions` (backend-specific knobs, validated at admission — a typo'd key fails in milliseconds naming the valid alternatives), and `mode`. Use `mode` only when the selected `workflow` `action:"config"` entry's `modes.availableModes` explicitly lists its exact id; `modes:null` means omit it, and never invent `"default"`. For example: `agent("pi/<advertised-provider>/<advertised-model-id>", "research X and report the top 3 findings", { cwd: "/repo" })`. An unknown option key rejects synchronously too. Retain the promise-handle before awaiting it. `steer` is transient active-turn control only; `queue` creates a durable, independently awaitable FIFO turn on the same session; `cancel` targets the current public turn, while a queued handle's `cancel` targets that exact queued turn.
 
 `checkpoint(question)` parks a promise for a human answer **inside the VM**. The raised checkpoint surfaces as an **output line** — `checkpoint c9: <question>` — and a later eval's `checkpoint.answer("c9", value)` resolves it. No side protocol: the question rides the ordinary output string and the answer rides the ordinary `eval` input.
 
@@ -800,11 +815,9 @@ Workspaces follow the daemon's project model exactly: **one VM per `projectDir`*
 
 ## The `author-workflow` prompt
 
-The server also exposes one [MCP prompt](https://modelcontextprotocol.io/docs/concepts/prompts): **`author-workflow`**. Prompts are a *user-controlled* primitive — prompt-capable hosts surface them for explicit invocation (Claude Code renders it as the `/mcp__<server>__author-workflow` slash command) — so this adds nothing to the model-facing tool list (`workflow` and `repl`) — the prompt registers no tool of its own.
+The server also exposes one [MCP prompt](https://modelcontextprotocol.io/docs/concepts/prompts): **`author-workflow`**. Prompts are a *user-controlled* primitive, so this adds no additional tool.
 
-Invoking it injects the complete, self-contained protocol-native edition of the published `agentprism-workflow-authoring` guide: the authoring guide, exhaustive DSL reference tables, and a complete validated example script, with terminal-only installation and command guidance omitted. It is always version-matched to the engine this server runs. Pass the optional **`task`** argument to have the guide close with "author a workflow that accomplishes: …, then run it with the `workflow` tool".
-
-Hosts without prompt support (Codex CLI, at the time of writing) simply never see it — install the [authoring skill](https://github.com/agentprism/agentprism-workflows/tree/main/skills/agentprism-workflow-authoring) there instead.
+The prompt is intentionally compact: it frames the optional **`task`**, directs the assistant to `docs` topic `workflow/quickstart` and only the related topics needed, then points it at protocol-native config discovery and automatic run validation. It no longer injects the complete optional skill or every API topic into one context window. Hosts without prompt support lose no authoring information because the model-facing `docs` tool carries the complete selective reference.
 
 ---
 
@@ -867,7 +880,7 @@ const run = await runDynamicWorkflow(
 console.log(run.status, run.result);
 ```
 
-This MCP-server package does export its own building blocks, for hosts that want to mount the same tools on a transport they control rather than the default stdio one. `createWorkflowServer(runner)` registers **both** the `workflow` and `repl` tools (plus the app-only `workflow-events` poller and the `author-workflow` prompt); the `repl` workspaces default to a private client-presence ledger and a server-owned eval-break channel, and `CreateWorkflowServerOptions` exposes `replRunner`, `replPresence`, `replClientId`, `replEvalBreakChannel`, and `replDrainBoundMs` to override them (the daemon passes shared instances):
+This MCP-server package does export its own building blocks, for hosts that want to mount the same tools on a transport they control rather than the default stdio one. `createWorkflowServer(runner)` registers the `docs`, `workflow`, and `repl` tools (plus the app-only `workflow-events` poller and the `author-workflow` prompt); the `repl` workspaces default to a private client-presence ledger and a server-owned eval-break channel, and `CreateWorkflowServerOptions` exposes `replRunner`, `replPresence`, `replClientId`, `replEvalBreakChannel`, and `replDrainBoundMs` to override them (the daemon passes shared instances):
 
 ```ts
 import { createWorkflowServer, installMcpServerLifecycle } from "@automatalabs/mcp-server";

@@ -67,7 +67,7 @@ uses the existing agent-error path.
 Read a routed harness's live catalog without sending a prompt:
 
 ```ts
-const { backendId, options } = await runner.probeConfigOptions("codex", {
+const { backendId, modes, options } = await runner.probeConfigOptions("codex", {
   cwd: "/abs/path/to/worktree",
 });
 
@@ -78,7 +78,7 @@ const selected = await runner.probeConfigOptions("pi/openrouter/vendor/model-id"
 ```
 
 `probeConfigOptions()` uses the normal first-segment routing and pool, opens exactly one session,
-returns the advertised `SessionConfigOption[]` shapes verbatim, then closes that session. By
+returns the advertised `SessionConfigOption[]` shapes verbatim plus the effective `modes` catalog, then closes that session. Dedicated ACP modes and the `category:"mode"` config-option fallback normalize to `SessionModeState`; `modes:null` explicitly means unsupported, so callers must omit `mode` rather than infer a generic default. By
 default it reads the session-default catalog without making a model config request. With
 `selectModel: true`, it first sends the routed model remainder verbatim and returns the echoed,
 model-specific catalog; no prompt is sent in either mode. Spawn, authentication, model-selection,

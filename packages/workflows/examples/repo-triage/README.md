@@ -46,7 +46,7 @@ would put a `checkpoint()` before the irreversible step — see the SDK README.)
 | `openWorkflowDir` + `runDynamicWorkflow` (list saved workflows, run one by **name**) | `src/main.ts` |
 | `exec` knobs: `agentTimeoutMs`, `agentRetries`, `onProgress` | `src/main.ts` |
 | Per-call **backend routing** (`model`) with registered prefixes and live-catalog-verified ids sent verbatim | the vendor pool in both scripts |
-| **Read-only session modes** (`mode: "plan"` / `"read-only"`) on pinned calls | the vendor pool in both scripts |
+| **Read-only session modes** copied from each selected model's published catalog snapshot | the vendor pool in both scripts |
 | `pipeline()` (barrier-less multi-stage flow) + `parallel()` (verification panel) | `repo-triage.workflow.js` |
 | Structured output via `schema`, placeholder guards in script code | both scripts |
 | `gate()` produce-until-approved loop and exposed terminal `reportVerdict` | Report stage |
@@ -135,8 +135,9 @@ approval paths. Do this after any script edit.
 - **The vendor pool is yours to edit** (top of each workflow script). The three
   entries are peers; sweeps rotate through the pool and every finding is judged by
   the two vendors that did not produce it, so no agent family gets to approve its own
-  blind spots. `mode` is strict per backend, so it is only set next to a pinned
-  `model` (OpenCode mode ids are config-specific, hence unset there).
+  blind spots. `mode` is strict per backend/model: probe each exact model before reuse,
+  keep a value only when the current `availableModes` explicitly lists it, and omit it
+  when modes are unsupported. Never infer a generic default (OpenCode stays unset here).
 - **Why the scripts don't share code:** a workflow script is one self-contained
   string executed in a deterministic realm — no imports — which is also why the pool
   appears in both scripts.

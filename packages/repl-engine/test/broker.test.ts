@@ -247,9 +247,6 @@ class FakeRunner implements BrokerRunner {
   loadedTurnText: string | null = null;
   /** Open failures to inject (each one rejects openSession once). */
   failNextOpens = 0;
-  /** Diagnostic-open failures to inject (each one rejects an openSession
-   *  WITHOUT configOptions — the [C]5 fallback's reopen — once). */
-  failDiagnosticOpens = 0;
   /** Load failures to inject (each one rejects loadSession once). */
   failNextLoads = 0;
   /** When true, loadSession PARKS (the caller releases it through
@@ -291,6 +288,8 @@ class FakeRunner implements BrokerRunner {
    *  late error names an accepted sibling while omitting the actual
    *  rejected key — the [C]5 message-short-circuit defect. */
   failConfigMessage = 'invalid config option';
+  /** Session mode ids rejected independently of configOptions. */
+  failModes: Set<string> = new Set();
 
   listBackends(): string[] {
     return ['claude', 'codex', 'opencode', 'pi', ...this.extraBackends];
@@ -305,6 +304,9 @@ class FakeRunner implements BrokerRunner {
   }
 
   async openSession(opts: BrokerOpenSessionOptions): Promise<FakeSession> {
+    if (opts.mode !== undefined && this.failModes.has(opts.mode)) {
+      throw new Error(`ACP agent (pi) cannot apply session mode "${opts.mode}" (advertised modes: none)`);
+    }
     if (this.failNextOpens > 0) {
       this.failNextOpens--;
       throw new Error('spawn failed');
@@ -315,10 +317,6 @@ class FakeRunner implements BrokerRunner {
           throw new Error(this.failConfigMessage);
         }
       }
-    }
-    if (opts.configOptions === undefined && this.failDiagnosticOpens > 0) {
-      this.failDiagnosticOpens--;
-      throw new Error('spawn failed');
     }
     const session = new FakeSession(opts);
     session.initializeMeta = this.supportsSteering ? { steering: { supported: true } } : {};
@@ -753,6 +751,19 @@ test('§4.1 admission validation: an unknown backend segment rejects SYNCHRONOUS
   assert.equal(custom.result, undefined);
   await tick();
   assert.equal(runner.sessions.length, 1, 'the custom backend dispatched');
+  await ws.dispose();
+});
+
+test('§4.1 admission validation: reserved configOptions.model rejects synchronously with REPL-native modelSpec guidance', async () => {
+  const { ws, broker, runner } = await setup();
+  const rejected = await broker.eval(
+    'await agent("pi/openai/model", "t", { configOptions: { model: "openai/other" } }).catch(e => e.message)',
+  );
+  assert.equal(
+    rejected.result,
+    'configOptions option "model" with authored value "openai/other" is reserved; use the first modelSpec argument instead',
+  );
+  assert.equal(runner.sessions.length, 0);
   await ws.dispose();
 });
 
@@ -2325,27 +2336,22 @@ test('an active queued turn that ignores cancellation for 5 seconds makes the la
   await ws.dispose();
 });
 
-test('§4.1 [C]5: the late configOptions error names the offending key EVEN WHEN the diagnostic reopen fails', async () => {
+test('§4.1 [C]5: an independently failing diagnostic reopen preserves the original mode error and never blames configOptions', async () => {
   const { ws, broker, runner } = await setup();
-  // Dynamic vocabulary (the seam returns undefined): admitted. The
-  // first open fails with the backend's own vague error (no key named),
-  // AND the diagnostic reopen without configOptions fails too — the
-  // late error must still name the offending key.
-  runner.failConfigKeys = new Set(['thinkinglevel']);
-  runner.failDiagnosticOpens = 1;
+  runner.failModes = new Set(['default']);
   const late = await broker.eval(
-    'const p = await agent("pi/x", "t", { configOptions: { thinkinglevel: "high" } }).catch(e => e.name + ": " + e.message); console.log("got", p); "done"',
+    'const p = await agent("pi/openai/model", "t", { mode: "default", configOptions: { thinkingLevel: "high" } }).catch(e => e.name + ": " + e.message); console.log("got", p); "done"',
   );
   assert.equal(late.result, undefined, 'the late rejection arrives after the eval suspended');
   await tick();
   await broker.pump();
   const probe = await broker.eval('"probe"');
-  const line = output(probe).find((l) => l.startsWith('got ConfigOptionsError'));
+  const line = output(probe).find((l) => l.startsWith('got Error'));
   assert.ok(line !== undefined, output(probe).join('\n'));
-  assert.ok(line.includes('thinkinglevel'), `the late error names the offending key: ${line}`);
-  assert.ok(line.includes('backend pi'), `the late error names the resolved backend: ${line}`);
-  assert.ok(line.includes('invalid config option'), `the original backend error is reported: ${line}`);
-  assert.ok(line.includes('diagnostic open without configOptions failed too'), `the failed diagnostic reopen is reported: ${line}`);
+  assert.ok(line.includes('cannot apply session mode "default" (advertised modes: none)'), line);
+  assert.ok(!line.includes('ConfigOptionsError'), line);
+  assert.ok(!line.includes('offending key'), line);
+  assert.ok(!line.includes('thinkingLevel'), line);
   await ws.dispose();
 });
 

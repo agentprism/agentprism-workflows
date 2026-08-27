@@ -2,7 +2,7 @@
 // direct nondeterministic call expressions) followed by an optional DRY RUN — the script
 // executes for real in the engine's deterministic realm, but every agent() call is served by
 // an in-process mock AgentRunner that fabricates schema-conforming results. Afterward, each
-// routed ACP backend/model pair is opened once without a prompt to read its advertised config options.
+// routed ACP backend/model pair is opened once without a prompt to read its advertised modes and config options.
 // No tokens are spent, a mock live confirm resolves checkpoints to their declared defaults,
 // and run state is journaled nowhere (journaling off + a throwaway persistence root for the run lease).
 //
@@ -30,6 +30,7 @@ import type {
   BackendRegistry,
   CustomBackendConfig,
   SessionConfigOption,
+  SessionModeState,
   ThoughtLevelDomainSemantics,
 } from "@automatalabs/acp-agents";
 import type { WorkflowDir } from "@automatalabs/workflow-engine";
@@ -134,6 +135,8 @@ export interface ValidateHarnessOptions {
   probed: boolean;
   /** Present when probed=false: the harness's spawn/auth/session error. */
   error?: string;
+  /** Effective advertised ACP modes; null means this backend/model supports no session modes. */
+  modes?: SessionModeState | null;
   options?: SessionConfigOption[];
 }
 
@@ -165,7 +168,7 @@ export interface ValidateWorkflowReport {
     phasesVisited: string[];
     logs: string[];
     durationMs: number;
-    /** Fresh, per-run advertised config-option catalogs for every routed backend/model pair. */
+    /** Fresh, per-run advertised mode and config-option catalogs for every routed backend/model pair. */
     harnessOptions?: ValidateHarnessOptions[];
     /** The script's return value, composed from fabricated agent results. */
     result?: unknown;
@@ -808,6 +811,7 @@ function registryOptions(registry: BackendRegistry): Record<string, CustomBacken
 interface ProbeStageResult {
   harnessOptions: ValidateHarnessOptions[];
   catalogs: Map<string, SessionConfigOption[]>;
+  modes: Map<string, SessionModeState | null>;
 }
 
 interface ConfigProbeTarget {
@@ -863,7 +867,8 @@ async function probeHarnessConfigOptions(
   const targets = configProbeTargets(calls, registry, hostRegistry, declared);
   const harnessOptions: ValidateHarnessOptions[] = [];
   const catalogs = new Map<string, SessionConfigOption[]>();
-  if (targets.length === 0) return { harnessOptions, catalogs };
+  const modes = new Map<string, SessionModeState | null>();
+  if (targets.length === 0) return { harnessOptions, catalogs, modes };
 
   let runner: ValidateProbeRunner;
   const ownsRunner = probeRunner === undefined;
@@ -882,7 +887,7 @@ async function probeHarnessConfigOptions(
         error: reason,
       });
     }
-    return { harnessOptions, catalogs };
+    return { harnessOptions, catalogs, modes };
   }
 
   try {
@@ -906,11 +911,13 @@ async function probeHarnessConfigOptions(
           probeTimeoutMs,
         );
         catalogs.set(key, result.options);
+        modes.set(key, result.modes ?? null);
         if (reportHarness) {
           harnessOptions.push({
             backendId: result.backendId,
             ...(target.model === undefined ? {} : { model: target.model }),
             probed: true,
+            modes: result.modes ?? null,
             options: result.options,
           });
         }
@@ -965,7 +972,7 @@ async function probeHarnessConfigOptions(
       }
     }
   }
-  return { harnessOptions, catalogs };
+  return { harnessOptions, catalogs, modes };
 }
 
 function withValidationProbeTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
@@ -1169,6 +1176,30 @@ function attachClientRecognizedDomains(
 
 function errorMessage(error: unknown): string {
   return redactText(error instanceof Error ? error.message : String(error)).value;
+}
+
+function sessionModeErrors(
+  calls: ValidatedAgentCall[],
+  modes: Map<string, SessionModeState | null>,
+  registry: BackendRegistry,
+  hostRegistry: BackendRegistry,
+  declared: Record<string, CustomBackendConfig> | undefined,
+): string[] {
+  const errors: string[] = [];
+  for (const call of calls) {
+    if (call.mode === undefined) continue;
+    const backendId = routeBackend(call.model, call.tier, registry, hostRegistry, declared).backendId;
+    const key = configCatalogKey(backendId, call.model);
+    if (!modes.has(key)) continue;
+    const advertised = modes.get(key)?.availableModes.map((mode) => mode.id) ?? [];
+    if (advertised.includes(call.mode)) continue;
+    errors.push(
+      `agent "${call.label}" mode authored value ${JSON.stringify(call.mode)} is not advertised by ` +
+        `${callModelName(backendId, call.model)}; advertised modes: ${displayAlternatives(advertised)}; ` +
+        "omit mode unless action:\"config\" explicitly lists the exact id",
+    );
+  }
+  return errors;
 }
 
 function configOptionErrors(
@@ -1452,7 +1483,7 @@ export function collapseHarnessOptionsForOutput(
 
 /**
  * Validate a workflow script: parse it, dry-run against a mock AgentRunner, then probe
- * each routed backend/model pair's advertised config options. Never throws for an invalid script —
+ * each routed backend/model pair's advertised modes and config options. Never throws for an invalid script —
  * read `report.ok` / `report.exitCode`.
  */
 export async function validateWorkflowScript(
@@ -1703,12 +1734,20 @@ export async function validateWorkflowScript(
       declaredBackends,
       warnings,
     );
-    const ok = runOk && optionErrors.length === 0;
+    const modeErrors = sessionModeErrors(
+      agentCalls,
+      probed.modes,
+      backendRegistry,
+      hostRegistry,
+      declaredBackends,
+    );
+    const configurationErrors = [...modeErrors, ...optionErrors];
+    const ok = runOk && configurationErrors.length === 0;
     const runReason = timedOut ? `dry run exceeded ${timeoutMs}ms and was aborted` : run.reason;
     const reason =
-      optionErrors.length === 0
+      configurationErrors.length === 0
         ? runReason
-        : [runReason, "configOptions validation failed:", ...optionErrors.map((error) => `- ${error}`)]
+        : [runReason, "agent configuration validation failed:", ...configurationErrors.map((error) => `- ${error}`)]
             .filter(Boolean)
             .join("\n");
 
@@ -1770,6 +1809,18 @@ export function renderHarnessOptionLines(
       continue;
     }
     lines.push(`${indent}${target}:`);
+    const modes = harness.modes;
+    if (modes === null) {
+      lines.push(`${indent}  modes: (none advertised — omit mode)`);
+    } else if (modes === undefined) {
+      lines.push(`${indent}  modes: (catalog unavailable — omit mode)`);
+    } else {
+      lines.push(
+        `${indent}  modes: current ${displayValue(modes.currentModeId)} | advertised ` +
+          displayAlternatives(modes.availableModes.map((mode) => mode.id)),
+      );
+    }
+    lines.push(`${indent}  config options:`);
     lines.push(`${indent}  id | type | current | choices`);
     if ((harness.options ?? []).length === 0) {
       lines.push(`${indent}  (none advertised)`);
@@ -1814,7 +1865,7 @@ export function formatValidateReport(report: ValidateWorkflowReport): string {
         .join("  ");
       lines.push(`    • ${call.label}  ${bits}`);
     }
-    lines.push("    advertised config options:");
+    lines.push("    advertised modes and config options:");
     lines.push(...renderHarnessOptionLines(dry.harnessOptions ?? [], "      "));
     if ((dry.harnessOptions ?? []).length === 0) lines.push("      (no routed harnesses)");
     for (const cp of dry.checkpoints) {

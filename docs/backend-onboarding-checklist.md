@@ -34,9 +34,7 @@ reason; topology, absent custom auth, or similarity to another backend never mak
 - [ ] Link updates or a `not applicable` rationale for user/API/README examples, environment
   variables, package exports, changelogs, and `CONTRIBUTING.md`'s `When the dependency gate blocks`
   runbook. Link compatibility re-export shims for relocated public symbols.
-- [ ] Link relevant source updates under `skills/agentprism-workflow-authoring/*.md`, including
-  routing/model/configuration tables. Record `node scripts/generate-authoring-prompt.mjs` plus the
-  generated-prompt drift and routing-sentinel results, and link the committed generated artifact.
+- [ ] Link relevant canonical MCP topic updates under `docs/authoring/`, including routing/model/configuration tables. Record `node scripts/generate-authoring-docs.mjs`, the generated-docs drift/API-vocabulary results, and the committed generated artifact. Update the optional `skills/agentprism-workflow-authoring/` guide when the same change affects non-MCP authors.
 - [ ] Link the `packages/mcp-server/src/server.ts` tool/backend description update.
 
 ## Live, release, and gate evidence

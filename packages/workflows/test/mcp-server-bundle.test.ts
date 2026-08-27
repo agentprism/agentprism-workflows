@@ -50,7 +50,7 @@ function request(id: number, method: string, params?: unknown): string {
   return `${JSON.stringify({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) })}\n`;
 }
 
-test("the bundled stdio server initializes once and advertises the workflow tool", { timeout: 30_000 }, async () => {
+test("the bundled stdio server initializes once and advertises docs/workflow/repl", { timeout: 30_000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "automatalabs-workflows-mcp-bundle-"));
   const child = spawn(process.execPath, [MCP_BUNDLE], {
     cwd: REPOSITORY_ROOT,
@@ -161,7 +161,9 @@ test("the bundled stdio server initializes once and advertises the workflow tool
     assert.equal(initializeResult.serverInfo?.version, MCP_PACKAGE.version);
 
     const toolsResult = toolsList.result as { tools?: Array<{ name?: unknown }> };
-    assert.ok(toolsResult.tools?.some((tool) => tool.name === "workflow"), "workflow tool was not advertised");
+    for (const name of ["docs", "workflow", "repl"]) {
+      assert.ok(toolsResult.tools?.some((tool) => tool.name === name), `${name} tool was not advertised`);
+    }
     // The workflow tool registers per-session in oninitialized (capability negotiation), so the
     // SDK legitimately emits notifications/tools/list_changed after initialize. Responses must
     // still be exactly one initialize and one tools/list — a double-started server would answer

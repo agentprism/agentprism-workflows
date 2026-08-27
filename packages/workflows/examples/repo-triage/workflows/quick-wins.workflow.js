@@ -24,7 +24,8 @@ const focus =
     : "small, safe, high-confidence improvements";
 const avoid = Array.isArray(opt.avoid) ? opt.avoid.filter((x) => typeof x === "string") : [];
 
-// These registered-prefix specs use ids verified against each live harness catalog.
+// Published catalog snapshot. Before reuse, probe each exact model's current catalog;
+// keep a mode only when availableModes explicitly lists it, otherwise omit it.
 const POOL = [
   { name: "claude", model: "claude/opus[1m]", mode: "plan" },
   { name: "codex", model: "codex/gpt-5.6-sol", mode: "read-only" },

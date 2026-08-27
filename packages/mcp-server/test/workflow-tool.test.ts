@@ -126,12 +126,12 @@ test("tool registration: one `workflow` tool advertises config plus the run life
   const { client, dispose } = await connect(okRunner(), { listTools: true });
   try {
     const { tools } = await client.listTools();
-    // The model-facing surface is `workflow` plus `repl` (the phase-D persistent
-    // workspace tool) plus the app-only `workflow-events` poller (visibility
+    // The model-facing surface is selective `docs`, `workflow`, and `repl` (the persistent
+    // workspace tool), plus the app-only `workflow-events` poller (visibility
     // ["app"] — Apps hosts keep it out of the model's tool loop; see app-ui.ts).
     assert.deepEqual(
       tools.map((candidate) => candidate.name).sort(),
-      ["repl", "workflow", "workflow-events"],
+      ["docs", "repl", "workflow", "workflow-events"],
     );
     const tool = tools.find((candidate) => candidate.name === "workflow");
     assert.ok(tool, "the workflow tool is registered");
@@ -234,6 +234,13 @@ test("action=config discovers the live runner catalog without creating or execut
         const backendId = spec?.split("/", 1)[0] || "claude";
         return {
           backendId,
+          modes: {
+            currentModeId: "default",
+            availableModes: [
+              { id: "default", name: "Default" },
+              { id: "plan", name: "Plan" },
+            ],
+          },
           options: [
             {
               id: "model",
@@ -267,11 +274,17 @@ test("action=config discovers the live runner catalog without creating or execut
     assert.equal(output?.action, "config");
     assert.equal(output?.ok, true);
     assert.equal((output?.harnessOptions as unknown[]).length, 1);
+    const discoveredHarness = (output?.harnessOptions as Array<Record<string, unknown>>)[0];
+    assert.deepEqual(
+      ((discoveredHarness?.modes as { availableModes: Array<{ id: string }> }).availableModes).map((mode) => mode.id),
+      ["default", "plan"],
+    );
     const models = output?.models as Array<Record<string, unknown>>;
     assert.deepEqual(models[0]?.matches, ["sonnet"]);
     assert.equal(agentRuns, 0, "config never calls AgentRunner.run");
     assert.equal(field(output, "runId"), undefined, "config creates no run ID");
     assert.match(textOf(result), /no workflow was started/);
+    assert.match(textOf(result), /modes: current "default" \| advertised "default", "plan"/);
 
     const selected = await client.callTool({
       name: "workflow",
@@ -830,6 +843,92 @@ test("automatic routed config validation rejects unknown options before the live
     assert.equal(realCalls, 0);
     assert.match(textOf(result), /invented/);
     assert.match(textOf(result), /advertised alternatives: option ids "fast"/);
+  } finally {
+    await dispose();
+  }
+});
+
+test("automatic mode validation rejects a guessed default when the selected backend advertises no modes", async () => {
+  let realCalls = 0;
+  let probes = 0;
+  const runner = Object.assign(
+    makeRunner(() => {
+      realCalls += 1;
+      return "real";
+    }),
+    {
+      listBackends: () => ["pi"],
+      defaultBackendId: () => "pi",
+      async probeConfigOptions() {
+        probes += 1;
+        return {
+          backendId: "pi",
+          modes: null,
+          options: [{ id: "thinkingLevel", name: "Thinking", type: "select" as const, currentValue: "high", options: [{ value: "high", name: "High" }] }],
+        };
+      },
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const discovered = await client.callTool({
+      name: "workflow",
+      arguments: { action: "config", harnesses: ["pi"] },
+    });
+    const piHarness = (structured(discovered)?.harnessOptions as Array<Record<string, unknown>>)[0];
+    assert.equal(piHarness?.modes, null, "config makes no-mode support explicit rather than omitting it");
+    assert.match(textOf(discovered), /modes: \(none advertised — omit mode\)/);
+    probes = 0;
+
+    const result = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: [
+          'export const meta = { name: "bad-mode", description: "must not admit" };',
+          'return agent("work", { label: "pi-call", model: "pi/openai/model", mode: "default", configOptions: { thinkingLevel: "high" } });',
+        ].join("\n"),
+      },
+    });
+    assert.equal(result.isError, true);
+    assert.equal(structured(result)?.status, "rejected");
+    assert.equal(probes, 1);
+    assert.equal(realCalls, 0);
+    assert.match(textOf(result), /mode authored value "default" is not advertised/);
+    assert.match(textOf(result), /advertised modes: \(none advertised\)/);
+    assert.doesNotMatch(textOf(result), /thinkingLevel.*unknown|offending key/);
+  } finally {
+    await dispose();
+  }
+});
+
+test("unknown workflow agent option keys reject before config probing or admission", async () => {
+  let realCalls = 0;
+  let probes = 0;
+  const runner = Object.assign(makeRunner(() => {
+    realCalls += 1;
+    return "real";
+  }), {
+    async probeConfigOptions() {
+      probes += 1;
+      return { backendId: "claude", modes: null, options: [] };
+    },
+  });
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const result = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: [
+          'export const meta = { name: "foreign-options", description: "must not admit" };',
+          'return agent("work", { label: "pi-call", backend: "pi", model: "openai/model", config: { thinkingLevel: "high" } });',
+        ].join("\n"),
+      },
+    });
+    assert.equal(result.isError, true);
+    assert.equal(structured(result)?.status, "rejected");
+    assert.equal(probes, 0);
+    assert.equal(realCalls, 0);
+    assert.match(textOf(result), /agent "pi-call" options contain unknown keys "backend", "config"/);
   } finally {
     await dispose();
   }

@@ -207,7 +207,7 @@ test("validate probes each distinct routed backend/model pair and surfaces catal
     assert.deepEqual(report.dryRun?.harnessOptions?.[0].options, ADVERTISED_OPTIONS);
     assert.equal(report.dryRun?.agentCalls[0].configOptions, undefined);
     const human = formatValidateReport(report);
-    assert.match(human, /advertised config options:/);
+    assert.match(human, /advertised modes and config options:/);
     assert.match(human, /reasoning_effort \| select \| "medium" \| "low", "high"/);
     assert.match(JSON.stringify(report), /reasoning_effort/);
   } finally {
@@ -215,6 +215,57 @@ test("validate probes each distinct routed backend/model pair and surfaces catal
     if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
     else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
   }
+});
+
+test("session mode validation rejects unadvertised ids and preserves an explicit no-modes catalog", async () => {
+  const probeRunner = {
+    async probeConfigOptions() {
+      return { backendId: "pi", options: ADVERTISED_OPTIONS, modes: null };
+    },
+  };
+  const report = await validateWorkflowScript(
+    [
+      'export const meta = { name: "bad-mode", description: "d" };',
+      'return agent("x", { label: "pi-call", model: "pi/openai/model", mode: "default", configOptions: { fast_mode: true } });',
+    ].join("\n"),
+    { probeRunner },
+  );
+
+  assert.equal(report.ok, false);
+  assert.equal(report.exitCode, 2);
+  assert.equal(report.dryRun?.harnessOptions?.[0]?.modes, null);
+  const reason = report.dryRun?.reason ?? "";
+  assert.match(reason, /agent "pi-call" mode authored value "default" is not advertised/);
+  assert.match(reason, /advertised modes: \(none advertised\)/);
+  assert.match(reason, /omit mode unless action:"config" explicitly lists the exact id/);
+  assert.doesNotMatch(reason, /offending key|fast_mode.*unknown/);
+  assert.match(formatValidateReport(report), /modes: \(none advertised — omit mode\)/);
+});
+
+test("session mode validation accepts only an explicitly advertised exact id", async () => {
+  const probeRunner = {
+    async probeConfigOptions() {
+      return {
+        backendId: "claude",
+        options: ADVERTISED_OPTIONS,
+        modes: {
+          currentModeId: "default",
+          availableModes: [
+            { id: "default", name: "Default" },
+            { id: "plan", name: "Plan" },
+          ],
+        },
+      };
+    },
+  };
+  const report = await validateWorkflowScript(
+    'export const meta = { name: "mode", description: "d" }; return agent("x", { label: "plan", model: "claude/opus", mode: "plan" });',
+    { probeRunner },
+  );
+
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.dryRun?.harnessOptions?.[0]?.modes?.availableModes.map((mode) => mode.id), ["default", "plan"]);
+  assert.match(formatValidateReport(report), /modes: current "default" \| advertised "default", "plan"/);
 });
 
 test("config-option error classes make validation INVALID with labels, values, and alternatives", async () => {
@@ -704,6 +755,30 @@ test("missing meta fails the static parse", async () => {
   const report = await validateWorkflowScript('return await agent("x");');
   assert.equal(report.exitCode, 1);
   assert.equal(report.parse.ok, false);
+});
+
+test("foreign workflow agent option dialects reject before probing or runner execution", async () => {
+  let probes = 0;
+  const report = await validateWorkflowScript(
+    [
+      'export const meta = { name: "foreign", description: "d" };',
+      'return agent("x", { label: "pi-call", backend: "pi", model: "openai/model", config: { thinkingLevel: "high" } });',
+    ].join("\n"),
+    {
+      probeRunner: {
+        async probeConfigOptions() {
+          probes++;
+          return { backendId: "claude", options: ADVERTISED_OPTIONS, modes: null };
+        },
+      },
+    },
+  );
+
+  assert.equal(report.ok, false);
+  assert.equal(report.exitCode, 2);
+  assert.equal(probes, 0);
+  assert.match(report.dryRun?.reason ?? "", /agent "pi-call" options contain unknown keys "backend", "config"/);
+  assert.equal(report.dryRun?.agentCalls.length, 0);
 });
 
 test("runtime script bugs surface as dry-run failures (exit 2) with the engine's message", async () => {

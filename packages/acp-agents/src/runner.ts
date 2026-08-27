@@ -43,6 +43,7 @@ import type {
   SetProviderRequest,
   SetProviderResponse,
   SessionConfigOption,
+  SessionModeState,
   StopReason,
 } from "@agentclientprotocol/sdk";
 import type { TSchema } from "typebox";
@@ -154,6 +155,8 @@ export interface ProbedConfigOptions {
   backendId: string;
   /** The agent-advertised options, verbatim ACP shapes (id, name, type, currentValue, choices). */
   options: SessionConfigOption[];
+  /** Effective ACP mode catalog after normalizing the mode config-option fallback; null means unsupported. AcpAgentRunner always returns this field. */
+  modes?: SessionModeState | null;
 }
 
 export interface ProbeConfigOptionsOptions {
@@ -497,6 +500,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       return {
         backendId: prepared.backend.id,
         options: session.advertisedConfigOptions,
+        modes: session.modes ?? null,
       };
     } finally {
       try {

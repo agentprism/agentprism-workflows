@@ -33,7 +33,7 @@ test("workflow carries the panel resource in _meta.ui; workflow-events is app-on
     const { tools } = await client.listTools();
     assert.deepEqual(
       tools.map((tool) => tool.name).sort(),
-      ["repl", "workflow", WORKFLOW_EVENTS_TOOL_NAME],
+      ["docs", "repl", "workflow", WORKFLOW_EVENTS_TOOL_NAME],
     );
 
     const workflow = tools.find((tool) => tool.name === "workflow");
@@ -80,7 +80,7 @@ test("absent and nonmatching UI capabilities receive only the identical text wor
 
     for (const session of [absent, nonmatching]) {
       const tools = (await session.client.listTools()).tools;
-      assert.deepEqual(tools.map((tool) => tool.name).sort(), ["repl", "workflow"]);
+      assert.deepEqual(tools.map((tool) => tool.name).sort(), ["docs", "repl", "workflow"]);
       const workflow = tools.find((tool) => tool.name === "workflow");
       assert.ok(workflow);
       assert.equal(workflow._meta, undefined, "text workflow has no UI metadata");

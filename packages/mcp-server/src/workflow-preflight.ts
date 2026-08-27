@@ -269,6 +269,7 @@ function projectHarnessOptions(harnesses: readonly unknown[]): {
       model?: string;
       probed: boolean;
       error?: string;
+      modes?: unknown;
       options?: unknown[];
     };
     const options = harness.options ?? [];
@@ -277,6 +278,7 @@ function projectHarnessOptions(harnesses: readonly unknown[]): {
       model: harness.model,
       probed: harness.probed,
       error: harness.error,
+      modes: harness.modes,
       options: options.slice(0, MAX_OPTIONS_PER_HARNESS),
       omittedOptions: Math.max(0, options.length - MAX_OPTIONS_PER_HARNESS),
     }) as Record<string, unknown>;

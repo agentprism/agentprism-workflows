@@ -176,7 +176,15 @@ test("the full MCP feature surface works through the shim: prompts, resources, e
   assert.ok(prompts.prompts.some((prompt) => prompt.name === "author-workflow"));
   const prompt = await session.client.getPrompt({ name: "author-workflow", arguments: {} });
   const promptText = prompt.messages.map((m) => (m.content.type === "text" ? m.content.text : "")).join("");
-  assert.ok(promptText.length > 10_000, "the authoring guide should be inlined through the shim");
+  assert.ok(promptText.length < 2_000, "the prompt should point to selective docs through the shim");
+  assert.match(promptText, /docs.*workflow\/quickstart/);
+
+  const docs = await session.client.callTool({ name: "docs", arguments: { topic: "workflow/quickstart" } });
+  const embeddedDoc = docs.content.find((block) => block.type === "resource");
+  assert.ok(embeddedDoc && embeddedDoc.type === "resource" && "text" in embeddedDoc.resource);
+  const directDoc = await session.client.readResource({ uri: embeddedDoc.resource.uri });
+  assert.ok("text" in directDoc.contents[0]!);
+  assert.equal(directDoc.contents[0]!.text, embeddedDoc.resource.text);
 
   // Elicitation: a foreground checkpoint answered by THIS client through the pump.
   const checkpointScript = [

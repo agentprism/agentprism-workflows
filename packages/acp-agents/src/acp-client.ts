@@ -1341,6 +1341,15 @@ function modeStateFromConfigOption(option: ModelSelectOption, currentModeId: str
   };
 }
 
+function advertisedModeState(
+  modes: SessionModeState | null | undefined,
+  configOptions: readonly SessionConfigOption[],
+): SessionModeState | null | undefined {
+  if (modes) return modes;
+  const option = configOptions.find(isModeConfigOption);
+  return option ? modeStateFromConfigOption(option, option.currentValue) : modes;
+}
+
 function modeSelectionError(
   backendId: BackendId,
   requested: string,
@@ -2729,9 +2738,9 @@ export class SessionHandle implements StructuredSource {
     return this.state.textChunks.join("");
   }
 
-  /** Agent-advertised session mode catalog plus the currently active mode, if supported. */
+  /** Effective agent-advertised mode catalog, including ACP's mode config-option fallback. */
   get modes(): SessionModeState | null | undefined {
-    return this.state.modes;
+    return advertisedModeState(this.state.modes, this.configOptions);
   }
 
   /** The connection-level initialize response parsed before this session was opened. */

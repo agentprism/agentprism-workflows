@@ -71,6 +71,26 @@ afterEach(async () => {
   await harness.cleanup();
 });
 
+test("probeConfigOptions returns the dedicated ACP mode catalog without prompting", async () => {
+  const { cwd, readLog } = configure({ modes: MODES });
+  const probed = await makeRunner().probeConfigOptions("claude", { cwd });
+
+  assert.deepEqual(probed.modes, MODES);
+  assert.equal(readLog().some((entry) => entry.method === "prompt"), false);
+});
+
+test("probeConfigOptions normalizes the mode config-option fallback and reports unsupported modes explicitly", async () => {
+  const supported = configure({ configOptions: MODE_CONFIG_OPTIONS });
+  const fallback = await makeRunner().probeConfigOptions("claude", { cwd: supported.cwd });
+  assert.equal(fallback.modes?.currentModeId, "build");
+  assert.deepEqual(fallback.modes?.availableModes.map((mode) => mode.id), ["build", "plan"]);
+
+  await harness.cleanup();
+  const unsupported = configure({ configOptions: [] });
+  const absent = await makeRunner().probeConfigOptions("claude", { cwd: unsupported.cwd });
+  assert.equal(absent.modes, null);
+});
+
 test("openSession({ mode }) drives session/set_mode before any prompt and exposes updated modes", async () => {
   const { cwd, readLog } = configure({ modes: MODES, turns: [{ text: "ok" }] });
   const runner = makeRunner();

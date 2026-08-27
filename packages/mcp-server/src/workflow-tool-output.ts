@@ -324,11 +324,24 @@ const waitSchema = z.object({
 });
 
 const diagnosticRecordSchema = z.record(z.string(), z.unknown());
+const sessionModeStateSchema = z.object({
+  currentModeId: z.string(),
+  availableModes: z.array(z.object({
+    id: z.string(),
+    name: z.string(),
+    description: z.string().optional(),
+    _meta: z.record(z.string(), z.unknown()).nullable().optional(),
+  })),
+  _meta: z.record(z.string(), z.unknown()).nullable().optional(),
+});
 const harnessDiagnosticSchema = z.object({
   backendId: z.string(),
   model: z.string().optional(),
   probed: z.boolean(),
   error: z.string().optional(),
+  modes: sessionModeStateSchema.nullable().optional().describe(
+    "Present on every probed:true row. Exact advertised mode domain; null means unsupported, so omit mode.",
+  ),
   options: z.array(z.unknown()),
   omittedOptions: z.number().int().nonnegative(),
 });

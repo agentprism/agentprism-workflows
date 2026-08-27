@@ -94,12 +94,12 @@ test("human and --json reports both surface the freshly probed harness catalog",
   assert.equal(json.status, 0, json.stderr);
   const report = JSON.parse(json.stdout);
   assert.deepEqual(report.dryRun.harnessOptions, [
-    { backendId: "claude", probed: true, options: [] },
+    { backendId: "claude", probed: true, modes: null, options: [] },
   ]);
 
   const human = runCli([SIMPLE]);
   assert.equal(human.status, 0, human.stderr);
-  assert.match(human.stdout, /advertised config options:/);
+  assert.match(human.stdout, /advertised modes and config options:/);
   assert.match(human.stdout, /claude:/);
   assert.match(human.stdout, /\(none advertised\)/);
 });

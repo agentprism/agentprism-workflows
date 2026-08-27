@@ -2,8 +2,9 @@
 // (see ./cli.ts), validate's sibling. Where validate probes only the harnesses a script
 // routes to, this probes any requested (or every routable) harness WITHOUT a script:
 // one no-prompt ACP session per harness, returning the agent-advertised session
-// config-option catalog verbatim — model ids (including bracket variants), effort
-// levels, modes, and every other negotiable option. Zero tokens. Authoring flows run
+// config-option catalog plus the effective ACP session-mode catalog — model ids
+// (including bracket variants), effort levels, modes, and every other negotiable option.
+// Zero tokens. Authoring flows run
 // this FIRST so `model` / `configOptions` values come from the live catalog, not memory.
 
 import { redactText } from "@automatalabs/workflow-engine";
@@ -97,6 +98,7 @@ export async function probeHarnessConfig(
           backendId: result.backendId,
           ...(target.selectModel ? { model: target.spec } : {}),
           probed: true,
+          modes: result.modes ?? null,
           options: result.options,
         });
       } catch (error) {
@@ -124,7 +126,7 @@ export async function probeHarnessConfig(
 
 /** Render a HarnessConfigReport as the human-readable CLI output (validate's table format). */
 export function formatHarnessConfigReport(report: HarnessConfigReport): string {
-  const lines: string[] = ["advertised config options:"];
+  const lines: string[] = ["advertised modes and config options:"];
   if (report.harnessOptions.length === 0) {
     lines.push("  (no harnesses requested)");
   } else {

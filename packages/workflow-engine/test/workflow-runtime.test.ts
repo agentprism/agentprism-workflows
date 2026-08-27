@@ -159,6 +159,36 @@ return agent('x', { label: 'reserved-call', configOptions: { model: 'shadow-mode
   assert.equal(calls, 0);
 });
 
+test("agent() rejects unknown option keys before allocation or runner invocation", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'foreign_options', description: 'reject foreign option dialects' }
+return agent('x', { label: 'pi-call', backend: 'pi', model: 'openai/model', config: { thinkingLevel: 'high' } })`,
+        {
+          agent: {
+            async run() {
+              calls++;
+              return "must not run";
+            },
+          },
+          persistLogs: false,
+        },
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+      assert.equal(error.recoverable, false);
+      assert.equal(error.agentLabel, "pi-call");
+      assert.match(error.message, /agent "pi-call" options contain unknown keys "backend", "config"/);
+      assert.match(error.message, /valid keys: label, phase, schema, model, mode, configOptions/);
+      return true;
+    },
+  );
+  assert.equal(calls, 0);
+});
+
 test("runWorkflow retries recoverable empty output then succeeds", async () => {
   let calls = 0;
   const journal: JournalEntry[] = [];

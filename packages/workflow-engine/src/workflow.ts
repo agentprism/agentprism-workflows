@@ -289,6 +289,28 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   ) => void;
 }
 
+const AGENT_OPTION_KEYS = [
+  "label",
+  "phase",
+  "schema",
+  "model",
+  "mode",
+  "configOptions",
+  "tier",
+  "isolation",
+  "resume",
+  "agentType",
+  "timeoutMs",
+  "retries",
+  "cwd",
+  "mcpServers",
+  "images",
+  "meta",
+  "promptMeta",
+  "keepSession",
+] as const;
+const AGENT_OPTION_KEY_SET = new Set<string>(AGENT_OPTION_KEYS);
+
 export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema | undefined> {
   label?: string;
   phase?: string;
@@ -965,6 +987,7 @@ export async function runWorkflow<T = unknown>(
     agentOptions: AgentOptions,
     onAllocated: (callIndex: number) => void,
   ): Promise<unknown> => {
+    validateAgentOptions(agentOptions, realmObjectPrototype);
     const resumeDeclared = validateResumeDeclaration(agentOptions, realmObjectPrototype);
     throwIfAborted();
 
@@ -3185,6 +3208,46 @@ export function hashCheckpointInputs(options: CheckpointOptions): string | undef
     ...(headless !== undefined ? { headless } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
   });
+}
+
+function validateAgentOptions(
+  options: AgentOptions,
+  realmObjectPrototype: object | undefined,
+): void {
+  try {
+    // The public bridge supplies script-realm objects while engine-owned helpers and
+    // the omitted-options default use host-realm objects. Accept exactly those plain
+    // prototypes (plus null), so inherited foreign option dialects cannot be ignored.
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      throw new Error("not an object");
+    }
+    const prototype = Reflect.getPrototypeOf(options);
+    if (prototype !== null && prototype !== Object.prototype && prototype !== realmObjectPrototype) {
+      throw new Error("wrong prototype");
+    }
+    const unknown = Reflect.ownKeys(options).filter(
+      (key): boolean => typeof key !== "string" || !AGENT_OPTION_KEY_SET.has(key),
+    );
+    if (unknown.length === 0) return;
+    const labelDescriptor = Reflect.getOwnPropertyDescriptor(options, "label");
+    const label = labelDescriptor && "value" in labelDescriptor && typeof labelDescriptor.value === "string"
+      ? labelDescriptor.value.trim()
+      : "";
+    const rendered = unknown.map((key) => typeof key === "symbol" ? key.toString() : JSON.stringify(key)).join(", ");
+    throw new WorkflowError(
+      `agent${label ? ` ${JSON.stringify(label)}` : ""} options contain unknown ${unknown.length === 1 ? "key" : "keys"} ${rendered}; ` +
+        `valid keys: ${AGENT_OPTION_KEYS.join(", ")}`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false, ...(label ? { agentLabel: label } : {}) },
+    );
+  } catch (error) {
+    if (error instanceof WorkflowError) throw error;
+    throw new WorkflowError(
+      "agent options must be a plain object with only documented keys",
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
 }
 
 function validateResumeDeclaration(
