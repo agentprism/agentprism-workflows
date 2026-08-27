@@ -1349,7 +1349,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         await expect(promptPromise).resolves.toMatchObject({stopReason: "cancelled"});
     });
 
-    it('returns success when a cancelled ACP prompt request completes before interruption wins', async () => {
+    it('returns cancelled when completion races with an already cancelled ACP prompt request', async () => {
         const { mockFixture, sessionState } = setupPromptFixture();
         const turnCompleted = deferred<TurnCompletedNotification>();
         vi.spyOn(mockFixture.getCodexAppServerClient(), "awaitTurnCompleted")
@@ -1389,7 +1389,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             threadId: "session-id",
             turn: createTurn("turn-id", "completed"),
         });
-        await expect(promptPromise).resolves.toMatchObject({stopReason: "end_turn"});
+        await expect(promptPromise).resolves.toMatchObject({stopReason: "cancelled"});
         expect(mockFixture.getAcpConnectionDump([])).toContain("tail output");
         turnInterrupt.resolve(undefined);
     });
