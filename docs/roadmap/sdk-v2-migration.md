@@ -1,6 +1,6 @@
 # MCP TypeScript SDK v2 migration — staged path
 
-**Status:** Stage 0 implemented and verified (release pending); Stages A–C remain gated and unstarted · **Updated:** 2026-08-27
+**Status:** Stage 0 released and post-release Apps negotiation audited; Stages A–C remain gated and unstarted · **Updated:** 2026-08-27
 
 **Provenance.** Owner directives: (2026-08-07) "I don't consider us to be spec conformant if
 we're behind on the mcp sdk version. We need a path to upgrade to the latest one"; (2026-08-27)
@@ -8,22 +8,23 @@ update the MCP libraries first, preserving backward compatibility through the of
 path, before auditing MCP Apps negotiation. Every factual claim below comes from a primary-source
 research pass on 2026-08-07 (typescript-sdk repo at the 2.0.0 release commit, npm registry,
 ext-apps repo, MCP Inspector source) or from
-direct inspection of this repo at main `4346f87`. Facts may drift — re-verify the §4 gates
+direct inspection of this repo at main `b40e260f`. Facts may drift — re-verify the §4 gates
 before starting any stage.
 
 ## 1. Ground truth (2026-08-07)
 
-- `@modelcontextprotocol/sdk` (v1 line): we pin **1.29.0**; npm latest of the line is
-  **1.30.0** (2026-07-27 — SSE keep-alive comment frames, keep-alive timer lifecycle fix,
+- `@modelcontextprotocol/sdk` (v1 line): Stage 0 released **1.30.0**, which remains npm latest
+  on that line (2026-07-27 — SSE keep-alive comment frames, keep-alive timer lifecycle fix,
   content-type validation, stdio buffer cap). v1 receives fixes ≥ 6 months post-v2.
 - **SDK v2** = new scoped packages (`@modelcontextprotocol/server`, `/client`, `/core`,
   `/node`, `/express`, `/fastify`, `/hono`, `/server-legacy`, `/codemod`), all **2.0.0**
   (2026-07-27), implementing spec revision 2026-07-28 ("Stateless MCP"). Declared the stable
   line. Zero patch releases in the first 11 days; fixes accumulating on main (see §4).
 - **Two independent moves, by design**: migrating packages to v2 does NOT change the wire —
-  "Nothing in v2 puts a 2026-07-28 byte on the wire by default" (migration docs). Published
-  v1 and v2 ship the same supported-version list; **2025-11-25 is the negotiated ceiling on
-  both lines today**. Being on 1.x is currency-behind, not protocol-nonconformant.
+  "Nothing in v2 puts a 2026-07-28 byte on the wire by default" (migration docs). The v1 and
+  v2 legacy paths share the same supported-version list; **2025-11-25 is their default negotiated
+  ceiling**, while v2's modern era requires explicit opt-in. Being on 1.x is currency-behind,
+  not protocol-nonconformant.
 - **Stateful parity retained**: v2 keeps the sessionful 2025-era model as a supported
   pattern — our exact architecture (one server + `StreamableHTTPServerTransport` per MCP
   session) survives as `NodeStreamableHTTPServerTransport` from `@modelcontextprotocol/node`
@@ -71,7 +72,35 @@ not run while another workstream is editing the same files (§5).
 - Acceptance: full gates green; no behavior change beyond the SDK minor's own.
 - Implementation: MCP SDK `1.30.0`, MCP Apps `1.7.5`, a workspace Zod floor of
   `^4.2.0`, and wrapped Claude Agent SDK `0.3.248`; package typechecks plus the MCP server,
-  ACP runner, Pi ACP, and Codex ACP suites pass.
+  ACP runner, Pi ACP, and Codex ACP suites pass. Published from release PR #400 as
+  `@automatalabs/mcp-server@0.33.2` and its coordinated dependency set.
+
+### Post-Stage 0 — MCP Apps negotiation audit (completed 2026-08-27)
+
+- **Legacy check confirmed:** ext-apps `1.7.5` and its stable 2026-01-26 Apps specification
+  direct servers to call `getUiCapability(server.getClientCapabilities())`, then require
+  `mimeTypes` to contain the exact `RESOURCE_MIME_TYPE` value
+  (`text/html;profile=mcp-app`). That is the path used by this server.
+- **The former SDK bug is closed:** TypeScript SDK versions before the fix stripped
+  `capabilities.extensions` while parsing initialize (ext-apps#521). SDK `1.30.0` includes
+  `extensions` in both client/server capability schemas. The in-memory integration test crosses
+  the real SDK Client/Server initialize exchange and proves the value reaches the helper.
+- **No `experimental` fallback:** ext-apps#231 explicitly retained `extensions`; an
+  `experimental` lookalike is not affirmative Apps support. Missing, nonmatching, malformed, and
+  experimental-only declarations all receive the identical text-only workflow surface.
+- **Runtime shape is validated:** `getUiCapability` locates and casts the extension settings but
+  does not parse them. The server additionally requires `mimeTypes` to be an actual array before
+  exact membership testing, preventing a malformed string from enabling UI.
+- **Do not conflate protocol eras:** this v1 server advertises its extension support in the legacy
+  initialize response and activates the Apps surface only from the client's initialize capabilities.
+  The modern 2026-07-28 protocol instead advertises server extensions through `server/discover` and
+  supplies client capabilities per request in
+  `_meta["io.modelcontextprotocol/clientCapabilities"]`. Modern discovery/per-request handling
+  belongs to Stage C; no speculative dual-path inference is added here.
+- **Graceful fallback retained:** the base `workflow` tool is registered before initialization.
+  Only an affirmatively capable client receives its UI metadata, `workflow-events`, and the
+  `ui://` resource; every other client receives the same input/output schemas and text/structured
+  results without an Apps surface.
 
 ### Stage A — shim first (client-only surface)
 - Migrate `packages/mcp-server/src/shim/*` (SDK `Client` + `StreamableHTTPClientTransport`)

@@ -1,5 +1,5 @@
-// MCP Apps surface: the server always declares the extension, but registers UI metadata, the
-// app-only events tool, and the ui:// resource only for clients advertising the exact app MIME.
+// MCP Apps surface: the legacy server registers UI metadata, the app-only events tool, and the
+// ui:// resource only for clients advertising a well-formed extensions entry with the exact MIME.
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -14,14 +14,11 @@ function runIdOf(res: Awaited<ReturnType<Awaited<ReturnType<typeof connect>>["cl
   return runId as string;
 }
 
-test("server declares the MCP Apps extension capability in its initialize response", async () => {
+test("legacy initialize advertises this server's MCP Apps extension support", async () => {
   const { client, dispose } = await connect(okRunner());
   try {
-    const capabilities = client.getServerCapabilities() as
-      | { extensions?: Record<string, unknown> }
-      | undefined;
-    assert.ok(capabilities?.extensions, "server capabilities include extensions");
-    assert.deepEqual(capabilities.extensions[EXTENSION_ID], {});
+    const capabilities = client.getServerCapabilities();
+    assert.deepEqual(capabilities?.extensions?.[EXTENSION_ID], {});
   } finally {
     await dispose();
   }
@@ -60,10 +57,13 @@ test("workflow carries the panel resource in _meta.ui; workflow-events is app-on
   }
 });
 
-test("absent and nonmatching UI capabilities receive only the identical text workflow surface", async () => {
+test("only the exact well-formed extensions capability receives the MCP Apps surface", async () => {
   const matching = await connect(okRunner(), { uiCapability: "matching" });
   const absent = await connect(okRunner(), { uiCapability: "absent" });
   const nonmatching = await connect(okRunner(), { uiCapability: "nonmatching" });
+  const missingMimeTypes = await connect(okRunner(), { uiCapability: "missing-mime-types" });
+  const experimentalOnly = await connect(okRunner(), { uiCapability: "experimental-only" });
+  const malformedString = await connect(okRunner(), { uiCapability: "malformed-string" });
   try {
     const matchingTools = (await matching.client.listTools()).tools;
     const matchingWorkflow = matchingTools.find((tool) => tool.name === "workflow");
@@ -78,7 +78,13 @@ test("absent and nonmatching UI capabilities receive only the identical text wor
       annotations: tool.annotations,
     });
 
-    for (const session of [absent, nonmatching]) {
+    for (const session of [
+      absent,
+      nonmatching,
+      missingMimeTypes,
+      experimentalOnly,
+      malformedString,
+    ]) {
       const tools = (await session.client.listTools()).tools;
       assert.deepEqual(tools.map((tool) => tool.name).sort(), ["docs", "repl", "workflow"]);
       const workflow = tools.find((tool) => tool.name === "workflow");
@@ -91,7 +97,14 @@ test("absent and nonmatching UI capabilities receive only the identical text wor
       );
     }
   } finally {
-    await Promise.all([matching.dispose(), absent.dispose(), nonmatching.dispose()]);
+    await Promise.all([
+      matching.dispose(),
+      absent.dispose(),
+      nonmatching.dispose(),
+      missingMimeTypes.dispose(),
+      experimentalOnly.dispose(),
+      malformedString.dispose(),
+    ]);
   }
 });
 

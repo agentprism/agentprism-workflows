@@ -275,9 +275,12 @@ From a source checkout, point at the built entry instead:
 ```
 
 **MCP Apps run monitor.** The `workflow` tool declares a UI resource
-(`_meta.ui.resourceUri`) per the [MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview),
-and the server advertises `io.modelcontextprotocol/ui` in its capabilities. Hosts that render
-MCP Apps (Claude, Claude Desktop, VS Code Copilot, Goose, …) show a live run-monitor panel
+(`_meta.ui.resourceUri`) per the [MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview).
+The server advertises `io.modelcontextprotocol/ui`; on the current legacy MCP wire, a client opts
+in through `capabilities.extensions["io.modelcontextprotocol/ui"]` with
+`mimeTypes: ["text/html;profile=mcp-app"]`. Only that exact, well-formed declaration adds the UI
+metadata and app-only surface. Supporting hosts (Claude, Claude Desktop, VS Code Copilot,
+Goose, …) show a live run-monitor panel
 for `workflow` calls: a phase/agent graph with per-node log drill-in, live token/cost totals,
 and a Stop control. The panel derives the runId from the call's arguments (inspect/await/stop)
 or from the execute result (immediately for `background: true` admissions), then keeps itself
@@ -292,9 +295,10 @@ hosts that treat a context update as conversational input, pushing it would wake
 repeatedly; `inspect`/`await` text summaries carry
 `annotations.audience: ["assistant"]`, and blocking `run`/`await` calls report
 `notifications/progress` when the client sends `_meta.progressToken`. Hosts without MCP Apps
-support ignore the UI metadata and get the same text/structured output as before. To try it
+support receive no UI metadata and get the same text/structured output as before. To try it
 locally against the ext-apps reference host, run
-`node packages/mcp-server/scripts/dev-app-host.mjs`.
+`node packages/mcp-server/scripts/dev-app-host.mjs`; its header shows the Apps capability the
+reference host's generic core client must advertise.
 
 > **Known limitation (upstream):** MCP Apps currently renders a **new** panel instance for
 > every model-initiated `workflow` call — the spec has no way to re-attach a call to an
