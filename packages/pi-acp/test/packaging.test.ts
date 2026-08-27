@@ -11,7 +11,7 @@ test("T24 manifest has exact runtime pins and split packed entries", async () =>
     "@agentclientprotocol/sdk": "1.4.0",
     "@earendil-works/pi-ai": "0.84.3",
     "@earendil-works/pi-coding-agent": "0.84.3",
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
     typebox: "1.3.2",
   });
   assert.equal(manifest.main, "./dist/lib.js");

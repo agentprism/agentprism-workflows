@@ -1,11 +1,13 @@
 # MCP TypeScript SDK v2 migration — staged path
 
-**Status:** planned — direction owner-approved, **no stage authorized or started** · **Updated:** 2026-08-07
+**Status:** Stage 0 implemented and verified (release pending); Stages A–C remain gated and unstarted · **Updated:** 2026-08-27
 
-**Provenance.** Owner directive (2026-08-07): "I don't consider us to be spec conformant if
-we're behind on the mcp sdk version. We need a path to upgrade to the latest one." Every
-factual claim below comes from a primary-source research pass on 2026-08-07 (typescript-sdk
-repo at the 2.0.0 release commit, npm registry, ext-apps repo, MCP Inspector source) or from
+**Provenance.** Owner directives: (2026-08-07) "I don't consider us to be spec conformant if
+we're behind on the mcp sdk version. We need a path to upgrade to the latest one"; (2026-08-27)
+update the MCP libraries first, preserving backward compatibility through the official migration
+path, before auditing MCP Apps negotiation. Every factual claim below comes from a primary-source
+research pass on 2026-08-07 (typescript-sdk repo at the 2.0.0 release commit, npm registry,
+ext-apps repo, MCP Inspector source) or from
 direct inspection of this repo at main `4346f87`. Facts may drift — re-verify the §4 gates
 before starting any stage.
 
@@ -60,13 +62,16 @@ Each stage is independently shippable and reversible, delivered by the repo's es
 convention (workflow-driven closed list, branch → PR → CI → merge → release). Stages must
 not run while another workstream is editing the same files (§5).
 
-### Stage 0 — currency + pre-flight (no v2 packages)
+### Stage 0 — currency + pre-flight (no v2 packages; implemented 2026-08-27)
 - Bump `@modelcontextprotocol/sdk` 1.29.0 → exact 1.30.0 (drop-in minor; the SSE keep-alive
   frames directly benefit the elicitation-hold path). Read release notes first, classify,
   changeset — the ACP-maintenance runbook shape.
 - Land/verify zod `^4.2.0` across the workspace; verify Node-version floors and ESM posture
   in the packages that will migrate. Fix what the verification finds, nothing speculative.
 - Acceptance: full gates green; no behavior change beyond the SDK minor's own.
+- Implementation: MCP SDK `1.30.0`, MCP Apps `1.7.5`, a workspace Zod floor of
+  `^4.2.0`, and wrapped Claude Agent SDK `0.3.248`; package typechecks plus the MCP server,
+  ACP runner, Pi ACP, and Codex ACP suites pass.
 
 ### Stage A — shim first (client-only surface)
 - Migrate `packages/mcp-server/src/shim/*` (SDK `Client` + `StreamableHTTPClientTransport`)
@@ -114,9 +119,9 @@ protocol-era changes to the ACP packages (different protocol; out of scope throu
 
 ## 4. Gate ledger — re-verify before each stage
 
-- ext-apps v2 compatibility: github.com/modelcontextprotocol/ext-apps/issues/702 (drafts
-  #719/#720 competing as of 2026-08-07; no ETA).
-- v2 patch cadence: still 2.0.0-across-the-board as of 2026-08-07. Watch for the first
+- ext-apps v2 compatibility: github.com/modelcontextprotocol/ext-apps/issues/702 remains open
+  (#719/#720 both still open as of 2026-08-27; no v2-compatible npm release).
+- v2 patch cadence: still 2.0.0-across-the-board as of 2026-08-27. Watch for the first
   patch carrying: validator memory leak fix (#2608, merged unreleased), progress/response
   race (#2580, fix PR #2586), `createMcpHandler` onclose chain leak (#2607, fix #2610),
   probe-fallback on unusable 2xx (#2619).
