@@ -1,5 +1,12 @@
 # @automatalabs/acp-agents
 
+## 0.41.1
+
+### Patch Changes
+
+- Updated dependencies [1ef9681]
+  - @automatalabs/codex-acp@2.1.0
+
 ## 0.41.0
 
 ### Minor Changes
