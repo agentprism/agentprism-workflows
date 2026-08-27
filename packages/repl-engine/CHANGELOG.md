@@ -1,5 +1,12 @@
 # @automatalabs/repl-engine
 
+## 0.4.4
+
+### Patch Changes
+
+- @automatalabs/acp-agents@0.41.1
+- @automatalabs/workflows@0.53.1
+
 ## 0.4.3
 
 ### Patch Changes
