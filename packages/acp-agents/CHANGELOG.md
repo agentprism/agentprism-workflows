@@ -1,5 +1,14 @@
 # @automatalabs/acp-agents
 
+## 0.41.2
+
+### Patch Changes
+
+- 9ddec60: Update the monolithic Model Context Protocol TypeScript SDK to 1.30.0, MCP Apps to 1.7.5, the workspace Zod floor to 4.2, and the wrapped Claude Agent SDK runtime to 0.3.248 before the separately gated SDK v2 migration.
+- Updated dependencies [9ddec60]
+  - @automatalabs/pi-acp@0.6.1
+  - @automatalabs/codex-acp@2.1.1
+
 ## 0.41.1
 
 ### Patch Changes
