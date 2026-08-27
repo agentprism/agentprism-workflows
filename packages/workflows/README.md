@@ -654,31 +654,32 @@ expressions), then a **dry run** — the script executes in the real engine real
 `agent()` call is served by an in-process mock `AgentRunner` that fabricates schema-conforming
 results. The dry run catches what a parse can't: thunk-vs-promise mistakes, reference errors,
 broken plumbing between calls. Finally, validation opens one no-prompt session for every distinct
-routed `{ backend, model }` pair, selects that call's model verbatim when one was authored, surfaces
-the echoed model-specific config-option catalog, and checks every authored `configOptions` bag
-against it. This probe uses zero tokens. A pair that cannot spawn, authenticate, select its model,
-or open a session contributes one warning and `probed:false`; only that pair's option checks are
-skipped, so probe failure alone never invalidates the script. There is no cached catalog or opt-out
-flag.
+routed backend/model target, selects that call's model verbatim when one was authored, surfaces
+the echoed model-specific ACP modes and config-option catalog, and checks every authored `mode`
+and `configOptions` bag against it. Only exact ids in `modes.availableModes` pass; `modes:null`
+means omit `mode`, never infer `"default"`. This probe uses zero tokens. A target that cannot spawn,
+authenticate, select its model, or open a session contributes one warning and `probed:false`; only
+that target's configuration checks are skipped, so probe failure alone never invalidates the script.
+There is no cached catalog or opt-out flag.
 A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"`
 dry-runs cleanly; `headless: "abort"` warns because a truly unattended run would abort.
 Script-declared `meta.backends` are treated as approved (with a warning that real runs require
-approval). The report lists every agent call with its backend attribution and `configOptions`
-echo, every checkpoint, the full option table for every routed backend/model pair (even when no call authors
-options), and warnings. Unknown ids, invalid select values, non-boolean boolean values, and the
-reserved `"model"` id make the report invalid with exit code `2`; each diagnostic names the call,
+approval). The report lists every agent call with its backend attribution, `mode`, and `configOptions`
+echo, every checkpoint, the full mode/option table for every routed backend/model target (even when no call authors
+options), and warnings. An unadvertised mode, unknown config id, invalid select value, non-boolean
+boolean value, or reserved `"model"` id makes the report invalid with exit code `2`; each diagnostic names the call,
 authored value, and advertised alternatives. For select options carrying
 `_meta["@automatalabs/agentprism"].recognizedValues`, a supported value passes, an unsupported but
 recognized value passes with a warning naming the effective clamp target, and an unrecognized value
 is invalid. Pi's `thinkingLevel` option publishes this metadata from Pi's own ordered domain and
 therefore needs no extra probes. For an ordered built-in that omits the metadata (Claude or Codex),
 validation reads its advertised model picker, probes each selectable model through the same
-per-`{ backend, model }` cache, merges consistent per-model thought-level orders, and applies the
+per-target probe cache, merges consistent per-model thought-level orders, and applies the
 same recognized-value/clamp path. Claude models that omit `effort` do not inherit another model's
 option, and its `default` sentinel is recognized but excluded from ceiling ordering. Enumeration is
 skipped, with a warning, when a picker advertises more than 32 models or the orders cannot be merged.
 OpenCode and custom/unknown backends are exact-set: an unadvertised thought-level value is invalid
-instead of clamping. Exit codes are `0` valid, `1` parse failure, `2` dry-run or config-option failure,
+instead of clamping. Exit codes are `0` valid, `1` parse failure, `2` dry-run or agent-configuration failure,
 `3` usage error.
 
 Flags: `--args <json>` / `--args-file <path>`, `--workflows-dir <dir>` (repeatable — validate by
@@ -732,7 +733,7 @@ const report = await validateWorkflowScript(script, { args: { target: "src/" }, 
 report.ok;                 // parse ok AND dry run completed
 report.dryRun?.agentCalls; // calls include mockAnswer: { glob, sequenceIndex?, sequenceLength? }
 report.dryRun?.harnessOptions;
-// [{ backendId, model?, probed, options?: SessionConfigOption[], error?: string }]
+// [{ backendId, model?, probed, modes?: SessionModeState | null, options?: SessionConfigOption[], error?: string }]
 report.dryRun?.mockAnswers;// normalized rule counters + item-level unused records
 report.warnings;           // approval reminders, phase mismatches, headless-abort checkpoints, …
 ```
@@ -754,8 +755,10 @@ npx @automatalabs/workflows config claude --json    # machine-readable report
 Harness names are the routing names: built-in `claude` / `codex` / `opencode` / `pi` plus any custom
 backend registered via `AGENTPRISM_BACKENDS` (registered customs also join the no-argument
 default set). Each harness opens one session without a prompt — zero tokens — and reports its
-advertised config-option catalog: model ids (including bracket variants), effort
-levels, modes, boolean knobs. A harness that cannot spawn or authenticate reports
+advertised ACP modes plus its config-option catalog: model ids (including bracket variants), effort
+levels, and boolean knobs. A non-null `modes` object contains `currentModeId` and `availableModes`;
+only exact listed ids may be authored. `modes: null` means omit `mode`, never infer `"default"`.
+A harness that cannot spawn or authenticate reports
 `probed: false` with the reason and never blocks the others. Flags: `--cwd <dir>` (probe
 session cwd; default the current directory), `--timeout-ms <n>` (per-harness bound, default
 60000), `--models[=<filter>]`, `--json`. Exit codes: `0` all probed, `1` at least one probe
@@ -776,7 +779,7 @@ import { probeHarnessConfig, formatHarnessConfigReport } from "@automatalabs/wor
 const report = await probeHarnessConfig({ harnesses: ["codex"] });
 const exact = await probeHarnessConfig({ modelSpecs: ["codex/gpt-5.6-sol"] }); // selects it first
 report.ok;             // every requested harness probed
-report.harnessOptions; // [{ backendId, model?, probed, options?: SessionConfigOption[], error?: string }]
+report.harnessOptions; // [{ backendId, model?, probed, modes?: SessionModeState | null, options?: SessionConfigOption[], error?: string }]
 formatHarnessConfigReport(report); // the CLI's human table
 ```
 

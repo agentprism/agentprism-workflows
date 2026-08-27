@@ -383,6 +383,9 @@ export class WorkflowScriptResources {
 
     this.mcp.server.setRequestHandler(SubscribeRequestSchema, (request) => {
       const uri = request.params.uri;
+      // Fixed external resources (authoring docs and the app panel) never update.
+      // Accept host auto-subscription as a no-op rather than claiming a listed URI is missing.
+      if (this.externalReaders.has(uri)) return {};
       const runId = workflowRunIdFromScriptUri(uri);
       if (runId) {
         if (!this.loadState(runId)) resourceNotFound(uri);
@@ -397,6 +400,7 @@ export class WorkflowScriptResources {
     });
     this.mcp.server.setRequestHandler(UnsubscribeRequestSchema, (request) => {
       const uri = request.params.uri;
+      if (this.externalReaders.has(uri)) return {};
       const runId = workflowRunIdFromScriptUri(uri);
       if (runId) {
         if (

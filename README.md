@@ -33,15 +33,15 @@ The backend is chosen **per `agent()` call**: a `claude/opus[1m]` review step, a
 
 ### Have your agent write the workflow
 
-You describe the workflow in plain language; your agent designs it with the right APIs, validates it, and runs it. Two ways to arm the agent:
+You describe the workflow in plain language; your agent designs it with the right APIs, validates it, and runs it. The connected MCP server is self-documenting:
 
-- **Agent skill** — install the bundled authoring skill into any skills-capable agent CLI:
+- **`docs` tool** — the preferred agent-controlled path. It serves version-matched workflow and REPL documentation one bounded topic at a time. Call it with no topic for the index, then select only what the task needs.
+- **MCP prompt** — prompt-capable hosts also expose **`author-workflow`** (optional `task`). It frames the task and directs the assistant to the selective `docs` topics instead of injecting the entire guide.
+- **Optional agent skill** — non-MCP or skills-first hosts can still install the standalone authoring skill:
 
   ```bash
   npx skills add agentprism/agentprism-workflows
   ```
-
-- **MCP prompt** — on prompt-capable MCP hosts, invoke the **`author-workflow`** prompt served by `@automatalabs/mcp-server` (in Claude Code it surfaces as a slash command, with an optional `task` argument). It injects the same authoring guide, so the agent targets the DSL that will actually execute the script.
 
 A representative ask:
 
@@ -440,7 +440,7 @@ Inspection returns lifecycle status, ordered phases, a redacted log tail, and at
 call previews. Its structured payload is capped at 24,576 UTF-8 bytes and its text at 8,192 bytes.
 Paused, failed, and aborted execution responses also include a redacted final-20 `logTail` immediately.
 
-The `workflow` and `repl` tools are the server's model-facing *tool* surface — `repl` is a persistent QuickJS-in-WASM JavaScript REPL (one VM per project) for live, stateful subagent orchestration, documented in the [package README](packages/mcp-server/README.md#the-repl-tool). Prompt-capable hosts additionally get the user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which injects the complete bundled authoring guide — in Claude Code it surfaces as a slash command. Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
+The model-facing surface is `docs`, `workflow`, and `repl`. `docs` embeds one selected, version-matched text/markdown topic per call; `repl` is a persistent QuickJS-in-WASM JavaScript VM (one per project) for live, stateful orchestration. Prompt-capable hosts additionally get the compact user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which directs the assistant to relevant `docs` topics. Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
 
 ---
 
@@ -471,9 +471,9 @@ Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in t
 
 MCP users need no separate validation or discovery step outside the tool. For terminal and CI workflows, the packages retain equivalent commands. Validate a script **without spending tokens**: `npx @automatalabs/workflows validate <file> --args '<json>'`.
 After its static parse and mock-agent dry run, validation opens each distinctly routed ACP harness
-once without a prompt to surface its advertised config-option table and check authored
-`configOptions`. An unavailable or unauthenticated harness adds one warning and skips only its
-option checks; it does not fail validation. Script a
+once without a prompt to surface its advertised mode/config-option catalogs and check authored
+`mode` and `configOptions`. An unavailable or unauthenticated harness adds one warning and skips only its
+configuration checks; it does not fail validation. Script a
 false branch by resolved label with `--mock-answers '{"refute:*":{"real":false}}'`; reusable answers
 deep-merge over fabricated schema defaults, and `$sequence` fixtures exercise multi-round convergence.
 Exit codes: `0` valid, `1` parse failure, `2` dry-run failure. See the
@@ -482,9 +482,10 @@ for file fixtures, precedence, validation, limits, and reports.
 
 Discover what a harness will negotiate **before** authoring: `npx @automatalabs/workflows config`
 probes each routable harness (built-ins + registered customs) with one no-prompt, zero-token
-session and prints its advertised config-option catalog — model ids (including bracket variants
-like `opus[1m]`), effort levels, modes. Name harnesses to scope it (`config codex`), `--json` for
-machines; it is the same table every validate report includes.
+session and prints its advertised modes plus config-option catalog — model ids (including bracket variants
+like `opus[1m]`) and effort levels. A successful result reports mode support explicitly: only ids in
+`modes.availableModes` may be authored; `modes:null` means omit `mode`, never infer `"default"`.
+Name harnesses to scope it (`config codex`), `--json` for machines; it is the same table every validate report includes.
 
 ---
 

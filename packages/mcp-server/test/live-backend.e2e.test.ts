@@ -504,6 +504,54 @@ test("live workflow config discovery: every backend exposes its no-prompt catalo
     const rows = output.harnessOptions as Array<Record<string, unknown>>;
     assert.deepEqual(rows.map((row) => row.backendId), ["claude", "codex", "opencode", "pi"]);
     assert.ok(rows.every((row) => row.probed === true), JSON.stringify(rows));
+    assert.ok(rows.every((row) => Object.hasOwn(row, "modes")), `every successful row explicitly reports modes: ${JSON.stringify(rows)}`);
+    assert.equal(rows.find((row) => row.backendId === "pi")?.modes, null, "Pi explicitly advertises no ACP session modes");
+
+    const guessedMode = await client.callTool({
+      name: "workflow",
+      arguments: {
+        projectDir,
+        script: [
+          'export const meta = { name: "live-pi-mode-rejection", description: "reject guessed mode before admission" };',
+          `return agent("x", { label: "pi-mode", model: ${JSON.stringify(`pi/${PI_E2E_MODEL}`)}, mode: "default" });`,
+        ].join("\n"),
+      },
+    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    assert.equal(guessedMode.isError, true, JSON.stringify(guessedMode));
+    const rejected = guessedMode.structuredContent as Record<string, unknown>;
+    assert.equal(rejected.status, "rejected");
+    assert.equal(rejected.runId, undefined);
+    assert.match(JSON.stringify(rejected), /mode authored value \\"default\\" is not advertised/);
+    assert.match(JSON.stringify(rejected), /advertised modes: \(none advertised\)/);
+
+    const exactPi = await client.callTool({
+      name: "workflow",
+      arguments: {
+        action: "config",
+        projectDir,
+        modelSpecs: [`pi/${PI_E2E_MODEL}`],
+        probeTimeoutMs: 120_000,
+      },
+    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    assert.notEqual(exactPi.isError, true, JSON.stringify(exactPi));
+    const exactPiRow = ((exactPi.structuredContent as Record<string, unknown>).harnessOptions as Array<Record<string, unknown>>)[0];
+    const thinking = (exactPiRow.options as Array<Record<string, unknown>>).find((option) => option.id === "thinkingLevel");
+    assert.equal(typeof thinking?.currentValue, "string", JSON.stringify(exactPiRow));
+
+    const replFailure = await client.callTool({
+      name: "repl",
+      arguments: {
+        action: "eval",
+        projectDir,
+        timeoutMs: 120_000,
+        code: `await agent(${JSON.stringify(`pi/${PI_E2E_MODEL}`)}, "must never prompt", { mode: "default", configOptions: { thinkingLevel: ${JSON.stringify(thinking?.currentValue)} } }).catch(e => e.name + ": " + e.message)`,
+      },
+    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    assert.notEqual(replFailure.isError, true, JSON.stringify(replFailure));
+    const replResult = (replFailure.structuredContent as Record<string, unknown>).result;
+    assert.equal(typeof replResult, "string", JSON.stringify(replFailure.structuredContent));
+    assert.match(replResult as string, /cannot apply session mode "default" \(advertised modes: none\)/);
+    assert.doesNotMatch(replResult as string, /ConfigOptionsError|offending key|thinkingLevel/);
   } finally {
     await client.close().catch(() => undefined);
     await transport.close().catch(() => undefined);

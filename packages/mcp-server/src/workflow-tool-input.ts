@@ -72,7 +72,7 @@ export const workflowToolInputShape = {
     .max(16)
     .optional()
     .describe(
-      'With action="config", exact routed model specs to select before reading their model-specific mode and config-option catalogs.',
+      'With action="config", exact routed model specs to select before reading their model-specific mode and config-option catalogs. Use mode only when modes.availableModes explicitly lists its exact id; modes:null means unsupported.',
     ),
   modelFilter: z
     .string()

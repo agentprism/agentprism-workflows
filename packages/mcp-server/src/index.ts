@@ -53,6 +53,22 @@ export type {
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
 export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
+export {
+  AUTHORING_DOC_MIME_TYPE,
+  DOCS_TOOL_NAME,
+  authoringDocResource,
+  authoringDocTopic,
+  docsToolInputShape,
+  docsToolOutputShape,
+  registerAuthoringDocs,
+} from "./docs-tool.js";
+export type { DocsToolResult, RegisterAuthoringDocsOptions } from "./docs-tool.js";
+export {
+  AUTHORING_DOCS_SCHEMA_VERSION,
+  AUTHORING_DOC_TOPICS,
+  AUTHORING_DOC_TOPIC_IDS,
+} from "./generated/authoring-docs-content.js";
+export type { AuthoringDocTopicId, GeneratedAuthoringDocTopic } from "./generated/authoring-docs-content.js";
 export { replToolInputShape, replToolOutputShape } from "./repl-tool.js";
 export type { ReplToolOptions } from "./repl-tool.js";
 export {

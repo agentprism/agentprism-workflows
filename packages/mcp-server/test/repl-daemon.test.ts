@@ -296,7 +296,7 @@ test("the repl tool registers alongside workflow with the redesign's two-action 
       const tools = await session.client.listTools();
       assert.deepEqual(
         tools.tools.map((t) => t.name).sort(),
-        ["repl", "workflow", "workflow-events"],
+        ["docs", "repl", "workflow", "workflow-events"],
         "repl registers alongside workflow (and the app-only events tool)",
       );
       const wire = tools.tools.find((t) => t.name === "repl")!;

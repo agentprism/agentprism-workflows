@@ -44,9 +44,10 @@ const rethrowPause = (err) => {
 // ── the vendor pool — one entry per first-class backend, treated symmetrically ──
 // Sweeps rotate through the pool; every finding is then judged by the two vendors
 // that did NOT produce it, so no vendor family approves its own blind spots.
-// Auditing calls pin an advertised read-only session mode where the backend has one
-// (`mode` is strict, so it is only ever set next to a pinned `model`); OpenCode mode
-// ids are config-specific, so its entry leaves `mode` unset. Each registered first segment
+// This published snapshot pins mode ids that its selected catalogs explicitly advertised.
+// Before reusing it, call action:"config" for each exact model and keep a mode only when
+// modes.availableModes still lists it; modes:null means omit it. OpenCode stays unset here.
+// Each registered first segment
 // routes and is stripped once; the remaining live-catalog-verified id is sent byte-for-byte.
 // Harness rejection follows the normal agent-error path, with no client-side fallback.
 const POOL = [

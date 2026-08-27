@@ -3918,6 +3918,14 @@ this.evalBreakArmed = false;
       );
     }
     if (parsed.configOptions !== undefined) {
+      if ('model' in parsed.configOptions) {
+        return new WorkflowError(
+          `configOptions option "model" with authored value ${JSON.stringify(parsed.configOptions.model)} is reserved; ` +
+            'use the first modelSpec argument instead',
+          CODE.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        );
+      }
       const vocabulary = this.runner.knownConfigOptionIds?.(segment);
       if (vocabulary !== undefined) {
         for (const key of Object.keys(parsed.configOptions)) {
@@ -4488,12 +4496,12 @@ this.evalBreakArmed = false;
           : backendSegment(modelSpec);
       (value as { replBackend?: string }).replBackend = backend;
       // The [C]5 fallback: a backend whose config-option vocabulary is
-      // genuinely dynamic cannot be validated at admission — its LATE
-      // error MUST name the offending key. When the call carried
-      // configOptions and the failure does not already name one, one
-      // bounded diagnostic reopen WITHOUT the config options decides
-      // whether the config caused the failure; if it did, the rejection
-      // names the offending key(s) explicitly.
+      // genuinely dynamic cannot be validated at admission. When the call
+      // carried configOptions and the failure does not already name one, one
+      // bounded diagnostic reopen WITHOUT the config options decides whether
+      // configuration caused the failure. Only a successful baseline reopen
+      // permits blaming and isolating a config key; an independently failing
+      // reopen preserves the backend's original error.
       if (openedSession === undefined && parsed.configOptions !== undefined && Object.keys(parsed.configOptions).length > 0) {
         return {
           outcome: 'reject',
@@ -4506,8 +4514,8 @@ this.evalBreakArmed = false;
 
   /**
    * The [C]5 fallback body: decide whether the openSession failure was
-   * the config options' doing and, when it was, guarantee the rejection
-   * NAMES the offending key. The diagnostic reopen (configOptions
+   * the config options' doing and, only when established, make the rejection
+   * name the offending key. The diagnostic reopen (configOptions
    * omitted, session NOT kept open) establishes whether configuration
    * caused the failure. For multiple keys, prompt-free prefix probes
    * isolate the actual offending key. These run only on the failure path.
@@ -4530,7 +4538,6 @@ this.evalBreakArmed = false;
     // prefix-probe isolation below on the strength of a message hit.
     if (keys.length === 1 && original.message.includes(keys[0])) return original;
     let diagnostic: BrokerSession | undefined;
-    let diagnosticOpenFailed = false;
     try {
       diagnostic = await this.runner.openSession({
         model: backendIdOverride ?? (modelSpec ?? undefined),
@@ -4543,31 +4550,10 @@ this.evalBreakArmed = false;
         retainSessionLog: true,
       });
     } catch {
-      diagnosticOpenFailed = true;
-      if (keys.length > 1) {
-        // Keep going: prefix probes below can still isolate the key
-        // even when this independent diagnostic open failed.
-      } else {
-        // The diagnostic open failed WITHOUT the config option too: the
-        // failure was not observably config-caused, but the [C]5
-        // guarantee stands — a late error on a call that carried
-        // configOptions MUST name the offending key even when the
-        // diagnostic reopen cannot decide.
-        const carried = `"${keys[0]}"`;
-        const backend = backendIdOverride ?? backendSegment(modelSpec);
-        return {
-          name: 'ConfigOptionsError',
-          message:
-            `backend ${backend} rejected the call with configOptions ${carried} present — ` +
-            `the offending key is ${carried} ` +
-            `(backend error: ${original.message}; a diagnostic open without configOptions failed too)`, // eslint-disable-line max-len
-          recoverable: false,
-          // The §4.6 attribution: the [C]5 fallback's replacement error
-          // names the resolved backend too (the call id is stamped by the
-          // guest library at settlement).
-          replBackend: backend,
-        };
-      }
+      // The same failure without configOptions proves that configuration was not
+      // observably causal. Preserve the backend's original error (for example an
+      // unsupported ACP mode) instead of falsely accusing one of the carried keys.
+      return original;
     }
     if (keys.length > 1) {
       // Dynamic vocabularies publish no admission-time key list. Isolate
@@ -4609,9 +4595,7 @@ this.evalBreakArmed = false;
         name: 'ConfigOptionsError',
         message:
           `backend ${backend} rejected the call's configOptions — offending key "${offendingKey}" ` +
-          `(backend error: ${original.message}` +
-          (diagnosticOpenFailed ? '; a diagnostic open without configOptions failed too' : '') +
-          ')',
+          `(backend error: ${original.message})`,
         recoverable: false,
         replBackend: backend,
       };

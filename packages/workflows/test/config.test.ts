@@ -79,7 +79,14 @@ test("default targets are the built-ins; catalogs and probe cwd flow through", a
     return {
       async probeConfigOptions(spec, opts) {
         probes.push({ spec, cwd: opts?.cwd });
-        return { backendId: spec ?? "claude", options: ADVERTISED_OPTIONS };
+        return {
+          backendId: spec ?? "claude",
+          options: ADVERTISED_OPTIONS,
+          modes: {
+            currentModeId: "default",
+            availableModes: [{ id: "default", name: "Default" }, { id: "plan", name: "Plan" }],
+          },
+        };
       },
       async dispose() {
         disposed++;
@@ -99,6 +106,7 @@ test("default targets are the built-ins; catalogs and probe cwd flow through", a
       );
       assert.ok(report.harnessOptions.every((harness) => harness.probed));
       assert.deepEqual(report.harnessOptions[0].options, ADVERTISED_OPTIONS);
+      assert.deepEqual(report.harnessOptions[0].modes?.availableModes.map((mode) => mode.id), ["default", "plan"]);
       assert.equal(disposed, 1);
     });
   } finally {
@@ -252,12 +260,14 @@ test("formatHarnessConfigReport renders validate's table format plus a probe sum
     ok: false,
     exitCode: 1,
     harnessOptions: [
-      { backendId: "claude", probed: true, options: ADVERTISED_OPTIONS },
+      { backendId: "claude", probed: true, modes: null, options: ADVERTISED_OPTIONS },
       { backendId: "codex", probed: false, error: "spawn failed" },
     ],
   });
-  assert.match(human, /^advertised config options:/);
+  assert.match(human, /^advertised modes and config options:/);
   assert.match(human, /^  claude:$/m);
+  assert.match(human, /^    modes: \(none advertised — omit mode\)$/m);
+  assert.match(human, /^    config options:$/m);
   assert.match(human, /^    id \| type \| current \| choices$/m);
   assert.match(human, /^    model \| select \| "default-model" \| "default-model", "opus\[1m\]"$/m);
   assert.match(human, /^    reasoning_effort \| select \| "medium" \| "low", "xhigh"$/m);
@@ -381,7 +391,7 @@ test("C3 CLI: config pi executes the hermetic real-pi origin probe and exposes m
 test("CLI: a named harness scopes the probe and renders the human table", () => {
   const result = runCli(["claude"]);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /^advertised config options:/);
+  assert.match(result.stdout, /^advertised modes and config options:/);
   assert.match(result.stdout, /^  claude:$/m);
   assert.match(result.stdout, /"gpt-5\.6-luna\[high\]"/);
   assert.match(result.stdout, /^result: 1\/1 harness\(es\) probed$/m);

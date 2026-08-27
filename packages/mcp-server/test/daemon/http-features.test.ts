@@ -25,8 +25,32 @@ test("author-workflow prompt is listed and served over HTTP", async () => {
     );
     const prompt = await session.client.getPrompt({ name: "author-workflow", arguments: {} });
     const text = prompt.messages.map((m) => (m.content.type === "text" ? m.content.text : "")).join("");
-    assert.ok(text.length > 10_000, "the authoring guide should be inlined");
-    assert.match(text, /projectDir/);
+    assert.ok(text.length < 2_000, "the prompt should frame the task without injecting every topic");
+    assert.match(text, /docs.*workflow\/quickstart/);
+    await session.dispose();
+  } finally {
+    await daemon.close();
+  }
+});
+
+test("selective docs tool embeds the same static resource served over HTTP", async () => {
+  const daemon = await startDaemon(okRunner());
+  try {
+    const session = await connectHttp(daemon.url);
+    const result = await session.client.callTool({
+      name: "docs",
+      arguments: { topic: "repl/agent-handles" },
+    });
+    assert.equal(result.isError, false);
+    const embedded = result.content.find((block) => block.type === "resource");
+    assert.ok(embedded && embedded.type === "resource" && "text" in embedded.resource);
+    assert.equal(embedded.resource.uri, "agentprism://docs/repl/agent-handles");
+
+    const listed = await session.client.listResources();
+    assert.ok(listed.resources.some((resource) => resource.uri === embedded.resource.uri));
+    const read = await session.client.readResource({ uri: embedded.resource.uri });
+    assert.ok("text" in read.contents[0]!);
+    assert.equal(read.contents[0]!.text, embedded.resource.text);
     await session.dispose();
   } finally {
     await daemon.close();

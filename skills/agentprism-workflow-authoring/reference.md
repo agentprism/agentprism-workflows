@@ -13,7 +13,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `schema` | JSON Schema object | Structured output. Plain object literal only — no schema builders exist in the realm. Part of the resume hash. |
 | `model` | `string` | Model spec: optional registered harness prefix plus a verbatim id, or a backend-only name. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
 | `tier` | `"small" \| "medium" \| "big"` | Coarse tier resolved from host config; beats phase/meta model, loses to explicit `model`. Part of the resume hash. |
-| `mode` | `string` | ACP session mode id advertised by the selected backend. **Strict**: unsupported/unadvertised ids fail the call (never silently unconfined). Ids are backend-specific and drift with harness versions — read the advertised `mode` select from the config probe or a validator report (Codex-family examples: `read-only`, `agent`, `agent-full-access`; Claude-family advertises permission modes such as `plan`, `acceptEdits`, and `dontAsk`). Part of the resume hash when set. |
+| `mode` | `string` | ACP session mode id advertised by the selected backend/model. **Strict**: unsupported/unadvertised ids fail before prompting (and automatic workflow preflight rejects them before admission). Read the selected `action:"config"` entry's `modes.availableModes` and copy only an exact id; `modes:null` means omit this field. Never infer a generic `"default"`. Part of the resume hash when set. |
 | `configOptions` | `Record<string, string \| boolean>` | Exact ACP session option ids and authored values. Applied in ascending id order after model and before the prompt, with no aliases or coercion. `"model"` is reserved for the dedicated `model` field. Part of the resume hash only when non-empty, with sorted keys. With MCP, read the advertised-options table from `workflow` action `config` before choosing values. |
 | `agentType` | `string` | Bind a named subagent definition (tools allow/deny, model, isolation, role prompt). See [agentType definitions](#agenttype-definitions). Part of the resume hash. |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree branched from the run cwd. **Always removed (worktree + branch) when the call ends** — edits are discarded; return work as data. Degrades to the shared tree outside a git repo (logged). |
@@ -202,12 +202,9 @@ The body is prepended to the agent's task as role guidance. An unknown `agentTyp
 
 The connected MCP `workflow` tool is the canonical way an agent runs an authored script; the per-action contracts are in the Running workflows guide section. The tool is self-contained: `config` discovers live backend options and `run` validates automatically before admission. The `workflow` tool is the server's whole *workflow* surface: config/run/resume/inspect/await/stop
 are action branches, not separate tools, and this input does not resolve a saved workflow name.
-(The server also registers a second, separate model-facing tool, `repl`, for interactive REPL
-orchestration — outside this authoring guide's scope.) A
+The server also registers model-facing `docs` for selective version-matched workflow/REPL reference topics and `repl` for interactive orchestration. This optional skill remains a standalone guide for non-MCP or skills-first hosts. A
 run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is
-logged in out-of-band (see below). Prompt-capable MCP hosts (e.g. Claude Code, where it surfaces as
-a slash command) also get this entire guide from the server itself as the **`author-workflow`**
-prompt, with an optional `task` argument.
+logged in out-of-band (see below). Prompt-capable MCP hosts also get the compact **`author-workflow`** prompt with an optional `task` argument; it frames the task and directs the assistant to relevant `docs` topics instead of injecting this entire skill.
 
 Environment knobs shared by the MCP server and the SDK: `AGENTPRISM_DEFAULT_BACKEND`,
 `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the
@@ -470,8 +467,8 @@ Backend auth comes from the machine the host runs on: Claude via a logged-in Cla
 npx @automatalabs/workflows validate <workflow-file> [options]
 ```
 
-Zero tokens; three passes — static parse, mocked dry run, then one no-prompt config probe per
-routed `{ backend, model }` pair — described in the guide's Validate before you run section. The
+Zero tokens; three passes — static parse, mocked dry run, then one no-prompt mode/config probe per
+routed backend/model target — described in the guide's Validate before you run section. The
 tables and grammar below are the exhaustive contract.
 
 | flag | meaning |
