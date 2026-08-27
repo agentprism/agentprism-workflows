@@ -1,5 +1,8 @@
 import * as acp from "@agentclientprotocol/sdk";
-import type {SessionNotification} from "@agentclientprotocol/sdk";
+import {
+    type AcpSessionUpdate,
+    asSdkSessionNotification,
+} from "./subagents/AcpSubagents";
 
 export type AcpClientConnection = Pick<acp.AgentContext, "notify" | "request">;
 
@@ -12,11 +15,11 @@ export class ACPSessionConnection {
         this.sessionId = sessionId;
     }
 
-    async update(update: UpdateSessionEvent) {
-        await this.connection.notify(acp.methods.client.session.update, {
-            sessionId: this.sessionId,
+    async update(update: UpdateSessionEvent, sessionId: string = this.sessionId) {
+        await this.connection.notify(acp.methods.client.session.update, asSdkSessionNotification({
+            sessionId,
             update: update
-        });
+        }));
     }
 
     /** Vendor-extension notification (e.g. `_session/loaded_turn/ended`),
@@ -26,4 +29,4 @@ export class ACPSessionConnection {
     }
 }
 
-export type UpdateSessionEvent = SessionNotification["update"];
+export type UpdateSessionEvent = AcpSessionUpdate;

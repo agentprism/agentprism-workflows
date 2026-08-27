@@ -20,8 +20,9 @@ This package is a fork of [`agentclientprotocol/codex-acp`](https://github.com/a
 - Fork extensions advertised under `agentCapabilities._meta["@automatalabs/codex-acp"]` for client-side feature detection.
 - Shell command, file change, [permission request](docs/permission-extension.md), MCP tool call, terminal output, reasoning, plan, web search, image generation, image view, token usage, and review events.
 - Client `fs.readTextFile` capability: when the client advertises it, file-change diff content is read through `fs/read_text_file` (so diffs reflect unsaved editor buffers), with local file system fallback otherwise. File writes happen inside codex itself — the app-server delegates no file IO to the client.
-- Subagent launches as standard ACP tool calls, with Codex thread identity and activity details in namespaced `_meta.codex.subagent` metadata.
+- [Native ACP subagent sessions](docs/subagent-sessions.md) (after capability negotiation) with separate child histories and root-routed permissions; a legacy tool-call fallback otherwise. Legacy tool updates retain Codex thread identity and activity details in namespaced `_meta.codex.subagent` metadata.
 - Session-scoped long-running goals through the provider-neutral [goal extension](docs/goal-extension.md).
+- A per-turn [agent file-change report](docs/agent-file-change-report.md) after capability negotiation.
 - Client-provided MCP servers over command-based stdio config and HTTP transport.
 - Slash commands: `/status`, `/mcp`, `/skills`, `/goal`, `/review`, `/review-branch`, `/review-commit`, `/compact`, and `/logout`, as well as configured skills.
 
@@ -153,6 +154,12 @@ npm run bundle:all
 ```
 
 See [readme-dev.md](readme-dev.md) for local client configuration, binary packaging, and Codex type regeneration.
+
+### Subagent sessions
+
+Subagent sessions follow the draft [ACP subagent RFD](https://github.com/agentclientprotocol/agent-client-protocol/pull/1992) and are enabled only after bilateral capability negotiation during `initialize`. Without native negotiation, the subagent lifecycle stays an ordinary ACP tool call.
+
+See [docs/subagent-sessions.md](docs/subagent-sessions.md) for the negotiation, lifecycle events, `session/load` reconstruction, and legacy fallback details.
 
 ## License
 

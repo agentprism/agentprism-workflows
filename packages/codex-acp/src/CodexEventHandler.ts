@@ -43,8 +43,6 @@ import type { McpStartupCompleteEvent } from "./app-server/McpStartupCompleteEve
 import {toTokenCount} from "./TokenCount";
 import {
     commandExecutionUsesTerminalOutput,
-    createCollabAgentToolCallCompleteUpdate,
-    createCollabAgentToolCallUpdate,
     createCommandExecutionUpdate,
     createContextCompactionCompleteUpdate,
     createContextCompactionStartUpdate,
@@ -61,7 +59,6 @@ import {
     createFuzzyFileSearchComplete,
     createFuzzyFileSearchStartOrUpdate,
     createMcpToolCallUpdate,
-    createSubAgentActivityUpdate,
     createWebSearchCompleteUpdate,
     createWebSearchStartUpdate,
     type FileContentReader,
@@ -84,6 +81,8 @@ import {
     AIR_SESSION_FAILURE_KEY,
     JETBRAINS_META_KEY,
 } from "./AirExtension";
+import {CodexSubagentEventRouter} from "./subagents/CodexSubagentEventRouter";
+import type {SubagentState} from "./subagents/AcpSubagents";
 
 export { stripShellPrefix };
 
@@ -230,7 +229,7 @@ export class CodexEventHandler {
     private readonly terminalCommandIds = new Set<string>();
     private readonly terminalCommandOutputIds = new Set<string>();
     private readonly agentMessagePhases = new Map<string, string | null>();
-    private readonly activeSubAgentActivities = new Set<string>();
+    private readonly subagents: CodexSubagentEventRouter;
 
     constructor(
         connection: AcpClientConnection,
@@ -238,9 +237,13 @@ export class CodexEventHandler {
         supportsPlanUpdates = false,
         supportsTypedSessionFailures = false,
         sessionFailureEpoch: string = randomUUID(),
+        subagents: CodexSubagentEventRouter = new CodexSubagentEventRouter(
+            sessionState.sessionId,
+            false,
+            new ACPSessionConnection(connection, sessionState.sessionId),
+        ),
         // Fork-owned parameters LAST so upstream call sites (and their tests) keep positional
-        // compatibility with the canonical (connection, sessionState, supportsPlanUpdates,
-        // supportsTypedSessionFailures, sessionFailureEpoch) shape.
+        // compatibility with the canonical parameters through `subagents`.
         readFileContent?: FileContentReader,
         // The `_session/loaded_turn/ended` push scheduler (review round 6):
         // when provided, the terminal marker is delivered through it — the
@@ -257,6 +260,7 @@ export class CodexEventHandler {
         this.readFileContent = readFileContent;
         this.loadedTurnEndedScheduler = loadedTurnEndedScheduler;
         this.session = new ACPSessionConnection(connection, sessionState.sessionId);
+        this.subagents = subagents;
         if (sessionState.sessionFailure !== undefined) {
             this.failuresById.set(sessionState.sessionFailure.id, sessionState.sessionFailure);
         }
@@ -429,10 +433,32 @@ export class CodexEventHandler {
 
     async handleNotification(notification: ServerNotification) {
         await this.flushPendingErrors();
+        const handledBySubagents = await this.subagents.handle(notification);
+        for (const buffered of this.subagents.takeBufferedNotifications()) {
+            await this.handleNotification(buffered);
+        }
+        if (handledBySubagents) {
+            return;
+        }
+        if (this.subagents.shouldIgnore(notification)) {
+            return;
+        }
         const updateEvent = await this.createUpdateEvent(notification);
         if (updateEvent) {
-            await this.session.update(updateEvent);
+            await this.session.update(updateEvent, this.subagents.notificationSessionId(notification));
         }
+    }
+
+    async waitForNativeSubagentSession(childThreadId: string): Promise<string | null> {
+        return await this.subagents.waitForMaterializedSession(childThreadId);
+    }
+
+    async waitForNativeSubagents(signal: AbortSignal): Promise<void> {
+        await this.subagents.wait(signal);
+    }
+
+    async finishOutstandingNativeSubagents(state: SubagentState): Promise<void> {
+        await this.subagents.finishOutstanding(state);
     }
 
     async flushPendingPlanUpdates(): Promise<void> {
@@ -750,15 +776,14 @@ export class CodexEventHandler {
                 this.activeImageGenerationItems.add(event.item.id);
                 return createImageGenerationStartUpdate(event.item);
             case "collabAgentToolCall":
-                return createCollabAgentToolCallUpdate(event.item);
+                return this.subagents.legacyCollaborationStarted(event.item);
             case "agentMessage":
                 this.rememberAgentMessagePhase(event.item);
                 return null;
             case "contextCompaction":
                 return createContextCompactionStartUpdate(event.item);
             case "subAgentActivity":
-                this.activeSubAgentActivities.add(event.item.id);
-                return createSubAgentActivityUpdate(event.item, "in_progress", "tool_call");
+                return this.subagents.legacyActivityStarted(event.item);
             case "sleep":
             case "userMessage":
             case "hookPrompt":
@@ -807,7 +832,7 @@ export class CodexEventHandler {
             case "webSearch":
                 return createWebSearchCompleteUpdate(event.item);
             case "collabAgentToolCall":
-                return createCollabAgentToolCallCompleteUpdate(event.item);
+                return this.subagents.legacyCollaborationCompleted(event.item);
             case "agentMessage":
                 this.rememberAgentMessagePhase(event.item);
                 return null;
@@ -820,12 +845,8 @@ export class CodexEventHandler {
             case "contextCompaction":
                 return createContextCompactionCompleteUpdate(event.item);
             //ignored types
-            case "subAgentActivity": {
-                const sessionUpdate = this.activeSubAgentActivities.delete(event.item.id)
-                    ? "tool_call_update"
-                    : "tool_call";
-                return createSubAgentActivityUpdate(event.item, "completed", sessionUpdate);
-            }
+            case "subAgentActivity":
+                return this.subagents.legacyActivityCompleted(event.item);
             case "sleep":
             case "userMessage":
             case "hookPrompt":

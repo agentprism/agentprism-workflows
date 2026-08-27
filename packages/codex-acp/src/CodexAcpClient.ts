@@ -63,6 +63,7 @@ import {
     createReportedAgentFileChangeReport,
     createUnavailableAgentFileChangeReport,
 } from "./AgentFileChangeReport";
+import {CodexSubagentSubscriptions} from "./subagents/CodexSubagentSubscriptions";
 
 /**
  * Well-known provider id for the client-configurable custom LLM gateway.
@@ -109,6 +110,7 @@ export class CodexAcpClient {
     private pendingLoginCompleted: Promise<AccountLoginCompletedNotification> | null = null;
     private pendingAccountUpdated: Promise<AccountUpdatedNotification> | null = null;
     private readonly sessionNotificationQueues = new Map<string, Promise<void>>();
+    private readonly subagents: CodexSubagentSubscriptions;
     private skillExtraRoots: string[] = [];
     private configPath: string | null = null;
 
@@ -118,6 +120,7 @@ export class CodexAcpClient {
         this.config = codexConfig ?? {};
         this.modelProvider = modelProvider ?? null;
         this.gatewayConfig = null;
+        this.subagents = new CodexSubagentSubscriptions(codexClient);
     }
 
     private readonly defaultClientInfo: ClientInfo = {
@@ -515,6 +518,13 @@ export class CodexAcpClient {
         };
     }
 
+    async readSessionThread(sessionId: string): Promise<Thread> {
+        return (await this.codexClient.threadRead({
+            threadId: sessionId,
+            includeTurns: true,
+        })).thread;
+    }
+
     async newSession(request: acp.NewSessionRequest): Promise<SessionMetadata> {
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
         await this.refreshSkills(request.cwd, additionalDirectories);
@@ -547,6 +557,7 @@ export class CodexAcpClient {
             await this.codexClient.threadUnsubscribe({threadId: sessionId});
         } finally {
             this.codexClient.clearThreadHandlers(sessionId);
+            this.subagents.clear(sessionId);
         }
     }
 
@@ -798,34 +809,28 @@ export class CodexAcpClient {
         sessionId: string,
         eventHandler: (result: ServerNotification) => void | Promise<void>,
         approvalHandler: ApprovalHandler,
-        elicitationHandler: ElicitationHandler
+        elicitationHandler: ElicitationHandler,
+        supportsSubagents: boolean,
+        observeInteraction: (result: ServerNotification) => void | Promise<void>,
+        waitForChildSession: (childThreadId: string) => Promise<string | null>,
     ) {
-        this.codexClient.onServerNotification(sessionId, (event) => {
+        const dispatch = (event: ServerNotification) => {
             this.enqueueSessionNotification(sessionId, () => eventHandler(event));
-        });
-        this.codexClient.onApprovalRequest(sessionId, {
-            handleCommandExecution: async (params) => {
-                await this.waitForSessionNotifications(sessionId);
-                return await approvalHandler.handleCommandExecution(params);
+        };
+        this.subagents.subscribe({
+            rootSessionId: sessionId,
+            supportsSubagents,
+            dispatch,
+            enqueueInteraction: (event) => {
+                // Child observation uses the same serialized, error-reporting queue
+                // as ordinary session notifications; callers intentionally do not
+                // await the callback registered with app-server.
+                this.enqueueSessionNotification(sessionId, () => observeInteraction(event));
             },
-            handleFileChange: async (params) => {
-                await this.waitForSessionNotifications(sessionId);
-                return await approvalHandler.handleFileChange(params);
-            },
-            handlePermissionsRequest: async (params) => {
-                await this.waitForSessionNotifications(sessionId);
-                return await approvalHandler.handlePermissionsRequest(params);
-            },
-        });
-        this.codexClient.onElicitationRequest(sessionId, {
-            handleElicitation: async (params) => {
-                await this.waitForSessionNotifications(sessionId);
-                return await elicitationHandler.handleElicitation(params);
-            },
-            handleUserInput: async (params) => {
-                await this.waitForSessionNotifications(sessionId);
-                return await elicitationHandler.handleUserInput(params);
-            },
+            approvalHandler,
+            elicitationHandler,
+            waitForRootNotifications: () => this.waitForSessionNotifications(sessionId),
+            waitForChildSession,
         });
     }
 
@@ -945,22 +950,9 @@ export class CodexAcpClient {
             });
             const outcome = await budget.wait(turnPromise);
             auditTurnCompleted = true;
-            const thread = await budget.wait(this.codexClient.threadRead({
-                threadId: forkThreadId,
-                includeTurns: true,
-            }));
-            const completedTurn = thread.thread.turns.find(
-                turn => turn.id === outcome.turn.id,
-            );
-            if (completedTurn === undefined) {
-                throw new AgentFileChangeReportError(
-                    "notReported",
-                    "The completed audit turn was not present in thread history",
-                );
-            }
             return createReportedAgentFileChangeReport(
                 params.requestId,
-                completedTurn,
+                outcome.turn,
                 params.workspace,
             );
         } catch (error) {
@@ -977,7 +969,7 @@ export class CodexAcpClient {
                 return createUnavailableAgentFileChangeReport(params.requestId, error.reason);
             }
             if (error instanceof AgentFileChangeReportError) {
-                logger.log("Agent file-change report unavailable", {reason: error.reason});
+                logger.error("Agent file-change report unavailable", error);
                 return createUnavailableAgentFileChangeReport(params.requestId, error.reason);
             }
             logger.error("Agent file-change report failed", error);
