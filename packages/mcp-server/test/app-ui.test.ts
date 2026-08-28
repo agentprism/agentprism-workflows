@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "@modelcontextprotocol/ext-apps/server";
+import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "../src/mcp-apps.js";
 
 import { RUN_MONITOR_RESOURCE_URI, WORKFLOW_EVENTS_TOOL_NAME } from "../src/index.js";
 import { ONE_AGENT_SCRIPT, connect, okRunner, structured, textOf } from "./_harness.js";

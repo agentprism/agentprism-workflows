@@ -49,6 +49,7 @@ const checkpointContextSchema = z.object({
   kind: z.enum(["confirm", "input", "select"]),
   choices: z.array(z.string()).optional(),
   default: z.unknown().optional(),
+  timeoutMs: z.number().nonnegative().optional(),
 });
 
 const fallbackSchema = z.object({

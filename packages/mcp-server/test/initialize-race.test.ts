@@ -1,5 +1,7 @@
 // The `workflow` tool must exist the moment a session can issue requests.
 //
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+
 // `notifications/initialized` is a NOTIFICATION: it carries no ordering guarantee against
 // the requests a client sends after it, and over the stdio shim each frame becomes its own
 // HTTP POST to the daemon. Registering the tool inside `oninitialized` therefore let a
@@ -11,10 +13,7 @@
 // construction, and only the negotiated MCP Apps surface waits for client capabilities.
 import assert from "node:assert/strict";
 import test from "node:test";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "@modelcontextprotocol/ext-apps/server";
+import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "../src/mcp-apps.js";
 
 import { createWorkflowServer } from "../src/index.js";
 import { WORKFLOW_EVENTS_TOOL_NAME } from "../src/app-ui.js";

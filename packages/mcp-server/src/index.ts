@@ -8,10 +8,16 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 import { createAcpRunner } from "@automatalabs/workflows";
+import { createEvalBreakChannel } from "@automatalabs/repl-engine";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
+import { REPL_DRAIN_BOUND_MS } from "./daemon/constants.js";
 import { installMcpServerLifecycle } from "./lifecycle.js";
+import { WorkflowProjectRegistry } from "./project-registry.js";
+import { ReplPresenceLedger } from "./repl-presence.js";
 import { ReplRelayStdioTransport } from "./repl-stdio-transport.js";
-import { createWorkflowServer } from "./server.js";
+import { createWorkflowServer, type WorkflowServer } from "./server.js";
+import { workflowRunEventsUri } from "./workflow-resources.js";
 
 export { BackgroundRunRegistry, createWorkflowServer, MAX_BACKGROUND_RUNS } from "./server.js";
 export type {
@@ -86,6 +92,15 @@ export {
   registerWorkflowAppUi,
 } from "./app-ui.js";
 export type { WorkflowAppUiDeps } from "./app-ui.js";
+export {
+  EXTENSION_ID,
+  RESOURCE_MIME_TYPE,
+  RESOURCE_URI_META_KEY,
+  appResourceToolMeta,
+  getUiCapability,
+  supportsMcpApps,
+} from "./mcp-apps.js";
+export type { UiCapability } from "./mcp-apps.js";
 export { disposeRunnerWithDeadline, installMcpServerLifecycle, SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
 export type { McpServerLifecycle, McpServerLifecycleOptions, McpServerShutdownReason, WorkflowServerControl } from "./lifecycle.js";
 export {
@@ -116,18 +131,61 @@ export type {
  */
 export async function main(): Promise<void> {
   const runner = createAcpRunner();
-  const server = createWorkflowServer(runner);
-  // The default-project-key source: the in-process server's own
-  // project — the relay fires the out-of-band break under it when a
-  // `repl` interrupt omits projectDir (the tool documents projectDir
-  // as optional in single-project mode; phase-F review round 4).
+  const projects = new WorkflowProjectRegistry(runner);
+  const defaultContext = projects.getOrCreate(process.cwd());
+  const replPresence = new ReplPresenceLedger(REPL_DRAIN_BOUND_MS);
+  const evalBreakChannel = createEvalBreakChannel();
+  let activeServer: WorkflowServer | undefined;
+  let activeEra: "legacy" | "modern" | undefined;
+
+  // The relay transport still owns the worker-thread eval-break fast path. serveStdio owns
+  // protocol-era arbitration and pins one factory instance to this long-lived connection.
   const transport = new ReplRelayStdioTransport(
-    () => server.replBreakUrl(),
-    () => server.replDefaultProjectDir?.(),
+    () => evalBreakChannel.breakUrl(),
+    () => defaultContext.projectDir,
   );
-  await server.connect(transport);
-  // Install after connect because the SDK takes transport callback ownership during connect.
-  installMcpServerLifecycle({ runner, server, transport });
+  const detachModernEvents = projects.onRunEventPersisted((record) => {
+    if (activeEra !== "modern") return;
+    void activeServer?.server.sendResourceUpdated({ uri: workflowRunEventsUri(record.runId) }).catch(() => undefined);
+  });
+
+  await serveStdio(
+    ({ era }) => {
+      const server = createWorkflowServer(runner, {
+        manager: defaultContext.manager,
+        backgroundRuns: defaultContext.backgroundRuns,
+        projects,
+        replPresence,
+        replClientId: () => "stdio-client",
+        replDrainBoundMs: REPL_DRAIN_BOUND_MS,
+        replEvalBreakChannel: evalBreakChannel,
+        protocolEra: era,
+        disconnectReplClientOnClose: true,
+      });
+      activeServer = server;
+      activeEra = era;
+      return server;
+    },
+    { transport },
+  );
+
+  // Install after serveStdio takes transport callback ownership. The lifecycle facade closes
+  // shared factory state that is not owned by any one probe/pinned server instance.
+  installMcpServerLifecycle({
+    runner,
+    transport,
+    server: {
+      stopAcceptingWork: () => activeServer?.stopAcceptingWork(),
+      replBreakUrl: () => evalBreakChannel.breakUrl(),
+      replDefaultProjectDir: () => defaultContext.projectDir,
+      async disposeReplEvalBreakChannel() {
+        detachModernEvents();
+        await projects.disposeReplStates();
+        replPresence.disconnectAll();
+        await evalBreakChannel.dispose();
+      },
+    },
+  });
 }
 
 // Back-compat: `node dist/index.js` was the documented registration path before the dedicated

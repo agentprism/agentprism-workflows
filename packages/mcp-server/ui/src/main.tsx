@@ -1,5 +1,7 @@
 // Run-monitor panel entrypoint (React, @modelcontextprotocol/ext-apps/react).
 //
+import type { CallToolResult } from "@modelcontextprotocol/client";
+
 // Rendered by MCP Apps hosts for `workflow` tool calls (the tool carries
 // _meta.ui.resourceUri). The panel derives the runId from whichever arrives first:
 //   - tool ARGUMENTS for action inspect/await/stop (runId is an input), or
@@ -14,7 +16,6 @@
 // nicobailon/pi-mcp-adapter#314. Stop issues `workflow` action:"stop" through the host bridge.
 import type { App } from "@modelcontextprotocol/ext-apps";
 import { useApp, useHostFonts, useHostStyleVariables } from "@modelcontextprotocol/ext-apps/react";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { StrictMode, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 

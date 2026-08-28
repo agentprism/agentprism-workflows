@@ -16,10 +16,14 @@ type ProgressParams = {
 
 function extra(notifications: ProgressParams[], withToken = true): WorkflowToolExtra {
   return {
-    signal: new AbortController().signal,
-    _meta: withToken ? { progressToken: "await-token" } : undefined,
-    sendNotification: async (notification: { params: ProgressParams }) => {
-      notifications.push(notification.params);
+    mcpReq: {
+      id: 1,
+      method: "tools/call",
+      signal: new AbortController().signal,
+      _meta: withToken ? { progressToken: "await-token" } : undefined,
+      notify: async (notification: { params?: unknown }) => {
+        notifications.push(notification.params as ProgressParams);
+      },
     },
   } as unknown as WorkflowToolExtra;
 }

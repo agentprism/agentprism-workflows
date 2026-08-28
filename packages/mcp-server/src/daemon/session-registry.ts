@@ -31,14 +31,12 @@
  *   eviction): the ledger drops the session's retained project affinity (a re-initialized
  *   client gets a NEW session id and must re-touch projects).
  */
-
-import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-
+import type { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import type { WorkflowServer } from "../server.js";
 
 export interface SessionRecord {
   sessionId: string;
-  transport: StreamableHTTPServerTransport;
+  transport: NodeStreamableHTTPServerTransport;
   server: WorkflowServer;
   lastActivityAt: number;
   openConnections: number;

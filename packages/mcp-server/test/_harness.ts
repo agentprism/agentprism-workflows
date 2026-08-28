@@ -1,6 +1,10 @@
 // Shared test harness for the @automatalabs/mcp-server suite.
 //
 // NOT a test file (no `.test.ts` suffix => excluded from the `test/**/*.test.ts`
+import { InMemoryTransport } from "@modelcontextprotocol/server";
+import type { McpServer } from "@modelcontextprotocol/server";
+import { Client } from "@modelcontextprotocol/client";
+
 // runner glob); it is imported by the real suites. It provides:
 //   - an in-memory MCP client<->server pair (the phase-3 smoke pattern: a Client and
 //     the real createWorkflowServer talking over InMemoryTransport, no stdio/process),
@@ -12,11 +16,7 @@
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "@modelcontextprotocol/ext-apps/server";
+import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "../src/mcp-apps.js";
 import type { AgentRunner, RunOptions } from "@automatalabs/shared-types";
 
 import { createWorkflowServer } from "../src/index.js";

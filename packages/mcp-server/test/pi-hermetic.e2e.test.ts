@@ -4,12 +4,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client } from "@modelcontextprotocol/client";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-
 const SERVER_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 const PI_FIXTURE = fileURLToPath(new URL("../../pi-acp/test/fixtures/hermetic-pi-acp.mjs", import.meta.url));
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
@@ -55,7 +53,7 @@ test("first-class pi runs end to end through pi-acp's credential-free AgentSessi
     const response = await client.callTool({
       name: "workflow",
       arguments: { script: SCRIPT },
-    }, undefined, { timeout: 45_000, maxTotalTimeout: 45_000 });
+    }, { timeout: 45_000, maxTotalTimeout: 45_000 });
     const result = response.structuredContent as Record<string, unknown> | undefined;
     assert.equal(response.isError, false, stderr);
     assert.equal(result?.status, "completed", stderr);
@@ -94,7 +92,7 @@ test("first-class pi captures schema output through the injected HTTP MCP tool",
   transport.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8_000); });
   try {
     await client.connect(transport);
-    const response = await client.callTool({ name: "workflow", arguments: { script: STRUCTURED_SCRIPT } }, undefined, {
+    const response = await client.callTool({ name: "workflow", arguments: { script: STRUCTURED_SCRIPT } }, {
       timeout: 45_000,
       maxTotalTimeout: 45_000,
     });

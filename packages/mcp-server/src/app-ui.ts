@@ -1,26 +1,22 @@
+import { ProtocolError } from "@modelcontextprotocol/server";
+import type { McpServer } from "@modelcontextprotocol/server";
+
 // packages/mcp-server/src/app-ui.ts
 //
-// MCP Apps (io.modelcontextprotocol/ui) surface for the workflow server, per the extension
-// spec's legacy-era capability-negotiation model: the server advertises Apps support and registers
-// this surface only after a client advertises the extension with the MCP Apps HTML MIME type. The
-// UI-enabled `workflow` tool carries `_meta.ui.resourceUri`; every other client receives the same
-// tool config without UI metadata. Modern advertisement through server/discover remains gated.
+// MCP Apps (io.modelcontextprotocol/ui) surface for the workflow server. The v2-native server
+// registers the union once; CapabilityAwareToolCatalog and the resource router project it only
+// when the current legacy initialize snapshot or modern per-request envelope contains the exact
+// Apps HTML MIME declaration. Incapable clients receive the unchanged text workflow surface.
 //
 // This module registers the two panel-support pieces:
 //   - the ui:// panel resource (the Vite single-file React app, embedded at build time), and
 //   - the app-only `workflow-events` cursor tool (visibility: ["app"]) the panel polls to
 //     stay live without any model involvement.
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { McpError } from "@modelcontextprotocol/sdk/types.js";
-import {
-  RESOURCE_MIME_TYPE,
-  registerAppResource,
-  registerAppTool,
-} from "@modelcontextprotocol/ext-apps/server";
 import { RunEventLogError } from "@automatalabs/workflows";
 import { z } from "zod";
 
 import { RUN_MONITOR_HTML } from "./generated/run-monitor-html.js";
+import { RESOURCE_MIME_TYPE, appResourceToolMeta } from "./mcp-apps.js";
 import type { WorkflowRunEventsResourceDocument } from "./workflow-resources.js";
 import { workflowEventsOutputShape } from "./workflow-tool-output.js";
 
@@ -49,7 +45,7 @@ export interface WorkflowAppUiDeps {
 /** Stable machine-readable prefix so the app can react to specific event-log faults. */
 function eventsErrorText(error: unknown): string {
   if (error instanceof RunEventLogError) return `[${error.code}] ${error.message}`;
-  if (error instanceof McpError) return error.message;
+  if (error instanceof ProtocolError) return error.message;
   return error instanceof Error ? error.message : String(error);
 }
 
@@ -64,20 +60,12 @@ export function registerWorkflowAppUi(mcp: McpServer, deps: WorkflowAppUiDeps): 
       },
     ],
   });
-  registerAppResource(
-    mcp,
-    "Workflow run monitor",
-    RUN_MONITOR_RESOURCE_URI,
-    {
-      description:
-        "Live monitor panel for a workflow run: phase/agent graph, per-node logs, token usage, and stop control.",
-    },
-    readRunMonitorHtml,
-  );
+  // UI resources may be omitted from resources/list. The custom resource router serves this
+  // fixed URI only to Apps-capable requests, avoiding a static registration that would leak
+  // the panel to an incapable modern request on a long-lived stdio connection.
   deps.registerResourceReader(RUN_MONITOR_RESOURCE_URI, readRunMonitorHtml);
 
-  registerAppTool(
-    mcp,
+  mcp.registerTool(
     WORKFLOW_EVENTS_TOOL_NAME,
     {
       title: "Read a page of workflow run events (app-only)",
@@ -88,7 +76,7 @@ export function registerWorkflowAppUi(mcp: McpServer, deps: WorkflowAppUiDeps): 
       // it (e.g. VS Code skips the pre-run confirmation, ChatGPT dev mode classifies un-hinted
       // tools as write actions); it does not change how any host narrates app-originated calls.
       annotations: { readOnlyHint: true },
-      inputSchema: {
+      inputSchema: z.object({
         runId: z.string().describe("Workflow runId whose event log to read."),
         after: z
           .number()
@@ -107,9 +95,9 @@ export function registerWorkflowAppUi(mcp: McpServer, deps: WorkflowAppUiDeps): 
           .string()
           .optional()
           .describe("Expected event stream generation; mismatch fails so the reader can restart."),
-      },
-      outputSchema: workflowEventsOutputShape,
-      _meta: { ui: { resourceUri: RUN_MONITOR_RESOURCE_URI, visibility: ["app"] } },
+      }),
+      outputSchema: z.object(workflowEventsOutputShape),
+      _meta: appResourceToolMeta(RUN_MONITOR_RESOURCE_URI, ["app"]),
     },
     ({ runId, after, limit, streamId }) => {
       try {

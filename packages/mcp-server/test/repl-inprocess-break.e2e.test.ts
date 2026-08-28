@@ -5,6 +5,10 @@
 // synchronous `while(true)`; the documented interrupt behavior must be
 // implemented in every supported mode, and it is not a v1 exclusion).
 //
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client } from "@modelcontextprotocol/client";
+import type { CallToolResult } from "@modelcontextprotocol/client";
+
 // The in-process server has no shim process, so its stdio transport's
 // stdin reader lives on a WORKER THREAD (`repl-stdio-transport.ts`):
 // the reader stays live while the main thread is wedged in the VM,
@@ -22,11 +26,6 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-
 const distEntry = resolve(fileURLToPath(import.meta.url), "../../dist/entry.js");
 
 const TEST_TMP = mkdtempSync(join(tmpdir(), "agentprism-repl-inprocess-"));
@@ -53,19 +52,18 @@ function startServer(home: string): Promise<Client> {
 function replEvalCode(client: Client, projectDir: string, code: string): Promise<CallToolResult> {
   return client.callTool(
     { name: "repl", arguments: { action: "eval", projectDir, code } },
-    undefined,
     { timeout: 60_000 },
   );
 }
 
 function replEvalNoDir(client: Client, code: string): Promise<CallToolResult> {
-  return client.callTool({ name: "repl", arguments: { action: "eval", code } }, undefined, {
+  return client.callTool({ name: "repl", arguments: { action: "eval", code } }, {
     timeout: 60_000,
   });
 }
 
 function replInterruptNoDir(client: Client): Promise<CallToolResult> {
-  return client.callTool({ name: "repl", arguments: { action: "interrupt" } }, undefined, {
+  return client.callTool({ name: "repl", arguments: { action: "interrupt" } }, {
     timeout: 60_000,
   });
 }
@@ -73,7 +71,6 @@ function replInterruptNoDir(client: Client): Promise<CallToolResult> {
 function replInterrupt(client: Client, projectDir: string): Promise<CallToolResult> {
   return client.callTool(
     { name: "repl", arguments: { action: "interrupt", projectDir } },
-    undefined,
     { timeout: 60_000 },
   );
 }

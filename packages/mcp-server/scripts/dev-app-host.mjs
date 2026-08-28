@@ -18,8 +18,7 @@
 // the real ACP runner instead (requires logged-in backends).
 import { randomUUID } from "node:crypto";
 import http from "node:http";
-
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import { WorkflowManager, createAcpRunner } from "@automatalabs/workflows";
 
 import { createWorkflowServer } from "../dist/index.js";
@@ -90,7 +89,7 @@ if (devCwd) {
   );
 }
 
-/** @type {Map<string, StreamableHTTPServerTransport>} */
+/** @type {Map<string, NodeStreamableHTTPServerTransport>} */
 const transports = new Map();
 
 function setCors(res) {
@@ -115,7 +114,7 @@ const httpServer = http.createServer(async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
     let transport = typeof sessionId === "string" ? transports.get(sessionId) : undefined;
     if (!transport) {
-      const created = new StreamableHTTPServerTransport({
+      const created = new NodeStreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => transports.set(sid, created),
       });

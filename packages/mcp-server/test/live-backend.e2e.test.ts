@@ -5,6 +5,9 @@
 // ACP servers (claude-agent-acp, the npm deps codex-acp and pi-acp, and OpenCode), so
 // the two structured-output cruxes — (1) a schema'd agent yields a typebox-validated
 // structured OBJECT (not text), and (2) ONE long-lived pooled backend subprocess serves
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client } from "@modelcontextprotocol/client";
+
 // every session — have a re-runnable guard against the actual adapters.
 //
 // GATE: it runs ONLY when AGENTPRISM_LIVE_E2E === "1" (and so needs creds + network +
@@ -23,9 +26,6 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { BuiltinBackendId } from "@automatalabs/acp-agents";
 
 type Backend = BuiltinBackendId;
@@ -281,7 +281,7 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
 
     poller = setInterval(pollOnce, 150);
 
-    const callPromise = client.callTool({ name: "workflow", arguments: { script, concurrency: 3 } }, undefined, {
+    const callPromise = client.callTool({ name: "workflow", arguments: { script, concurrency: 3 } }, {
       onprogress: () => {
         out.progressEvents++;
       },
@@ -495,7 +495,7 @@ test("live workflow config discovery: every backend exposes its no-prompt catalo
         harnesses: ["claude", "codex", "opencode", "pi"],
         probeTimeoutMs: 120_000,
       },
-    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    }, { timeout: 240_000, maxTotalTimeout: 240_000 });
     assert.notEqual(result.isError, true, JSON.stringify(result));
     const output = result.structuredContent as Record<string, unknown>;
     assert.equal(output.action, "config");
@@ -516,7 +516,7 @@ test("live workflow config discovery: every backend exposes its no-prompt catalo
           `return agent("x", { label: "pi-mode", model: ${JSON.stringify(`pi/${PI_E2E_MODEL}`)}, mode: "default" });`,
         ].join("\n"),
       },
-    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    }, { timeout: 240_000, maxTotalTimeout: 240_000 });
     assert.equal(guessedMode.isError, true, JSON.stringify(guessedMode));
     const rejected = guessedMode.structuredContent as Record<string, unknown>;
     assert.equal(rejected.status, "rejected");
@@ -532,7 +532,7 @@ test("live workflow config discovery: every backend exposes its no-prompt catalo
         modelSpecs: [`pi/${PI_E2E_MODEL}`],
         probeTimeoutMs: 120_000,
       },
-    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    }, { timeout: 240_000, maxTotalTimeout: 240_000 });
     assert.notEqual(exactPi.isError, true, JSON.stringify(exactPi));
     const exactPiRow = ((exactPi.structuredContent as Record<string, unknown>).harnessOptions as Array<Record<string, unknown>>)[0];
     const thinking = (exactPiRow.options as Array<Record<string, unknown>>).find((option) => option.id === "thinkingLevel");
@@ -546,7 +546,7 @@ test("live workflow config discovery: every backend exposes its no-prompt catalo
         timeoutMs: 120_000,
         code: `await agent(${JSON.stringify(`pi/${PI_E2E_MODEL}`)}, "must never prompt", { mode: "default", configOptions: { thinkingLevel: ${JSON.stringify(thinking?.currentValue)} } }).catch(e => e.name + ": " + e.message)`,
       },
-    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    }, { timeout: 240_000, maxTotalTimeout: 240_000 });
     assert.notEqual(replFailure.isError, true, JSON.stringify(replFailure));
     const replResult = (replFailure.structuredContent as Record<string, unknown>).result;
     assert.equal(typeof replResult, "string", JSON.stringify(replFailure.structuredContent));
@@ -594,7 +594,7 @@ test("live REPL queue smoke: Claude, Codex, OpenCode, and Pi continue one sessio
     const founding = await client.callTool({
       name: "repl",
       arguments: { action: "eval", projectDir, code: foundingSource, timeoutMs: 120_000 },
-    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    }, { timeout: 240_000, maxTotalTimeout: 240_000 });
     assert.notEqual(founding.isError, true, JSON.stringify(founding));
     const foundingResult = (founding.structuredContent as Record<string, unknown> | undefined)?.result;
     assert.equal(typeof foundingResult, "string", JSON.stringify(founding.structuredContent));
@@ -611,7 +611,7 @@ test("live REPL queue smoke: Claude, Codex, OpenCode, and Pi continue one sessio
     const queued = await client.callTool({
       name: "repl",
       arguments: { action: "eval", projectDir, code: queueSource, timeoutMs: 120_000 },
-    }, undefined, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    }, { timeout: 240_000, maxTotalTimeout: 240_000 });
     assert.notEqual(queued.isError, true, JSON.stringify(queued));
     const queuedResult = (queued.structuredContent as Record<string, unknown> | undefined)?.result;
     assert.equal(typeof queuedResult, "string", JSON.stringify(queued.structuredContent));

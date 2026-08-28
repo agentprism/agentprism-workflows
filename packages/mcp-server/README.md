@@ -44,10 +44,12 @@ the server emits goes to `stderr`.
 
 The `workflow` tool declares a UI resource per the
 [MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview). The server
-advertises `io.modelcontextprotocol/ui`; on the current legacy MCP wire, a client opts in through
-`capabilities.extensions["io.modelcontextprotocol/ui"]` with
-`mimeTypes: ["text/html;profile=mcp-app"]`. Only that exact, well-formed declaration adds the
-UI metadata and app-only surface. Supporting hosts show a live run-monitor panel for `workflow`
+advertises `io.modelcontextprotocol/ui`. Legacy clients opt in through initialize-scoped
+`capabilities.extensions["io.modelcontextprotocol/ui"]`; modern `2026-07-28` clients carry the
+same extension declaration in each request's client-capabilities envelope. In both eras its
+`mimeTypes` must contain `"text/html;profile=mcp-app"`. Only that exact, well-formed declaration
+adds the UI metadata and app-only surface for that client/request. Supporting hosts show a live
+run-monitor panel for `workflow`
 calls — a phase/agent graph with per-node log drill-in
 (including expandable per-tool results), live token/cost totals, and a Stop control. The panel
 keeps itself current by polling the app-only `workflow-events` tool, so no model tokens are
@@ -102,7 +104,7 @@ With `--in-process`, the old lifecycle applies: on stdin EOF, transport close, `
 
 ### The workflow daemon
 
-- **Discovery**: the daemon records `{pid, port, url, version, envFingerprint}` (mode 0600) under `~/.agentprism/workflows/daemons/` — a **family pointer** `<envFingerprint>.json` naming the current daemon for that env, plus one `instances/<pid>.json` per live daemon. Shims verify liveness via pid + `/healthz` and never dial a port blind. Concurrent shims race a per-family spawn lock, so a cold start produces exactly one daemon. Logs land in `~/.agentprism/workflows/logs/daemon.log`.
+- **Discovery**: the daemon records `{pid, port, url, version, envFingerprint}` (mode 0600) under `~/.agentprism/workflows/daemons/` — a **family pointer** `<envFingerprint>.json` naming the current daemon for that env, plus one `instances/<pid>.json` per live daemon. A separate mode-0600 `<envFingerprint>.request-state-key.json` keeps modern integrity-protected multi-round-trip state verifiable across successor daemons; malformed key storage fails closed. Shims verify liveness via pid + `/healthz` and never dial a port blind. Concurrent shims race a per-family spawn lock, so a cold start produces exactly one daemon. Logs land in `~/.agentprism/workflows/logs/daemon.log`.
 - **Succession**: a shim that finds its family's daemon **older** than itself never adopts it — it spawns a successor (ephemeral port), which atomically repoints the family pointer; the old daemon becomes a *lame duck*: it admits no new sessions, closes its idle sessions so their shims transparently re-initialize on the successor, finishes in-flight requests, runs, and REPL drains, and exits on the next reaper tick. A daemon **equal to or newer** than the shim is adopted (version is a total order, so two client versions can never flip discovery back and forth). `daemon status` lists every daemon on the machine (current, draining, other env families, legacy); `daemon stop --all` stops them all.
 - **Port**: default `29888` (`AGENTPRISM_DAEMON_PORT` / `--port`). If the port is held — by a foreign process, or by a draining predecessor still finishing its work — the daemon falls back to an ephemeral port — discovery still works, only hardcoded client URLs need the actual port from `daemon status`.
 - **Sessions and projects**: sessions are project-agnostic — every `run` call names its project via the **required `projectDir` argument** (absolute path), so one registration serves any number of projects concurrently. `inspect`/`await`/`stop` take only a runId and locate its project store automatically (live contexts first, then the on-disk store manifests). Each project gets its own `WorkflowManager` — same per-project run stores as before — while all projects share one ACP backend pool. Background runs are visible from every session, and `MAX_BACKGROUND_RUNS` caps runs **per project** rather than per client process. The `repl` tool's workspace is the same shape of per-project context: **one persistent QuickJS VM per `projectDir`**, restored lazily from the per-project `repl/` store on first touch, persisted at every state-changing boundary, and drained when the project's last MCP client disconnects (both tools share one client-presence ledger, so a `workflow`-only client keeps the workspace's children warm too). See [The `repl` tool](#the-repl-tool).
@@ -127,7 +129,7 @@ url = "http://127.0.0.1:29888/mcp"
 
 One registration — global or per-project — serves every project: each run names its project via the required `projectDir` tool argument, and runId actions need no project at all.
 
-The daemon must be running before an HTTP-only host connects (`daemon start`); any stdio shim usage also keeps it alive. The transport implements the full 2025-11-25 Streamable HTTP contract: per-session `Mcp-Session-Id`, SSE with priming events and `Last-Event-ID` resumability (dropped connections replay missed messages, including tool responses), `DELETE` session termination, and 404-driven re-initialize.
+The daemon must be running before an HTTP-only host connects (`daemon start`); any stdio shim usage also keeps it alive. One endpoint serves both protocol eras. Legacy clients retain the full 2025-11-25 Streamable HTTP contract: per-session `Mcp-Session-Id`, SSE with priming events and `Last-Event-ID` resumability, `DELETE` termination, and 404-driven re-initialize. Modern clients negotiate through `server/discover` and use the SDK's stateless per-request `2026-07-28` handler, `input_required` rounds, response-stream cancellation, and `subscriptions/listen`; modern requests never allocate a legacy daemon session.
 
 ---
 
@@ -627,8 +629,11 @@ client `resources` capability to gate these server-offered primitives.
   The cancelled call has a durable failed record but no journal result, so a later resume executes
   that occurrence live. The engine-owned latch settles even an abort-ignoring runner while the ACP
   layer closes/recycles a session that ignores cancellation.
-- **Checkpoints.** Foreground uses MCP elicitation when advertised. Background never retains that
-  request-scoped callback: omitted/`"default"` returns `default ?? true`, `"abort"` becomes failed
+- **Checkpoints.** Foreground uses MCP elicitation when advertised. Legacy clients use the established
+  server-to-client request; modern clients receive the equivalent SDK `input_required` round, with the
+  paused run/checkpoint identity carried in integrity-protected request state and resumed through the
+  same durable journal. Background never retains a live callback: omitted/`"default"` returns
+  `default ?? true`, `"abort"` becomes failed
   with `WORKFLOW_ABORTED`, and `"pause"` becomes paused with `checkpoint_required` plus
   `outcome.checkpointContext`. Resume by starting a new run with `resumeFromRunId` and
   `checkpointReplies`; no particular `resumePolicy` is required, and the decision value becomes the
@@ -836,7 +841,7 @@ Each `agent()` call is dispatched to an **ACP agent server** chosen by the call'
 
 Beyond the built-ins, **any ACP agent** can be registered as a named backend via `AGENTPRISM_BACKENDS` (see the table below) and routed to with `agent(p, { model: "<name>" })` — or `"<name>/<inner-model>"` to send `<inner-model>` verbatim as its model config value. Scripts can pass arbitrary session/turn `_meta` to such agents with `agent(p, { meta, promptMeta })`.
 
-A workflow script can also **declare its own backends** in its meta block (`meta.backends: { <name>: { command, args?, env?, sessionMeta? } }`). Because these spawn commands on this machine, they require approval before the run starts: if the connected client supports MCP **elicitation**, the user is asked to approve each unique spawn config (approvals stick for the session); otherwise the call fails with an informative error naming the `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` env opt-in. Host-registered names (`AGENTPRISM_BACKENDS`) always win over script declarations of the same name.
+A workflow script can also **declare its own backends** in its meta block (`meta.backends: { <name>: { command, args?, env?, sessionMeta? } }`). Because these spawn commands on this machine, they require approval before the run starts: if the connected client supports MCP **elicitation**, the user is asked to approve each unique spawn config; otherwise the call fails with an informative error naming the `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` env opt-in. Approvals remain session-sticky on legacy connections and are integrity-bound to the active multi-round-trip call on stateless modern connections. Host-registered names (`AGENTPRISM_BACKENDS`) always win over script declarations of the same name.
 
 **Authentication belongs to the agents, not this server.** Claude, Codex, and OpenCode use their normal CLI credentials; pi uses the selected provider's environment key or `~/.pi/agent/auth.json`. There is no separate auth state for an MCP host to inspect or manage. If a run genuinely hits expired/missing credentials, the backend returns ACP `AUTH_REQUIRED` and the managed run **pauses** with `reason: "auth_required"` plus a non-secret `authContext` naming the backend and advertised methods: configure that credential out-of-band, then call `workflow` again with the original script and `resumeFromRunId` — the run continues from its journal. Programmatic auth flows (env-var/gateway credential injection, LLM provider routing) live in the [`@automatalabs/workflows`](../workflows) SDK runner APIs for hosts that embed the engine directly.
 
@@ -884,21 +889,18 @@ const run = await runDynamicWorkflow(
 console.log(run.status, run.result);
 ```
 
-This MCP-server package does export its own building blocks, for hosts that want to mount the same tools on a transport they control rather than the default stdio one. `createWorkflowServer(runner)` registers the `docs`, `workflow`, and `repl` tools (plus the app-only `workflow-events` poller and the `author-workflow` prompt); the `repl` workspaces default to a private client-presence ledger and a server-owned eval-break channel, and `CreateWorkflowServerOptions` exposes `replRunner`, `replPresence`, `replClientId`, `replEvalBreakChannel`, and `replDrainBoundMs` to override them (the daemon passes shared instances):
+This MCP-server package does export its own building blocks, for hosts that want to mount the same tools on a transport they control rather than the default stdio one. `createWorkflowServer(runner)` registers the `docs`, `workflow`, and `repl` tools (plus the app-only `workflow-events` poller and the `author-workflow` prompt); the `repl` workspaces default to a private client-presence ledger and a server-owned eval-break channel. `CreateWorkflowServerOptions` exposes `protocolEra` for SDK serving factories, `requestStateCodec` for deployments that need a durable/shared modern multi-round-trip key, plus `replRunner`, `replPresence`, `replClientId`, `replEvalBreakChannel`, and `replDrainBoundMs` for host lifecycle integration (the daemon passes shared instances):
 
 ```ts
-import { createWorkflowServer, installMcpServerLifecycle } from "@automatalabs/mcp-server";
+import { createWorkflowServer } from "@automatalabs/mcp-server";
 import { createAcpRunner } from "@automatalabs/workflows";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
 const runner = createAcpRunner();
-const server = createWorkflowServer(runner);
-const transport = new StdioServerTransport();
-await server.connect(transport);
-installMcpServerLifecycle({ runner, server, transport });
+await serveStdio(({ era }) => createWorkflowServer(runner, { protocolEra: era }));
 ```
 
-> **Synchronous-runaway interruption needs the relay transport.** A vanilla `StdioServerTransport` (above) serves every `repl` action, but its stdin reader runs on the main thread, so it cannot fire the out-of-band eval-break for a *fully synchronous* runaway — that eval only stops at the per-eval deadline. The bundled `main()` instead uses the internal relay stdio transport (a worker-thread stdin reader that fires `server.replBreakUrl()` before forwarding a no-id `interrupt`), so the documented no-id interrupt breaks a synchronous runaway mid-run. A yielding eval is interruptible on either transport.
+> **Use an SDK serving entry for dual-era hosting.** A hand-constructed server connected directly to `StdioServerTransport` intentionally serves only the legacy era. `serveStdio(factory)` performs the official modern/legacy arbitration while registering each tool once through the factory. The bundled `main()` additionally supplies its internal relay transport, whose worker-thread stdin reader can fire the out-of-band eval-break for a fully synchronous runaway; a vanilla stdio transport remains bounded by the per-eval deadline for that case.
 
 The REPL-specific exports are `replToolInputShape` / `replToolOutputShape` (the tool's Zod input/output schemas), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). Other workflow-side exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
 `clampWorkflowInput` (primitive schema, action discriminator, execution clamp),

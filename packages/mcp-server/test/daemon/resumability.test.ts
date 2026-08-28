@@ -1,13 +1,11 @@
 // Spec resumability end-to-end: a client that vanishes mid-call reconnects with the
 // priming event's ID via GET + Last-Event-ID and receives the stored tool response. This
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import type { JSONRPCMessage } from "@modelcontextprotocol/client";
+
 // exercises the BoundedEventStore through the real SDK transports, not in isolation.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
-
 import { structured, ONE_AGENT_SCRIPT } from "../_harness.js";
 import { connectHttp, gatedRunner, makeProjectDir, startDaemon } from "../_http-harness.js";
 
@@ -27,7 +25,6 @@ test("a dropped foreground call's response is replayed via GET + Last-Event-ID",
         method: "tools/call",
         params: { name: "workflow", arguments: { script: ONE_AGENT_SCRIPT, projectDir } },
       },
-      CallToolResultSchema,
       { onresumptiontoken: (token) => (resumptionToken = token) },
     );
     pending.catch(() => undefined); // The deliberate disconnect below rejects it.

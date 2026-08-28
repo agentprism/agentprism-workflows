@@ -1,6 +1,6 @@
 # MCP TypeScript SDK v2 migration — staged path
 
-**Status:** Stage 0 released and Apps negotiation audited; Stage A is ready but unstarted; Stages B–C remain technically gated · **Updated:** 2026-08-27
+**Status:** Stage 0 released; split-SDK migration and dual-era serving implemented on `feat/mcp-dual-era` · **Updated:** 2026-08-28
 
 **Provenance.** Owner directives: (2026-08-07) "I don't consider us to be spec conformant if
 we're behind on the mcp sdk version. We need a path to upgrade to the latest one"; (2026-08-27)
@@ -60,6 +60,28 @@ before starting any stage.
   objects never flow between v1-imported and v2-imported modules (nominal types, separate
   error classes). Our shim↔daemon boundary is the wire, so they migrate independently.
 
+### Implementation outcome (2026-08-28)
+
+The migration was executed from the official SDK documents rather than this roadmap:
+`upgrade-to-v2` for the codemod/manual v1→v2 API work and `support-2026-07-28` for
+protocol adoption. The resulting server:
+
+- uses `@modelcontextprotocol/client`, `/server`, and `/node` 2.0.0 with no production
+  import of the monolithic v1 SDK;
+- preserves the daemon's stateful legacy session path and routes modern envelopes through
+  `createMcpHandler(factory, { legacy: "reject" })` using `isLegacyRequest`;
+- uses `serveStdio(factory)` for dual-era in-process stdio and keeps the default stdio shim a
+  byte-preserving proxy to the dual-era daemon;
+- implements modern checkpoints and script-backend approvals through `inputRequired` plus
+  integrity-protected, daemon-family request state while retaining the legacy push behavior
+  needed for its existing per-checkpoint timeout contract;
+- publishes modern change events through `subscriptions/listen`; and
+- removes the ext-apps server-object boundary with a local v2-native, request-aware Apps
+  catalog while retaining ext-apps only in the bundled browser UI.
+
+The modern and legacy paths are covered by real HTTP, built stdio, daemon-replacement,
+request-state tamper/restart, Apps capability, and subscription end-to-end tests.
+
 ## 2. The staged plan
 
 Each stage is independently shippable and reversible, delivered by the repo's established
@@ -105,7 +127,7 @@ not run while another workstream is editing the same files (§5).
   `ui://` resource; every other client receives the same input/output schemas and text/structured
   results without an Apps surface.
 
-### Stage A — shim first (client-only surface)
+### Stage A — shim first (client-only surface; implemented 2026-08-28)
 - Migrate `packages/mcp-server/src/shim/*` (SDK `Client` + `StreamableHTTPClientTransport`)
   to `@modelcontextprotocol/client`. Codemod, then manual sweep of its markers.
 - Keep default (legacy) version negotiation — explicitly do NOT enable `'auto'` while the
@@ -114,7 +136,7 @@ not run while another workstream is editing the same files (§5).
   on missing capability (`enforceStrictCapabilities` restores v1 semantics if needed).
 - Acceptance: shim↔v1-daemon interop proven by the existing e2e suite; no wire change.
 
-### Stage B — daemon SDK surface, architecture unchanged
+### Stage B — daemon SDK surface, architecture unchanged (implemented 2026-08-28)
 - Codemod `packages/mcp-server` server side to `@modelcontextprotocol/server` + `/node`,
   keeping the per-session transport map exactly as-is. No `createMcpHandler`, no wire change.
 - Known manual hotspots (from the guide + our code): method-string `setRequestHandler` for
@@ -122,7 +144,8 @@ not run while another workstream is editing the same files (§5).
   `authInfo`); error taxonomy (`McpError`→`ProtocolError`, `SdkHttpError`, match on codes at
   dual-role boundaries); header reads via `.get()`; eager-capability re-baselining (declaring
   a capability now advertises `listChanged: true` and answers empty lists instead of -32601);
-  unknown-tool calls reject instead of `isError`; `pi-acp`'s 3 SDK files.
+  unknown-tool calls reject instead of `isError`. `pi-acp` remains a separate package/process
+  boundary and was not part of the MCP server migration.
 - **Official boundary condition:** ext-apps#702 ships a v2-compatible release, or Stage B is
   redesigned so no SDK object crosses between v1 ext-apps code and v2 server code. The official
   migration guide says dependencies compiled against the host's v1 SDK keep their interfacing host
@@ -131,28 +154,29 @@ not run while another workstream is editing the same files (§5).
 - Acceptance: full gates + live e2e; Apps panel verified working end-to-end in an
   Apps-capable host; no wire change.
 
-### Stage C — actually going modern (2026-07-28 beside 2025)
+### Stage C — actually going modern (2026-07-28 beside 2025; implemented 2026-08-28)
 - HTTP: `isLegacyRequest` routing in front of a `legacy:'reject'` `createMcpHandler`; the
   existing sessionful deployment keeps serving legacy clients (the documented dual-stack
   pattern). stdio: `serveStdio` dual-era arbitration (this also properly answers
   `server/discover`, closing the shim's -32601 stopgap).
-- Rewrite elicitation handlers once to the `inputRequired(...)` style — the SDK's legacy
-  shim keeps serving 2025 clients via real server→client requests.
+- Modern requests return `inputRequired(...)` and resume through sealed request state. The
+  legacy path deliberately retains its push elicitation adapter because the workflow DSL's
+  per-checkpoint `timeoutMs` contract cannot be represented by the SDK legacy shim's one global
+  round timeout; tool execution and durable checkpoint identity remain shared.
 - Change delivery via `handler.notify.*`/`ServerEventBus`; modern-era state via sealed
   `requestState` where session state is today (scope per-surface when this stage is specced).
-- **GATES**: at least one v2 patch release published (the §4 fix list actually shipping);
-  ext-apps has a modern-era answer for extension notifications (typescript-sdk#2569).
-- This stage gets its own detailed spec before any build — this document deliberately does
-  not spec it.
+- The pre-implementation gates were discharged by executable proof rather than assumption:
+  the stable 2.0.0 entries pass both-era e2e in this topology, and the Apps redesign removes
+  all in-process v1/v2 SDK object crossing without consuming an unpublished ext-apps branch.
 
-## 3. Explicit non-goals until their stage
+## 3. Historical staging non-goals
 
 No v2 packages before Stage A. No `createMcpHandler`/`serveStdio`/`versionNegotiation:'auto'`
 before Stage C. No direct flow of SDK objects between v1 ext-apps code and v2 server code; casts
 are not treated as migration. No protocol-era changes to the ACP packages (different protocol;
 out of scope throughout).
 
-## 4. Gate ledger — re-verify before each stage
+## 4. Pre-implementation gate ledger (historical audit context)
 
 - ext-apps v2 compatibility: github.com/modelcontextprotocol/ext-apps/issues/702 remains open
   (#719/#720 both still open as of 2026-08-27; no v2-compatible npm release).

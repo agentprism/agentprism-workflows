@@ -60,8 +60,7 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import type { Transport, JSONRPCMessage } from "@modelcontextprotocol/server";
 
 /** The worker's EOF marker (the stdin pipe closed — the main thread
  *  closes the transport, mirroring `StdioServerTransport`'s close-on-

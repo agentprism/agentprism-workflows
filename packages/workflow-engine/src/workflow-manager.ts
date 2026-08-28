@@ -303,6 +303,8 @@ export interface ExecOptions {
     options: CheckpointOptions,
     context?: CheckpointCallContext,
   ) => Promise<unknown>;
+  /** Force every checkpoint to pause durably for an out-of-band host reply. */
+  pauseOnCheckpoint?: boolean;
   /** Called synchronously when workflow() allocates a unique child-run ordinal. */
   onNestedWorkflow?: (ordinal: number, childRunId: string) => void;
   /**
@@ -1585,6 +1587,9 @@ export class WorkflowManager extends EventEmitter {
     }
 
     if (appendedRecord !== undefined) {
+      // Stable host seam for protocol-native resource update publication. Emitted only after
+      // the append is durable; consumers may safely direct readers to the new watermark.
+      this.emit("runEventPersisted", appendedRecord);
       try {
         actions.afterAppend?.(appendedRecord);
       } catch (error) {
@@ -1685,6 +1690,7 @@ export class WorkflowManager extends EventEmitter {
       concurrency,
       agentRetries,
       confirm,
+      pauseOnCheckpoint,
       onNestedWorkflow,
       scriptBackends,
     } = exec;
@@ -1741,6 +1747,7 @@ export class WorkflowManager extends EventEmitter {
         maxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
         confirm,
+        pauseOnCheckpoint,
         onNestedWorkflow: (ordinal, childRunId) => {
           managed.nestedWorkflows = true;
           onNestedWorkflow?.(ordinal, childRunId);

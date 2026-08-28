@@ -1,5 +1,5 @@
 import type { AgentRunner } from "@automatalabs/shared-types";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { Transport } from "@modelcontextprotocol/server";
 
 /** The maximum time reserved for graceful ACP process teardown before exit is forced. */
 export const SHUTDOWN_DEADLINE_MS = 5_000;

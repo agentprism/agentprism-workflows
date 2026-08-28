@@ -40,9 +40,8 @@
  * drain failure that lost state, which still get a one-line notice in
  * the next eval's output (losses are never silent).
  */
-
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { Broker, BrokerRunner, EvalBreakChannel, WasmModule } from "@automatalabs/repl-engine";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
@@ -165,7 +164,7 @@ const REPL_ACTION_FIELDS: Record<string, ReadonlySet<ReplInputField>> = {
 };
 
 function invalidReplInput(message: string): never {
-  throw new McpError(ErrorCode.InvalidParams, `Invalid repl tool input: ${message}`);
+  throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Invalid repl tool input: ${message}`);
 }
 
 /** Apply the action discriminator after the MCP SDK has validated the
@@ -223,7 +222,7 @@ function resolveContext(
   }
   const resolution = resolveProjectDir(projectDir);
   if (!resolution.ok) {
-    throw new McpError(ErrorCode.InvalidParams, `Invalid repl tool input: ${resolution.message}`);
+    throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Invalid repl tool input: ${resolution.message}`);
   }
   return options.projects.getOrCreate(resolution.projectDir);
 }
@@ -466,8 +465,8 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
     },
     async (rawArgs) => {
       if (!options.acceptingWork()) {
-        throw new McpError(
-          ErrorCode.InternalError,
+        throw new ProtocolError(
+          ProtocolErrorCode.InternalError,
           "Workflow server is shutting down and is no longer accepting tool calls.",
         );
       }

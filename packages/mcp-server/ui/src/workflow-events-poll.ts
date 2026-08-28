@@ -1,5 +1,5 @@
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/client";
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
 
 import type { RunStatus } from "./state.js";

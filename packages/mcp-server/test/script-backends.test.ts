@@ -1,5 +1,7 @@
 // The MCP shell's TRUST GATE for script-declared meta.backends:
 //   - client WITHOUT the elicitation capability -> informative tool error naming the
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+
 //     AGENTPRISM_ALLOW_SCRIPT_BACKENDS env opt-in (never a silent drop, never a hang);
 //   - env opt-in set -> approved headlessly, registry threaded to the runner;
 //   - eliciting client: accept -> run proceeds (approval is session-sticky per spawn config —
@@ -7,10 +9,6 @@
 //   - scripts without meta.backends are untouched by the gate.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentRunner, RunOptions } from "@automatalabs/shared-types";
 
 import { createWorkflowServer } from "../src/index.js";
@@ -49,7 +47,7 @@ async function connectEliciting(
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "mcp-server-test", version: "0.0.0" }, { capabilities: { elicitation: {} } });
   const prompts: string[] = [];
-  client.setRequestHandler(ElicitRequestSchema, async (request) => {
+  client.setRequestHandler('elicitation/create', async (request) => {
     prompts.push(request.params.message);
     const { action, approve } = respond(request.params.message);
     return action === "accept" ? { action, content: { approve: approve ?? true } } : { action };

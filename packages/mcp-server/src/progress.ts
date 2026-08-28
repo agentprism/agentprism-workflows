@@ -1,10 +1,10 @@
+import type { ServerContext } from "@modelcontextprotocol/server";
+
 // packages/mcp-server/src/progress.ts
 //
 // Bridges live foreground snapshots and persisted background event tails onto the MCP
 // progress notification. MCP correlates each notification to the tools/call request via
 // the client's progressToken; without one there is no addressable progress channel.
-import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { redactText, truncateUtf8 } from "@automatalabs/workflows";
 import type { PersistedRunState } from "@automatalabs/workflows";
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
@@ -19,8 +19,8 @@ const EVENT_TEXT_LIMIT_BYTES = 512;
  */
 export type WorkflowProgressCallback = (progress: number, total?: number, message?: string) => void;
 
-/** The `extra` bag the SDK passes to a tool handler: progress sink + AbortSignal + request `_meta`. */
-export type WorkflowToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+/** The v2 context the SDK passes to a tool handler: request metadata, notifications, and cancellation. */
+export type WorkflowToolExtra = ServerContext;
 
 export interface AwaitProgressReporter {
   seed(snapshot: PersistedRunState): void;
@@ -40,7 +40,7 @@ export function formatAgentProgressMessage(progress: RunAgentProgressPayload): s
  * or failing transport must never abort the workflow.
  */
 export function createProgressReporter(extra: WorkflowToolExtra): WorkflowProgressCallback {
-  const progressToken = extra._meta?.progressToken;
+  const progressToken = extra.mcpReq._meta?.progressToken;
   if (progressToken === undefined) {
     return () => {
       /* no progressToken on this call -> progress is not addressable; intentionally skip. */
@@ -53,8 +53,7 @@ export function createProgressReporter(extra: WorkflowToolExtra): WorkflowProgre
       ...(total === undefined ? {} : { total }),
       ...(message === undefined ? {} : { message }),
     };
-    void extra
-      .sendNotification({
+    void extra.mcpReq.notify({
         method: "notifications/progress",
         params,
       })
@@ -66,7 +65,7 @@ export function createProgressReporter(extra: WorkflowToolExtra): WorkflowProgre
 
 /** Build the distinct-call projection used only while one background await is pending. */
 export function createAwaitProgressReporter(extra: WorkflowToolExtra): AwaitProgressReporter {
-  if (extra._meta?.progressToken === undefined) {
+  if (extra.mcpReq._meta?.progressToken === undefined) {
     return { seed() {}, record() {} };
   }
 

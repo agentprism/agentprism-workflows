@@ -1,8 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-
-import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
-import type { JsonSchemaType } from "@modelcontextprotocol/sdk/validation";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/server/validators/ajv";
+import type { JsonSchemaType } from "@modelcontextprotocol/server";
 import { WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 
 import { workflowToolOutputShape } from "../src/workflow-tool-output.js";
