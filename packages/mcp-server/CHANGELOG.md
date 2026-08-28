@@ -1,5 +1,19 @@
 # @automatalabs/mcp-server
 
+## 0.36.0
+
+### Minor Changes
+
+- 661d9d1: Keep workflow run control reachable across daemon version succession. Run leases now expose opaque owner identity, managers can safely cold-stop lease-free persisted runs, and daemon successors persist and forward authenticated stop/cancel operations to predecessor execution owners with an explicit fenced force escalation.
+
+  Update the embedded Pi runtime packages to 0.84.4. The release changes an unused agent-loop hook ordering and otherwise delivers compatible session, compaction, provider-stream, and Windows abort fixes; the provider error-classification strings remain unchanged.
+
+### Patch Changes
+
+- Updated dependencies [661d9d1]
+  - @automatalabs/workflows@0.56.0
+  - @automatalabs/repl-engine@0.4.9
+
 ## 0.35.0
 
 ### Minor Changes
