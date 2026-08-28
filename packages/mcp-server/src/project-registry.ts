@@ -13,7 +13,7 @@
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
-import type { AgentRunner } from "@automatalabs/shared-types";
+import type { AgentRunner, RunEventLogRecord } from "@automatalabs/shared-types";
 import {
   WORKFLOW_PROJECTS_SUBDIR,
   WorkflowManager,
@@ -85,6 +85,8 @@ export interface RunStoreRouter {
   stores(): ProjectContext[];
   /** Aggregated runDeleted events across all current and future contexts; returns detach. */
   onRunDeleted(listener: (event: { runId: string }) => void): () => void;
+  /** Durable event appends across all current and future contexts; returns detach. */
+  onRunEventPersisted(listener: (record: RunEventLogRecord) => void): () => void;
 }
 
 export type ProjectDirResolution = { ok: true; projectDir: string } | { ok: false; message: string };
@@ -114,6 +116,7 @@ export function resolveProjectDir(raw: unknown): ProjectDirResolution {
 export class WorkflowProjectRegistry implements RunStoreRouter {
   private readonly contexts = new Map<string, ProjectContext>();
   private readonly deletionListeners = new Set<(event: { runId: string }) => void>();
+  private readonly persistedEventListeners = new Set<(record: RunEventLogRecord) => void>();
 
   constructor(private readonly runner: AgentRunner) {}
 
@@ -143,6 +146,9 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
     this.contexts.set(context.projectDir, context);
     context.manager.on("runDeleted", (event: { runId: string }) => {
       for (const listener of this.deletionListeners) listener(event);
+    });
+    context.manager.on("runEventPersisted", (record: RunEventLogRecord) => {
+      for (const listener of this.persistedEventListeners) listener(record);
     });
     return context;
   }
@@ -194,6 +200,11 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
   onRunDeleted(listener: (event: { runId: string }) => void): () => void {
     this.deletionListeners.add(listener);
     return () => this.deletionListeners.delete(listener);
+  }
+
+  onRunEventPersisted(listener: (record: RunEventLogRecord) => void): () => void {
+    this.persistedEventListeners.add(listener);
+    return () => this.persistedEventListeners.delete(listener);
   }
 
   activeRunCount(): number {
@@ -261,6 +272,10 @@ export function singleStoreRouter(manager: WorkflowManager): RunStoreRouter {
     onRunDeleted: (listener) => {
       manager.on("runDeleted", listener);
       return () => manager.off("runDeleted", listener);
+    },
+    onRunEventPersisted: (listener) => {
+      manager.on("runEventPersisted", listener);
+      return () => manager.off("runEventPersisted", listener);
     },
   };
 }

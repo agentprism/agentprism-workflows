@@ -1,13 +1,14 @@
 // The run-monitor app-only tool poll's transport and timing/stop policy: structuredContent pages
 // fold by cursor, idle polls back off
 // 2s → 4s → 8s → cap and reset the moment new events arrive, error retries back off to the cap,
+import type { CallToolResult } from "@modelcontextprotocol/server";
+
 // and the loop gives up only after a bounded run of consecutive faults so a dead run is not polled
 // forever. These are the ITEM 2a (adaptive no-op backoff) and ITEM 2c (bounded retry) rules,
 // factored out of the React effect so they can be checked without a DOM or fake timers.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
 
 import {

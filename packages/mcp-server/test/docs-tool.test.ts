@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import {
   AUTHORING_DOC_TOPICS,
   AUTHORING_DOC_TOPIC_IDS,

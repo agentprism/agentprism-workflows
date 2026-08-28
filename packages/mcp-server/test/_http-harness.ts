@@ -1,13 +1,11 @@
 // HTTP-transport sibling of _harness.ts: a real createDaemon() on an ephemeral loopback
 // port, driven by real SDK Clients over StreamableHTTPClientTransport. Importing _harness
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
+
 // first inherits its $HOME isolation, stub runner factories, and result accessors.
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ElicitRequestSchema, ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentRunner } from "@automatalabs/shared-types";
 
 import {
@@ -45,6 +43,8 @@ export async function connectHttp(
   opts: {
     listTools?: boolean;
     uiCapability?: UiCapabilityMode;
+    /** Legacy is the v2 SDK default; auto negotiates modern with conservative fallback. */
+    protocolMode?: "legacy" | "auto" | "modern";
     /** Advertise the elicitation capability and answer checkpoint forms with this. */
     elicit?: (request: ElicitRequest) => ElicitResult | Promise<ElicitResult>;
   } = {},
@@ -55,20 +55,27 @@ export async function connectHttp(
     {
       capabilities: {
         ...uiClientCapabilities(opts.uiCapability ?? "matching"),
-        ...(opts.elicit ? { elicitation: {} } : {}),
+        ...(opts.elicit ? { elicitation: { form: {} } } : {}),
       },
+      ...(opts.protocolMode === undefined || opts.protocolMode === "legacy"
+        ? {}
+        : {
+            versionNegotiation: {
+              mode: opts.protocolMode === "auto" ? "auto" as const : { pin: "2026-07-28" },
+            },
+          }),
     },
   );
   const elicitations: ElicitRequest[] = [];
   if (opts.elicit) {
     const respond = opts.elicit;
-    client.setRequestHandler(ElicitRequestSchema, async (request) => {
+    client.setRequestHandler('elicitation/create', async (request) => {
       elicitations.push(request);
       return await respond(request);
     });
   }
   const resourceUpdates: string[] = [];
-  client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+  client.setNotificationHandler('notifications/resources/updated', (notification) => {
     resourceUpdates.push(notification.params.uri);
   });
   await client.connect(transport);

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 // Internals under test, imported via ../src (same-package unit test).
@@ -102,7 +102,7 @@ test("resume policy and source validation reject invalid values and combinations
   ]) {
     assert.throws(
       () => parseWorkflowToolInput(Schema.parse(input)),
-      (error: unknown) => error instanceof McpError && error.code === ErrorCode.InvalidParams,
+      (error: unknown) => error instanceof ProtocolError && error.code === ProtocolErrorCode.InvalidParams,
     );
   }
 });
@@ -295,7 +295,7 @@ test("the discriminator rejects every missing or mixed run/inspect/await branch"
     assert.throws(
       () => parseWorkflowToolInput(primitive),
       (error: unknown) =>
-        error instanceof McpError && error.code === ErrorCode.InvalidParams && /Invalid workflow tool input/.test(error.message),
+        error instanceof ProtocolError && error.code === ProtocolErrorCode.InvalidParams && /Invalid workflow tool input/.test(error.message),
     );
   }
 });

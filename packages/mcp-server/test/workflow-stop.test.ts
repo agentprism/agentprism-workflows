@@ -3,10 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import type { RunOptions } from "@automatalabs/shared-types";
 import {
   WorkflowManager,
@@ -646,10 +643,10 @@ test("stop cancels an in-flight foreground checkpoint elicitation", async () => 
   );
   let elicitationStarted = false;
   let elicitationCancelled = false;
-  client.setRequestHandler(ElicitRequestSchema, (_request, extra) => {
+  client.setRequestHandler('elicitation/create', (_request, ctx) => {
     elicitationStarted = true;
     return new Promise((resolve) => {
-      extra.signal.addEventListener(
+      ctx.mcpReq.signal.addEventListener(
         "abort",
         () => {
           elicitationCancelled = true;

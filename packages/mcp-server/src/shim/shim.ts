@@ -5,33 +5,37 @@
  * process is disposable by design: the client may kill it at will; runs live in the daemon.
  *
  * The only frames the shim inspects:
- *  - the client's `initialize` request — cached for recovery, and its response sniffed to
- *    call setProtocolVersion() (there is no protocol layer to do it);
- *  - the `initialized` notification — forwarded verbatim; the SDK client transport then
- *    auto-opens the standalone GET stream (SSE) for server-initiated messages;
- *  - client requests — their ids are tracked until the response arrives, so a request whose
- *    daemon session dies underneath it is answered with an error instead of hanging forever.
+ *  - a legacy client's `initialize` request — cached for session recovery, and its response
+ *    sniffed to call setProtocolVersion() (there is no protocol layer in this proxy);
+ *  - the legacy `initialized` notification — forwarded before the standalone GET stream opens;
+ *  - client requests in either era — ids are tracked until their response arrives, so an
+ *    ambiguous request on a dead daemon is failed rather than replayed or left hanging.
  *
- * Session recovery — the spec's 404 after eviction or a daemon restart, a 503 from a
+ * Legacy session recovery — the spec's 404 after eviction or a daemon restart, a 503 from a
  * superseded (lame-duck) daemon, a network error because the daemon died, or the standalone
  * GET stream failing for any of those reasons — always takes the same path: re-ensure the
  * daemon (it may have been replaced by a newer one on another port), re-initialize a fresh
  * session with the cached initialize, re-arm subscriptions, and drain the queue. The client
  * never notices an eviction, a daemon restart, or a version upgrade. Recovery is triggered
  * PROACTIVELY from the GET stream's failure (not only from the client's next frame) so that
- * server-push continuity resumes promptly after a migration.
+ * server-push continuity resumes promptly after a migration. Modern traffic has no session:
+ * recovery replaces only the upstream HTTP transport, fails ambiguous ordinary in-flight work,
+ * reopens idempotent `subscriptions/listen` streams, and forwards later stateless requests
+ * without inventing initialize or session state.
  */
 
 import { realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
+  SdkHttpError,
   StreamableHTTPClientTransport,
-  StreamableHTTPError,
-} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { isJSONRPCError, isJSONRPCRequest, isJSONRPCResponse } from "@modelcontextprotocol/sdk/types.js";
-import type { JSONRPCMessage, JSONRPCRequest, RequestId } from "@modelcontextprotocol/sdk/types.js";
-
+  isJSONRPCErrorResponse,
+  isJSONRPCNotification,
+  isJSONRPCRequest,
+  isJSONRPCResultResponse,
+} from "@modelcontextprotocol/client";
+import type { JSONRPCMessage, JSONRPCRequest, RequestId } from "@modelcontextprotocol/client";
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { DAEMON_NAME } from "../daemon/constants.js";
 import { ensureDaemonRunning } from "./ensure-daemon.js";
 
@@ -46,7 +50,7 @@ const RECOVERY_WINDOW_MS = 60_000;
 const RECOVERY_MAX_PER_WINDOW = 6;
 
 function initializeResultProtocolVersion(message: JSONRPCMessage): string | undefined {
-  if (!isJSONRPCResponse(message)) return undefined;
+  if (!isJSONRPCResultResponse(message)) return undefined;
   const version = (message.result as { protocolVersion?: unknown }).protocolVersion;
   return typeof version === "string" ? version : undefined;
 }
@@ -61,7 +65,7 @@ function initializeResultProtocolVersion(message: JSONRPCMessage): string | unde
  *    the standalone GET (or a resumable POST stream) failed to reconnect.
  */
 function isRecoverableError(error: unknown): boolean {
-  if (error instanceof StreamableHTTPError) return error.code === 404 || error.code === 503;
+  if (error instanceof SdkHttpError) return error.status === 404 || error.status === 503;
   if (error instanceof TypeError) return true;
   if (error instanceof Error) {
     return /Maximum reconnection attempts|Failed to reconnect|Failed to open SSE stream/.test(error.message);
@@ -126,6 +130,10 @@ export async function runShim(options: RunShimOptions): Promise<void> {
   // starts with none. Responses to replayed subscribes are shim-internal and swallowed.
   const subscribedUris = new Set<string>();
   const swallowedIds = new Set<string>();
+  // Modern subscriptions/listen requests are idempotent stream establishments. Keep their
+  // original ids/envelopes so daemon replacement can reopen them without ending the client's
+  // still-live subscription handle. Ordinary requests are never replayed after ambiguity.
+  const modernSubscriptions = new Map<string, JSONRPCRequest>();
 
   // Client requests forwarded to the daemon whose response has not arrived yet, keyed by
   // request id and remembering which transport carried them. When that transport is retired
@@ -158,7 +166,7 @@ export async function runShim(options: RunShimOptions): Promise<void> {
   function failPendingOn(transport: StreamableHTTPClientTransport, reason: string): number {
     let failed = 0;
     for (const [key, entry] of [...pending.entries()]) {
-      if (entry.transport !== transport) continue;
+      if (entry.transport !== transport || modernSubscriptions.has(key)) continue;
       pending.delete(key);
       failed++;
       void stdio
@@ -203,11 +211,20 @@ export async function runShim(options: RunShimOptions): Promise<void> {
   }
 
   function onDaemonMessage(message: JSONRPCMessage, transport: StreamableHTTPClientTransport): void {
-    if ((isJSONRPCResponse(message) || isJSONRPCError(message)) && message.id !== null && message.id !== undefined) {
-      pending.delete(keyOf(message.id));
-    }
     if (retired.has(transport)) return; // a retired transport's late replies belong to a dead session
-    if (pendingReinitId !== undefined && isJSONRPCResponse(message) && message.id === pendingReinitId) {
+    if ((isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) && message.id !== null && message.id !== undefined) {
+      const key = keyOf(message.id);
+      if (modernSubscriptions.has(key) && isJSONRPCResultResponse(message)) {
+        // A modern listen stream ending without a client cancellation is an upstream loss,
+        // not the end of the stdio client's subscription handle. Swallow the terminal result
+        // and reopen the idempotent stream through the normal stateless recovery path.
+        void startReinitialize("modern subscriptions/listen stream ended");
+        return;
+      }
+      pending.delete(key);
+      modernSubscriptions.delete(key);
+    }
+    if (pendingReinitId !== undefined && isJSONRPCResultResponse(message) && message.id === pendingReinitId) {
       // Shim-internal re-initialize: swallow the response, restore protocol state, re-arm
       // the client's subscriptions on the fresh session, then drain.
       pendingReinitId = undefined;
@@ -234,10 +251,10 @@ export async function runShim(options: RunShimOptions): Promise<void> {
         .catch((error: unknown) => failPump(`re-initialize handshake failed: ${String(error)}`));
       return;
     }
-    if ((isJSONRPCResponse(message) || isJSONRPCError(message)) && typeof message.id === "string" && swallowedIds.delete(message.id)) {
+    if ((isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) && typeof message.id === "string" && swallowedIds.delete(message.id)) {
       return;
     }
-    if (clientInitializeId !== undefined && isJSONRPCResponse(message) && message.id === clientInitializeId) {
+    if (clientInitializeId !== undefined && isJSONRPCResultResponse(message) && message.id === clientInitializeId) {
       const version = initializeResultProtocolVersion(message);
       if (version !== undefined) http.setProtocolVersion(version);
       clientInitializeId = undefined;
@@ -265,11 +282,11 @@ export async function runShim(options: RunShimOptions): Promise<void> {
     }
     recoveryTimes.push(Date.now());
     reinitializing = true;
-    if (cachedInitialize === undefined) {
-      failPump("daemon session lost before the client ever initialized");
-      return;
-    }
-    log(`[${DAEMON_NAME} shim] recovering the daemon session (${reason})`);
+    log(
+      cachedInitialize === undefined
+        ? `[${DAEMON_NAME} shim] recovering the modern stateless daemon path (${reason})`
+        : `[${DAEMON_NAME} shim] recovering the daemon session (${reason})`,
+    );
     try {
       retireTransport(http, reason);
       // Re-ensure: the daemon may have restarted (new port) or been superseded by a newer one.
@@ -277,8 +294,22 @@ export async function runShim(options: RunShimOptions): Promise<void> {
       replBreakUrl = fresh.replBreakUrl;
       http = makeHttpTransport(fresh.url);
       await http.start();
+      if (cachedInitialize === undefined) {
+        // Modern 2026-07-28 traffic is per-request: there is no initialize/session state to
+        // reconstruct. Reopen only idempotent listen streams. Ordinary in-flight calls are
+        // failed by retireTransport as ambiguous and are never replayed.
+        let reopened = 0;
+        for (const [key, subscription] of modernSubscriptions) {
+          pending.set(key, { transport: http, message: subscription });
+          await http.send(subscription);
+          reopened += 1;
+        }
+        log(`[${DAEMON_NAME} shim] modern stateless path ready; reopened ${reopened} subscription(s)`);
+        flushQueue();
+        return;
+      }
       pendingReinitId = `__shim_reinit_${++reinitCounter}__`;
-      const reinit = { ...(cachedInitialize as object), id: pendingReinitId } as JSONRPCMessage;
+      const reinit = { ...cachedInitialize, id: pendingReinitId } as JSONRPCMessage;
       await http.send(reinit);
       // Continues in onDaemonMessage when the InitializeResult for pendingReinitId arrives.
     } catch (error) {
@@ -304,13 +335,18 @@ export async function runShim(options: RunShimOptions): Promise<void> {
     try {
       await transport.send(message);
     } catch (error) {
-      // The frame never reached the daemon: it is not pending there, and it can be replayed.
-      if (isJSONRPCRequest(message)) pending.delete(keyOf(message.id));
       if (isRecoverableError(error)) {
-        queue.push(message);
+        if (cachedInitialize !== undefined) {
+          // Preserve the established legacy recovery behavior. Modern send failures are
+          // ambiguous (the daemon may have executed before response headers were lost), so
+          // their pending request stays registered for retireTransport to fail exactly once.
+          if (isJSONRPCRequest(message)) pending.delete(keyOf(message.id));
+          queue.push(message);
+        }
         void startReinitialize(`send failed: ${String(error)}`);
         return;
       }
+      if (isJSONRPCRequest(message)) pending.delete(keyOf(message.id));
       log(`[${DAEMON_NAME} shim] send failed: ${String(error)}`);
       if (isJSONRPCRequest(message)) {
         void stdio
@@ -332,6 +368,8 @@ export async function runShim(options: RunShimOptions): Promise<void> {
       if (message.method === "initialize") {
         cachedInitialize = structuredClone(message);
         clientInitializeId = message.id;
+      } else if (message.method === "subscriptions/listen") {
+        modernSubscriptions.set(keyOf(message.id), message);
       } else if (message.method === "resources/subscribe" || message.method === "resources/unsubscribe") {
         const uri = (message.params as { uri?: unknown } | undefined)?.uri;
         if (typeof uri === "string") {
@@ -354,6 +392,13 @@ export async function runShim(options: RunShimOptions): Promise<void> {
             fireOutOfBandBreak(args.projectDir);
           }
         }
+      }
+    } else if (isJSONRPCNotification(message) && message.method === "notifications/cancelled") {
+      const requestId = (message.params as { requestId?: unknown } | undefined)?.requestId;
+      if (typeof requestId === "string" || typeof requestId === "number") {
+        const key = keyOf(requestId);
+        modernSubscriptions.delete(key);
+        pending.delete(key);
       }
     }
     // Forward in the order the client sent. pumpSend is async, so firing each frame

@@ -3,10 +3,8 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import type { AgentRunner } from "@automatalabs/shared-types";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import type { Transport } from "@modelcontextprotocol/client";
 import { installMcpServerLifecycle } from "../src/lifecycle.js";
 import { createWorkflowServer } from "../src/server.js";
 

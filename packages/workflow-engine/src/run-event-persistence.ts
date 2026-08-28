@@ -434,6 +434,7 @@ function isCheckpointContext(value: unknown, projected: boolean): boolean {
   if (hasOwn(value, "choices") && value.choices !== undefined) {
     if (!Array.isArray(value.choices) || (projected && value.choices.length > 20) || !value.choices.every(text)) return false;
   }
+  if (!hasOptional(value, "timeoutMs", isNonNegativeFinite)) return false;
   return !projected || !hasOwn(value, "default") || value.default === undefined || isProjectionValue(value.default);
 }
 

@@ -1,9 +1,9 @@
 // The `author-workflow` MCP prompt is a user-controlled convenience that frames an authoring
+import type { McpServer } from "@modelcontextprotocol/server";
+
 // task and points the assistant at the selective, version-matched `docs` tool. It deliberately
 // does not inject the complete optional skill or every API topic into one context window.
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-
 export const AUTHORING_PROMPT_NAME = "author-workflow";
 
 /** Assemble a compact task frame. The agent chooses only the documentation topics it needs. */
@@ -33,9 +33,9 @@ export function registerAuthoringPrompt(mcp: McpServer): void {
       description:
         "Frame a workflow-authoring task and direct the assistant to select only the version-matched " +
         "workflow documentation topics it needs through the `docs` tool.",
-      argsSchema: {
-        task: z.string().optional().describe("What the workflow should accomplish (optional)."),
-      },
+      argsSchema: z.object({
+              task: z.string().optional().describe("What the workflow should accomplish (optional)."),
+            }),
     },
     ({ task }) => ({
       messages: [

@@ -6,6 +6,10 @@
 // advertised in daemon.json) is the one path that can reach the running
 // eval: the quickjs interrupt handler consumes the relay's shared-memory
 // flag mid-execution and breaks the eval. Two delivery paths are pinned:
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import type { CallToolResult } from "@modelcontextprotocol/client";
+
 // the shim fires the relay automatically when it forwards a repl
 // interrupt (the stdio path), and the relay endpoint works standalone
 // (the direct-HTTP path — a host that fires it itself).
@@ -20,12 +24,6 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { envFingerprint } from "../../src/daemon/daemon-info.js";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-
 const distEntry = resolve(fileURLToPath(import.meta.url), "../../../dist/entry.js");
 const e2eHome = mkdtempSync(join(tmpdir(), "agentprism-repl-break-e2e-"));
 const childEnv: Record<string, string> = {
@@ -81,7 +79,6 @@ async function startDaemon(): Promise<E2eDaemonInfo> {
 function replEvalCode(client: Client, projectDir: string, code: string): Promise<CallToolResult> {
   return client.callTool(
     { name: "repl", arguments: { action: "eval", projectDir, code } },
-    undefined,
     { timeout: 60_000 },
   );
 }
@@ -89,7 +86,6 @@ function replEvalCode(client: Client, projectDir: string, code: string): Promise
 function replInterrupt(client: Client, projectDir: string): Promise<CallToolResult> {
   return client.callTool(
     { name: "repl", arguments: { action: "interrupt", projectDir } },
-    undefined,
     { timeout: 60_000 },
   );
 }

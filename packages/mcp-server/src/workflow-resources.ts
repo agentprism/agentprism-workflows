@@ -1,12 +1,5 @@
-import { ResourceTemplate, type McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  ErrorCode,
-  McpError,
-  ReadResourceRequestSchema,
-  SubscribeRequestSchema,
-  UnsubscribeRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import type { ResourceLink } from "@modelcontextprotocol/sdk/types.js";
+import { ResourceTemplate, ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
+import type { McpServer, ResourceLink, ServerContext, ServerNotifier } from "@modelcontextprotocol/server";
 import type {
   PersistedRunLineageTombstone,
   PersistedRunState,
@@ -35,7 +28,7 @@ const EVENTS_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/events(?:
 const STREAM_ID_PATTERN = /^[0-9a-f]{32}$/;
 
 function resourceNotFound(uri: string): never {
-  throw new McpError(ErrorCode.InvalidParams, `Workflow script resource not found: ${uri}`);
+  throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Workflow script resource not found: ${uri}`);
 }
 
 export function workflowScriptUri(runId: string): string {
@@ -121,16 +114,16 @@ const INVALID_EVENT_CODES = new Set<RunEventLogErrorCode>([
 ]);
 
 function malformedEventsUri(): never {
-  throw new McpError(ErrorCode.InvalidParams, "Malformed workflow run events URI.");
+  throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Malformed workflow run events URI.");
 }
 
 function mapEventError(error: unknown, parsed: ParsedWorkflowRunEventsUri): never {
-  if (error instanceof McpError) throw error;
+  if (error instanceof ProtocolError) throw error;
   if (error instanceof RunEventLogError) {
-    const code = INVALID_EVENT_CODES.has(error.code) ? ErrorCode.InvalidParams : ErrorCode.InternalError;
-    throw new McpError(code, `Workflow events ${parsed.normalizedUri} for ${parsed.runId} failed (${error.code}).`);
+    const code = INVALID_EVENT_CODES.has(error.code) ? ProtocolErrorCode.InvalidParams : ProtocolErrorCode.InternalError;
+    throw new ProtocolError(code, `Workflow events ${parsed.normalizedUri} for ${parsed.runId} failed (${error.code}).`);
   }
-  throw new McpError(ErrorCode.InternalError, `Workflow events ${parsed.normalizedUri} for ${parsed.runId} failed.`);
+  throw new ProtocolError(ProtocolErrorCode.InternalError, `Workflow events ${parsed.normalizedUri} for ${parsed.runId} failed.`);
 }
 
 function startedAtMillis(state: PersistedRunState): number {
@@ -154,7 +147,10 @@ export class WorkflowScriptResources {
   private readonly subscriptions = new Set<string>();
   private readonly externalReaders = new Map<
     string,
-    () => { contents: Array<{ uri: string; mimeType: string; text: string }> }
+    {
+      read: () => { contents: Array<{ uri: string; mimeType: string; text: string }> };
+      available?: (ctx: ServerContext) => boolean;
+    }
   >();
   private readonly eventSubscriptions = new Map<string, EventSubscription>();
   private readonly deletedRunIds = new Set<string>();
@@ -168,12 +164,16 @@ export class WorkflowScriptResources {
     this.cancelPendingElicitation(runId);
     this.deletedRunIds.add(runId);
     const notify = !this.silentDeletionRunIds.delete(runId);
-    if (notify) void this.mcp.sendResourceListChanged();
+    if (notify) {
+      if (this.modernNotifier) this.modernNotifier.resourcesChanged();
+      else void this.mcp.sendResourceListChanged();
+    }
   };
 
   constructor(
     private readonly mcp: McpServer,
     source: WorkflowManager | { router: RunStoreRouter },
+    private readonly modernNotifier?: ServerNotifier,
   ) {
     this.router = source instanceof WorkflowManager ? singleStoreRouter(source) : source.router;
     this.detachRunDeleted = this.router.onRunDeleted(this.onRunDeleted);
@@ -232,14 +232,16 @@ export class WorkflowScriptResources {
   registerExternalResourceReader(
     uri: string,
     read: () => { contents: Array<{ uri: string; mimeType: string; text: string }> },
+    available?: (ctx: ServerContext) => boolean,
   ): void {
-    this.externalReaders.set(uri, read);
+    this.externalReaders.set(uri, { read, available });
   }
 
   /** Announce a resource only after the server has read its admitted record back successfully. */
   notifyRunAdmitted(runId: string): void {
     this.deletedRunIds.delete(runId);
-    void this.mcp.sendResourceListChanged();
+    if (this.modernNotifier) this.modernNotifier.resourcesChanged();
+    else void this.mcp.sendResourceListChanged();
   }
 
   /** Bind the only request-lifetime admission state after the manager reveals the run ID. */
@@ -374,18 +376,25 @@ export class WorkflowScriptResources {
     // This handler REPLACES the SDK's default resources/read dispatch, so any fixed resource
     // registered outside this class (e.g. the MCP Apps ui:// panel) must also register a
     // reader here via registerExternalResourceReader.
-    this.mcp.server.setRequestHandler(ReadResourceRequestSchema, (request) => {
+    this.mcp.server.setRequestHandler('resources/read', (request, ctx) => {
       const uri = request.params.uri;
       const external = this.externalReaders.get(uri);
-      if (external) return external();
+      if (external) {
+        if (external.available !== undefined && !external.available(ctx)) resourceNotFound(uri);
+        return external.read();
+      }
       return uri.includes("/events") ? this.readEventsResource(uri) : this.readResource(uri);
     });
 
-    this.mcp.server.setRequestHandler(SubscribeRequestSchema, (request) => {
+    this.mcp.server.setRequestHandler('resources/subscribe', (request, ctx) => {
       const uri = request.params.uri;
       // Fixed external resources (authoring docs and the app panel) never update.
       // Accept host auto-subscription as a no-op rather than claiming a listed URI is missing.
-      if (this.externalReaders.has(uri)) return {};
+      const external = this.externalReaders.get(uri);
+      if (external) {
+        if (external.available !== undefined && !external.available(ctx)) resourceNotFound(uri);
+        return {};
+      }
       const runId = workflowRunIdFromScriptUri(uri);
       if (runId) {
         if (!this.loadState(runId)) resourceNotFound(uri);
@@ -395,12 +404,16 @@ export class WorkflowScriptResources {
       if (!uri.includes("/events")) resourceNotFound(uri);
       const parsed = parseWorkflowRunEventsUri(uri);
       if (!parsed) malformedEventsUri();
-      if (!parsed.canonical) throw new McpError(ErrorCode.InvalidParams, `Only ${workflowRunEventsUri(parsed.runId)} is subscribable.`);
+      if (!parsed.canonical) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Only ${workflowRunEventsUri(parsed.runId)} is subscribable.`);
       return this.subscribeEvents(parsed);
     });
-    this.mcp.server.setRequestHandler(UnsubscribeRequestSchema, (request) => {
+    this.mcp.server.setRequestHandler('resources/unsubscribe', (request, ctx) => {
       const uri = request.params.uri;
-      if (this.externalReaders.has(uri)) return {};
+      const external = this.externalReaders.get(uri);
+      if (external) {
+        if (external.available !== undefined && !external.available(ctx)) resourceNotFound(uri);
+        return {};
+      }
       const runId = workflowRunIdFromScriptUri(uri);
       if (runId) {
         if (
@@ -417,7 +430,7 @@ export class WorkflowScriptResources {
       if (!parsed || !parsed.canonical) malformedEventsUri();
       if (!this.loadState(parsed.runId) && !this.loadTombstone(parsed.runId) &&
           !this.deletedRunIds.has(parsed.runId) && !this.eventSubscriptions.has(parsed.normalizedUri)) {
-        throw new McpError(ErrorCode.InvalidParams, `Workflow events resource ${parsed.normalizedUri} is not known.`);
+        throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Workflow events resource ${parsed.normalizedUri} is not known.`);
       }
       this.closeEventSubscription(parsed.normalizedUri);
       return {};
@@ -431,7 +444,7 @@ export class WorkflowScriptResources {
       const persistence = this.persistenceFor(parsed.runId);
       const state = persistence?.load(parsed.runId);
       if (!persistence || !state?.eventStreamId || state.eventSeq === undefined) {
-        throw new McpError(ErrorCode.InvalidParams, `Workflow events ${parsed.normalizedUri} for ${parsed.runId} are unavailable.`);
+        throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Workflow events ${parsed.normalizedUri} for ${parsed.runId} are unavailable.`);
       }
       const page = persistence.readEvents(parsed.runId, { limit: 1, streamId: state.eventStreamId });
       const watcher = persistence.watchEvents(parsed.runId, { after: page.endCursor, streamId: page.streamId });
@@ -515,8 +528,8 @@ export class WorkflowScriptResources {
     const persistence = this.persistenceFor(request.runId);
     const state = persistence?.load(request.runId);
     if (!persistence || !state?.eventStreamId || state.eventSeq === undefined) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
         `Workflow events for ${request.runId} are unavailable.`,
       );
     }
@@ -535,7 +548,7 @@ export class WorkflowScriptResources {
     const persistence = this.persistenceFor(runId);
     const state = persistence?.load(runId);
     if (!persistence || !state?.eventStreamId || state.eventSeq === undefined) {
-      throw new McpError(ErrorCode.InvalidParams, `Workflow events for ${runId} are unavailable.`);
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Workflow events for ${runId} are unavailable.`);
     }
     const head = persistence.readEvents(runId, { limit: 1, streamId: state.eventStreamId });
     const effectiveAfter = Math.max(0, head.endCursor - RUN_EVENT_READ_LIMIT_DEFAULT);

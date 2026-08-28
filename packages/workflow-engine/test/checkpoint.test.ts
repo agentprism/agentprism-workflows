@@ -167,6 +167,22 @@ return await checkpoint('Proceed?', { headless: 'pause', default: false })`;
   assert.equal(calls, 1, "the live channel wins over headless:'pause'");
 });
 
+test("checkpoint(): pauseOnCheckpoint overrides a headless default for protocol multi-round-trip serving", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+return await checkpoint('Proceed?', { kind: 'confirm', default: false, timeoutMs: 250 })`;
+  await assert.rejects(
+    () => runWorkflow(script, { agent: noopAgent, persistLogs: false, pauseOnCheckpoint: true }),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.CHECKPOINT_REQUIRED);
+      assert.equal(error.checkpointContext?.prompt, "Proceed?");
+      assert.equal(error.checkpointContext?.default, false);
+      assert.equal(error.checkpointContext?.timeoutMs, 250);
+      return true;
+    },
+  );
+});
+
 test("checkpoint(): replays the journaled reply on resume (no re-prompt)", async () => {
   const script = `export const meta = { name: 'c', description: 'checkpoint' }
 const r = await checkpoint('Approve?', {})

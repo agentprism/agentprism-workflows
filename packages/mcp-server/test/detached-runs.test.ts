@@ -2,11 +2,9 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/sdk/types.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { InMemoryTransport } from "@modelcontextprotocol/server";
+import type { ElicitRequest, ElicitResult, McpServer } from "@modelcontextprotocol/server";
+import { Client } from "@modelcontextprotocol/client";
 import type { AgentUsage, RunOptions } from "@automatalabs/shared-types";
 import { WorkflowError, WorkflowErrorCode, WorkflowManager } from "@automatalabs/workflows";
 import { createWorkflowServer, MAX_BACKGROUND_RUNS } from "../src/index.js";
@@ -96,7 +94,6 @@ test("background acceptance is immediate and await reports immediate, timeout, c
           agentTimeoutMs: 50_000,
         },
       },
-      undefined,
       { signal: initiating.signal },
     );
     const acceptedRunId = runIdOf(accepted);
@@ -168,7 +165,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
 
     type DirectHandler = (
       args: Record<string, unknown>,
-      extra: { signal: AbortSignal },
+      ctx: { mcpReq: { signal: AbortSignal } },
     ) => Promise<{ structuredContent?: unknown; content: Array<{ type: string; text?: string }>; isError?: boolean }>;
     const registered = server as unknown as {
       _registeredTools: Record<string, { handler: DirectHandler }>;
@@ -176,7 +173,7 @@ test("background acceptance is immediate and await reports immediate, timeout, c
     const awaitController = new AbortController();
     const cancelledPromise = registered._registeredTools.workflow.handler(
       { action: "await", runId: acceptedRunId, waitMs: 25_000 },
-      { signal: awaitController.signal },
+      { mcpReq: { signal: awaitController.signal } },
     );
     awaitController.abort();
     const cancelled = await cancelledPromise;
@@ -297,10 +294,12 @@ test("await tails post-watermark progress while background admission stays silen
   };
   type DirectHandler = (
     args: Record<string, unknown>,
-    extra: {
-      signal: AbortSignal;
-      _meta?: { progressToken?: string | number };
-      sendNotification: (notification: { params: ProgressParams }) => Promise<void>;
+    ctx: {
+      mcpReq: {
+        signal: AbortSignal;
+        _meta?: { progressToken?: string | number };
+        notify: (notification: { params: ProgressParams }) => Promise<void>;
+      };
     },
   ) => Promise<DirectResult>;
   const registered = server as unknown as {
@@ -313,10 +312,12 @@ test("await tails post-watermark progress while background admission stays silen
     const accepted = await handler(
       { script: TWO_AGENT_BACKGROUND, background: true },
       {
-        signal: new AbortController().signal,
-        _meta: { progressToken: "admission" },
-        sendNotification: async (notification) => {
-          admissionProgress.push(notification.params);
+        mcpReq: {
+          signal: new AbortController().signal,
+          _meta: { progressToken: "admission" },
+          notify: async (notification) => {
+            admissionProgress.push(notification.params);
+          },
         },
       },
     );
@@ -328,10 +329,12 @@ test("await tails post-watermark progress while background admission stays silen
     const awaited = handler(
       { action: "await", runId, waitMs: 5_000 },
       {
-        signal: new AbortController().signal,
-        _meta: { progressToken: "await" },
-        sendNotification: async (notification) => {
-          awaitProgress.push(notification.params);
+        mcpReq: {
+          signal: new AbortController().signal,
+          _meta: { progressToken: "await" },
+          notify: async (notification) => {
+            awaitProgress.push(notification.params);
+          },
         },
       },
     );
@@ -389,7 +392,7 @@ test("await cancellation closes its event watcher without cancelling the workflo
     });
     type DirectHandler = (
       args: Record<string, unknown>,
-      extra: { signal: AbortSignal },
+      ctx: { mcpReq: { signal: AbortSignal } },
     ) => Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }>;
     const handler = (server as unknown as {
       _registeredTools: Record<string, { handler: DirectHandler }>;
@@ -397,7 +400,7 @@ test("await cancellation closes its event watcher without cancelling the workflo
     const controller = new AbortController();
     const awaited = handler(
       { action: "await", runId: runIdOf(accepted), waitMs: 5_000 },
-      { signal: controller.signal },
+      { mcpReq: { signal: controller.signal } },
     );
     controller.abort();
 
@@ -453,10 +456,12 @@ test("legacy and unsafe event logs fall back without await progress notification
       type ProgressParams = { progressToken: string | number; progress: number; total?: number; message?: string };
       type DirectHandler = (
         args: Record<string, unknown>,
-        extra: {
-          signal: AbortSignal;
-          _meta: { progressToken: string | number };
-          sendNotification: (notification: { params: ProgressParams }) => Promise<void>;
+        ctx: {
+          mcpReq: {
+            signal: AbortSignal;
+            _meta: { progressToken: string | number };
+            notify: (notification: { params: ProgressParams }) => Promise<void>;
+          };
         },
       ) => Promise<{ structuredContent?: Record<string, unknown>; isError?: boolean }>;
       const handler = (server as unknown as {
@@ -466,10 +471,12 @@ test("legacy and unsafe event logs fall back without await progress notification
       const awaited = handler(
         { action: "await", runId, waitMs: 5_000 },
         {
-          signal: new AbortController().signal,
-          _meta: { progressToken: fixture },
-          sendNotification: async (notification) => {
-            progress.push(notification.params);
+          mcpReq: {
+            signal: new AbortController().signal,
+            _meta: { progressToken: fixture },
+            notify: async (notification) => {
+              progress.push(notification.params);
+            },
           },
         },
       );
@@ -656,7 +663,7 @@ async function connectEliciting(runner: ReturnType<typeof makeRunner>): Promise<
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "detached-elicitation", version: "0.0.0" }, { capabilities: { elicitation: {} } });
   const requests: ElicitRequest[] = [];
-  client.setRequestHandler(ElicitRequestSchema, async (request): Promise<ElicitResult> => {
+  client.setRequestHandler('elicitation/create', async (request): Promise<ElicitResult> => {
     requests.push(request);
     return { action: "accept", content: { approve: true } };
   });

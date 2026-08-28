@@ -1,29 +1,22 @@
+import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
+
 // Input schema and cross-field discriminator for the single MCP `workflow` tool.
 // Numeric execution knobs retain their existing clamp-at-runtime behavior. Inspection
 // bounds are rejected at the Zod boundary because they are wire-contract limits.
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { WorkflowRunInspectionOptions } from "@automatalabs/workflows";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 
-const checkpointRepliesSchema = z
-  .record(
-    z.string().refine(
-      (key) => {
-        const callIndex = Number(key);
-        return Number.isSafeInteger(callIndex) && callIndex >= 0 && String(callIndex) === key;
-      },
-      "checkpoint reply keys must be canonical non-negative safe integer call indexes",
-    ),
-    z.unknown(),
-  )
-  .transform(
-    (replies) =>
-      Object.fromEntries(Object.entries(replies).map(([callIndex, reply]) => [Number(callIndex), reply])) as Record<
-        number,
-        unknown
-      >,
-  );
+const checkpointRepliesSchema = z.record(
+  z.string().refine(
+    (key) => {
+      const callIndex = Number(key);
+      return Number.isSafeInteger(callIndex) && callIndex >= 0 && String(callIndex) === key;
+    },
+    "checkpoint reply keys must be canonical non-negative safe integer call indexes",
+  ),
+  z.unknown(),
+);
 
 export const workflowToolInputShape = {
   action: z
@@ -274,7 +267,7 @@ interface RawWorkflowToolInput {
   agentTimeoutMs?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
-  checkpointReplies?: Record<number, unknown>;
+  checkpointReplies?: Record<string, unknown>;
   background?: boolean;
   runId?: string;
   callIndex?: number;
@@ -306,7 +299,7 @@ function hasExecutionFields(raw: RawWorkflowToolInput): boolean {
 }
 
 function invalid(message: string): never {
-  throw new McpError(ErrorCode.InvalidParams, `Invalid workflow tool input: ${message}`);
+  throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Invalid workflow tool input: ${message}`);
 }
 
 export interface ParseWorkflowToolInputOptions {
@@ -439,7 +432,11 @@ export function parseWorkflowToolInput(
     agentTimeoutMs: raw.agentTimeoutMs,
     resumeFromRunId: raw.resumeFromRunId,
     resumePolicy: raw.resumePolicy,
-    checkpointReplies: raw.checkpointReplies,
+    checkpointReplies: raw.checkpointReplies === undefined
+      ? undefined
+      : Object.fromEntries(
+          Object.entries(raw.checkpointReplies).map(([callIndex, reply]) => [Number(callIndex), reply]),
+        ),
     background: raw.background ?? false,
   };
   return hasScript

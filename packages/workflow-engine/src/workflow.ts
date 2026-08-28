@@ -233,6 +233,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     options: CheckpointOptions,
     context?: CheckpointCallContext,
   ) => Promise<unknown>;
+  /** Force every live checkpoint to become a durable CHECKPOINT_REQUIRED pause. */
+  pauseOnCheckpoint?: boolean;
   onLog?: (message: string, context?: WorkflowCallbackContext) => void;
   onPhase?: (title: string, context?: WorkflowCallbackContext) => void;
   onAgentStart?: (event: {
@@ -2670,7 +2672,7 @@ export async function runWorkflow<T = unknown>(
           WorkflowErrorCode.WORKFLOW_ABORTED,
           { recoverable: false },
         );
-      } else if (checkpointHeadless === "pause") {
+      } else if (options.pauseOnCheckpoint || checkpointHeadless === "pause") {
         throw new WorkflowError(
           `checkpoint "${promptText}" awaits a human decision`,
           WorkflowErrorCode.CHECKPOINT_REQUIRED,
@@ -2683,6 +2685,7 @@ export async function runWorkflow<T = unknown>(
               kind: checkpointKind ?? "confirm",
               ...(checkpointChoices === undefined ? {} : { choices: checkpointChoices }),
               ...(checkpointDefault === undefined ? {} : { default: checkpointDefault }),
+              ...(checkpointTimeoutMs === undefined ? {} : { timeoutMs: checkpointTimeoutMs }),
             },
           },
         );

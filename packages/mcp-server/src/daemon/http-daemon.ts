@@ -14,18 +14,30 @@
 
 import http from "node:http";
 import { randomUUID } from "node:crypto";
-
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  createMcpHandler,
+  createRequestStateCodec,
+  isJsonContentType,
+  isLegacyRequest,
+  type ServerNotifier,
+} from "@modelcontextprotocol/server";
+import {
+  NodeStreamableHTTPServerTransport,
+  toNodeHandler,
+  toWebRequest,
+} from "@modelcontextprotocol/node";
 import type { AgentRunner } from "@automatalabs/shared-types";
 import type { BrokerRunner, EvalBreakChannel } from "@automatalabs/repl-engine";
 
 import { createWorkflowServer, SERVER_VERSION } from "../server.js";
+import { workflowRunEventsUri } from "../workflow-resources.js";
 import { WorkflowProjectRegistry } from "../project-registry.js";
 import { ReplPresenceLedger } from "../repl-presence.js";
 import { DAEMON_NAME, HEALTHZ_PATH, MCP_ENDPOINT_PATH, REPL_DRAIN_BOUND_MS } from "./constants.js";
 import { envFingerprint, isSupersededBy } from "./daemon-info.js";
 import { BoundedEventStore } from "./event-store.js";
 import { validateRequest } from "./middleware.js";
+import { loadOrCreateRequestStateKey } from "./request-state.js";
 import { SessionRegistry } from "./session-registry.js";
 
 export interface CreateDaemonOptions {
@@ -113,9 +125,51 @@ export class DaemonPortInUseError extends Error {
   }
 }
 
-function writeJsonRpcError(res: http.ServerResponse, status: number, message: string): void {
+function writeJsonRpcError(
+  res: http.ServerResponse,
+  status: number,
+  message: string,
+  code = -32000,
+): void {
   res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message }, id: null }));
+  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }));
+}
+
+const MAX_MCP_BODY_BYTES = 4 * 1024 * 1024;
+const BODY_REJECTED = Symbol("body-rejected");
+
+/** Parse a body once so the official era classifier and either Node handler share it. */
+async function readMcpJsonBody(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<unknown | typeof BODY_REJECTED> {
+  if (req.method !== "POST") return undefined;
+  const contentType = Array.isArray(req.headers["content-type"])
+    ? req.headers["content-type"][0]
+    : req.headers["content-type"];
+  if (!isJsonContentType(contentType)) {
+    writeJsonRpcError(res, 415, "Unsupported Media Type: Content-Type must be application/json", -32600);
+    return BODY_REJECTED;
+  }
+
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > MAX_MCP_BODY_BYTES) {
+      writeJsonRpcError(res, 413, "Request body exceeds the 4 MiB limit", -32600);
+      return BODY_REJECTED;
+    }
+    chunks.push(buffer);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  try {
+    return JSON.parse(text);
+  } catch {
+    writeJsonRpcError(res, 400, "Parse error", -32700);
+    return BODY_REJECTED;
+  }
 }
 
 export async function createDaemon(options: CreateDaemonOptions): Promise<DaemonHandle> {
@@ -128,6 +182,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
   // A lame duck (a newer daemon owns discovery) admits no new sessions. Re-evaluated per
   // request so that if discovery is ever repointed back at this daemon it resumes service.
   const isSuperseded = options.isSuperseded ?? (() => isSupersededBy(ownPid));
+  const familyFingerprint = envFingerprint(env);
 
   const sessions = new SessionRegistry();
   // ONE registry shared by every session: run calls select their project via the required
@@ -150,12 +205,64 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
   sessions.onLastConnectionClosed = (sessionId) => replPresence.disconnect(sessionId);
   sessions.onSessionDeleted = (sessionId) => replPresence.forget(sessionId);
   let boundPort = options.port;
+  let modernInflight = 0;
+
+  // One family-scoped integrity key serves every per-request modern server instance and its
+  // successor daemons. No authorization state is accepted from an unverified requestState token.
+  const requestStateCodec = createRequestStateCodec<unknown>({
+    key: loadOrCreateRequestStateKey(familyFingerprint),
+    bind: (ctx) => ctx.mcpReq.method,
+  });
+  let modernHandler!: ReturnType<typeof createMcpHandler>;
+  const modernNotifier: ServerNotifier = {
+    toolsChanged: () => modernHandler.notify.toolsChanged(),
+    promptsChanged: () => modernHandler.notify.promptsChanged(),
+    resourcesChanged: () => modernHandler.notify.resourcesChanged(),
+    resourceUpdated: (uri) => modernHandler.notify.resourceUpdated(uri),
+  };
+  modernHandler = createMcpHandler(
+    () => {
+      const clientId = `modern:${randomUUID()}`;
+      return createWorkflowServer(options.runner, {
+        projects,
+        requireProjectDir: true,
+        replRunner: options.replRunner,
+        replPresence,
+        replClientId: () => clientId,
+        replDrainBoundMs,
+        replEvalBreakChannel: options.evalBreakChannel,
+        protocolEra: "modern",
+        requestStateCodec,
+        disconnectReplClientOnClose: true,
+        modernNotifier,
+      });
+    },
+    {
+      legacy: "reject",
+      onerror: (error) => log(`[${DAEMON_NAME}] modern MCP request failed: ${String(error)}`),
+    },
+  );
+  const handleModernNodeRequest = toNodeHandler(modernHandler, {
+    onerror: (error) => log(`[${DAEMON_NAME}] modern Node adapter failed: ${String(error)}`),
+  });
+  const detachModernRunDeleted = projects.onRunDeleted(() => modernNotifier.resourcesChanged());
+  const detachModernRunEvent = projects.onRunEventPersisted((record) => {
+    modernNotifier.resourceUpdated(workflowRunEventsUri(record.runId));
+  });
 
   const handleMcpRequest = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     const sessionHeader = req.headers["mcp-session-id"];
     const sessionId = typeof sessionHeader === "string" ? sessionHeader : undefined;
 
-    if (sessionId !== undefined) {
+    // Classify every request before consulting legacy session state. A modern envelope carrying
+    // a stale or malicious Mcp-Session-Id still belongs to the modern validation path; genuine
+    // legacy session POSTs share the parsed body with their retained Node transport.
+    const parsedBody = await readMcpJsonBody(req, res);
+    if (parsedBody === BODY_REJECTED) return;
+    const webRequest = await toWebRequest(req, parsedBody);
+    const legacy = await isLegacyRequest(webRequest, parsedBody);
+
+    if (legacy && sessionId !== undefined) {
       const record = sessions.get(sessionId);
       if (record === undefined) {
         // Spec: after termination the server MUST 404 the old session id; the client MUST
@@ -164,23 +271,18 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
         return;
       }
       sessions.connectionOpened(sessionId);
-      // A POST is work in flight (a GET is only the standalone stream; a DELETE ends the
-      // session): the lame-duck migration never cuts a request being processed.
       const isRequest = req.method === "POST";
       if (isRequest) sessions.requestStarted(sessionId);
       res.on("close", () => {
         if (isRequest) sessions.requestFinished(sessionId);
         sessions.connectionClosed(sessionId);
       });
-      await record.transport.handleRequest(req, res);
+      await record.transport.handleRequest(req, res, parsedBody);
       return;
     }
 
-    // No session header: this must be an initialize request (the SDK transport 400s
-    // anything else). A superseded daemon is a lame duck — a newer daemon owns discovery, so
-    // this one finishes its existing sessions and runs but admits NO new sessions. Every new
-    // client therefore lands on the current daemon, and this daemon can drain and exit. (The
-    // check is stateless: if discovery is repointed back at us we admit again.)
+    // A superseded daemon is a lame duck — it keeps existing legacy sessions but admits no
+    // new legacy session and no modern stateless exchange.
     if (isSuperseded()) {
       writeJsonRpcError(
         res,
@@ -190,8 +292,19 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
       return;
     }
 
+    if (!legacy) {
+      modernInflight += 1;
+      try {
+        await handleModernNodeRequest(req, res, parsedBody);
+      } finally {
+        modernInflight -= 1;
+      }
+      return;
+    }
+
+    // Legacy opening: preserve the existing one-transport/server-per-session architecture.
     // Sessions are project-agnostic — every run call names its project.
-    const transport = new StreamableHTTPServerTransport({
+    const transport = new NodeStreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       eventStore: new BoundedEventStore(),
       onsessioninitialized: (sid) => {
@@ -228,7 +341,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
       }
       if (transport.sessionId !== undefined) sessions.delete(transport.sessionId);
     };
-    await transport.handleRequest(req, res);
+    await transport.handleRequest(req, res, parsedBody);
     if (transport.sessionId !== undefined && !res.closed) {
       sessions.connectionOpened(transport.sessionId);
       res.on("close", () => {
@@ -256,10 +369,10 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
             startedAt,
             sessions: sessions.size,
             activeRuns: projects.activeRunCount(),
-            envFingerprint: envFingerprint(env),
+            envFingerprint: familyFingerprint,
             projects: projects.snapshot(),
             lameDuck: isSuperseded(),
-            inflightRequests: sessions.inflightCount(),
+            inflightRequests: sessions.inflightCount() + modernInflight,
           }),
         );
         return;
@@ -296,7 +409,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     projects,
     activeRunCount: () => projects.activeRunCount(),
     activeReplDrainCount: () => replPresence.drainingCount(),
-    inflightRequestCount: () => sessions.inflightCount(),
+    inflightRequestCount: () => sessions.inflightCount() + modernInflight,
     isSuperseded,
     evictDrainableSessions: () => sessions.evictDrainable((sessionId) => replPresence.sessionHasBusyWorkspace(sessionId)),
     async close() {
@@ -310,6 +423,9 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
       await projects.disposeReplStates();
       replPresence.disconnectAll();
       await sessions.closeAll();
+      detachModernRunEvent();
+      detachModernRunDeleted();
+      await modernHandler.close();
       httpServer.closeAllConnections();
       await closed;
     },

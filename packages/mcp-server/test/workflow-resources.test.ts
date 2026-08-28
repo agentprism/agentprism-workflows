@@ -3,16 +3,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  ElicitRequestSchema,
-  ResourceListChangedNotificationSchema,
-  ResourceUpdatedNotificationSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import type { ElicitResult } from "@modelcontextprotocol/sdk/types.js";
+import { InMemoryTransport, McpServer } from "@modelcontextprotocol/server";
+import type { ElicitResult } from "@modelcontextprotocol/server";
+import { Client } from "@modelcontextprotocol/client";
 import {
   WorkflowManager,
   type PersistedRunState,
@@ -198,7 +191,7 @@ test("readback rejects a transient initial save failure before execution can res
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "transient-admission-client", version: "0.0.0" }, { capabilities: {} });
   let listChanged = 0;
-  client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
+  client.setNotificationHandler('notifications/resources/list_changed', () => {
     listChanged++;
   });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -253,12 +246,12 @@ test("failed foreground admission cannot enter the VM or abandon a checkpoint el
   let elicitationRequests = 0;
   let activeElicitations = 0;
   let cancelledElicitations = 0;
-  client.setRequestHandler(ElicitRequestSchema, (_request, extra): ElicitResult | Promise<ElicitResult> => {
+  client.setRequestHandler('elicitation/create', (_request, ctx): ElicitResult | Promise<ElicitResult> => {
     elicitationRequests++;
     if (priming) return { action: "accept", content: { approve: true } };
     activeElicitations++;
     return new Promise<ElicitResult>((resolve) => {
-      extra.signal.addEventListener("abort", () => {
+      ctx.mcpReq.signal.addEventListener("abort", () => {
         activeElicitations--;
         cancelledElicitations++;
         resolve({ action: "cancel" });
@@ -362,7 +355,7 @@ test("persistent admission save failure returns no URI and cleans the run, resou
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "persistent-admission-client", version: "0.0.0" }, { capabilities: {} });
   let listChanged = 0;
-  client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
+  client.setNotificationHandler('notifications/resources/list_changed', () => {
     listChanged++;
   });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -541,10 +534,10 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
   const client = new Client({ name: "resource-client", version: "0.0.0" }, { capabilities: {} });
   let listChanged = 0;
   let updated = 0;
-  client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
+  client.setNotificationHandler('notifications/resources/list_changed', () => {
     listChanged++;
   });
-  client.setNotificationHandler(ResourceUpdatedNotificationSchema, () => {
+  client.setNotificationHandler('notifications/resources/updated', () => {
     updated++;
   });
   await Promise.all([mcp.connect(serverTransport), client.connect(clientTransport)]);
@@ -692,7 +685,7 @@ test("createWorkflowServer observes injected-manager deletion exactly once and k
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "manager-delete-client", version: "0.0.0" }, { capabilities: {} });
   let listChanged = 0;
-  client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
+  client.setNotificationHandler('notifications/resources/list_changed', () => {
     listChanged++;
   });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -1132,7 +1125,7 @@ test("events resources push append hints and page exact durable catch-up", async
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "events-client", version: "0.0.0" }, { capabilities: {} });
   let updated = 0;
-  client.setNotificationHandler(ResourceUpdatedNotificationSchema, () => { updated += 1; });
+  client.setNotificationHandler('notifications/resources/updated', () => { updated += 1; });
   await Promise.all([mcp.connect(serverTransport), client.connect(clientTransport)]);
   try {
     const run = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "events-resource"));

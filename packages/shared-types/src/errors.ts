@@ -84,6 +84,8 @@ export interface CheckpointContext {
   kind: "confirm" | "input" | "select";
   choices?: string[];
   default?: unknown;
+  /** Optional host deadline for a pending checkpoint interaction. */
+  timeoutMs?: number;
 }
 
 /** Strict-JSON projection of a thrown value recorded in a run's call manifest. */

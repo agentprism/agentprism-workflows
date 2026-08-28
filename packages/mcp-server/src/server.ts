@@ -1,3 +1,20 @@
+import {
+  McpServer,
+  ProtocolError,
+  ProtocolErrorCode,
+  createRequestStateCodec,
+  inputRequired,
+  inputResponse,
+} from "@modelcontextprotocol/server";
+import type {
+  ElicitRequestFormParams,
+  RequestStateCodec,
+  Server,
+  ServerContext,
+  ServerNotifier,
+  ToolCallback,
+} from "@modelcontextprotocol/server";
+
 // packages/mcp-server/src/server.ts
 //
 // The MCP shell: constructs an McpServer, registers the `workflow`, `repl`, and selective
@@ -15,12 +32,10 @@
 //   - resumeFromRunId, resumePolicy, and checkpointReplies pass straight to the manager,
 //     which owns source admission, durable seed construction, and checkpoint injection.
 //     The shell neither hydrates journals nor owns/forges a runId.
-// Mid-run progress streams via notifications/progress; extra.signal threads cancellation into
+// Mid-run progress streams via notifications/progress; ctx.mcpReq.signal threads cancellation into
 // the engine; checkpoint() is driven by the engine's `confirm` hook only when the client
 // advertises elicitation. Otherwise the checkpoint's authored headless mode applies.
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { ErrorCode, McpError, type ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
@@ -54,13 +69,7 @@ import {
   type EvalBreakChannel,
 } from "@automatalabs/repl-engine";
 
-import {
-  EXTENSION_ID,
-  RESOURCE_MIME_TYPE,
-  RESOURCE_URI_META_KEY,
-  getUiCapability,
-  type ToolCallback,
-} from "@modelcontextprotocol/ext-apps/server";
+import { z } from "zod";
 
 import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
 import {
@@ -71,6 +80,7 @@ import {
   type ProjectContext,
 } from "./project-registry.js";
 import { RUN_MONITOR_RESOURCE_URI, registerWorkflowAppUi } from "./app-ui.js";
+import { EXTENSION_ID } from "./mcp-apps.js";
 import {
   toWorkflowExecutionOutcome,
   toWorkflowToolResult,
@@ -87,6 +97,7 @@ import { registerAuthoringPrompt } from "./authoring-prompt.js";
 import { registerAuthoringDocs } from "./docs-tool.js";
 import { registerReplTool } from "./repl-tool.js";
 import { ReplPresenceLedger } from "./repl-presence.js";
+import { CapabilityAwareToolCatalog } from "./tool-catalog.js";
 import { createReplProjectState, DEFAULT_REPL_EVAL_TIMEOUT_MS } from "./repl-project.js";
 import { REPL_DRAIN_BOUND_MS } from "./daemon/constants.js";
 import {
@@ -103,6 +114,10 @@ import {
 } from "./workflow-resources.js";
 
 const SERVER_NAME = "agentprism-workflow";
+const DEFAULT_REQUEST_STATE_CODEC = createRequestStateCodec<unknown>({
+  key: randomBytes(32),
+  bind: (ctx) => ctx.mcpReq.method,
+});
 const require = createRequire(import.meta.url);
 /**
  * The server's code identity — ALWAYS the mcp-server package version, whichever artifact
@@ -407,7 +422,9 @@ function scriptBackendsAllowedByEnv(): boolean {
 type BackendApprovals = Set<string>;
 
 function backendApprovalKey(name: string, config: WorkflowBackendConfig): string {
-  return JSON.stringify({ name, command: config.command, args: config.args ?? [], env: config.env ?? {} });
+  return createHash("sha256")
+    .update(JSON.stringify({ name, command: config.command, args: config.args ?? [], env: config.env ?? {} }))
+    .digest("hex");
 }
 
 function describeBackend(name: string, config: WorkflowBackendConfig): string {
@@ -419,9 +436,122 @@ function describeBackend(name: string, config: WorkflowBackendConfig): string {
   return lines.join("\n");
 }
 
+type WorkflowMcpRequestState =
+  | {
+      version: 1;
+      flow: "backend-approval";
+      inputHash: string;
+      scriptHash: string;
+      approvedKeys: string[];
+      pendingKey: string;
+    }
+  | {
+      version: 1;
+      flow: "checkpoint";
+      inputHash: string;
+      scriptHash: string;
+      runId: string;
+      callIndex: number;
+      checkpointHash: string;
+      approvedKeys: string[];
+      expiresAt?: number;
+    };
+
+function canonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") return Number.isFinite(value) ? JSON.stringify(value) : "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+  }
+  return "null";
+}
+
+function workflowInputHash(args: unknown): string {
+  return createHash("sha256").update(canonicalJson(args)).digest("hex");
+}
+
+function workflowScriptHash(script: string): string {
+  return createHash("sha256").update(script).digest("hex");
+}
+
+function parseWorkflowRequestState(value: unknown, inputHash: string): WorkflowMcpRequestState | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== "object") {
+    throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid workflow requestState");
+  }
+  const state = value as Record<string, unknown>;
+  if (
+    state.version !== 1 ||
+    state.inputHash !== inputHash ||
+    typeof state.scriptHash !== "string" ||
+    !/^[0-9a-f]{64}$/.test(state.scriptHash)
+  ) {
+    throw new ProtocolError(
+      ProtocolErrorCode.InvalidParams,
+      "Invalid workflow requestState: the retried workflow arguments do not match the originating call",
+    );
+  }
+  if (state.flow === "backend-approval") {
+    if (
+      !Array.isArray(state.approvedKeys) ||
+      state.approvedKeys.length > 64 ||
+      !state.approvedKeys.every((key) => typeof key === "string" && /^[0-9a-f]{64}$/.test(key)) ||
+      typeof state.pendingKey !== "string" ||
+      !/^[0-9a-f]{64}$/.test(state.pendingKey)
+    ) {
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid workflow backend-approval requestState");
+    }
+    return {
+      version: 1,
+      flow: "backend-approval",
+      inputHash,
+      scriptHash: state.scriptHash as string,
+      approvedKeys: [...new Set(state.approvedKeys)],
+      pendingKey: state.pendingKey,
+    };
+  }
+  if (state.flow === "checkpoint") {
+    if (
+      typeof state.runId !== "string" ||
+      !Number.isSafeInteger(state.callIndex) ||
+      (state.callIndex as number) < 0 ||
+      typeof state.checkpointHash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(state.checkpointHash) ||
+      !Array.isArray(state.approvedKeys) ||
+      state.approvedKeys.length > 64 ||
+      !state.approvedKeys.every((key) => typeof key === "string" && /^[0-9a-f]{64}$/.test(key)) ||
+      (state.expiresAt !== undefined && (typeof state.expiresAt !== "number" || !Number.isFinite(state.expiresAt)))
+    ) {
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid workflow checkpoint requestState");
+    }
+    return {
+      version: 1,
+      flow: "checkpoint",
+      inputHash,
+      scriptHash: state.scriptHash as string,
+      runId: state.runId,
+      callIndex: state.callIndex as number,
+      checkpointHash: state.checkpointHash,
+      approvedKeys: [...new Set(state.approvedKeys)],
+      ...(state.expiresAt === undefined ? {} : { expiresAt: state.expiresAt as number }),
+    };
+  }
+  throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid workflow requestState flow");
+}
+
 type ScriptBackendsGate =
   | { ok: true; backends?: Record<string, WorkflowBackendConfig> }
   | { ok: false; message: string };
+
+type ModernScriptBackendsGate = ScriptBackendsGate | {
+  ok: false;
+  approval: { name: string; config: WorkflowBackendConfig; key: string };
+};
 
 /**
  * The TRUST GATE for script-declared `meta.backends` (they spawn arbitrary commands on this
@@ -503,6 +633,54 @@ async function resolveScriptBackends(
     approvals.add(key);
   }
   return { ok: true, backends: declared };
+}
+
+function backendApprovalElicitation(name: string, config: WorkflowBackendConfig): ElicitRequestFormParams {
+  return {
+    mode: "form",
+    message:
+      `Workflow wants to spawn a custom ACP agent backend on this machine:\n\n` +
+      `${describeBackend(name, config)}\n\n` +
+      "Approve spawning this command?",
+    requestedSchema: {
+      type: "object",
+      properties: {
+        approve: {
+          type: "boolean",
+          title: "Approve",
+          description: `Allow the workflow to spawn "${config.command}" as backend "${name}".`,
+        },
+      },
+      required: ["approve"],
+    },
+  };
+}
+
+function resolveModernScriptBackends(
+  script: string,
+  approvedKeys: ReadonlySet<string>,
+): ModernScriptBackendsGate {
+  let declared: Record<string, WorkflowBackendConfig> | undefined;
+  try {
+    declared = parseWorkflowScript(script).meta.backends;
+  } catch {
+    return { ok: true };
+  }
+  if (!declared || Object.keys(declared).length === 0) return { ok: true };
+  if (scriptBackendsAllowedByEnv()) return { ok: true, backends: declared };
+
+  for (const [name, config] of Object.entries(declared)) {
+    const key = backendApprovalKey(name, config);
+    if (!approvedKeys.has(key)) return { ok: false, approval: { name, config, key } };
+  }
+  return { ok: true, backends: declared };
+}
+
+function declinedBackendMessage(name: string, config: WorkflowBackendConfig): string {
+  return (
+    `User declined to spawn script-declared backend "${name}" (command: ${config.command}) — ` +
+    `the workflow was not run. Remove meta.backends.${name} or re-run and approve it.`
+  );
 }
 
 /** Human-readable summary for a completed run. */
@@ -835,8 +1013,8 @@ function readScriptAtAdmission(scriptPath: string): string {
     return readFileSync(scriptPath, "utf8");
   } catch (error) {
     const cause = error instanceof Error ? error.message : String(error);
-    throw new McpError(
-      ErrorCode.InvalidParams,
+    throw new ProtocolError(
+      ProtocolErrorCode.InvalidParams,
       `Invalid workflow tool input: unable to read scriptPath "${scriptPath}": ${cause}`,
     );
   }
@@ -875,8 +1053,8 @@ function requireAdmissionResource(
   } catch {
     // Best-effort cleanup has already attempted stop, terminal persistence, and lease release.
   }
-  throw new McpError(
-    ErrorCode.InternalError,
+  throw new ProtocolError(
+    ProtocolErrorCode.InternalError,
     `Workflow admission failed for runId "${runId}" because ${failure}; the run was not acknowledged.`,
   );
 }
@@ -898,8 +1076,8 @@ function requireDurableStoppedRun(manager: WorkflowManager, runId: string): void
   const persistence = manager.getPersistence();
   const persisted = persistence.load(runId);
   if (persisted?.status !== "aborted") {
-    throw new McpError(
-      ErrorCode.InternalError,
+    throw new ProtocolError(
+      ProtocolErrorCode.InternalError,
       `Workflow stop for runId "${runId}" could not be durably acknowledged: the persisted status is ${persisted?.status ?? "missing"}, not aborted.`,
     );
   }
@@ -909,8 +1087,8 @@ function requireDurableStoppedRun(manager: WorkflowManager, runId: string): void
     persisted.eventSeq === undefined ||
     persisted.eventSeq < 1
   ) {
-    throw new McpError(
-      ErrorCode.InternalError,
+    throw new ProtocolError(
+      ProtocolErrorCode.InternalError,
       `Workflow stop for runId "${runId}" could not be durably acknowledged: its stopped event is not durably readable.`,
     );
   }
@@ -929,8 +1107,8 @@ function requireDurableStoppedRun(manager: WorkflowManager, runId: string): void
     stoppedEventIsDurable = false;
   }
   if (!stoppedEventIsDurable) {
-    throw new McpError(
-      ErrorCode.InternalError,
+    throw new ProtocolError(
+      ProtocolErrorCode.InternalError,
       `Workflow stop for runId "${runId}" could not be durably acknowledged: its terminal stopped event is missing.`,
     );
   }
@@ -1257,6 +1435,14 @@ export interface CreateWorkflowServerOptions {
    * `SESSION_IDLE_TTL_MS`.
    */
   replDrainBoundMs?: number;
+  /** Protocol era selected by an SDK serving entry. Hand-connected servers remain legacy. */
+  protocolEra?: "legacy" | "modern";
+  /** Shared codec used by every modern per-request server instance in this process. */
+  requestStateCodec?: RequestStateCodec<unknown>;
+  /** Modern request instances have request-scoped presence and disconnect when the instance closes. */
+  disconnectReplClientOnClose?: boolean;
+  /** Daemon-scoped publisher for modern subscriptions/listen change delivery. */
+  modernNotifier?: ServerNotifier;
 }
 
 export interface WorkflowServer extends McpServer, WorkflowServerControl {}
@@ -1265,10 +1451,16 @@ export function createWorkflowServer(
   runner: AgentRunner,
   options: CreateWorkflowServerOptions = {},
 ): WorkflowServer {
+  const requestStateCodec = options.requestStateCodec ?? DEFAULT_REQUEST_STATE_CODEC;
   const mcp = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
-    { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS },
+    {
+      capabilities: { tools: {} },
+      instructions: SERVER_INSTRUCTIONS,
+      requestState: { verify: requestStateCodec.verify },
+    },
   );
+  const toolCatalog = new CapabilityAwareToolCatalog(mcp, options.protocolEra ?? "legacy");
   let acceptingWork = true;
   // The REPL eval-break channel (phase-F review round 3): the in-process/
   // library server OWNS one by default — the documented no-id interrupt
@@ -1322,7 +1514,7 @@ export function createWorkflowServer(
   const defaultContext: ProjectContext | undefined = requireProjectDir
     ? undefined
     : projects.adopt(options.manager ?? new WorkflowManager({ agent: runner }), options.backgroundRuns);
-  const scriptResources = new WorkflowScriptResources(mcp, { router: projects });
+  const scriptResources = new WorkflowScriptResources(mcp, { router: projects }, options.modernNotifier);
   registerAuthoringDocs(mcp, {
     registerResourceReader: (uri, read) => scriptResources.registerExternalResourceReader(uri, read),
   });
@@ -1347,7 +1539,7 @@ export function createWorkflowServer(
     if (input.projectDir !== undefined) {
       const resolution = resolveProjectDir(input.projectDir);
       if (!resolution.ok) {
-        throw new McpError(ErrorCode.InvalidParams, `Invalid workflow tool input: ${resolution.message}`);
+        throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Invalid workflow tool input: ${resolution.message}`);
       }
       return projects.getOrCreate(resolution.projectDir);
     }
@@ -1375,6 +1567,8 @@ export function createWorkflowServer(
     acceptingWork: () => acceptingWork,
   });
 
+  const workflowToolInputSchema = z.object(workflowToolInputShape);
+  const workflowToolOutputSchema = workflowToolOutputShape;
   const workflowToolConfig = {
     title: "Discover, validate, run, inspect, await, stop, or narrow-cancel an agent workflow",
     description:
@@ -1415,37 +1609,56 @@ export function createWorkflowServer(
         "Every admitted script is readable at workflow://runs/{runId}/script and results include resource links. " +
         "Background runs are tracked per project, capped at four active/starting runs, and use " +
         "headless checkpoint semantics; checkpointReplies continue a checkpoint pause in a new run.",
-    inputSchema: workflowToolInputShape,
-    outputSchema: workflowToolOutputShape,
+    inputSchema: workflowToolInputSchema,
+    outputSchema: workflowToolOutputSchema,
     annotations: undefined,
   };
 
-  const workflowToolHandler: ToolCallback<typeof workflowToolInputShape> = async (args, extra) => {
+  const workflowToolHandler: ToolCallback<typeof workflowToolInputSchema> = async (args, ctx: ServerContext) => {
       if (!acceptingWork) {
-        throw new McpError(
-          ErrorCode.InternalError,
+        throw new ProtocolError(
+          ProtocolErrorCode.InternalError,
           "Workflow server is shutting down and is no longer accepting tool calls.",
         );
       }
-      const parsedInput = parseWorkflowToolInput(args, { requireProjectDir });
+      const inputHash = workflowInputHash(args);
+      const requestState = options.protocolEra === "modern"
+        ? parseWorkflowRequestState(ctx.mcpReq.requestState<unknown>(), inputHash)
+        : undefined;
+      let parsedInput = parseWorkflowToolInput(args, { requireProjectDir });
+      const approvedBackendKeys = new Set<string>();
+      let declinedBackendKey: string | undefined;
+      if (requestState !== undefined) {
+        for (const key of requestState.approvedKeys) approvedBackendKeys.add(key);
+      }
+      if (requestState?.flow === "backend-approval") {
+        const response = inputResponse(ctx.mcpReq.inputResponses, "backendApproval");
+        if (response.kind === "elicit") {
+          if (response.action === "accept" && response.content?.approve === true) {
+            approvedBackendKeys.add(requestState.pendingKey);
+          } else {
+            declinedBackendKey = requestState.pendingKey;
+          }
+        }
+      }
       if (parsedInput.action === "config") {
         let cwd = defaultContext?.projectDir;
         if (parsedInput.projectDir !== undefined) {
           const resolution = resolveProjectDir(parsedInput.projectDir);
           if (!resolution.ok) {
-            throw new McpError(ErrorCode.InvalidParams, `Invalid workflow tool input: ${resolution.message}`);
+            throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Invalid workflow tool input: ${resolution.message}`);
           }
           cwd = resolution.projectDir;
         }
         if (cwd === undefined) {
-          throw new McpError(ErrorCode.InvalidParams, "Invalid workflow tool input: config requires projectDir on this server");
+          throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid workflow tool input: config requires projectDir on this server");
         }
         if (parsedInput.modelFilter !== undefined) {
           try {
             buildModelFilter(parsedInput.modelFilter);
           } catch (error) {
-            throw new McpError(
-              ErrorCode.InvalidParams,
+            throw new ProtocolError(
+              ProtocolErrorCode.InvalidParams,
               `Invalid workflow tool input: modelFilter is invalid — ${error instanceof Error ? error.message : String(error)}`,
             );
           }
@@ -1461,8 +1674,8 @@ export function createWorkflowServer(
         try {
           projected = configSummary(report, parsedInput.modelFilter);
         } catch (error) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
             `Invalid workflow tool input: modelFilter is invalid — ${error instanceof Error ? error.message : String(error)}`,
           );
         }
@@ -1500,6 +1713,80 @@ export function createWorkflowServer(
       replPresence.touch(context.repl, options.replClientId?.() ?? "unknown");
       const manager = context.manager;
       const backgroundRuns = context.backgroundRuns;
+
+      if (requestState?.flow === "checkpoint") {
+        if (
+          (parsedInput.action !== undefined && parsedInput.action !== "run") ||
+          parsedInput.background ||
+          parsedInput.resumeFromRunId !== undefined ||
+          parsedInput.checkpointReplies !== undefined
+        ) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            "Invalid workflow checkpoint retry: the original foreground run arguments must be replayed unchanged",
+          );
+        }
+        const persisted = manager.getPersistence().load(requestState.runId);
+        const checkpoint = persisted?.checkpointContext;
+        if (
+          persisted?.status !== "paused" ||
+          persisted.pauseReason !== "checkpoint_required" ||
+          checkpoint === undefined ||
+          checkpoint.callIndex !== requestState.callIndex ||
+          checkpoint.hash !== requestState.checkpointHash
+        ) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            `Invalid workflow checkpoint retry: runId "${requestState.runId}" is no longer paused at that checkpoint`,
+          );
+        }
+
+        let decision: unknown;
+        let hasDecision = false;
+        if (requestState.expiresAt !== undefined && Date.now() >= requestState.expiresAt) {
+          decision = checkpoint.default ?? true;
+          hasDecision = true;
+        } else {
+          const response = inputResponse(ctx.mcpReq.inputResponses, "checkpoint");
+          if (response.kind === "elicit") {
+            if (response.action !== "accept") {
+              decision = false;
+              hasDecision = true;
+            } else if (checkpoint.kind === "input" && typeof response.content?.value === "string") {
+              decision = response.content.value;
+              hasDecision = true;
+            } else if (
+              checkpoint.kind === "select" &&
+              typeof response.content?.choice === "string" &&
+              checkpoint.choices?.includes(response.content.choice)
+            ) {
+              decision = response.content.choice;
+              hasDecision = true;
+            } else if (checkpoint.kind === "confirm" && typeof response.content?.approve === "boolean") {
+              decision = response.content.approve;
+              hasDecision = true;
+            }
+          }
+        }
+
+        if (!hasDecision) {
+          const elicitation = createCheckpointElicitation(checkpoint.prompt, checkpoint);
+          if (elicitation === undefined) {
+            throw new ProtocolError(ProtocolErrorCode.InternalError, "Persisted checkpoint cannot be represented as MCP elicitation");
+          }
+          return inputRequired({
+            inputRequests: { checkpoint: inputRequired.elicit(elicitation) },
+            requestState: await requestStateCodec.mint(requestState, ctx),
+          });
+        }
+
+        parsedInput = {
+          ...parsedInput,
+          resumeFromRunId: requestState.runId,
+          checkpointReplies: { [requestState.callIndex]: decision },
+        };
+      }
+
       if ((parsedInput.action === undefined || parsedInput.action === "run") && parsedInput.resumeFromRunId !== undefined) {
         // Cross-project resume is an explicit redirect, never a silent miss in the wrong store.
         if (!manager.getPersistence().load(parsedInput.resumeFromRunId)) {
@@ -1567,8 +1854,8 @@ export function createWorkflowServer(
         }
         const persisted = manager.getPersistence().load(parsedInput.runId);
         if (!persisted) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
             `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
           );
         }
@@ -1580,14 +1867,14 @@ export function createWorkflowServer(
         };
         if (parsedInput.callIndex !== undefined) {
           if (isAlreadyTerminalForStop(persisted.status)) {
-            throw new McpError(
-              ErrorCode.InvalidParams,
+            throw new ProtocolError(
+              ProtocolErrorCode.InvalidParams,
               `Workflow run "${parsedInput.runId}" is already terminal (${persisted.status}); no agent call is in flight to cancel. Whole-run stop without callIndex is a successful no-op for terminal runs.`,
             );
           }
           if (!manager.getRun(parsedInput.runId)) {
-            throw new McpError(
-              ErrorCode.InvalidParams,
+            throw new ProtocolError(
+              ProtocolErrorCode.InvalidParams,
               `Workflow run "${parsedInput.runId}" is persisted as ${persisted.status}, but there is nothing live to cancel in this server process.`,
             );
           }
@@ -1596,17 +1883,17 @@ export function createWorkflowServer(
           try {
             cancellation = await manager.cancelAgentCall(parsedInput.runId, parsedInput.callIndex);
           } catch (error) {
-            throw new McpError(
+            throw new ProtocolError(
               error instanceof WorkflowError && error.code === WorkflowErrorCode.PERSISTENCE_ERROR
-                ? ErrorCode.InternalError
-                : ErrorCode.InvalidParams,
+                ? ProtocolErrorCode.InternalError
+                : ProtocolErrorCode.InvalidParams,
               error instanceof Error ? error.message : String(error),
             );
           }
           const status = manager.inspectRun(parsedInput.runId, inspectionOptions);
           if (!status) {
-            throw new McpError(
-              ErrorCode.InternalError,
+            throw new ProtocolError(
+              ProtocolErrorCode.InternalError,
               `Workflow agent cancellation did not produce a snapshot for runId "${parsedInput.runId}".`,
             );
           }
@@ -1634,8 +1921,8 @@ export function createWorkflowServer(
         if (!alreadyTerminal) {
           const live = manager.getRun(parsedInput.runId);
           if (!live) {
-            throw new McpError(
-              ErrorCode.InvalidParams,
+            throw new ProtocolError(
+              ProtocolErrorCode.InvalidParams,
               `Workflow run "${parsedInput.runId}" is persisted as ${persisted.status}, but there is nothing live to stop in this server process. Resume it with resumeFromRunId instead.`,
             );
           }
@@ -1644,8 +1931,8 @@ export function createWorkflowServer(
             const current = manager.getPersistence().load(parsedInput.runId);
             alreadyTerminal = current !== null && isAlreadyTerminalForStop(current.status);
             if (!alreadyTerminal) {
-              throw new McpError(
-                ErrorCode.InvalidParams,
+              throw new ProtocolError(
+                ProtocolErrorCode.InvalidParams,
                 `Workflow run "${parsedInput.runId}" could not be stopped; its persisted status is ${current?.status ?? persisted.status}.`,
               );
             }
@@ -1657,14 +1944,14 @@ export function createWorkflowServer(
 
         const status = manager.inspectRun(parsedInput.runId, inspectionOptions);
         if (!status) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
             `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
           );
         }
         if (status.status === "pending" || status.status === "running" || status.status === "paused") {
-          throw new McpError(
-            ErrorCode.InternalError,
+          throw new ProtocolError(
+            ProtocolErrorCode.InternalError,
             `Workflow stop did not produce a terminal snapshot for runId "${parsedInput.runId}".`,
           );
         }
@@ -1692,7 +1979,7 @@ export function createWorkflowServer(
       }
 
       if (parsedInput.action === "await") {
-        if (extra.signal.aborted) {
+        if (ctx.mcpReq.signal.aborted) {
           return {
             content: [
               {
@@ -1736,9 +2023,9 @@ export function createWorkflowServer(
             manager,
             parsedInput.runId,
             parsedInput.waitMs ?? 20_000,
-            extra.signal,
+            ctx.mcpReq.signal,
             backgroundRuns.get(parsedInput.runId),
-            createAwaitProgressReporter(extra),
+            createAwaitProgressReporter(ctx),
           );
           if (waited === AWAIT_CANCELLED) {
             return {
@@ -1820,6 +2107,12 @@ export function createWorkflowServer(
       const input = clampWorkflowInput(parsedInput);
       const scriptSource = input.script === undefined ? "path" as const : "inline" as const;
       const admittedScript = input.script ?? readScriptAtAdmission(input.scriptPath);
+      if (requestState !== undefined && requestState.scriptHash !== workflowScriptHash(admittedScript)) {
+        throw new ProtocolError(
+          ProtocolErrorCode.InvalidParams,
+          "Invalid workflow requestState: scriptPath content changed during the multi-round-trip call",
+        );
+      }
       let backgroundReservation = false;
       const executionLatch = createExecutionAdmissionLatch();
       let elicitationController: AbortController | undefined;
@@ -1842,10 +2135,50 @@ export function createWorkflowServer(
           };
         }
 
-        // Trust gate for script-declared meta.backends — BEFORE any run exists. A refusal is an
-        // informative tool error (never a silent drop, never a hang on a non-eliciting client).
-        const backendsGate = await resolveScriptBackends(mcp.server, admittedScript, backendApprovals);
+        // Trust gate for script-declared meta.backends — BEFORE any run exists. Legacy keeps
+        // its established push elicitation path; modern returns inputRequired and re-enters this
+        // same tool handler with integrity-protected approval state.
+        const backendsGate = options.protocolEra === "modern"
+          ? resolveModernScriptBackends(admittedScript, approvedBackendKeys)
+          : await resolveScriptBackends(mcp.server, admittedScript, backendApprovals);
         if (!backendsGate.ok) {
+          if ("approval" in backendsGate) {
+            const { name, config, key } = backendsGate.approval;
+            if (declinedBackendKey === key) {
+              return {
+                content: [{ type: "text", text: declinedBackendMessage(name, config) }],
+                isError: true,
+              };
+            }
+            if (!toolCatalog.clientCapabilities(ctx)?.elicitation) {
+              return {
+                content: [{
+                  type: "text",
+                  text:
+                    `This workflow declares custom ACP backends (meta.backends: ${name}), which spawn commands on this machine ` +
+                    `and require user approval — but this MCP client does not support elicitation. To allow script-declared ` +
+                    `backends, set ${ALLOW_SCRIPT_BACKENDS_ENV}=1 in the "env" block of this server's mcpServers config entry ` +
+                    `(this approves ALL script-declared backends headlessly), or remove meta.backends and register the backends ` +
+                    `host-side via AGENTPRISM_BACKENDS instead.`,
+                }],
+                isError: true,
+              };
+            }
+            const state: WorkflowMcpRequestState = {
+              version: 1,
+              flow: "backend-approval",
+              inputHash,
+              scriptHash: workflowScriptHash(admittedScript),
+              approvedKeys: [...approvedBackendKeys].sort(),
+              pendingKey: key,
+            };
+            return inputRequired({
+              inputRequests: {
+                backendApproval: inputRequired.elicit(backendApprovalElicitation(name, config)),
+              },
+              requestState: await requestStateCodec.mint(state, ctx),
+            });
+          }
           return {
             content: [{ type: "text", text: backendsGate.message }],
             isError: true,
@@ -1912,9 +2245,9 @@ export function createWorkflowServer(
           checkpointReplies: input.checkpointReplies,
         };
         if (!input.background) {
-          const reporter = createProgressReporter(extra);
+          const reporter = createProgressReporter(ctx);
           let lastActivitySeq = 0;
-          exec.signal = extra.signal;
+          exec.signal = ctx.mcpReq.signal;
           // The engine drives progress with the live snapshot; project it onto the MCP wire
           // shape (settled agents / total seen so far / current phase). `settled` is monotonic.
           exec.onProgress = (snapshot: WorkflowSnapshot) => {
@@ -1929,15 +2262,20 @@ export function createWorkflowServer(
               reporter(settled, snapshot.agents.length || undefined, snapshot.currentPhase);
             }
           };
-          // A callback is a LIVE channel and therefore wins over headless:"pause". Do not
-          // install a defaulting shim for non-elicitation clients; the authored headless mode
-          // must remain visible to the engine.
-          if (mcp.server.getClientCapabilities()?.elicitation) {
-            elicitationController = new AbortController();
-            cancelElicitationFromRequest = () => elicitationController?.abort();
-            extra.signal.addEventListener("abort", cancelElicitationFromRequest, { once: true });
-            if (extra.signal.aborted) elicitationController.abort();
-            exec.confirm = createConfirm(mcp.server, elicitationController.signal);
+          // A callback is a LIVE channel and therefore wins over headless:"pause". Legacy
+          // retains push elicitation. Modern deliberately raises a durable pause so the outer
+          // tool handler can return inputRequired and resume on the client's retry.
+          const canElicit = Boolean(toolCatalog.clientCapabilities(ctx)?.elicitation);
+          if (canElicit) {
+            if (options.protocolEra === "modern") {
+              exec.pauseOnCheckpoint = true;
+            } else {
+              elicitationController = new AbortController();
+              cancelElicitationFromRequest = () => elicitationController?.abort();
+              ctx.mcpReq.signal.addEventListener("abort", cancelElicitationFromRequest, { once: true });
+              if (ctx.mcpReq.signal.aborted) elicitationController.abort();
+              exec.confirm = createConfirm(mcp.server, elicitationController.signal);
+            }
           }
         }
 
@@ -1952,7 +2290,7 @@ export function createWorkflowServer(
           );
           const admittedRun = manager.getRun(started.runId);
           if (!admittedRun?.limits) {
-            throw new McpError(ErrorCode.InternalError, "Workflow admission did not resolve run limits");
+            throw new ProtocolError(ProtocolErrorCode.InternalError, "Workflow admission did not resolve run limits");
           }
           executionLatch.admit();
           const workflowName = admittedRun.snapshot.name;
@@ -2012,6 +2350,35 @@ export function createWorkflowServer(
         );
         executionLatch.admit();
         const run = await settleForegroundRun(manager, started);
+        if (
+          options.protocolEra === "modern" &&
+          toolCatalog.clientCapabilities(ctx)?.elicitation &&
+          run.status === "paused" &&
+          run.reason === "checkpoint_required" &&
+          run.checkpointContext !== undefined
+        ) {
+          const checkpoint = run.checkpointContext;
+          const elicitation = createCheckpointElicitation(checkpoint.prompt, checkpoint);
+          if (elicitation === undefined) {
+            throw new ProtocolError(ProtocolErrorCode.InternalError, "Paused checkpoint cannot be represented as MCP elicitation");
+          }
+          const timeoutMs = readCheckpointTimeoutMs(checkpoint);
+          const state: WorkflowMcpRequestState = {
+            version: 1,
+            flow: "checkpoint",
+            inputHash,
+            scriptHash: workflowScriptHash(admittedScript),
+            runId: run.runId,
+            callIndex: checkpoint.callIndex,
+            checkpointHash: checkpoint.hash,
+            approvedKeys: [...approvedBackendKeys].sort(),
+            ...(timeoutMs === undefined ? {} : { expiresAt: Date.now() + timeoutMs }),
+          };
+          return inputRequired({
+            inputRequests: { checkpoint: inputRequired.elicit(elicitation) },
+            requestState: await requestStateCodec.mint(state, ctx),
+          });
+        }
         const scriptUri = workflowScriptUri(run.runId);
         const structuredContent = {
           ...toWorkflowToolResult(run, { scriptSource, scriptUri }),
@@ -2030,7 +2397,7 @@ export function createWorkflowServer(
         if (foregroundRunId) scriptResources.cancelPendingElicitation(foregroundRunId);
         else elicitationController?.abort();
         if (cancelElicitationFromRequest) {
-          extra.signal.removeEventListener("abort", cancelElicitationFromRequest);
+          ctx.mcpReq.signal.removeEventListener("abort", cancelElicitationFromRequest);
         }
         if (backgroundReservation) backgroundRuns.releaseReservation();
       }
@@ -2042,32 +2409,43 @@ export function createWorkflowServer(
   // tools/call, and over the stdio shim those arrive as independent HTTP POSTs), so gating
   // the tool on that notification let a client's very first request reach a server with
   // nothing registered: an empty tools/list, or a tool-not-found result on the first call.
-  const workflowTool = mcp.registerTool("workflow", workflowToolConfig, workflowToolHandler);
+  mcp.registerTool("workflow", workflowToolConfig, workflowToolHandler);
 
-  // Only the MCP Apps surface is negotiated, and it can be: the initialize request is the
-  // first point at which the client's MCP Apps MIME support is known, and a client that
-  // never advertised the extension has no use for the panel anyway. Adding it here also
-  // emits tools/list_changed, so a capable client re-lists and picks up the UI metadata.
-  // Preserve any callback installed by a caller before composing this hook.
+  // Register the Apps union once. tools/list, direct app-only calls, and the fixed UI resource
+  // are projected from the current request's capabilities; no modern request inherits another
+  // request's decision, including on long-lived stdio connections.
+  registerWorkflowAppUi(mcp, {
+    readEventsPage: (request) => scriptResources.readEventsPage(request),
+    registerResourceReader: (uri, read) =>
+      scriptResources.registerExternalResourceReader(uri, read, (ctx) => toolCatalog.supportsApps(ctx)),
+  });
+  toolCatalog.setWorkflowAppResource(RUN_MONITOR_RESOURCE_URI);
+  toolCatalog.installListHandler();
+
+  // Legacy capabilities are initialize-scoped. Modern requests bypass this snapshot and read
+  // only their own ctx.mcpReq.envelope through CapabilityAwareToolCatalog.
   const previousOnInitialized = mcp.server.oninitialized;
   mcp.server.oninitialized = () => {
     previousOnInitialized?.();
-    const uiCap = getUiCapability(mcp.server.getClientCapabilities());
-    // getUiCapability locates the official extension key but intentionally casts its settings;
-    // validate the REQUIRED array at runtime so malformed string/object values cannot enable UI.
-    if (!Array.isArray(uiCap?.mimeTypes) || !uiCap.mimeTypes.includes(RESOURCE_MIME_TYPE)) return;
-    registerWorkflowAppUi(mcp, {
-      readEventsPage: (request) => scriptResources.readEventsPage(request),
-      registerResourceReader: (uri, read) => scriptResources.registerExternalResourceReader(uri, read),
-    });
-    // The same normalization registerAppTool applies: both the nested and the flat key.
-    workflowTool.update({
-      _meta: {
-        ui: { resourceUri: RUN_MONITOR_RESOURCE_URI },
-        [RESOURCE_URI_META_KEY]: RUN_MONITOR_RESOURCE_URI,
-      },
-    });
+    if (toolCatalog.setLegacyCapabilities(mcp.server.getClientCapabilities())) {
+      void mcp.sendToolListChanged();
+    }
   };
+
+  if (options.disconnectReplClientOnClose) {
+    const previousOnClose = mcp.server.onclose;
+    mcp.server.onclose = () => {
+      try {
+        previousOnClose?.();
+      } finally {
+        const clientId = options.replClientId?.();
+        if (clientId !== undefined) {
+          replPresence.disconnect(clientId);
+          replPresence.forget(clientId);
+        }
+      }
+    };
+  }
 
   return server;
 }

@@ -1,11 +1,10 @@
 // BoundedEventStore: the SDK EventStore contract (storeEvent/getStreamIdForEventId/
 // replayEventsAfter) plus the bounding behavior the daemon depends on — per-stream ring,
+import type { JSONRPCMessage } from "@modelcontextprotocol/server";
+
 // global LRU cap, and replay-miss degrading to "re-bind the stream, replay what remains".
 import assert from "node:assert/strict";
 import { test } from "node:test";
-
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
-
 import { BoundedEventStore } from "../../src/daemon/event-store.js";
 
 function msg(n: number): JSONRPCMessage {

@@ -6,6 +6,10 @@
 //
 // Requires `pnpm build` first (spawns dist/entry.js). Uses AGENTPRISM_DAEMON_PORT=0 so the
 // daemon binds an ephemeral port — daemon.json is the discovery channel, so nothing here
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client } from "@modelcontextprotocol/client";
+import type { ElicitResult } from "@modelcontextprotocol/client";
+
 // can collide with a developer's real daemon.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -16,12 +20,6 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { envFingerprint } from "../../src/daemon/daemon-info.js";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { ElicitRequestSchema, ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { ElicitResult } from "@modelcontextprotocol/sdk/types.js";
-
 const distEntry = resolve(fileURLToPath(import.meta.url), "../../../dist/entry.js");
 const e2eHome = mkdtempSync(join(tmpdir(), "agentprism-shim-e2e-home-"));
 const childEnv: Record<string, string> = {
@@ -69,9 +67,10 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-async function connectShim(opts: { elicit?: () => ElicitResult } = {}): Promise<{
+async function connectShim(opts: { elicit?: () => ElicitResult; protocolMode?: "legacy" | "modern" } = {}): Promise<{
   client: Client;
   resourceUpdates: string[];
+  resourceListChanges: () => number;
   shimStderr: () => string;
   close: () => Promise<void>;
 }> {
@@ -83,15 +82,24 @@ async function connectShim(opts: { elicit?: () => ElicitResult } = {}): Promise<
   });
   const client = new Client(
     { name: "shim-e2e", version: "0.0.0" },
-    { capabilities: opts.elicit ? { elicitation: {} } : {} },
+    {
+      capabilities: opts.elicit ? { elicitation: { form: {} } } : {},
+      ...(opts.protocolMode === "modern"
+        ? { versionNegotiation: { mode: "auto" as const } }
+        : {}),
+    },
   );
   if (opts.elicit) {
     const respond = opts.elicit;
-    client.setRequestHandler(ElicitRequestSchema, async () => respond());
+    client.setRequestHandler('elicitation/create', async () => respond());
   }
   const resourceUpdates: string[] = [];
-  client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+  client.setNotificationHandler('notifications/resources/updated', (notification) => {
     resourceUpdates.push(notification.params.uri);
+  });
+  let resourceListChanges = 0;
+  client.setNotificationHandler('notifications/resources/list_changed', () => {
+    resourceListChanges += 1;
   });
   let stderrBuffer = "";
   await client.connect(transport);
@@ -101,6 +109,7 @@ async function connectShim(opts: { elicit?: () => ElicitResult } = {}): Promise<
   return {
     client,
     resourceUpdates,
+    resourceListChanges: () => resourceListChanges,
     shimStderr: () => stderrBuffer,
     close: async () => {
       await client.close().catch(() => undefined);
@@ -111,7 +120,6 @@ async function connectShim(opts: { elicit?: () => ElicitResult } = {}): Promise<
 async function callWorkflow(client: Client): Promise<Record<string, unknown> | undefined> {
   const result = await client.callTool(
     { name: "workflow", arguments: { script: NO_AGENT_SCRIPT, projectDir: e2eHome } },
-    undefined,
     { timeout: 60_000 },
   );
   assert.equal(result.isError ?? false, false, JSON.stringify(result.content));
@@ -149,6 +157,37 @@ test("two cold-started shims race to exactly one daemon, which outlives them bot
   assert.ok(pidAlive(info.pid), "daemon must survive its clients exiting");
   const stillUp = await fetch(`http://127.0.0.1:${info.port}/healthz`);
   assert.equal(stillUp.status, 200);
+});
+
+test("a modern stdio client negotiates through the shim and survives daemon replacement without a legacy session", async () => {
+  const session = await connectShim({ protocolMode: "modern" });
+  const subscription = await session.client.listen({ resourcesListChanged: true });
+  try {
+    assert.equal(session.client.getProtocolEra(), "modern");
+    assert.equal((await callWorkflow(session.client))?.status, "completed");
+
+    const before = readInfo();
+    assert.ok(before);
+    process.kill(before.pid, "SIGTERM");
+    await waitFor(() => !pidAlive(before.pid), "old modern daemon to exit");
+    await waitFor(
+      () => session.shimStderr().includes("modern stateless path ready; reopened 1 subscription(s)"),
+      "modern shim recovery and listen reopening",
+    );
+
+    const changesBeforeRecovery = session.resourceListChanges();
+    assert.equal((await callWorkflow(session.client))?.status, "completed");
+    await waitFor(
+      () => session.resourceListChanges() > changesBeforeRecovery,
+      "reopened modern subscriptions/listen to deliver resources/list_changed",
+    );
+    const after = readInfo();
+    assert.ok(after);
+    assert.notEqual(after.pid, before.pid);
+  } finally {
+    await subscription.close();
+    await session.close();
+  }
 });
 
 test("a connected shim transparently recovers when the daemon is killed mid-session", async () => {
@@ -193,7 +232,6 @@ test("the full MCP feature surface works through the shim: prompts, resources, e
   ].join("\n");
   const answered = await session.client.callTool(
     { name: "workflow", arguments: { script: checkpointScript, projectDir: e2eHome } },
-    undefined,
     { timeout: 60_000 },
   );
   assert.equal(answered.isError ?? false, false, JSON.stringify(answered.content));
@@ -219,7 +257,6 @@ test("the full MCP feature surface works through the shim: prompts, resources, e
   ].join("\n");
   const startedBg = await session.client.callTool(
     { name: "workflow", arguments: { script: pausingScript, background: true, projectDir: e2eHome } },
-    undefined,
     { timeout: 60_000 },
   );
   assert.equal(startedBg.isError ?? false, false, JSON.stringify(startedBg.content));
@@ -228,7 +265,6 @@ test("the full MCP feature surface works through the shim: prompts, resources, e
   await session.client.subscribeResource({ uri: eventsUri });
   await session.client.callTool(
     { name: "workflow", arguments: { action: "stop", runId: bgRunId } },
-    undefined,
     { timeout: 60_000 },
   );
   await waitFor(() => session.resourceUpdates.includes(eventsUri), "resources/updated through the shim");
@@ -247,7 +283,6 @@ test("subscriptions survive daemon death: the shim re-subscribes on session reco
     ].join("\n");
     const started = await session.client.callTool(
       { name: "workflow", arguments: { script: pausingScript, background: true, projectDir: e2eHome } },
-      undefined,
       { timeout: 60_000 },
     );
     const runId = (started.structuredContent as { runId: string }).runId;
@@ -264,7 +299,6 @@ test("subscriptions survive daemon death: the shim re-subscribes on session reco
     // and the shim replays the tracked subscription onto the new session.
     const inspected = await session.client.callTool(
       { name: "workflow", arguments: { action: "inspect", runId } },
-      undefined,
       { timeout: 60_000 },
     );
     assert.equal(inspected.isError ?? false, false, JSON.stringify(inspected.content));
@@ -282,7 +316,6 @@ test("subscriptions survive daemon death: the shim re-subscribes on session reco
     ].join("\n");
     const second = await session.client.callTool(
       { name: "workflow", arguments: { script: secondScript, background: true, projectDir: e2eHome } },
-      undefined,
       { timeout: 60_000 },
     );
     const secondRunId = (second.structuredContent as { runId: string }).runId;
@@ -290,7 +323,6 @@ test("subscriptions survive daemon death: the shim re-subscribes on session reco
     await session.client.subscribeResource({ uri: secondEventsUri });
     await session.client.callTool(
       { name: "workflow", arguments: { action: "stop", runId: secondRunId } },
-      undefined,
       { timeout: 60_000 },
     );
     await waitFor(() => session.resourceUpdates.includes(secondEventsUri), "resources/updated on recovered session", 20_000);
@@ -310,7 +342,6 @@ test("a request in flight when the daemon dies is answered with an error (never 
   // daemon is killed outright.
   const inflight = session.client.callTool(
     { name: "repl", arguments: { action: "eval", projectDir: e2eHome, code: "while (true) {}" } },
-    undefined,
     { timeout: 50_000 },
   );
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
@@ -329,6 +360,42 @@ test("a request in flight when the daemon dies is answered with an error (never 
   assert.ok(after);
   assert.notEqual(after.pid, before.pid);
   await session.close();
+});
+
+test("a modern in-flight request is failed as ambiguous and never replayed after daemon death", { timeout: 60_000 }, async () => {
+  const session = await connectShim({ protocolMode: "modern" });
+  try {
+    assert.equal((await callWorkflow(session.client))?.status, "completed");
+    const before = readInfo();
+    assert.ok(before);
+
+    const inflight = session.client.callTool(
+      { name: "repl", arguments: { action: "eval", projectDir: e2eHome, code: "while (true) {}" } },
+      { timeout: 50_000 },
+    );
+    const inflightFailure = inflight.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+    process.kill(before.pid, "SIGKILL");
+    await waitFor(() => !pidAlive(before.pid), "old modern daemon to die");
+
+    const error = await inflightFailure;
+    assert.match(String((error as Error | undefined)?.message), /session lost|daemon unreachable/i);
+    await waitFor(
+      () => session.shimStderr().includes("modern stateless path ready"),
+      "modern stateless recovery",
+    );
+    const second = callWorkflow(session.client);
+    assert.equal(
+      (await second)?.status,
+      "completed",
+      "the ambiguous eval was not replayed onto the successor and did not block it",
+    );
+  } finally {
+    await session.close();
+  }
 });
 
 test("daemon stop terminates the daemon and clears discovery state", async () => {

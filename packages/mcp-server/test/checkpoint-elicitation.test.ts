@@ -1,11 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/sdk/types.js";
-
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
 import { createWorkflowServer } from "../src/index.js";
 import { okRunner, structured, textOf, type ToolCallResult } from "./_harness.js";
 
@@ -22,7 +18,7 @@ async function connectCheckpoint(
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "mcp-checkpoint-test", version: "0.0.0" }, { capabilities: { elicitation: {} } });
   const requests: ElicitRequest[] = [];
-  client.setRequestHandler(ElicitRequestSchema, async (request) => {
+  client.setRequestHandler('elicitation/create', async (request) => {
     requests.push(request);
     return await respond(request);
   });

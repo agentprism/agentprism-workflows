@@ -9,10 +9,7 @@
  * evicted, the parsed streamId is still returned so the SDK re-binds the reconnected stream
  * to live traffic.
  */
-
-import type { EventStore } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
-
+import type { EventStore, JSONRPCMessage } from "@modelcontextprotocol/server";
 import { EVENT_STORE_MAX_EVENTS_PER_STREAM, EVENT_STORE_MAX_TOTAL_EVENTS } from "./constants.js";
 
 interface StoredEvent {
