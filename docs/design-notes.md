@@ -320,10 +320,17 @@ The shipped server registers the `workflow` and `repl` tools — and no auth too
 the agents' own CLI credential stores, and the server deliberately exposes no auth state for a
 host to inspect: agents that self-authenticate from disk are invisible to any host-side auth
 bookkeeping, so an auth-status surface could only report "unauthenticated" on fully logged-in
-machines — an LLM host reads that as a blocker. `AUTH_REQUIRED` pauses a run with the
-non-secret `authContext`; the recovery sequence is an out-of-band CLI login, then re-call
-`workflow` with `resumeFromRunId`. Programmatic credential injection stays in the SDK's
-auth-capable runner APIs for embedding hosts.
+machines — an LLM host reads that as a blocker. This also bounds MCP automatic default discovery:
+a no-prompt `session/new`/config probe can rule out definite failures but cannot prove universal
+first-prompt authentication. When `AGENTPRISM_DEFAULT_BACKEND` is absent and a mock routing pass
+reaches a model-less call, the MCP composition root probes configured backends, excludes failures
+and explicitly empty built-in catalogs, prefers positive session-open evidence (Codex's auth check;
+Pi's credential-filtered model catalog), then falls back to the first session-ready unknown. It
+pins that backend-only spec into engine validation, call identity, persistence, and resume. A later
+`AUTH_REQUIRED` pauses on that backend; there is no mid-run provider fallback. `AUTH_REQUIRED`
+pauses a run with the non-secret `authContext`; the recovery sequence is an out-of-band CLI login,
+then re-call `workflow` with `resumeFromRunId`. Programmatic credential injection stays in the
+SDK's auth-capable runner APIs for embedding hosts.
 
 Resume is **not lost**, it becomes **explicit**: expose a `resumeFromRunId` tool parameter; the
 host calls `workflow` again to continue from the persisted journal (the engine already supports
@@ -483,7 +490,9 @@ ACP is a *unified* protocol — nothing about the runner is backend-specific exc
   (`createAcpRunner({ backends })`) or via `AGENTPRISM_BACKENDS` (JSON env). Routing matches
   registered names FIRST (`model: "browser"` or `"browser/<inner-model>"` — the name is
   routing; the part after the slash is selected via Session Config Options), then the
-  built-in heuristics. `AGENTPRISM_DEFAULT_BACKEND` may name a registry entry.
+  built-in heuristics. `AGENTPRISM_DEFAULT_BACKEND` may name a registry entry. The runner's
+  historical unset fallback remains Claude; MCP's separate composition-root policy may inject a
+  discovered backend-only `defaultModel` before the runner sees an otherwise omitted model.
   `"claude"`/`"codex"`/`"opencode"`/`"pi"` are reserved. A custom backend speaks the repo's published generic
   dialect: schema IN as turn-level `_meta.outputSchema` (plain JSON Schema, not
   OpenAI-strict), optionally a client-hosted StructuredOutput MCP tool when HTTP MCP is

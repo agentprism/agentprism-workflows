@@ -184,6 +184,7 @@ export interface RunIsolationOptions {
   signal?: AbortSignal;
   agentsDir?: string;
   mainModel?: string;
+  defaultModel?: string;
   environmentKey?: string;
   onProgress?: (snapshot: WorkflowSnapshot) => void;
 }
@@ -463,7 +464,7 @@ function validateStructure(recording: PersistedRunState): void {
   if (!isNonEmptyString(recording.runId)) corrupt(recording, "runId");
   if (!isNonEmptyString(recording.script)) corrupt(recording, "script");
   if (typeof recording.status !== "string") corrupt(recording, "status");
-  for (const field of ["effectiveCwd", "cwd", "mainModel", "agentsDir"] as const) {
+  for (const field of ["effectiveCwd", "cwd", "mainModel", "defaultModel", "agentsDir"] as const) {
     if (recording[field] !== undefined && typeof recording[field] !== "string") corrupt(recording, field);
   }
   for (const field of ["argsUnreplayable", "nestedWorkflows", "legacyResume", "abortSignaled"] as const) {
@@ -1583,6 +1584,7 @@ export async function runIsolation<T = unknown>(
         cwd: executionCwd,
         journaling,
         scriptBackends: options.scriptBackends,
+        defaultModel: options.defaultModel ?? recording.defaultModel,
         onProgress: options.onProgress,
         signal: combinedSignal,
         concurrency: options.concurrency ?? recording.limits?.concurrency,

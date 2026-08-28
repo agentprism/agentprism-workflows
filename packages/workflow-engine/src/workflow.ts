@@ -95,8 +95,15 @@ export interface WorkflowAgentOptions {
   /**
    * The session's main model spec. A registered first segment routes and is stripped once;
    * the remaining id is sent verbatim. A backend name alone uses that harness's default.
+   * Used as the fallback for an unresolved authored tier.
    */
   mainModel?: string;
+  /**
+   * Host-pinned model/backend for calls that author no model, agentType model, tier, or
+   * phase/meta route. Unlike a runner's ambient default, this participates in the call
+   * identity hash and therefore stays deterministic throughout the run and its nested workflows.
+   */
+  defaultModel?: string;
 }
 
 /**
@@ -1014,18 +1021,20 @@ export async function runWorkflow<T = unknown>(
     }
 
     // Model precedence: explicit agentOptions.model > agentType.model > resolved tier >
-    // mainModel tier fallback > historical behavior. A tier suppresses phase routing; when
-    // it has no configured model and no mainModel fallback, leave model undefined and pass
-    // the raw tier through for the runner to route under the same deterministic rules.
+    // mainModel tier fallback > phase/meta route > host-pinned defaultModel > historical
+    // runner default. A tier suppresses phase/default routing; when it has no configured
+    // model and no mainModel fallback, leave model undefined and pass the raw tier through
+    // for the runner to route under the same deterministic rules.
     const explicitModel = agentOptions.model ?? agentDef?.model;
     const tierModel =
       !explicitModel && agentOptions.tier && modelTierConfig
         ? resolveTierModel(agentOptions.tier, modelTierConfig)
         : undefined;
+    const phaseModel = agentOptions.tier ? undefined : resolveModelForPhase(assignedPhase, routingConfig);
     const modelSpec =
       explicitModel ??
-      (agentOptions.tier ? tierModel || options.mainModel : resolveModelForPhase(assignedPhase, routingConfig));
-    // For display in /workflows: the model this agent runs on — its explicit/phase
+      (agentOptions.tier ? tierModel || options.mainModel : phaseModel ?? options.defaultModel);
+    // For display in /workflows: the model this agent runs on — its explicit/phase/default
     // spec, else the session's main model. The real resolved id overrides this via
     // onModelResolved once the subagent session is created.
     let displayModel = modelSpec ?? options.mainModel;
@@ -2878,8 +2887,8 @@ function sameFallback(left: WorkflowRunFallback, right: WorkflowRunFallback): bo
   );
 }
 
-export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {
-  const ast = parse(script, {
+function parseWorkflowAst(script: string): AnyNode {
+  return parse(script, {
     ecmaVersion: "latest",
     sourceType: "module",
     allowAwaitOutsideFunction: true,
@@ -2887,6 +2896,10 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
     locations: true,
     ranges: false,
   }) as AnyNode;
+}
+
+export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {
+  const ast = parseWorkflowAst(script);
 
   // This direct-syntax check provides fast author feedback without chasing aliases.
   // DETERMINISM_PRELUDE remains the authoritative runtime enforcement for aliases,
@@ -2947,6 +2960,65 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
   };
 }
 
+/**
+ * Conservative static companion to the validator's reached-path mock report. It catches direct
+ * model-less calls hidden behind branches the fabricated dry-run result did not take, plus stdlib
+ * helpers/nested workflows that can allocate default-model agents. Aliased/computed calls are left
+ * to the reached-path report; a prior direct agent that controls such a branch is already enough to
+ * make this return true.
+ */
+export function workflowMayUseDefaultModel(script: string): boolean {
+  const parsed = parseWorkflowScript(script);
+  const ast = parseWorkflowAst(script);
+  const metaDefault = typeof parsed.meta.model === "string" && parsed.meta.model.trim() !== "";
+  const pending = [ast];
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    if (node.type === "CallExpression" && node.callee?.type === "Identifier") {
+      const name = node.callee.name;
+      if (name === "workflow") return true;
+      if (["verify", "judgePanel", "completenessCheck"].includes(name) && !metaDefault) return true;
+      if (name === "agent" && !metaDefault && !hasStaticModelOrTier(node.arguments?.[1])) return true;
+    }
+    pushAstChildren(node, pending);
+  }
+  return false;
+}
+
+function hasStaticModelOrTier(options: AnyNode | undefined): boolean {
+  if (options?.type !== "ObjectExpression") return false;
+  let modelPinned = false;
+  let tierPinned = false;
+  for (const property of options.properties as AnyNode[]) {
+    // A spread/computed key can replace either field. Later literal properties may pin it again.
+    if (property.type !== "Property" || property.computed || property.kind !== "init") {
+      modelPinned = false;
+      tierPinned = false;
+      continue;
+    }
+    const key = property.key?.type === "Identifier" ? property.key.name : property.key?.value;
+    if (key !== "model" && key !== "tier") continue;
+    const value = property.value?.type === "Literal" ? property.value.value : undefined;
+    if (key === "model") modelPinned = typeof value === "string";
+    else tierPinned = typeof value === "string" && value.trim() !== "";
+  }
+  return modelPinned || tierPinned;
+}
+
+function pushAstChildren(node: AnyNode, pending: AnyNode[]): void {
+  const children: AnyNode[] = [];
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item && typeof item === "object" && typeof (item as AnyNode).type === "string") children.push(item as AnyNode);
+      }
+    } else if (value && typeof value === "object" && typeof (value as AnyNode).type === "string") {
+      children.push(value as AnyNode);
+    }
+  }
+  for (let index = children.length - 1; index >= 0; index--) pending.push(children[index]);
+}
+
 function findDeterminismViolation(ast: AnyNode): { api: string; node: AnyNode } | undefined {
   const pending = [ast];
   while (pending.length > 0) {
@@ -2954,19 +3026,7 @@ function findDeterminismViolation(ast: AnyNode): { api: string; node: AnyNode } 
     const api = nondeterministicApi(node);
     if (api) return { api, node };
 
-    const children: AnyNode[] = [];
-    for (const value of Object.values(node)) {
-      if (Array.isArray(value)) {
-        for (const item of value) {
-          if (item && typeof item === "object" && typeof (item as AnyNode).type === "string") {
-            children.push(item as AnyNode);
-          }
-        }
-      } else if (value && typeof value === "object" && typeof (value as AnyNode).type === "string") {
-        children.push(value as AnyNode);
-      }
-    }
-    for (let index = children.length - 1; index >= 0; index--) pending.push(children[index]);
+    pushAstChildren(node, pending);
   }
   return undefined;
 }

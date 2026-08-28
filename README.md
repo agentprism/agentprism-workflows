@@ -250,8 +250,7 @@ killing the process; add `--in-process` to the args for the old single-process b
   "mcpServers": {
     "agentprism-workflow": {
       "command": "npx",
-      "args": ["-y", "@automatalabs/workflows", "mcp"],
-      "env": { "AGENTPRISM_DEFAULT_BACKEND": "claude" }
+      "args": ["-y", "@automatalabs/workflows", "mcp"]
     }
   }
 }
@@ -259,7 +258,10 @@ killing the process; add `--in-process` to the args for the old single-process b
 
 The server is bundled in the `@automatalabs/workflows` tarball, so this needs no separate
 server installation. The independently published `@automatalabs/mcp-server` package and its
-`agentprism-workflow` bin remain available as an alternative.
+`agentprism-workflow` bin remain available as an alternative. With no
+`AGENTPRISM_DEFAULT_BACKEND`, a workflow that reaches a model-less `agent()` call probes configured
+backends without prompting, prefers positive session-open readiness evidence, and pins one backend
+for that project/run. Set the environment variable only when you want an explicit operator default.
 
 From a source checkout, point at the built entry instead:
 
@@ -512,7 +514,7 @@ The backend is chosen per `agent()` call from the effective `model`/`tier` spec 
 
 - Split on the first `/`. If the first segment, ASCII-case-insensitively, is `claude`, `codex`, `opencode`, `pi`, or a registered custom backend name, route there and strip exactly that segment. Custom registrations take priority on a name collision.
 - A backend name alone (`claude`, `codex`, `opencode`, `pi`, or a custom name) selects no model, leaving that harness's configured default untouched.
-- Otherwise route the entire authored string, unchanged, to `AGENTPRISM_DEFAULT_BACKEND` (historical default `claude`). `anthropic/…`, `openai/…`, bare `opus`, and bare `gpt-…` are not routing aliases.
+- Otherwise route the entire authored string, unchanged, to the effective default backend. In the SDK runner this is `AGENTPRISM_DEFAULT_BACKEND` (historical fallback `claude`). In the MCP server an explicitly present environment value wins; when truly unset, a model-less workflow performs zero-token readiness probes and pins one project default before validation/execution. `anthropic/…`, `openai/…`, bare `opus`, and bare `gpt-…` are not routing aliases.
 - When a model id remains, it is sent byte-for-byte through `session/set_config_option`: no catalog matching, case folding, bracket parsing, or fallback. Brackets, dots, and provider prefixes are ordinary id characters, and a harness rejection follows the existing agent-error path.
 
 Per-call `configOptions` extends that same verbatim rule to the rest of the harness's ACP session
@@ -583,7 +585,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `AGENTPRISM_DEFAULT_BACKEND` | `claude` | Backend when the model/tier doesn't imply one (`claude` \| `codex` \| `opencode` \| `pi` \| a registered custom name). |
+| `AGENTPRISM_DEFAULT_BACKEND` | unset | Explicit backend when the model/tier doesn't imply one (`claude` \| `codex` \| `opencode` \| `pi` \| a registered custom name). When absent, the MCP server auto-selects and pins a project default from zero-token readiness probes; the SDK runner retains its historical Claude fallback. |
 | `AGENTPRISM_BACKENDS` | (none) | Custom ACP backends as JSON: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}}}`. Programmatic `createAcpRunner({ backends })` wins per name. |
 | `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` | (unset) | MCP server only: `1`/`true` approves **script-declared** `meta.backends` headlessly (for clients without elicitation support). |
 | `AGENTPRISM_PERSISTENCE_ROOT` | `~/.agentprism/workflows` | Absolute root for persisted run state, logs, journals, and resume data. |

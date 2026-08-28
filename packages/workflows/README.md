@@ -46,8 +46,10 @@ pnpm add @automatalabs/workflows
   - **OpenCode** — credentials configured for the provider OpenCode will use.
   - **pi** — a selected provider API key or credentials in `~/.pi/agent/auth.json`.
 
-You only need auth for the backend(s) your scripts actually route to. The default backend is
-Claude (override with `AGENTPRISM_DEFAULT_BACKEND`; see [Backend selection](#backend-selection)).
+You only need auth for the backend(s) your scripts actually route to. Direct SDK runners retain
+the historical Claude default (override with `AGENTPRISM_DEFAULT_BACKEND`; see
+[Backend selection](#backend-selection)). The bundled MCP server auto-selects a pinned project
+default from no-prompt readiness probes when that environment variable is absent.
 
 ---
 
@@ -660,7 +662,8 @@ and `configOptions` bag against it. Only exact ids in `modes.availableModes` pas
 means omit `mode`, never infer `"default"`. This probe uses zero tokens. A target that cannot spawn,
 authenticate, select its model, or open a session contributes one warning and `probed:false`; only
 that target's configuration checks are skipped, so probe failure alone never invalidates the script.
-There is no cached catalog or opt-out flag.
+There is no cached catalog. Programmatic hosts may set `probeConfig:false` for a mock routing-discovery
+pass that intentionally skips all no-prompt config checks; the CLI and ordinary validation keep them enabled.
 A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"`
 dry-runs cleanly; `headless: "abort"` warns because a truly unattended run would abort.
 Script-declared `meta.backends` are treated as approved (with a warning that real runs require
@@ -729,7 +732,12 @@ const mockAnswers: MockAnswers = {
     ],
   },
 };
-const report = await validateWorkflowScript(script, { args: { target: "src/" }, mockAnswers });
+const report = await validateWorkflowScript(script, {
+  args: { target: "src/" },
+  mockAnswers,
+  // defaultModel: "codex", // optional host-pinned fallback for otherwise model-less calls
+  // probeConfig: false,    // optional routing-discovery pass; skips live config checks
+});
 report.ok;                 // parse ok AND dry run completed
 report.dryRun?.agentCalls; // calls include mockAnswer: { glob, sequenceIndex?, sequenceLength? }
 report.dryRun?.harnessOptions;
@@ -758,8 +766,10 @@ default set). Each harness opens one session without a prompt — zero tokens �
 advertised ACP modes plus its config-option catalog: model ids (including bracket variants), effort
 levels, and boolean knobs. A non-null `modes` object contains `currentModeId` and `availableModes`;
 only exact listed ids may be authored. `modes: null` means omit `mode`, never infer `"default"`.
-A harness that cannot spawn or authenticate reports
-`probed: false` with the reason and never blocks the others. Flags: `--cwd <dir>` (probe
+A harness that reports spawn/session/auth failure during `session/new` produces
+`probed: false` with the reason and never blocks the others. A successful row proves only that
+session/config discovery completed; some agents defer credential validation until the first prompt,
+so `probed:true` is not a universal authentication-status result. Flags: `--cwd <dir>` (probe
 session cwd; default the current directory), `--timeout-ms <n>` (per-harness bound, default
 60000), `--models[=<filter>]`, `--json`. Exit codes: `0` all probed, `1` at least one probe
 failed, `3` usage error.
@@ -882,7 +892,10 @@ the string on its first `/`. If the first segment, ASCII-case-insensitively, is 
 once; a custom registration wins on a built-in-name collision. A registered harness name alone is
 backend-only and preserves that harness's configured default model. Any other first segment sends
 the entire authored string unchanged to `AGENTPRISM_DEFAULT_BACKEND` (default `claude`). Omitting
-the spec also uses the configured default backend and its default model.
+the spec also uses the configured default backend and its default model. This paragraph describes
+the SDK runner. The bundled MCP composition root adds an operator-friendly policy: when the env var
+is truly unset and a workflow reaches a model-less call, it probes backend readiness without
+prompting and injects a pinned backend-only default before validation/execution and resume.
 
 ```ts
 import { selectBackend } from "@automatalabs/workflows";
@@ -924,6 +937,7 @@ runIsolation,                 // ACP-defaulted single-target substitution over a
 createReplayRunner,           // backend-neutral in-memory replay composition primitive
 runWorkflow,                  // the bare engine run (no status trio)
 parseWorkflowScript,          // parse a script's meta + body
+workflowMayUseDefaultModel,   // conservative static detection of host-default agent allocation
 validateWorkflowScript,       // token-free parse + mock dry run + no-prompt harness option probes
 probeHarnessConfig,           // the same no-prompt option probe standalone (the `config` CLI command)
 fabricateFromSchema,          // the dry run's JSON-Schema value fabricator

@@ -135,6 +135,35 @@ describe("WorkflowManager PR3 state", () => {
     }
   });
 
+  it("persists a host-pinned default model and includes it in the agent call identity", async () => {
+    const dirs = tempDirs();
+    try {
+      const seen: Array<string | undefined> = [];
+      const manager = new WorkflowManager({
+        cwd: dirs.cwd,
+        persistenceRoot: dirs.root,
+        agent: {
+          async run(_prompt, options) {
+            seen.push(options?.model);
+            return "ok";
+          },
+        },
+      });
+      const result = await manager.runSync(
+        script(`return await agent('model-less', { label: 'model-less' })`, "pinned-default"),
+        undefined,
+        { defaultModel: "codex" },
+      );
+      assert.equal(result.status, "completed");
+      assert.deepEqual(seen, ["codex"]);
+      const persisted = manager.getPersistence().load(result.runId);
+      assert.equal(persisted?.defaultModel, "codex");
+      assert.equal(persisted?.calls?.[0]?.modelRequested, "codex");
+    } finally {
+      dirs.cleanup();
+    }
+  });
+
   it("snapshots args on resume and keeps the persisted pre-execution value", async () => {
     const dirs = tempDirs();
     try {

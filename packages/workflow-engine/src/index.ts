@@ -6,6 +6,7 @@
 export {
   runWorkflow,
   parseWorkflowScript,
+  workflowMayUseDefaultModel,
   hashCheckpointInputs,
   resolveAgentTimeoutMs,
   resolveWorkflowRunLimits,

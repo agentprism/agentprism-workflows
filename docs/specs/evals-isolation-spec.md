@@ -325,7 +325,8 @@ reuse the same id today (§2.3's ordinal fixes; r5 B5).
 `model` > `agentType.model`; else, **when `tier` is set**, the tier-resolved model
 or — with no configured entry — `options.mainModel` (phase/meta routing NOT
 consulted for tier-bearing calls); else phase-resolved routing (which consults
-`meta.model`). The resolved spec (`modelSpec`) is what `hashAgentCall` hashes and
+`meta.model`), then the optional host-pinned `options.defaultModel`. The resolved spec
+(`modelSpec`) is what `hashAgentCall` hashes and
 the runner receives; `onModelResolved`/`onModelFallback`/`onSessionOpen` are
 OPTIONAL callbacks a conforming ACP runner invokes
 (`acp-agents/src/runner.ts:1262-1276`) but a structural `AgentRunner` may ignore —
@@ -1158,6 +1159,8 @@ nested-child events patching parent rows).
    *  workflow-manager.ts:547-548). Absent when unset. §4.3 defaults isolation runs
    *  back to these (r5 B13.1 — now declared here, not merely referenced). */
   mainModel?: string;
+  /** Additive host pin for calls with no authored/definition/tier/phase/meta model. */
+  defaultModel?: string;
   agentsDir?: string;
   /** NEW — set when workflow() was invoked during this run (§2.3). */
   nestedWorkflows?: true;
@@ -1201,14 +1204,15 @@ mutated after its terminal save. Disclosed behavior fix (previously a late journ
 write re-persisted a completed run's file).
 
 Other manager changes: `persistRun` writes `effectiveCwd`, `runtime`, `environment`,
-`mainModel`, `agentsDir`, and the markers on every save, and `callsAllocated`/
+`mainModel`, `defaultModel`, `agentsDir`, and the markers on every save, and `callsAllocated`/
 `limits`/`abortSignaled` on completion; `resumeInBackground` sets `legacyResume` when
 the loaded state lacks `calls[]`, and — new gate — returns `{ accepted: false }` for
 any persisted state with `executionMode` present (§4.2). `ExecOptions` gains three
 additive fields: `runId?: string` (caller-minted id; the §4.8 lease-first collision
 guard), `executionMode?: PersistedRunState["executionMode"]`, and
 `environmentKey?: string` (the non-git environment identity input, r6 B14; also on
-`WorkflowManagerOptions` as a run-default).
+`WorkflowManagerOptions` as a run-default), plus `defaultModel?: string` as a per-run,
+persisted model-resolution pin.
 
 ### 3.4 Snapshot + `PersistedAgentState` typing (the honesty fix)
 
@@ -1438,9 +1442,11 @@ export interface RunIsolationOptions {
   agentRetries?: number;
   signal?: AbortSignal;
   /** Model-resolution reproduction inputs. Defaults (normative):
-   *  agentsDir ?? recording.agentsDir; mainModel ?? recording.mainModel (§3.3a). */
+   *  agentsDir ?? recording.agentsDir; mainModel ?? recording.mainModel;
+   *  defaultModel ?? recording.defaultModel (§3.3a). */
   agentsDir?: string;
   mainModel?: string;
+  defaultModel?: string;
   /** The non-git environment identity input (r6 B14): required by preflight when the
    *  BASELINE carries environment.key (equality-checked); ignored when the baseline
    *  carries environment.git (the executing repo state is measured directly). */
@@ -1748,8 +1754,8 @@ actually enforced and by which guard:
 > admissibility PRECONDITION, not a claim the engine proves.
 
 Model-resolution reproduction precondition (unchanged need): the hash embeds the
-resolved spec, whose inputs are the tier config file, `mainModel`, and the `agentsDir`
-registry (`workflow.ts:343-358,484-499`). `mainModel`/`agentsDir` are persisted and
+resolved spec, whose inputs are the tier config file, `mainModel`, `defaultModel`, and the
+`agentsDir` registry (`workflow.ts:343-358,484-499`). `mainModel`/`defaultModel`/`agentsDir` are persisted and
 defaulted back (§3.3a/§4.3); tier-config and agents-directory CONTENTS — and the
 `scriptBackends` approval set — are documented caller preconditions; drift is
 fail-visible (a mismatch lands in rule 6's typed refusals or the target-identity

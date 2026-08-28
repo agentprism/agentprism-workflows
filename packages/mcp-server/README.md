@@ -142,10 +142,7 @@ Add the server to your host's `mcpServers` config. The host spawns the bin and t
   "mcpServers": {
     "agentprism-workflow": {
       "command": "agentprism-workflow",
-      "args": [],
-      "env": {
-        "AGENTPRISM_DEFAULT_BACKEND": "claude"
-      }
+      "args": []
     }
   }
 }
@@ -158,16 +155,13 @@ If the bin isn't on the host's `PATH`, launch it through `npx` instead:
   "mcpServers": {
     "agentprism-workflow": {
       "command": "npx",
-      "args": ["-y", "@automatalabs/mcp-server"],
-      "env": {
-        "AGENTPRISM_DEFAULT_BACKEND": "claude"
-      }
+      "args": ["-y", "@automatalabs/mcp-server"]
     }
   }
 }
 ```
 
-`env` here is inherited by the server process **and** by every agent subprocess it spawns (see [Backends & auth](#backends--auth)), so it is where you put `AGENTPRISM_*` settings and any credentials the agent CLIs need. Set `AGENTPRISM_DEFAULT_BACKEND` to `claude` (the default), `codex`, `opencode`, `pi`, or a registered custom backend name to choose the backend used when an `agent()` call's `model`/`tier` does not pin a provider.
+`env` here is inherited by the server process **and** by every agent subprocess it spawns (see [Backends & auth](#backends--auth)), so it is where you put `AGENTPRISM_*` settings and any credentials the agent CLIs need. Leave `AGENTPRISM_DEFAULT_BACKEND` unset for automatic MCP selection: when a workflow reaches a model-less `agent()` call, the server probes configured backends without prompting, pins one project default before validation/execution, and preserves it across resume. Set it explicitly to `claude`, `codex`, `opencode`, `pi`, or a registered custom backend name only when the operator wants to force that backend.
 
 After your host reloads, the `workflow` and `repl` tools appear in its tool list.
 
@@ -832,7 +826,7 @@ The prompt is intentionally compact: it frames the optional **`task`**, directs 
 
 ## Backends & auth
 
-Each `agent()` call is dispatched to an **ACP agent server** chosen by the call's `model`/`tier`, falling back to `AGENTPRISM_DEFAULT_BACKEND` (default `claude`). The four built-in backends are:
+Each `agent()` call is dispatched to an **ACP agent server** chosen by the call's effective `model`/`tier`. An explicitly present `AGENTPRISM_DEFAULT_BACKEND` is the fallback. When it is truly unset, the MCP server runs zero-token session/config probes only for workflows that reach a model-less call, excludes definite probe failures and explicitly empty built-in model catalogs, prefers positive session-open readiness evidence (Codex authorization or Pi's credential-filtered catalog), then falls back to the first session-ready backend whose prompt authentication remains unknown. The selected backend is pinned into validation, call identity, execution, and resume; a later `AUTH_REQUIRED` pauses rather than switching providers. The four built-in backends are:
 
 - **Claude** → `@agentclientprotocol/claude-agent-acp` (the Claude Agent SDK over ACP). By default the server resolves that package's bin and runs it under the current Node; if it can't be resolved, it falls back to `npx -y @agentclientprotocol/claude-agent-acp`.
 - **Codex** → `@automatalabs/codex-acp` (a published fork that bakes in the structured-output patch). By default the server resolves that package and runs it under the current Node.
@@ -843,7 +837,7 @@ Beyond the built-ins, **any ACP agent** can be registered as a named backend via
 
 A workflow script can also **declare its own backends** in its meta block (`meta.backends: { <name>: { command, args?, env?, sessionMeta? } }`). Because these spawn commands on this machine, they require approval before the run starts: if the connected client supports MCP **elicitation**, the user is asked to approve each unique spawn config; otherwise the call fails with an informative error naming the `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` env opt-in. Approvals remain session-sticky on legacy connections and are integrity-bound to the active multi-round-trip call on stateless modern connections. Host-registered names (`AGENTPRISM_BACKENDS`) always win over script declarations of the same name.
 
-**Authentication belongs to the agents, not this server.** Claude, Codex, and OpenCode use their normal CLI credentials; pi uses the selected provider's environment key or `~/.pi/agent/auth.json`. There is no separate auth state for an MCP host to inspect or manage. If a run genuinely hits expired/missing credentials, the backend returns ACP `AUTH_REQUIRED` and the managed run **pauses** with `reason: "auth_required"` plus a non-secret `authContext` naming the backend and advertised methods: configure that credential out-of-band, then call `workflow` again with the original script and `resumeFromRunId` — the run continues from its journal. Programmatic auth flows (env-var/gateway credential injection, LLM provider routing) live in the [`@automatalabs/workflows`](../workflows) SDK runner APIs for hosts that embed the engine directly.
+**Authentication belongs to the agents, not this server.** Claude, Codex, and OpenCode use their normal CLI credentials; pi uses the selected provider's environment key or `~/.pi/agent/auth.json`. There is no separate auth state for an MCP host to inspect or manage. In particular, a successful no-prompt config probe means session/config discovery succeeded, not that ACP universally proved first-prompt authentication; ambient CLI credentials are not observable through generic runner bookkeeping, so automatic default selection reports unknown readiness honestly where necessary. If a run genuinely hits expired/missing credentials, the backend returns ACP `AUTH_REQUIRED` and the managed run **pauses** with `reason: "auth_required"` plus a non-secret `authContext` naming the backend and advertised methods: configure that credential out-of-band, then call `workflow` again with the original script and `resumeFromRunId` — the run continues from its journal on the same pinned backend. Programmatic auth flows (env-var/gateway credential injection, LLM provider routing) live in the [`@automatalabs/workflows`](../workflows) SDK runner APIs for hosts that embed the engine directly.
 
 ---
 
@@ -853,7 +847,7 @@ All settings are read from the environment of the `agentprism-workflow` process 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AGENTPRISM_DEFAULT_BACKEND` | `claude` | Backend used when an `agent()` call's `model`/`tier` does not pin a provider: `claude`, `codex`, `opencode`, `pi`, or a registered custom backend name. Unknown values fall back to Claude. |
+| `AGENTPRISM_DEFAULT_BACKEND` | unset | Explicit backend used when an `agent()` call's model/tier does not pin a provider: `claude`, `codex`, `opencode`, `pi`, or a registered custom backend name. When absent, MCP auto-selects a project default as described above. If explicitly present but empty/unknown, historical runner behavior falls back to Claude. |
 | `AGENTPRISM_BACKENDS` | — | Custom ACP backends as a JSON object: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}}}`. Registered names route `model`/`tier` specs **before** built-in heuristics; `claude`/`codex`/`opencode`/`pi` are reserved. |
 | `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` | — | `1`/`true` approves **script-declared** `meta.backends` headlessly. Only needed for clients without elicitation support — eliciting clients are prompted per spawn config instead. Understand the risk: this lets any workflow script spawn arbitrary commands. |
 | `AGENTPRISM_ACP_INIT_TIMEOUT_MS` | `60000` | Deadline for a backend's one-time ACP `initialize` handshake; a command that is not an ACP server fails fast with a clear error instead of hanging. |

@@ -336,6 +336,288 @@ test("config discovery structured diagnostics stay within 24 KiB", async () => {
   }
 });
 
+test("model-less MCP workflows auto-select and cache the first backend with positive readiness evidence", async () => {
+  const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
+  delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+  const liveModels: Array<string | undefined> = [];
+  const probes: Array<{ spec?: string; selectModel?: boolean }> = [];
+  const modelOption = (currentValue: string, choices: string[] = [currentValue]) => ({
+    id: "model",
+    name: "Model",
+    type: "select" as const,
+    currentValue,
+    options: choices.filter(Boolean).map((value) => ({ value, name: value })),
+  });
+  const runner = Object.assign(
+    makeRunner((_prompt, options) => {
+      liveModels.push(options.model);
+      return "ok";
+    }),
+    {
+      defaultBackendId: () => "claude",
+      listBackends: () => ["claude", "codex", "opencode", "pi"],
+      listCustomBackends: () => [],
+      async probeConfigOptions(spec?: string, options?: { selectModel?: boolean }) {
+        probes.push({ spec, selectModel: options?.selectModel });
+        const backendId = spec?.split("/", 1)[0] ?? "claude";
+        if (backendId === "opencode") throw new Error("opencode is not installed");
+        if (backendId === "pi") return { backendId, options: [modelOption("", [])] };
+        return {
+          backendId,
+          options: [modelOption(backendId === "codex" ? "gpt" : "opus")],
+        };
+      },
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const first = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    assert.notEqual(first.isError, true);
+    assert.deepEqual(liveModels, ["codex"]);
+    assert.match(textOf(first), /auto-selected backend "codex"/);
+    assert.match(textOf(first), /will not switch providers automatically/);
+    assert.equal(probes.filter(({ spec }) => spec === "claude").length, 1);
+    assert.equal(probes.filter(({ spec }) => spec === "opencode").length, 1);
+    assert.equal(probes.filter(({ spec }) => spec === "pi").length, 1);
+    assert.equal(probes.filter(({ spec }) => spec === "codex").length, 2, "discovery plus routed preflight");
+
+    const second = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    assert.notEqual(second.isError, true);
+    assert.deepEqual(liveModels, ["codex", "codex"]);
+    assert.equal(probes.filter(({ spec }) => spec === "claude").length, 1, "project discovery is cached");
+    assert.equal(probes.filter(({ spec }) => spec === "opencode").length, 1);
+    assert.equal(probes.filter(({ spec }) => spec === "pi").length, 1);
+    assert.equal(probes.filter(({ spec }) => spec === "codex").length, 3, "only normal preflight repeats");
+  } finally {
+    await dispose();
+    if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+    else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
+  }
+});
+
+test("a resumed MCP run inherits its source's pinned automatic backend instead of rediscovering", async () => {
+  const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
+  delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+  const modelOption = (currentValue: string) => ({
+    id: "model",
+    name: "Model",
+    type: "select" as const,
+    currentValue,
+    options: [{ value: currentValue, name: currentValue }],
+  });
+  const firstRunner = Object.assign(makeRunner(() => "source"), {
+    defaultBackendId: () => "claude",
+    listBackends: () => ["claude", "codex"],
+    listCustomBackends: () => [],
+    async probeConfigOptions(spec?: string) {
+      const backendId = spec ?? "claude";
+      return { backendId, options: [modelOption(backendId === "codex" ? "gpt" : "opus")] };
+    },
+  });
+  const firstConnection = await connect(firstRunner, { listTools: true });
+  let sourceRunId: string;
+  try {
+    const source = await firstConnection.client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    assert.notEqual(source.isError, true);
+    sourceRunId = String(structured(source)?.runId);
+  } finally {
+    await firstConnection.dispose();
+  }
+
+  const probes: string[] = [];
+  const resumedRunner = Object.assign(makeRunner(() => "should replay"), {
+    defaultBackendId: () => "claude",
+    listBackends: () => ["pi"],
+    listCustomBackends: () => [],
+    async probeConfigOptions(spec?: string) {
+      probes.push(spec ?? "claude");
+      return { backendId: spec ?? "claude", options: [modelOption("default")] };
+    },
+  });
+  const secondConnection = await connect(resumedRunner, { listTools: true });
+  try {
+    const resumed = await secondConnection.client.callTool({
+      name: "workflow",
+      arguments: { script: ONE_AGENT_SCRIPT, resumeFromRunId: sourceRunId! },
+    });
+    assert.notEqual(resumed.isError, true);
+    assert.deepEqual(probes, ["codex"], "the inherited source backend receives only normal preflight");
+    assert.match(textOf(resumed), /inherit pinned backend "codex" from the resume source/);
+  } finally {
+    await secondConnection.dispose();
+    if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+    else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
+  }
+});
+
+test("an explicit AGENTPRISM_DEFAULT_BACKEND wins and skips automatic candidate discovery", async () => {
+  const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
+  process.env.AGENTPRISM_DEFAULT_BACKEND = "pi";
+  const liveModels: Array<string | undefined> = [];
+  const probes: string[] = [];
+  const runner = Object.assign(
+    makeRunner((_prompt, options) => {
+      liveModels.push(options.model);
+      return "ok";
+    }),
+    {
+      defaultBackendId: () => "pi",
+      listBackends: () => ["claude", "codex", "opencode", "pi"],
+      async probeConfigOptions(spec?: string) {
+        probes.push(spec ?? "claude");
+        return { backendId: spec ?? "pi", options: [] };
+      },
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const result = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    assert.notEqual(result.isError, true);
+    assert.deepEqual(liveModels, ["pi"]);
+    assert.deepEqual(probes, ["pi"], "only the normal routed preflight probes the explicit backend");
+    assert.doesNotMatch(textOf(result), /auto-selected backend/);
+  } finally {
+    await dispose();
+    if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+    else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
+  }
+});
+
+test("automatic default discovery rejects admission when every backend is definitely unavailable", async () => {
+  const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
+  delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+  let liveCalls = 0;
+  const runner = Object.assign(
+    makeRunner(() => {
+      liveCalls++;
+      return "unexpected";
+    }),
+    {
+      defaultBackendId: () => "claude",
+      listBackends: () => ["claude", "codex", "pi"],
+      async probeConfigOptions(spec?: string) {
+        if (spec === "pi") {
+          return {
+            backendId: "pi",
+            options: [{ id: "model", name: "Model", type: "select" as const, currentValue: "", options: [] }],
+          };
+        }
+        throw new Error(`${spec} login required`);
+      },
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const result = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    assert.equal(result.isError, true);
+    assert.equal(structured(result), undefined, "no run or validation artifact is created");
+    assert.equal(liveCalls, 0);
+    assert.match(textOf(result), /No usable default ACP backend/);
+    assert.match(textOf(result), /claude login required/);
+    assert.match(textOf(result), /pi: session opened but/);
+  } finally {
+    await dispose();
+    if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+    else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
+  }
+});
+
+test("fully pinned and agent-less workflows do not trigger automatic backend discovery", async () => {
+  const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
+  delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+  const probes: string[] = [];
+  const liveModels: Array<string | undefined> = [];
+  const runner = Object.assign(
+    makeRunner((_prompt, options) => {
+      liveModels.push(options.model);
+      return "ok";
+    }),
+    {
+      defaultBackendId: () => "claude",
+      listBackends: () => ["claude", "codex", "opencode", "pi"],
+      async probeConfigOptions(spec?: string) {
+        probes.push(spec ?? "claude");
+        return { backendId: spec?.split("/", 1)[0] ?? "claude", options: [] };
+      },
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const pinned = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: [
+          'export const meta = { name: "pinned", description: "d" };',
+          'return agent("work", { label: "work", model: "pi" });',
+        ].join("\n"),
+      },
+    });
+    assert.notEqual(pinned.isError, true);
+    assert.deepEqual(liveModels, ["pi"]);
+    assert.deepEqual(probes, ["pi"], "the explicit call receives only its normal preflight probe");
+
+    probes.length = 0;
+    const deterministic = await client.callTool({ name: "workflow", arguments: { script: NO_AGENT_SCRIPT } });
+    assert.notEqual(deterministic.isError, true);
+    assert.deepEqual(probes, []);
+  } finally {
+    await dispose();
+    if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+    else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
+  }
+});
+
+test("static routing discovery pins the default for a model-less branch the fabricated dry run does not reach", async () => {
+  const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
+  delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+  const liveModels: Array<string | undefined> = [];
+  const runner = Object.assign(
+    makeRunner((_prompt, options) => {
+      liveModels.push(options.model);
+      return liveModels.length === 1 ? "take-live-branch" : "done";
+    }),
+    {
+      defaultBackendId: () => "claude",
+      listBackends: () => ["claude", "codex"],
+      listCustomBackends: () => [],
+      async probeConfigOptions(spec?: string) {
+        const backendId = spec?.split("/", 1)[0] ?? "claude";
+        return {
+          backendId,
+          options: [{
+            id: "model",
+            name: "Model",
+            type: "select" as const,
+            currentValue: backendId === "codex" ? "gpt" : "opus",
+            options: [{ value: backendId === "codex" ? "gpt" : "opus", name: "default" }],
+          }],
+        };
+      },
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const result = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: [
+          'export const meta = { name: "hidden-default", description: "d" };',
+          'const decision = await agent("decide", { label: "decide", model: "claude" });',
+          'if (decision === "take-live-branch") return agent("hidden", { label: "hidden" });',
+          'return "dry-path";',
+        ].join("\n"),
+      },
+    });
+    assert.notEqual(result.isError, true);
+    assert.deepEqual(liveModels, ["claude", "codex"]);
+    assert.match(textOf(result), /auto-selected backend "codex"/);
+  } finally {
+    await dispose();
+    if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+    else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
+  }
+});
+
 test("runtime and advertised output schemas enforce exact result branches", async () => {
   const fixtures = outputVariantFixtures();
   for (const [name, fixture] of Object.entries(fixtures)) {
