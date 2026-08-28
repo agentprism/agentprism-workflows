@@ -86,6 +86,17 @@ function outputVariantFixtures() {
     stopped: true,
     alreadyTerminal: false,
   };
+  const pendingStop = {
+    ...inspectionFixture("running"),
+    stopped: false,
+    alreadyTerminal: false,
+    control: {
+      state: "pending" as const,
+      operationId: "00000000-0000-4000-8000-000000000000",
+      requestedAt: "2026-08-28T00:00:00.000Z",
+      owner: { pid: 42, instanceId: "owner-generation", version: "1.0.0", lameDuck: true, controlProtocol: 1 as const },
+    },
+  };
   const background = {
     runId: "fixture-run",
     status: "running" as const,
@@ -115,7 +126,7 @@ function outputVariantFixtures() {
       omittedWarnings: 0,
     },
   };
-  return { config, rejected, execution, background, inspection, terminalAwait, nonterminalAwait, stop };
+  return { config, rejected, execution, background, inspection, terminalAwait, nonterminalAwait, stop, pendingStop };
 }
 
 // Engine-owned run id shape (run-persistence.generateRunId): `${base36ts}-${base36rand}`.
@@ -153,6 +164,7 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     assert.ok(inputProps.includes("lastN") && inputProps.includes("labelGlob") && inputProps.includes("logLines"));
     assert.ok(inputProps.includes("checkpointReplies"), "durable checkpoint reply channel is advertised");
     assert.ok(inputProps.includes("concurrency") && inputProps.includes("agentRetries"));
+    assert.ok(inputProps.includes("forceOwner"), "explicit predecessor-force authorization is advertised");
     assert.ok(inputProps.includes("harnesses") && inputProps.includes("modelSpecs") && inputProps.includes("modelFilter") && inputProps.includes("probeTimeoutMs"));
 
     // The machine-readable output core includes structured pause contexts.
@@ -183,12 +195,13 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       "validation",
       "harnessOptions",
       "models",
+      "control",
     ]) {
       assert.ok(outProps.includes(k), `output schema exposes ${k}`);
     }
     assert.deepEqual(field(tool.outputSchema, "required"), undefined);
     const variants = field(tool.outputSchema, "oneOf") as Array<Record<string, unknown>>;
-    assert.equal(variants.length, 7);
+    assert.equal(variants.length, 8);
     assert.deepEqual(variants.map((variant) => variant.required), [
       ["action", "ok", "harnessOptions", "omittedHarnesses", "models"],
       ["action", "status", "validation"],
@@ -209,6 +222,21 @@ test("tool registration: one `workflow` tool advertises config plus the run life
         "lineage",
         "stopped",
         "alreadyTerminal",
+      ],
+      [
+        "runId",
+        "status",
+        "scriptUri",
+        "workflowName",
+        "phases",
+        "logTail",
+        "calls",
+        "filter",
+        "truncation",
+        "lineage",
+        "stopped",
+        "alreadyTerminal",
+        "control",
       ],
     ]);
     const outcome = field(field(tool.outputSchema, "properties"), "outcome");
@@ -657,6 +685,8 @@ test("runtime and advertised output schemas enforce exact result branches", asyn
       tokenUsage: { input: 1, output: 2, total: 3, cost: 0 },
     },
     "stop with await outcome": { ...fixtures.stop, outcome: terminalOutcomeFixture },
+    "pending stop claiming terminal status": { ...fixtures.pendingStop, status: "aborted" },
+    "pending stop claiming completion": { ...fixtures.pendingStop, stopped: true },
     "terminal await with top-level logs": { ...fixtures.terminalAwait, logs: [] },
     "terminal await without outcome": (() => {
       const { outcome: _outcome, ...withoutOutcome } = fixtures.terminalAwait;

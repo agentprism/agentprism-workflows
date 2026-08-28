@@ -80,6 +80,8 @@ function formatInstance(instance: ProbedInstance, currentPid: number | undefined
     `  pid:         ${info.pid}`,
     `  url:         ${info.url}`,
     `  role:        ${role}`,
+    `  instance:    ${health?.instanceId ?? info.instanceId ?? "legacy/unknown"}`,
+    `  run control: ${health?.controlProtocol === 1 || info.controlProtocol === 1 ? "v1" : "unavailable"}`,
   ];
   if (health === undefined) {
     lines.push("  health:      not responding (pid alive, /healthz unreachable)");

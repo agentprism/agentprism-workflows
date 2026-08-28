@@ -37,7 +37,8 @@ import {
 import type { JSONRPCMessage, JSONRPCRequest, RequestId } from "@modelcontextprotocol/client";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { DAEMON_NAME } from "../daemon/constants.js";
-import { ensureDaemonRunning } from "./ensure-daemon.js";
+import { probeHealthz } from "../daemon/daemon-info.js";
+import { ensureDaemonRunning, type EnsuredDaemonInfo } from "./ensure-daemon.js";
 
 export interface RunShimOptions {
   /** Entry file spawned with --daemon-run when no daemon is running (the shim's own bundle). */
@@ -86,6 +87,7 @@ export async function runShim(options: RunShimOptions): Promise<void> {
   // eval ends or breaks; the relay's flag is what breaks it mid-run).
   let replBreakUrl: string | undefined = info.replBreakUrl;
   let exiting = false;
+  let compatibilityDrainTimer: NodeJS.Timeout | undefined;
 
   /** Fire the out-of-band break for a `repl` interrupt without an id
    *  (best-effort, fire-and-forget: the daemon's own processing clears
@@ -274,6 +276,34 @@ export async function runShim(options: RunShimOptions): Promise<void> {
     void shutdown(1);
   }
 
+  function armCompatibilityDrain(candidate: EnsuredDaemonInfo): void {
+    if (compatibilityDrainTimer !== undefined) {
+      clearInterval(compatibilityDrainTimer);
+      compatibilityDrainTimer = undefined;
+    }
+    if (candidate.compatibilityDrain !== true) return;
+    compatibilityDrainTimer = setInterval(() => {
+      void (async () => {
+        if (exiting || reinitializing) return;
+        const health = await probeHealthz(candidate.port, 1_000);
+        if (
+          health === undefined ||
+          health.pid !== candidate.pid ||
+          (health.activeRuns === 0 && (health.inflightRequests ?? 0) === 0)
+        ) {
+          if (compatibilityDrainTimer !== undefined) clearInterval(compatibilityDrainTimer);
+          compatibilityDrainTimer = undefined;
+          await startReinitialize(
+            health === undefined
+              ? "compatibility-drain predecessor became unavailable"
+              : "compatibility-drain predecessor became idle",
+          );
+        }
+      })().catch((error: unknown) => log(`[${DAEMON_NAME} shim] compatibility-drain monitor failed: ${String(error)}`));
+    }, 1_000);
+    compatibilityDrainTimer.unref();
+  }
+
   async function startReinitialize(reason: string): Promise<void> {
     if (reinitializing || exiting) return;
     if (!recoveryAllowed()) {
@@ -292,6 +322,7 @@ export async function runShim(options: RunShimOptions): Promise<void> {
       // Re-ensure: the daemon may have restarted (new port) or been superseded by a newer one.
       const fresh = await ensureDaemonRunning({ bundlePath: options.bundlePath, port: options.port, log });
       replBreakUrl = fresh.replBreakUrl;
+      armCompatibilityDrain(fresh);
       http = makeHttpTransport(fresh.url);
       await http.start();
       if (cachedInitialize === undefined) {
@@ -413,6 +444,8 @@ export async function runShim(options: RunShimOptions): Promise<void> {
   async function shutdown(code: number): Promise<void> {
     if (exiting) return;
     exiting = true;
+    if (compatibilityDrainTimer !== undefined) clearInterval(compatibilityDrainTimer);
+    compatibilityDrainTimer = undefined;
     // Politely end our session (spec DELETE); the daemon and its runs live on regardless.
     await http.terminateSession().catch(() => undefined);
     await http.close().catch(() => undefined);
@@ -424,6 +457,7 @@ export async function runShim(options: RunShimOptions): Promise<void> {
   process.once("SIGINT", () => void shutdown(0));
   process.once("SIGTERM", () => void shutdown(0));
 
+  armCompatibilityDrain(info);
   await http.start();
   await stdio.start();
 }

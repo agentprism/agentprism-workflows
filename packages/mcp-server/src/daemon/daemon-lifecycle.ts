@@ -7,12 +7,11 @@
  *
  * Supersession (a newer daemon owns this family's discovery pointer) turns the daemon into a
  * lame duck, and the reaper then actively drains it instead of waiting for idleness:
- *   - with no active runs, every session that has no request in flight is closed, so its client
- *     transparently re-initializes on the successor (sessions whose REPL workspace is mid-turn
- *     are kept until the turn settles, so the workspace is never left split between daemons);
- *   - with active runs, sessions are kept (a paused run's checkpoint must stay answerable from
- *     the client that owns it) and migration waits for the runs to finish;
- *   - the moment nothing is busy — no sessions, no runs, no REPL drains — the daemon exits,
+ *   - every session with no request in flight and no REPL workspace mid-turn is closed so its
+ *     client transparently re-initializes on the successor; workflow execution remains on the
+ *     predecessor and is reached through the internal run-control plane;
+ *   - durable whole-stop intents are scanned on every reaper cadence;
+ *   - the moment nothing is busy — no sessions, runs, requests, or REPL drains — the daemon exits,
  *     regardless of the idle TTL (even a disabled one: a superseded daemon with nothing to do is
  *     garbage, not a long-lived service).
  */
@@ -67,6 +66,7 @@ export function installDaemonLifecycle(options: DaemonLifecycleOptions): DaemonL
   const reaper = setInterval(() => {
     const daemon = options.daemon;
     const superseded = daemon.isSuperseded();
+    void daemon.processPendingControlIntents?.();
 
     if (superseded) {
       if (!supersessionAnnounced) {
@@ -77,15 +77,12 @@ export function installDaemonLifecycle(options: DaemonLifecycleOptions): DaemonL
             `${daemon.inflightRequestCount()} request(s) in flight`,
         );
       }
-      // Migrate idle sessions to the successor. Sessions are kept while runs are active (a
-      // paused run's checkpoint is answered through the session that owns it) and while their
-      // REPL workspace is mid-turn (the successor must not open a workspace this daemon is
-      // still mutating).
-      if (daemon.activeRunCount() === 0) {
-        const migrated = daemon.evictDrainableSessions();
-        if (migrated.length > 0) {
-          log(`[agentprism-daemon] migrated ${migrated.length} idle session(s) to the successor: ${migrated.join(", ")}`);
-        }
+      // MCP sessions are front-door state, not workflow ownership. Migrate every drainable
+      // session independently; in-flight requests and busy REPL workspaces remain protected by
+      // SessionRegistry's eviction predicate.
+      const migrated = daemon.evictDrainableSessions();
+      if (migrated.length > 0) {
+        log(`[agentprism-daemon] migrated ${migrated.length} idle session(s) to the successor: ${migrated.join(", ")}`);
       }
     } else {
       supersessionAnnounced = false;
@@ -104,7 +101,10 @@ export function installDaemonLifecycle(options: DaemonLifecycleOptions): DaemonL
     // drain's bound with the five-second shutdown deadline, so in-flight
     // turns were not guaranteed to drain to completion under the
     // documented bound).
-    const busy = daemon.sessions.size > 0 || daemon.activeRunCount() > 0 || daemon.activeReplDrainCount() > 0;
+    const busy = daemon.sessions.size > 0 ||
+      daemon.activeRunCount() > 0 ||
+      daemon.inflightRequestCount() > 0 ||
+      daemon.activeReplDrainCount() > 0;
     if (busy) {
       idleSince = undefined;
       return;

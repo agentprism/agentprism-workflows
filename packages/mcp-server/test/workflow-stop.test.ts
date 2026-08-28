@@ -93,8 +93,9 @@ function faultablePersistence(root: string): {
 async function connectWithManager(
   runner: ReturnType<typeof makeRunner>,
   manager: WorkflowManager,
+  options: Pick<NonNullable<Parameters<typeof createWorkflowServer>[1]>, "runControl"> = {},
 ): Promise<{ client: Client; server: ReturnType<typeof createWorkflowServer> }> {
-  const server = createWorkflowServer(runner, { manager });
+  const server = createWorkflowServer(runner, { manager, ...options });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "stop-fault-client", version: "0.0.0" }, { capabilities: {} });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -118,6 +119,56 @@ function runIdOf(result: ToolCallResult): string {
 function links(result: ToolCallResult): Array<Record<string, unknown>> {
   return (result.content as Array<Record<string, unknown>>).filter((block) => block.type === "resource_link");
 }
+
+test("whole-run stop exposes a durable pending operation when an external owner does not settle", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-stop-pending-"));
+  const store = faultablePersistence(root);
+  const controlled = new AbortAwareRunner();
+  const owner = new WorkflowManager({ cwd: root, agent: controlled.runner, persistence: store.persistence });
+  const started = owner.startInBackground(
+    [
+      'export const meta = { name: "pending-stop", description: "pending stop" };',
+      'return await agent("block");',
+    ].join("\n"),
+    undefined,
+    { runId: "pending-stop" },
+  );
+  await waitUntil(() => controlled.calls.length === 1, "the external owner run should start");
+  const observer = new WorkflowManager({ cwd: root, agent: okRunner(), persistence: store.persistence });
+  const connection = await connectWithManager(okRunner(), observer, {
+    runControl: {
+      async control() {
+        return {
+          kind: "whole",
+          state: "pending",
+          operationId: "00000000-0000-4000-8000-000000000000",
+          requestedAt: "2026-08-28T00:00:00.000Z",
+          owner: { pid: 4242, instanceId: "predecessor", version: "0.34.0", lameDuck: true },
+        };
+      },
+    },
+  });
+  try {
+    const result = await connection.client.callTool({
+      name: "workflow",
+      arguments: { action: "stop", runId: started.runId },
+    });
+    assert.equal(result.isError, false);
+    assert.equal(structured(result)?.status, "running");
+    assert.equal(structured(result)?.stopped, false);
+    assert.equal(structured(result)?.control?.state, "pending");
+    assert.equal(structured(result)?.control?.operationId, "00000000-0000-4000-8000-000000000000");
+    assert.match(textOf(result), /durably pending/);
+    assert.equal(store.load(started.runId)?.status, "running", "pending acknowledgement never fabricates terminal fate");
+  } finally {
+    owner.stop(started.runId);
+    for (const call of controlled.calls) call.resolve("cleanup");
+    await started.promise.catch(() => undefined);
+    await connection.client.close().catch(() => {});
+    await connection.server.close().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("stop durably aborts a background run, publishes stopped, retains its resource, and supports kill-patch-resume", async () => {
   const dir = mkdtempSync(join(tmpdir(), "agentprism-mcp-stop-loop-"));
@@ -469,8 +520,17 @@ test("stop refuses a final acknowledgement when the terminal snapshot save fails
       name: "workflow",
       arguments: { action: "stop", runId },
     });
-    assert.equal(coldStop.isError, true);
-    assert.match(textOf(coldStop), /nothing live to stop in this server process/i);
+    assert.equal(coldStop.isError, false);
+    assert.equal(structured(coldStop)?.status, "aborted");
+    assert.equal(structured(coldStop)?.stopped, true);
+    assert.equal(structured(coldStop)?.alreadyTerminal, false);
+    const coldState = freshManager.getPersistence().load(runId);
+    const coldEvents = freshManager.getPersistence().readEvents(runId, { streamId: coldState?.eventStreamId });
+    assert.equal(
+      coldEvents.events.filter((record) => record.event.type === "stopped").length,
+      1,
+      "cold snapshot repair reuses the durable stopped event from the failed first acknowledgement",
+    );
   } finally {
     store.setSaveFailure(false);
     for (const call of controlled.calls) call.resolve("cleanup");
@@ -543,7 +603,7 @@ test("stop refuses a final acknowledgement when the stopped event append fails",
   }
 });
 
-test("stop is retry-safe for terminal runs and disambiguates unknown and persisted-but-not-live runs", async () => {
+test("stop is retry-safe for terminal runs and cold-stops an orphaned persisted run under its lease", async () => {
   const firstConnection = await connect(okRunner());
   let completedRunId: string;
   try {
@@ -593,13 +653,14 @@ test("stop is retry-safe for terminal runs and disambiguates unknown and persist
       name: "workflow",
       arguments: { action: "stop", runId: completedRunId! },
     });
-    assert.equal(notLive.isError, true);
-    assert.match(textOf(notLive), /persisted as paused/);
-    assert.match(textOf(notLive), /nothing live to stop in this server process/);
-    assert.match(textOf(notLive), /resumeFromRunId/);
+    assert.equal(notLive.isError, false);
+    assert.equal(structured(notLive)?.status, "aborted");
+    assert.equal(structured(notLive)?.stopped, true);
+    assert.equal(structured(notLive)?.alreadyTerminal, false);
     const reconciled = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-    assert.equal(reconciled.pauseReason, "interrupted");
-    assert.match(String(reconciled.reason), /owning process exited before completion/);
+    assert.equal(reconciled.status, "aborted");
+    assert.equal(reconciled.pauseReason, undefined);
+    assert.equal(reconciled.reason, undefined);
   } finally {
     await secondConnection.dispose();
   }

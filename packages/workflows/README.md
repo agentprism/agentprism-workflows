@@ -313,9 +313,7 @@ decision bound to changing content should interpolate that content into the chec
 participates in the checkpoint's hashed replay identity and a divergence re-asks instead of
 injecting.
 
-`WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a
-`loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence`
-implementation, and per-agent timeout/retry defaults.
+`WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence` implementation, per-agent timeout/retry defaults, and an optional opaque `leaseOwnerId` for multi-process hosts. Default filesystem persistence exposes read-only lease-owner inspection/validation. `stopPersistedRun(runId)` cold-stops only after acquiring the lease, returning `owned-elsewhere` rather than stealing a live writer's lock.
 
 A finite run-level `agentTimeoutMs` is the ceiling for every attempt. Script-level `timeoutMs` may
 tighten it but cannot raise or disable it; without a host ceiling, per-call `null`/omission is
@@ -971,7 +969,7 @@ RunDynamicWorkflowOptions, RunIsolationSdkOptions, RunIsolationOptions, Isolatio
 IsolationTarget, ReplayRunnerOptions, ReplayRunner, ReplayObservation, ReplayReport,
 ReplayCallReport, ReplayDivergenceEvent, ResolvedIsolationTarget,
 WorkflowRunOptions, AgentOptions, ExecOptions, CheckpointCallContext,
-WorkflowAgentAttemptControl, WorkflowAgentCallCancellation,
+WorkflowAgentAttemptControl, WorkflowAgentCallCancellation, PersistedRunStopResult,
 MockAnswerJson, MockAnswerSequence, MockAnswerRule, MockAnswers,
 ValidatedMockAnswerUse, ValidatedMockAnswerRule, UnusedMockAnswer, ValidatedMockAnswers,
 ValidateWorkflowOptions, ValidateWorkflowReport, ValidateHarnessOptions,
@@ -985,7 +983,7 @@ WorkflowResumeCallLiveReason, WorkflowResumeCallFailedReason,
 WorkflowCallReplayProvenance, WorkflowResumeCallDecision, WorkflowResumeReport,
 WorkflowReplayOperationalOption, WorkflowReplayOperationalChange,
 WorkflowReplayFirstNonReplay, WorkflowReplayEligibility,
-WorkflowPathOptions, RunPersistence, RunPersistenceOptions,
+WorkflowPathOptions, RunPersistence, RunPersistenceOptions, RunLeaseOwner,
 AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig, WorkflowCallRecord, WorkflowRecordedError,
 InteractiveSessionOptions, InteractiveTurn, SteeringOutcome, ProbeConfigOptionsOptions, ProbedConfigOptions, SessionConfigOption,

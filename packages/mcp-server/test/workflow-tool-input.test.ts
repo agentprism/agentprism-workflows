@@ -51,6 +51,7 @@ test("input shape: one tool advertises the exact config, run, inspect, await, an
       "callIndex",
       "checkpointReplies",
       "concurrency",
+      "forceOwner",
       "harnesses",
       "labelGlob",
       "lastN",
@@ -239,6 +240,15 @@ test("stop requires runId, accepts an optional per-agent callIndex, and rejects 
     undefined,
     "omission retains whole-run stop",
   );
+  assert.equal(
+    parseWorkflowToolInput(Schema.parse({ action: "stop", runId: "a-b", forceOwner: true })).forceOwner,
+    true,
+    "whole-run stop can explicitly authorize predecessor termination",
+  );
+  assert.throws(
+    () => parseWorkflowToolInput(Schema.parse({ action: "stop", runId: "a-b", callIndex: 7, forceOwner: true })),
+    /forceOwner is forbidden with callIndex/,
+  );
   for (const callIndex of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(() => Schema.parse({ action: "stop", runId: "a-b", callIndex }));
   }
@@ -249,6 +259,7 @@ test("stop requires runId, accepts an optional per-agent callIndex, and rejects 
     { action: "stop", runId: "a-b", args: {} },
     { action: "stop", runId: "a-b", background: true },
     { action: "stop", runId: "a-b", waitMs: 0 },
+    { action: "inspect", runId: "a-b", forceOwner: true },
   ]) {
     assert.throws(() => parseWorkflowToolInput(Schema.parse(input)), /Invalid workflow tool input/);
   }

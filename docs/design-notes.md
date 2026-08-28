@@ -294,10 +294,7 @@ The `workflow` tool grew from Pi's single-form input
   fields: `args`, `maxAgents` (default 1000), `concurrency` (clamped to 16), `agentRetries`
   (clamped to ≤3), `agentTimeoutMs` (default none), the explicit-resume
   trio `resumeFromRunId` / `resumePolicy` / `checkpointReplies`, and `background`.
-- **Inspect / await / stop** — take a `runId` and never execution fields; `await` adds `waitMs`
-  (default 20 000), `stop` adds an optional `callIndex` that cancels one in-flight agent (its slot
-  settles to `null` with `AGENT_CANCELLED`) instead of aborting the whole run, and all three accept
-  the `lastN` / `labelGlob` / `logLines` projection bounds.
+- **Inspect / await / stop** — take a `runId` and never execution fields; `await` adds `waitMs` (default 20 000). Whole-run stop is location-independent across daemon generations: the successor persists an idempotent intent, routes signed control to the lease owner, and may return a nonterminal pending-control acknowledgement before final settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and cancellation is never reconstructed after owner loss. All three actions accept the `lastN` / `labelGlob` / `logLines` projection bounds.
 - **Bounds clamp, don't reject:** accept `concurrency`/`agentRetries` as plain numbers in the tool
   schema — *not* Zod `.max()`, which rejects out-of-range input with `InvalidParams`. The engine
   already clamps them (`normalizeConcurrency` → `MAX_CONCURRENCY` 16, `normalizeAgentRetries` →
@@ -312,9 +309,7 @@ The `workflow` tool grew from Pi's single-form input
 But background support was **not** dropped. Runs execute in a shared per-user **workflow daemon**
 (the stdio entry is a thin shim that auto-starts it), so `background: true` acknowledges after
 durable admission with a `runId` and the run outlives the request — collected later with bounded
-`await` calls, and durable across client disconnects, shim kills, and session eviction (only daemon
-exit, or the single client-owned process exiting under `--in-process`, stops in-flight work). Resume
-is **explicit**: a new run with `resumeFromRunId` continues from the persisted journal.
+`await` calls, and durable across client disconnects, shim kills, and session eviction. Version succession moves the family front door without moving live VM/ACP state: a predecessor keeps its run lease while the successor joins that lease to the predecessor's PID/instance record and forwards control over a user-key HMAC endpoint. A pre-control busy predecessor is temporarily retained for the first rolling upgrade. Owner exit, or the single client-owned process exiting under `--in-process`, can interrupt work; no timeout steals a live lease. Resume is **explicit**: a new run with `resumeFromRunId` continues from the persisted journal.
 
 The shipped server registers the `workflow` and `repl` tools — and no auth tool. Backend auth belongs to
 the agents' own CLI credential stores, and the server deliberately exposes no auth state for a

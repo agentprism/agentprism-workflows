@@ -18,6 +18,7 @@
 // successor can stand in for the detached daemon), the real installDaemonLifecycle() reaper,
 // and the real pid-guarded daemon.json — all under _harness's isolated $HOME.
 import assert from "node:assert/strict";
+import http from "node:http";
 import { rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -65,6 +66,9 @@ function infoForHandle(handle: DaemonHandle, pid: number, version = SERVER_VERSI
     url: handle.url,
     startedAt: handle.startedAt,
     envFingerprint: envFingerprint(),
+    instanceId: handle.instanceId,
+    controlUrl: handle.controlUrl,
+    controlProtocol: 1,
   };
 }
 
@@ -153,6 +157,76 @@ test("succession: a divergent shim never adopts the old daemon (even busy) — i
     await newSession.dispose();
   } finally {
     await oldDaemon.close();
+    for (const successor of successors) await successor.close();
+    resetDiscovery();
+  }
+});
+
+test("the first run-control release temporarily adopts a busy pre-v1 predecessor, then supersedes it once work drains", async () => {
+  resetDiscovery();
+  let activeRuns = 1;
+  const oldVersion = "0.0.0-pre-control";
+  const oldStartedAt = new Date().toISOString();
+  const oldServer = http.createServer((req, res) => {
+    if (req.url !== "/healthz") {
+      res.writeHead(404).end();
+      return;
+    }
+    const address = oldServer.address();
+    const port = address !== null && typeof address !== "string" ? address.port : 0;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      name: DAEMON_NAME,
+      version: oldVersion,
+      pid: process.pid,
+      port,
+      startedAt: oldStartedAt,
+      sessions: 0,
+      activeRuns,
+      inflightRequests: 0,
+      envFingerprint: envFingerprint(),
+      projects: [],
+    }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    oldServer.once("error", reject);
+    oldServer.listen(0, "127.0.0.1", resolve);
+  });
+  const address = oldServer.address();
+  assert.ok(address !== null && typeof address !== "string");
+  const oldInfo: DaemonInfo = {
+    name: DAEMON_NAME,
+    version: oldVersion,
+    pid: process.pid,
+    port: address.port,
+    url: `http://127.0.0.1:${address.port}/mcp`,
+    startedAt: oldStartedAt,
+    envFingerprint: envFingerprint(),
+  };
+  writeDaemonInfo(oldInfo);
+  const successors: DaemonHandle[] = [];
+  let spawnCount = 0;
+  const spawn = () => {
+    spawnCount += 1;
+    void (async () => {
+      const successor = await createDaemon({ runner: okRunner(), port: 0, log: () => undefined });
+      successors.push(successor);
+      writeDaemonInfo(infoForHandle(successor, process.pid, SERVER_VERSION));
+    })();
+  };
+  try {
+    const compatibility = await ensureDaemonRunning({ bundlePath: "unused", log: () => undefined, spawn });
+    assert.equal(compatibility.url, oldInfo.url, "the busy legacy owner remains the reachable control surface");
+    assert.equal(compatibility.compatibilityDrain, true);
+    assert.equal(spawnCount, 0, "busy pre-v1 work is not stranded behind a new family pointer");
+
+    activeRuns = 0;
+    const current = await ensureDaemonRunning({ bundlePath: "unused", log: () => undefined, spawn });
+    assert.equal(spawnCount, 1, "succession proceeds as soon as execution ownership drains");
+    assert.notEqual(current.url, oldInfo.url);
+    assert.equal(readDaemonInfo()?.url, current.url);
+  } finally {
+    await new Promise<void>((resolve) => oldServer.close(() => resolve()));
     for (const successor of successors) await successor.close();
     resetDiscovery();
   }

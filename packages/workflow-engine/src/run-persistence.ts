@@ -243,6 +243,10 @@ export interface RunPersistence {
   acquireRunLease(runId: string): RunLease | null;
   /** Release a lease previously returned by acquireRunLease(). */
   releaseRunLease(lease: RunLease): void;
+  /** Read the current cross-process owner without acquiring or mutating the lease. */
+  inspectRunLease?(runId: string): RunLeaseOwner | null;
+  /** Confirm that a previously acquired lease token still owns the on-disk lock. */
+  validateRunLease?(lease: RunLease): boolean;
   /** Get runs directory path. */
   getRunsDir(): string;
 }
@@ -250,8 +254,18 @@ export interface RunPersistence {
 export interface RunLease {
   runId: string;
   token: string;
+  /** Opaque host/process generation identity written into the lock, when configured. */
+  ownerId?: string;
   /** PID recorded by a dead lock owner replaced while acquiring this lease. */
   recoveredOwnerPid?: number;
+}
+
+export interface RunLeaseOwner {
+  runId: string;
+  pid: number;
+  startedAt: string;
+  /** Opaque owner identity; daemon managers use their daemon instance ID. */
+  ownerId?: string;
 }
 
 interface LockFile {
@@ -260,6 +274,7 @@ interface LockFile {
   pid: number;
   startedAt: string;
   token: string;
+  ownerId?: string;
 }
 
 /**
@@ -285,6 +300,8 @@ export type FsLayer = {
 export interface RunPersistenceOptions {
   /** Absolute workflow persistence root; explicit value wins over AGENTPRISM_PERSISTENCE_ROOT. */
   persistenceRoot?: string;
+  /** Opaque host/process generation identity attached to newly acquired run leases. */
+  leaseOwnerId?: string;
 }
 
 export function createRunPersistence(
@@ -391,7 +408,8 @@ export function createRunPersistence(
     value.runPath === expectedRunPath &&
     Number.isInteger(value.pid) &&
     value.pid > 0 &&
-    typeof value.token === "string";
+    typeof value.token === "string" &&
+    (value.ownerId === undefined || typeof value.ownerId === "string");
 
   const removeStaleLegacyLock = (
     runId: string,
@@ -565,12 +583,14 @@ export function createRunPersistence(
           pid: process.pid,
           startedAt: new Date().toISOString(),
           token,
+          ...(options.leaseOwnerId === undefined ? {} : { ownerId: options.leaseOwnerId }),
         };
         try {
           _writeFileSync(lock, JSON.stringify(payload, null, 2), { flag: "wx" });
           return {
             runId,
             token,
+            ...(options.leaseOwnerId === undefined ? {} : { ownerId: options.leaseOwnerId }),
             ...(recoveredOwnerPid === undefined ? {} : { recoveredOwnerPid }),
           };
         } catch (err) {
@@ -599,6 +619,24 @@ export function createRunPersistence(
       } catch {
         // Best-effort cleanup only.
       }
+    },
+
+    inspectRunLease(runId: string): RunLeaseOwner | null {
+      const existing = readLock(runId);
+      if (!validLockOwner(existing, runId, primaryRunPath(runId))) return null;
+      return {
+        runId,
+        pid: existing.pid,
+        startedAt: existing.startedAt,
+        ...(existing.ownerId === undefined ? {} : { ownerId: existing.ownerId }),
+      };
+    },
+
+    validateRunLease(lease: RunLease): boolean {
+      const existing = readLock(lease.runId);
+      return validLockOwner(existing, lease.runId, primaryRunPath(lease.runId)) &&
+        existing.token === lease.token &&
+        (lease.ownerId === undefined || existing.ownerId === lease.ownerId);
     },
 
     getRunsDir(): string {

@@ -23,6 +23,7 @@ import {
 import type { ReplProjectState } from "./repl-project.js";
 import { disposeReplProjectState } from "./repl-project.js";
 import { SHUTDOWN_DEADLINE_MS } from "./lifecycle.js";
+import { deleteRunControlSidecars } from "./daemon/run-control-store.js";
 
 export const MAX_BACKGROUND_RUNS = 4;
 
@@ -99,6 +100,8 @@ export interface RunStoreRouter {
   onRunDeleted(listener: (event: { runId: string }) => void): () => void;
   /** Durable event appends across all current and future contexts; returns detach. */
   onRunEventPersisted(listener: (record: RunEventLogRecord) => void): () => void;
+  /** Whole-run stop events across all current and future contexts; returns detach. */
+  onRunStopped(listener: (event: { runId: string }) => void): () => void;
 }
 
 export type ProjectDirResolution = { ok: true; projectDir: string } | { ok: false; message: string };
@@ -129,8 +132,12 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
   private readonly contexts = new Map<string, ProjectContext>();
   private readonly deletionListeners = new Set<(event: { runId: string }) => void>();
   private readonly persistedEventListeners = new Set<(record: RunEventLogRecord) => void>();
+  private readonly stoppedListeners = new Set<(event: { runId: string }) => void>();
 
-  constructor(private readonly runner: AgentRunner) {}
+  constructor(
+    private readonly runner: AgentRunner,
+    private readonly options: { leaseOwnerId?: string } = {},
+  ) {}
 
   /** Adopt an externally built manager as its project's context (composition back-compat). */
   adopt(manager: WorkflowManager, backgroundRuns?: BackgroundRunRegistry): ProjectContext {
@@ -149,7 +156,11 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
     if (existing !== undefined) return existing;
     return this.register({
       projectDir,
-      manager: new WorkflowManager({ agent: this.runner, cwd: projectDir }),
+      manager: new WorkflowManager({
+        agent: this.runner,
+        cwd: projectDir,
+        leaseOwnerId: this.options.leaseOwnerId,
+      }),
       backgroundRuns: new BackgroundRunRegistry(),
     });
   }
@@ -157,10 +168,14 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
   private register(context: ProjectContext): ProjectContext {
     this.contexts.set(context.projectDir, context);
     context.manager.on("runDeleted", (event: { runId: string }) => {
+      deleteRunControlSidecars(context.manager, event.runId);
       for (const listener of this.deletionListeners) listener(event);
     });
     context.manager.on("runEventPersisted", (record: RunEventLogRecord) => {
       for (const listener of this.persistedEventListeners) listener(record);
+    });
+    context.manager.on("stopped", (event: { runId: string }) => {
+      for (const listener of this.stoppedListeners) listener(event);
     });
     return context;
   }
@@ -219,9 +234,14 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
     return () => this.persistedEventListeners.delete(listener);
   }
 
+  onRunStopped(listener: (event: { runId: string }) => void): () => void {
+    this.stoppedListeners.add(listener);
+    return () => this.stoppedListeners.delete(listener);
+  }
+
   activeRunCount(): number {
     let total = 0;
-    for (const context of this.contexts.values()) total += context.backgroundRuns.activeCount();
+    for (const context of this.contexts.values()) total += context.manager.activeExecutionCount();
     return total;
   }
 
@@ -269,7 +289,7 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
   snapshot(): Array<{ projectDir: string; activeRuns: number }> {
     return [...this.contexts.values()].map((context) => ({
       projectDir: context.projectDir,
-      activeRuns: context.backgroundRuns.activeCount(),
+      activeRuns: context.manager.activeExecutionCount(),
     }));
   }
 }
@@ -288,6 +308,10 @@ export function singleStoreRouter(manager: WorkflowManager): RunStoreRouter {
     onRunEventPersisted: (listener) => {
       manager.on("runEventPersisted", listener);
       return () => manager.off("runEventPersisted", listener);
+    },
+    onRunStopped: (listener) => {
+      manager.on("stopped", listener);
+      return () => manager.off("stopped", listener);
     },
   };
 }

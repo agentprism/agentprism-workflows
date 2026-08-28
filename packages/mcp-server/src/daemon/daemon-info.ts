@@ -45,6 +45,12 @@ export interface DaemonInfo {
   url: string;
   startedAt: string;
   envFingerprint: string;
+  /** Opaque process-generation identity. Absent on daemons predating run control. */
+  instanceId?: string;
+  /** Signed loopback run-control endpoint. Absent on daemons predating run control. */
+  controlUrl?: string;
+  /** Internal run-control protocol version. */
+  controlProtocol?: 1;
   /** The REPL eval-break relay's loopback endpoint (see
    *  `repl-engine`'s `EvalBreakChannel`): the shim fires the interrupt
    *  tool's no-id break here while the daemon's main thread is blocked
@@ -71,6 +77,8 @@ export interface DaemonHealth {
   activeRuns: number;
   envFingerprint: string;
   projects: Array<{ projectDir: string; activeRuns: number }>;
+  instanceId?: string;
+  controlProtocol?: 1;
   /**
    * True when this daemon has been superseded — a newer daemon owns its family's discovery
    * pointer (it names a different pid) so this one is a lame duck: it admits no new sessions,
@@ -161,6 +169,11 @@ function readInfoFile(path: string): DaemonInfo | undefined {
 /** The family pointer's record (default: this process's env family). */
 export function readDaemonInfo(fingerprint: string = envFingerprint()): DaemonInfo | undefined {
   return readInfoFile(daemonInfoPath(fingerprint));
+}
+
+/** One PID-guarded daemon generation record, if readable. */
+export function readDaemonInstance(pid: number): DaemonInfo | undefined {
+  return readInfoFile(daemonInstancePath(pid));
 }
 
 function writeInfoFile(path: string, info: DaemonInfo): void {

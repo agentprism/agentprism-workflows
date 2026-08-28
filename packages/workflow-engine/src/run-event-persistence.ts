@@ -1580,6 +1580,12 @@ function withRunEventsInternal(persistence: RunPersistence, fs: ResolvedEventFs)
       runCaches.delete(lease.runId);
       return persistence.releaseRunLease(lease);
     },
+    inspectRunLease(runId: string) {
+      return persistence.inspectRunLease?.(runId) ?? null;
+    },
+    validateRunLease(lease: RunLease) {
+      return persistence.validateRunLease?.(lease) ?? true;
+    },
     getRunsDir() {
       return persistence.getRunsDir();
     },

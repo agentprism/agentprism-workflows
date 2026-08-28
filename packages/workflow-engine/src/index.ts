@@ -32,12 +32,14 @@ export {
   type ExecOptions,
   type ManagedRun,
   type WorkflowAgentCallCancellation,
+  type PersistedRunStopResult,
 } from "./workflow-manager.js";
 export {
   createRunPersistence,
   generateRunId,
   type RunPersistence,
   type RunLease,
+  type RunLeaseOwner,
   type RunStatus,
   type PersistedRunState,
   type PersistedAgentState,

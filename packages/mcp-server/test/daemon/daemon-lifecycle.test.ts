@@ -35,6 +35,8 @@ function fakeHandle(state: {
     port: 0,
     url: "http://127.0.0.1:0/mcp",
     startedAt: new Date().toISOString(),
+    instanceId: "test-instance",
+    controlUrl: "http://127.0.0.1:0/_agentprism/control/v1/run",
     sessions: { get size() { return state.sessions; }, evictIdle: () => [], inflightCount: () => 0 } as never,
     projects: { disposeReplStates: async () => undefined } as never,
     activeRunCount: () => state.activeRuns,
@@ -47,6 +49,7 @@ function fakeHandle(state: {
       state.sessions = 0;
       return ids;
     },
+    processPendingControlIntents: async () => undefined,
     close: async () => undefined,
   };
 }
@@ -153,7 +156,7 @@ test("a superseded daemon does not wait for the idle TTL: it migrates idle sessi
   }
 });
 
-test("a superseded daemon with active runs keeps its sessions (a paused run's checkpoint stays answerable) and exits once the runs finish", async () => {
+test("a superseded daemon migrates drainable MCP sessions while retaining execution ownership, then exits once runs finish", async () => {
   const state = { sessions: 2, activeRuns: 1, activeDrains: 0, superseded: true, migrated: 0 };
   const { handle, exits } = fakeProcess();
   const lifecycle = installDaemonLifecycle({
@@ -168,12 +171,11 @@ test("a superseded daemon with active runs keeps its sessions (a paused run's ch
   });
   try {
     await sleep(80);
-    assert.equal(state.migrated, 0, "sessions are kept while a run is active");
-    assert.deepEqual(exits, []);
+    assert.equal(state.migrated, 2, "front-door sessions migrate independently of predecessor-owned executions");
+    assert.deepEqual(exits, [], "the predecessor remains alive while it owns execution");
     state.activeRuns = 0;
     await sleep(80);
-    assert.equal(state.migrated, 2, "once the runs finished, the idle sessions migrated");
-    assert.deepEqual(exits, [0]);
+    assert.deepEqual(exits, [0], "the predecessor exits after its execution responsibility settles");
   } finally {
     if (exits.length === 0) await lifecycle.shutdown("SIGTERM");
   }

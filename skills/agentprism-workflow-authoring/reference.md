@@ -362,13 +362,7 @@ completion include only the 50 newest runs, but a direct URI read works for any 
 run. A path is never persisted or implicitly re-read, and the MCP layer retains no scripts, args,
 or synthetic lineage metadata in process memory.
 
-`action:"stop"` durably aborts a `running` or `paused` run live in the serving process: it cancels
-any pending agent/checkpoint request, appends `stopped`, releases the lease, and returns the final
-inspection projection with `stopped:true`. Only backend session wind-down can remain, observable
-through inspect's agent states. A repeated stop on a terminal run succeeds with `stopped:false,
-alreadyTerminal:true`. An in-flight stop may lack a quiescent terminal-environment proof, so the
-manager can conservatively run the following resume live; inspect `replayEligibility` and
-`resumeReport` rather than assuming a prefix replay.
+`action:"stop"` is location-independent: it stops a local live run, cold-stops a lease-free persisted run, or writes an idempotent intent and forwards signed control to a predecessor that holds the run lease. Final success appends `stopped`, releases the lease, and returns the final inspection projection with `stopped:true`. When cross-generation control does not settle inside the bound, the successful nonterminal result carries `control:{state:"pending",operationId,requestedAt,owner?}`; retry stop, inspect, or await. A repeated stop on a terminal run succeeds with `stopped:false,alreadyTerminal:true`. `forceOwner:true` explicitly authorizes terminating a superseded owner daemon and may interrupt sibling runs; it is forbidden with `callIndex`. Targeted call cancellation routes only to the live owner and is never reconstructed after owner loss. An in-flight stop may lack a quiescent terminal-environment proof, so the manager can conservatively run the following resume live; inspect `replayEligibility` and `resumeReport` rather than assuming a prefix replay.
 
 Retain the run ID and inspect halted runs before guessing. The exact inspection input is:
 
