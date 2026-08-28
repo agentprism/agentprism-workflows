@@ -46,6 +46,7 @@ import {
   redactText,
   validateWorkflowScript,
   truncateUtf8,
+  workflowMayUseDefaultModel,
   WorkflowError,
   WorkflowErrorCode,
   WorkflowManager,
@@ -72,6 +73,13 @@ import {
 import { z } from "zod";
 
 import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
+import {
+  DEFAULT_BACKEND_ENV,
+  NoAutoDefaultBackendError,
+  discoverProjectDefaultBackend,
+  recordedDefaultModel,
+  workflowNeedsPinnedDefault,
+} from "./default-backend.js";
 import {
   BackgroundRunRegistry,
   MAX_BACKGROUND_RUNS,
@@ -1581,7 +1589,7 @@ export function createWorkflowServer(
         "The only agent option keys are label, phase, model, tier, mode, configOptions, schema, cwd, timeoutMs, retries, isolation:\"worktree\", resume, agentType, mcpServers, images, meta, promptMeta, and keepSession; unknown keys reject before admission. " +
         "Every parallel entry must be a thunk: parallel([() => agent(...), () => agent(...)]). For deeper syntax, read docs topic workflow/quickstart and then one related workflow/* topic. " +
         "Minimal script: `export const meta = { name: \"review\", description: \"Review a target\", phases: [{ title: \"Review\" }] }; phase(\"Review\"); const report = await agent(\"Review \" + args.target, { label: \"review\" }); return { report };`. " +
-        "Omit model for the server default, or use a backend name alone to preserve that backend's configured default. " +
+        "Omit model for the server default (explicit AGENTPRISM_DEFAULT_BACKEND, else a zero-token auto-selected project pin), or use a backend name alone to preserve that backend's configured default. " +
         "Before choosing a pinned model, mode, or configOptions, call action:\"config\" with projectDir and optional harnesses/modelFilter; after choosing a model, pass modelSpecs to read its model-specific options. " +
         "Set mode only when that selected harness entry's modes.availableModes explicitly lists the exact id; modes:null means unsupported, so omit mode—never infer a default from an absent value. " +
         "Config opens no-prompt sessions, spends zero tokens, and starts no workflow. " +
@@ -2185,15 +2193,66 @@ export function createWorkflowServer(
           };
         }
 
-        // Full zero-token preflight: execute control flow against the mock runner, resolve
-        // host-served nested workflows, then probe each routed backend/model without prompting.
-        // Invalid scripts are diagnostics, not failed runs: admission has not started yet.
+        // Discover whether the mocked execution reaches any agent call whose backend remains
+        // completely unauthored. This pass deliberately skips live config probes: it exists only
+        // to avoid probing backends for deterministic/no-agent or fully pinned workflows.
+        const routingDiscovery = await validateWorkflowScript(admittedScript, {
+          args: input.args,
+          cwd: context.projectDir,
+          maxAgents: input.maxAgents,
+          timeoutMs: 30_000,
+          probeConfig: false,
+          loadSavedWorkflow: (name) => context.manager.resolveSavedWorkflow(name),
+        });
+
+        let defaultModel: string | undefined;
+        let defaultBackendWarning: string | undefined;
+        if (workflowNeedsPinnedDefault(routingDiscovery) || workflowMayUseDefaultModel(admittedScript)) {
+          const explicitDefault = process.env[DEFAULT_BACKEND_ENV] !== undefined;
+          if (explicitDefault) {
+            // Preserve the explicit operator contract, including its historical unknown/empty ->
+            // Claude resolution. Pin the runner's resolved backend into engine identity for this run.
+            defaultModel = probeRunner.defaultBackendId?.();
+          } else {
+            const source = input.resumeFromRunId
+              ? context.manager.getPersistence().load(input.resumeFromRunId)
+              : null;
+            defaultModel = recordedDefaultModel(source);
+            if (defaultModel) {
+              defaultBackendWarning =
+                `Model-less agent calls inherit pinned backend ${JSON.stringify(defaultModel)} from the resume source; ` +
+                "the run will not switch providers automatically.";
+            } else if (probeRunner.defaultBackendId && probeRunner.listBackends) {
+              try {
+                const selected = await discoverProjectDefaultBackend(context, probeRunner);
+                defaultModel = selected.backendId;
+                defaultBackendWarning =
+                  `Model-less agent calls use auto-selected backend ${JSON.stringify(selected.backendId)} for this run ` +
+                  `(${selected.reason}); the run will not switch providers automatically.`;
+              } catch (error) {
+                if (error instanceof NoAutoDefaultBackendError) {
+                  return {
+                    content: [{ type: "text", text: truncateUtf8(error.message, 8_192, "…[backend diagnostics truncated]") }],
+                    isError: true,
+                  };
+                }
+                throw error;
+              }
+            }
+          }
+        }
+
+        // Full zero-token preflight: execute control flow against the mock runner using the same
+        // pinned default as live execution, resolve host-served nested workflows, then probe each
+        // routed backend/model without prompting. Invalid scripts are diagnostics, not failed runs:
+        // admission has not started yet.
         const preflight = await validateWorkflowScript(admittedScript, {
           args: input.args,
           cwd: context.projectDir,
           maxAgents: input.maxAgents,
           timeoutMs: 30_000,
           probeTimeoutMs: 60_000,
+          defaultModel,
           probeRunner,
           loadSavedWorkflow: (name) => context.manager.resolveSavedWorkflow(name),
         });
@@ -2205,10 +2264,14 @@ export function createWorkflowServer(
             isError: true,
           };
         }
-        if (preflight.warnings.length > 0) {
-          const lines = preflight.warnings.slice(0, 20).map((warning) => `- ${warning}`);
-          if (preflight.warnings.length > lines.length) {
-            lines.push(`- … ${preflight.warnings.length - lines.length} more warning(s) omitted`);
+        const admissionWarnings = [
+          ...(defaultBackendWarning ? [defaultBackendWarning] : []),
+          ...preflight.warnings,
+        ];
+        if (admissionWarnings.length > 0) {
+          const lines = admissionWarnings.slice(0, 20).map((warning) => `- ${warning}`);
+          if (admissionWarnings.length > lines.length) {
+            lines.push(`- … ${admissionWarnings.length - lines.length} more warning(s) omitted`);
           }
           preflightWarningText = truncateUtf8(
             `\nPreflight warnings (the run was admitted):\n${lines.join("\n")}`,
@@ -2235,6 +2298,7 @@ export function createWorkflowServer(
         const exec: ExecOptions = {
           agent: runner,
           executionAdmission: executionLatch.decision,
+          defaultModel,
           scriptBackends: backendsGate.backends,
           maxAgents: input.maxAgents,
           concurrency: input.concurrency,

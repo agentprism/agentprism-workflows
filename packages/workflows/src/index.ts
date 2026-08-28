@@ -40,6 +40,7 @@ type OwnedAcpRunner = AgentRunner & { dispose: () => Promise<void> };
 export {
   runWorkflow,
   parseWorkflowScript,
+  workflowMayUseDefaultModel,
   hashCheckpointInputs,
   resolveAgentTimeoutMs,
   resolveWorkflowRunLimits,

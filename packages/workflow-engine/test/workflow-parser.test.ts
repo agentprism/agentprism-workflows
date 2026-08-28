@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { parseWorkflowScript } from "../src/workflow.js";
+import { parseWorkflowScript, workflowMayUseDefaultModel } from "../src/workflow.js";
 
 const validScript = `export const meta = {
   name: 'demo_workflow',
@@ -13,6 +13,22 @@ const validScript = `export const meta = {
 phase('Scan')
 return { ok: true }
 `;
+
+test("workflowMayUseDefaultModel conservatively detects hidden/default-model agent allocation", () => {
+  const script = (body: string, model = "") =>
+    `export const meta = { name: "routing", description: "d"${model ? `, model: ${JSON.stringify(model)}` : ""} };\n${body}`;
+
+  assert.equal(workflowMayUseDefaultModel(script("return 1")), false);
+  assert.equal(workflowMayUseDefaultModel(script('return agent("x", { model: "codex" })')), false);
+  assert.equal(workflowMayUseDefaultModel(script('return agent("x", { tier: "small" })')), false);
+  assert.equal(workflowMayUseDefaultModel(script('if (args.use) return agent("x"); return 1')), true);
+  assert.equal(workflowMayUseDefaultModel(script('return agent("x", { model: args.model })')), true);
+  assert.equal(workflowMayUseDefaultModel(script('return agent("x", { model: "codex", ...args.options })')), true);
+  assert.equal(workflowMayUseDefaultModel(script('return agent("x", { ...args.options, model: "codex" })')), false);
+  assert.equal(workflowMayUseDefaultModel(script('return verify("claim")')), true);
+  assert.equal(workflowMayUseDefaultModel(script('return workflow(args.child)')), true);
+  assert.equal(workflowMayUseDefaultModel(script('return agent("x")', "codex")), false);
+});
 
 test("parseWorkflowScript accepts literal workflow metadata", () => {
   const parsed = parseWorkflowScript(validScript);

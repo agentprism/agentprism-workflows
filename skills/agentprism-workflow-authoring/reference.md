@@ -44,7 +44,7 @@ A `model` string is resolved solely from its first segment, then delegated to th
 
 | spec shape | routes to | notes |
 |---|---|---|
-| *(omitted)* | host default backend | `AGENTPRISM_DEFAULT_BACKEND` (`claude` \| `codex` \| `opencode` \| `pi` \| custom name; default `claude`), session default model. Most portable. |
+| *(omitted)* | host-pinned/default backend | MCP: explicit `AGENTPRISM_DEFAULT_BACKEND` wins; when truly unset, zero-token readiness discovery pins one project default before validation/execution and preserves it across resume. SDK runner: configured default, historical fallback `claude`. The selected harness keeps its session default model. Most portable. |
 | `claude`, `codex`, `opencode`, `pi`, or `<custom-name>` | that registered harness | Backend-only: no model config call; the harness default remains active. |
 | `claude/<id>`, `codex/<id>`, `opencode/<id>`, `pi/<id>`, or `<custom-name>/<id>` | that registered harness | Match the first segment ASCII-case-insensitively and strip exactly one segment. Custom names take priority on collision. The remaining `<id>` is sent verbatim, including further `/` characters. For Pi, that remainder is its `<provider>/<model-id>` and Pi preserves any further slashes in the model id. |
 | any other string, including `anthropic/…`, `openai/…`, bare `opus`, or bare `gpt-…` | host default backend | The **entire** authored string is sent verbatim; these are not routing aliases. |

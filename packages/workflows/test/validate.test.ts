@@ -118,6 +118,33 @@ test("valid script: parse + dry run complete; calls, backends, checkpoints, phas
   assert.equal(report.warnings.length, 0);
 });
 
+test("defaultModel is resolved during the dry run and probeConfig:false performs routing discovery without probes", async () => {
+  let probes = 0;
+  const report = await validateWorkflowScript(
+    [
+      'export const meta = { name: "default-model", description: "d" };',
+      'return await agent("look", { label: "look" });',
+    ].join("\n"),
+    {
+      cwd: TEST_HOME,
+      defaultModel: "codex",
+      probeConfig: false,
+      probeRunner: {
+        async probeConfigOptions() {
+          probes++;
+          return { backendId: "codex", options: ADVERTISED_OPTIONS };
+        },
+      },
+    },
+  );
+
+  assert.equal(report.ok, true);
+  assert.equal(report.dryRun?.agentCalls[0]?.model, "codex");
+  assert.equal(report.dryRun?.agentCalls[0]?.backend, "codex");
+  assert.deepEqual(report.dryRun?.harnessOptions, []);
+  assert.equal(probes, 0);
+});
+
 test("validate reuses a host-owned probe runner, passes approved script backends, and never disposes it", async () => {
   let disposed = 0;
   const probes: Array<{ spec?: string; hasBrowser: boolean }> = [];

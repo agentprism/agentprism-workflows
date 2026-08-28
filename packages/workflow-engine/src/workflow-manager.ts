@@ -136,6 +136,8 @@ export interface ManagedRun {
   limits?: NonNullable<WorkflowRunResult["effectiveLimits"]>;
   abortSignaled?: true;
   mainModel?: string;
+  /** Host-pinned fallback for otherwise unmodelled agent calls in this execution. */
+  defaultModel?: string;
   agentsDir?: string;
   nestedWorkflows?: true;
   legacyResume?: true;
@@ -295,6 +297,11 @@ export interface ExecOptions {
   onProgress?: (snapshot: WorkflowSnapshot) => void;
   /** Max concurrent agents for this execution. */
   concurrency?: number;
+  /**
+   * Host-pinned model/backend for agent calls with no authored model, agentType model,
+   * tier, or phase/meta route. Persisted with the run and included in call identity.
+   */
+  defaultModel?: string;
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
@@ -1455,6 +1462,7 @@ export class WorkflowManager extends EventEmitter {
           : this.defaultAgentTimeoutMs,
       }),
       mainModel: this.mainModel,
+      defaultModel: exec.defaultModel,
       agentsDir: this.agentsDir,
       executionMode: exec.executionMode,
       ...(exec.resumeFromRunId ? { resumeSourceRunId: exec.resumeFromRunId } : {}),
@@ -1740,6 +1748,7 @@ export class WorkflowManager extends EventEmitter {
         args: argsForVm,
         agent,
         mainModel: managed.mainModel,
+        defaultModel: managed.defaultModel,
         agentsDir: managed.agentsDir,
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
@@ -2404,6 +2413,7 @@ export class WorkflowManager extends EventEmitter {
       ...(managed.resumeReport ? { resumeReport: managed.resumeReport } : {}),
       ...(managed.replayEligibility ? { replayEligibility: managed.replayEligibility } : {}),
       mainModel: managed.mainModel,
+      defaultModel: managed.defaultModel,
       agentsDir: managed.agentsDir,
       executionMode: managed.executionMode,
       eventStreamId: managed.eventStreamId,
@@ -2767,6 +2777,7 @@ export class WorkflowManager extends EventEmitter {
           : this.defaultAgentTimeoutMs,
       }),
       mainModel: persisted.mainModel ?? this.mainModel,
+      defaultModel: exec.defaultModel ?? persisted.defaultModel,
       agentsDir: persisted.agentsDir ?? this.agentsDir,
       legacyResume: true,
       journaling: true,

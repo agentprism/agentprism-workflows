@@ -67,10 +67,22 @@ export class BackgroundRunRegistry {
   }
 }
 
+export type AutoDefaultBackendReadiness = "ready" | "unknown";
+
+export interface AutoDefaultBackendSelection {
+  backendId: string;
+  readiness: AutoDefaultBackendReadiness;
+  reason: string;
+}
+
 export interface ProjectContext {
   projectDir: string;
   manager: WorkflowManager;
   backgroundRuns: BackgroundRunRegistry;
+  /** Successful MCP-only automatic default discovery, cached for this project/daemon. */
+  autoDefaultBackend?: AutoDefaultBackendSelection;
+  /** Coalesces concurrent first-run discovery; failures are never cached. */
+  autoDefaultBackendPending?: Promise<AutoDefaultBackendSelection>;
   /** The REPL workspace's daemon state (phase D): created on first touch
    *  of the `repl` tool, null until then — a pure-workflow project never
    *  opens a repl store. See `src/repl-project.ts`. */

@@ -417,7 +417,7 @@ test("no declared phases => agent phase stays undefined (no synthetic phase)", a
   assert.deepEqual(phases, [undefined]);
 });
 
-test("runWorkflow routes models: explicit opts.model > phase model > default", async () => {
+test("runWorkflow routes models: explicit opts.model > phase model > host-pinned default", async () => {
   const seen: Array<string | undefined> = [];
   const capturingAgent = {
     async run(_prompt: string, options: { model?: string; onUsage?: (u: AgentUsage) => void }) {
@@ -437,9 +437,13 @@ test("runWorkflow routes models: explicit opts.model > phase model > default", a
   await agent('no model -> default', { label: 'n' })
   return {}`;
 
-  await runWorkflow(script, { agent: capturingAgent, persistLogs: false });
+  await runWorkflow(script, {
+    agent: capturingAgent,
+    defaultModel: "host/default-backend",
+    persistLogs: false,
+  });
 
-  assert.deepEqual(seen, ["explicit-model", "phase-a-model", undefined]);
+  assert.deepEqual(seen, ["explicit-model", "phase-a-model", "host/default-backend"]);
 });
 
 test("runWorkflow plumbs opts.tier through to the agent with correct precedence", async () => {
@@ -466,7 +470,11 @@ test("runWorkflow plumbs opts.tier through to the agent with correct precedence"
 
   try {
     process.env.HOME = emptyHome;
-    await runWorkflow(script, { agent: capturingAgent, persistLogs: false });
+    await runWorkflow(script, {
+      agent: capturingAgent,
+      defaultModel: "host/default-backend",
+      persistLogs: false,
+    });
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
@@ -474,7 +482,7 @@ test("runWorkflow plumbs opts.tier through to the agent with correct precedence"
   }
 
   // 1) tier set, no explicit model: model is left undefined so the tier (resolved
-  //    inside run()) wins over the phase model; tier is forwarded.
+  //    inside run()) wins over both the phase model and host-pinned default; tier is forwarded.
   assert.deepEqual(seen[0], { model: undefined, tier: "small" });
   // 2) explicit model + tier: explicit model is forwarded and still wins.
   assert.deepEqual(seen[1], { model: "explicit-model", tier: "small" });

@@ -72,6 +72,13 @@ export interface ValidateWorkflowOptions {
   timeoutMs?: number;
   /** Per routed backend/model config-probe limit. Default 60_000 ms. */
   probeTimeoutMs?: number;
+  /**
+   * Host-pinned model/backend for calls with no authored model, agentType model, tier,
+   * or phase/meta route. The dry run resolves and reports it like live execution.
+   */
+  defaultModel?: string;
+  /** Run routed no-prompt config probes after the mock dry run. Default true. */
+  probeConfig?: boolean;
   /** Host-owned no-prompt probe runner. When supplied it is reused and never disposed. */
   probeRunner?: ValidateProbeRunner;
   /** Optional saved-workflow resolver used by nested workflow("name") calls in the dry run. */
@@ -1654,6 +1661,7 @@ export async function validateWorkflowScript(
       journaling: false,
       signal: controller.signal,
       maxAgents: options.maxAgents,
+      defaultModel: options.defaultModel,
       scriptBackends: declaredBackends,
       confirm: async (promptText: string, checkpointOptions: unknown) => {
         const opts = (checkpointOptions ?? {}) as { kind?: string; default?: unknown; headless?: string };
@@ -1716,31 +1724,37 @@ export async function validateWorkflowScript(
 
     const mockAnswers = mockAnswerState ? buildMockAnswersReport(mockAnswerState) : undefined;
     if (mockAnswerState && mockAnswers) appendMockAnswerWarnings(mockAnswerState, mockAnswers, warnings);
-    const probed = await probeHarnessConfigOptions(
-      agentCalls,
-      baseCwd,
-      backendRegistry,
-      hostRegistry,
-      declaredBackends,
-      warnings,
-      options.probeRunner,
-      probeTimeoutMs,
-    );
-    const optionErrors = configOptionErrors(
-      agentCalls,
-      probed.catalogs,
-      backendRegistry,
-      hostRegistry,
-      declaredBackends,
-      warnings,
-    );
-    const modeErrors = sessionModeErrors(
-      agentCalls,
-      probed.modes,
-      backendRegistry,
-      hostRegistry,
-      declaredBackends,
-    );
+    const probed = options.probeConfig === false
+      ? { harnessOptions: [], catalogs: new Map<string, SessionConfigOption[]>(), modes: new Map<string, SessionModeState | null>() }
+      : await probeHarnessConfigOptions(
+          agentCalls,
+          baseCwd,
+          backendRegistry,
+          hostRegistry,
+          declaredBackends,
+          warnings,
+          options.probeRunner,
+          probeTimeoutMs,
+        );
+    const optionErrors = options.probeConfig === false
+      ? []
+      : configOptionErrors(
+          agentCalls,
+          probed.catalogs,
+          backendRegistry,
+          hostRegistry,
+          declaredBackends,
+          warnings,
+        );
+    const modeErrors = options.probeConfig === false
+      ? []
+      : sessionModeErrors(
+          agentCalls,
+          probed.modes,
+          backendRegistry,
+          hostRegistry,
+          declaredBackends,
+        );
     const configurationErrors = [...modeErrors, ...optionErrors];
     const ok = runOk && configurationErrors.length === 0;
     const runReason = timedOut ? `dry run exceeded ${timeoutMs}ms and was aborted` : run.reason;
