@@ -52,6 +52,7 @@ export type {
   WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
   WorkflowScriptSource,
+  WorkflowStopPendingResult,
   WorkflowStopResult,
   WorkflowToolResult,
   WorkflowValidationRejected,

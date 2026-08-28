@@ -347,10 +347,7 @@ incomplete sidecar raises `RunEventLogError`; snapshot/journal recovery remains 
 [`docs/api.md`](../../docs/api.md#durable-run-event-log) for the complete policy and error/remedy
 table.
 
-Exactly one writer per run is required. `WorkflowManager` holds the cross-process run lease around
-publication and deletion; custom/direct callers of `appendEvent()`, `save()`, or `delete()` must
-provide equivalent exclusion. `deleteRun()` removes the sidecar before the snapshot while holding
-that lease, preventing detached callbacks or a competing process from recreating durable state.
+Exactly one writer per run is required. `WorkflowManager` holds the cross-process run lease around publication and deletion; custom/direct callers of `appendEvent()`, `save()`, or `delete()` must provide equivalent exclusion. A host may set `WorkflowManagerOptions.leaseOwnerId` (or `RunPersistenceOptions.leaseOwnerId`) to stamp an opaque process-generation identity. Default persistence exposes `inspectRunLease(runId)` as read-only `{runId,pid,startedAt,ownerId?}` and `validateRunLease(lease)`; manager writes fail closed after token loss. `stopPersistedRun(runId)` acquires rather than steals the lease, reloads under it, and durably cold-stops a nonterminal run with exactly one `stopped` event; it reports `owned-elsewhere` while a live writer holds the lock. `deleteRun()` removes the event sidecar before the snapshot while holding that lease, preventing detached callbacks or a competing process from recreating durable state.
 
 ## Key exports
 
@@ -362,8 +359,8 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
   `RESUME_CALL_LIVE_REASONS`, `RESUME_CALL_FAILED_REASONS`, `PreparedContinuation`,
   `ContinuationCandidate`, and the resume policy/report/replay-eligibility types.
 - **Manager & persistence** — `WorkflowManager` (`WorkflowManagerOptions`, `ExecOptions`,
-  `ManagedRun`, `WorkflowAgentCallCancellation`); `createRunPersistence`, `generateRunId`, and
-  types `RunPersistence`, `RunEventPersistence`, `RunEventStream`, `RunLease`, `RunStatus`, `PersistedRunState`,
+  `ManagedRun`, `WorkflowAgentCallCancellation`, `PersistedRunStopResult`); `createRunPersistence`, `generateRunId`, and
+  types `RunPersistence`, `RunEventPersistence`, `RunEventStream`, `RunLease`, `RunLeaseOwner`, `RunStatus`, `PersistedRunState`,
   `PersistedAgentState`, `FsLayer`; `readEvents()`/`watchEvents()` options/results/errors; safe
   `inspectRun()` and the `WorkflowRunStatus` / inspection / log-tail / call / truncation contracts.
 - **Saved workflows** — `openWorkflowDir` and the `WorkflowDir` / `WorkflowDirEntry` /

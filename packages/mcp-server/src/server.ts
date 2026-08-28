@@ -97,6 +97,7 @@ import {
 import type {
   WorkflowExecutionOutcome,
   WorkflowRunAwaitResult,
+  WorkflowStopPendingResult,
   WorkflowStopResult,
 } from "./workflow-tool-output.js";
 import { createAwaitProgressReporter, createProgressReporter, formatAgentProgressMessage } from "./progress.js";
@@ -108,6 +109,7 @@ import { ReplPresenceLedger } from "./repl-presence.js";
 import { CapabilityAwareToolCatalog } from "./tool-catalog.js";
 import { createReplProjectState, DEFAULT_REPL_EVAL_TIMEOUT_MS } from "./repl-project.js";
 import { REPL_DRAIN_BOUND_MS } from "./daemon/constants.js";
+import type { WorkflowRunControlRouter } from "./daemon/run-control.js";
 import {
   configSummary,
   configText,
@@ -120,6 +122,7 @@ import {
   WorkflowScriptResources,
   workflowScriptUri,
 } from "./workflow-resources.js";
+import { requireDurableStoppedRun } from "./workflow-stop.js";
 
 const SERVER_NAME = "agentprism-workflow";
 const DEFAULT_REQUEST_STATE_CODEC = createRequestStateCodec<unknown>({
@@ -1003,6 +1006,21 @@ function formatStopSummary(result: WorkflowStopResult): string {
   return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
 }
 
+function formatPendingStopSummary(result: WorkflowStopPendingResult): string {
+  const lines = inspectionSummaryLines(result);
+  const owner = result.control.owner;
+  lines.splice(
+    2,
+    0,
+    `Stop request ${result.control.operationId} is durably pending; retry stop, inspect, or await to observe settlement.`,
+    owner === undefined
+      ? "No live execution owner is currently discoverable; a later lease holder will apply the intent."
+      : `Execution owner: daemon pid ${owner.pid}${owner.version ? ` v${owner.version}` : ""}` +
+        `${owner.lameDuck ? " (draining)" : ""}.`,
+  );
+  return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
+}
+
 function formatAgentCancellationSummary(
   status: WorkflowRunStatus,
   cancellation: WorkflowAgentCallCancellation,
@@ -1077,48 +1095,6 @@ async function settleForegroundRun(
     const settled = manager.getRun(started.runId)?.result;
     if (settled) return settled;
     throw error;
-  }
-}
-
-function requireDurableStoppedRun(manager: WorkflowManager, runId: string): void {
-  const persistence = manager.getPersistence();
-  const persisted = persistence.load(runId);
-  if (persisted?.status !== "aborted") {
-    throw new ProtocolError(
-      ProtocolErrorCode.InternalError,
-      `Workflow stop for runId "${runId}" could not be durably acknowledged: the persisted status is ${persisted?.status ?? "missing"}, not aborted.`,
-    );
-  }
-  if (
-    persisted.eventLogIncomplete ||
-    persisted.eventStreamId === undefined ||
-    persisted.eventSeq === undefined ||
-    persisted.eventSeq < 1
-  ) {
-    throw new ProtocolError(
-      ProtocolErrorCode.InternalError,
-      `Workflow stop for runId "${runId}" could not be durably acknowledged: its stopped event is not durably readable.`,
-    );
-  }
-
-  let stoppedEventIsDurable = false;
-  try {
-    const events = persistence.readEvents(runId, {
-      after: persisted.eventSeq - 1,
-      streamId: persisted.eventStreamId,
-      limit: 1,
-    });
-    stoppedEventIsDurable = events.events.some(
-      (record) => record.seq === persisted.eventSeq && record.event.type === "stopped",
-    );
-  } catch {
-    stoppedEventIsDurable = false;
-  }
-  if (!stoppedEventIsDurable) {
-    throw new ProtocolError(
-      ProtocolErrorCode.InternalError,
-      `Workflow stop for runId "${runId}" could not be durably acknowledged: its terminal stopped event is missing.`,
-    );
   }
 }
 
@@ -1451,6 +1427,8 @@ export interface CreateWorkflowServerOptions {
   disconnectReplClientOnClose?: boolean;
   /** Daemon-scoped publisher for modern subscriptions/listen change delivery. */
   modernNotifier?: ServerNotifier;
+  /** Daemon-only location-transparent run-control router. */
+  runControl?: WorkflowRunControlRouter;
 }
 
 export interface WorkflowServer extends McpServer, WorkflowServerControl {}
@@ -1602,7 +1580,7 @@ export function createWorkflowServer(
         (requireProjectDir
           ? "config and run REQUIRE projectDir (absolute): it is the discovery cwd and selects the project-scoped run store/default execution cwd. "
           : "run optionally takes projectDir (absolute) to select the project-scoped run store; default is this server's own project. ") +
-        "inspect/await/stop take only a runId — it locates its project store automatically. " +
+        "inspect/await/stop locate the project store from runId and never accept projectDir. " +
         "Foreground is the default and streams progress; background:true returns " +
         "a durable runId for bounded action:\"await\" calls. run and await honor _meta.progressToken " +
         "with notifications/progress while they block. Pass resumeFromRunId to execute a new " +
@@ -1611,9 +1589,8 @@ export function createWorkflowServer(
         "panel and the panel reports phase starts, pauses, and terminal outcomes on its own — do NOT poll " +
         'action:"inspect" to check on a run there; prefer a single bounded action:"await". ' +
         'Use action:"inspect" with a runId when you need machine-readable status data: a safe bounded status, log tail, and attributed call previews. ' +
-        'Use action:"stop" to durably abort a live run; add callIndex to cancel only that in-flight agent ' +
-        "and keep the run live. labelGlob remains an output filter in both forms. A whole-run stop returns " +
-        "the final run fate; resume is safe immediately, and only agent-session wind-down can remain asynchronous. " +
+        'Use action:"stop" to durably abort through the run\'s execution owner; cross-generation control may return a durable pending operationId before final settlement. Add callIndex to cancel only that live agent and keep the run live. forceOwner explicitly authorizes terminating a superseded owner and is forbidden with callIndex. ' +
+        "labelGlob remains an output filter. A final whole-run stop makes resume safe immediately; pending control must be retried or observed with inspect/await. " +
         "Every admitted script is readable at workflow://runs/{runId}/script and results include resource links. " +
         "Background runs are tracked per project, capped at four active/starting runs, and use " +
         "headless checkpoint semantics; checkpointReplies continue a checkpoint pause in a new run.",
@@ -1880,23 +1857,36 @@ export function createWorkflowServer(
               `Workflow run "${parsedInput.runId}" is already terminal (${persisted.status}); no agent call is in flight to cancel. Whole-run stop without callIndex is a successful no-op for terminal runs.`,
             );
           }
-          if (!manager.getRun(parsedInput.runId)) {
-            throw new ProtocolError(
-              ProtocolErrorCode.InvalidParams,
-              `Workflow run "${parsedInput.runId}" is persisted as ${persisted.status}, but there is nothing live to cancel in this server process.`,
-            );
-          }
-
           let cancellation: WorkflowAgentCallCancellation;
-          try {
-            cancellation = await manager.cancelAgentCall(parsedInput.runId, parsedInput.callIndex);
-          } catch (error) {
-            throw new ProtocolError(
-              error instanceof WorkflowError && error.code === WorkflowErrorCode.PERSISTENCE_ERROR
-                ? ProtocolErrorCode.InternalError
-                : ProtocolErrorCode.InvalidParams,
-              error instanceof Error ? error.message : String(error),
-            );
+          if (!manager.getRun(parsedInput.runId)) {
+            if (!options.runControl) {
+              throw new ProtocolError(
+                ProtocolErrorCode.InvalidParams,
+                `Workflow run "${parsedInput.runId}" is persisted as ${persisted.status}, but there is nothing live to cancel in this server process.`,
+              );
+            }
+            const routed = await options.runControl.control(manager, {
+              runId: parsedInput.runId,
+              callIndex: parsedInput.callIndex,
+            });
+            if (routed.kind !== "agent") {
+              throw new ProtocolError(
+                ProtocolErrorCode.InternalError,
+                `Workflow agent cancellation returned an invalid routed outcome for runId "${parsedInput.runId}".`,
+              );
+            }
+            cancellation = routed.cancellation;
+          } else {
+            try {
+              cancellation = await manager.cancelAgentCall(parsedInput.runId, parsedInput.callIndex);
+            } catch (error) {
+              throw new ProtocolError(
+                error instanceof WorkflowError && error.code === WorkflowErrorCode.PERSISTENCE_ERROR
+                  ? ProtocolErrorCode.InternalError
+                  : ProtocolErrorCode.InvalidParams,
+                error instanceof Error ? error.message : String(error),
+              );
+            }
           }
           const status = manager.inspectRun(parsedInput.runId, inspectionOptions);
           if (!status) {
@@ -1929,22 +1919,99 @@ export function createWorkflowServer(
         if (!alreadyTerminal) {
           const live = manager.getRun(parsedInput.runId);
           if (!live) {
-            throw new ProtocolError(
-              ProtocolErrorCode.InvalidParams,
-              `Workflow run "${parsedInput.runId}" is persisted as ${persisted.status}, but there is nothing live to stop in this server process. Resume it with resumeFromRunId instead.`,
-            );
-          }
-          stopped = manager.stop(parsedInput.runId);
-          if (!stopped) {
-            const current = manager.getPersistence().load(parsedInput.runId);
-            alreadyTerminal = current !== null && isAlreadyTerminalForStop(current.status);
-            if (!alreadyTerminal) {
-              throw new ProtocolError(
-                ProtocolErrorCode.InvalidParams,
-                `Workflow run "${parsedInput.runId}" could not be stopped; its persisted status is ${current?.status ?? persisted.status}.`,
-              );
+            if (options.runControl) {
+              const routed = await options.runControl.control(manager, {
+                runId: parsedInput.runId,
+                forceOwner: parsedInput.forceOwner,
+              });
+              if (routed.kind !== "whole") {
+                throw new ProtocolError(
+                  ProtocolErrorCode.InternalError,
+                  `Workflow stop returned an invalid routed outcome for runId "${parsedInput.runId}".`,
+                );
+              }
+              if (routed.state === "pending") {
+                const pendingStatus = manager.inspectRun(parsedInput.runId, inspectionOptions);
+                if (!pendingStatus) {
+                  throw new ProtocolError(
+                    ProtocolErrorCode.InvalidParams,
+                    `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
+                  );
+                }
+                if (pendingStatus.status !== "pending" && pendingStatus.status !== "running") {
+                  throw new ProtocolError(
+                    ProtocolErrorCode.InternalError,
+                    `Workflow stop intent ${routed.operationId} remained pending but runId "${parsedInput.runId}" is ${pendingStatus.status}.`,
+                  );
+                }
+                const lineage = scriptResources.lineage(parsedInput.runId);
+                const projected = addInspectionResourceFields(
+                  pendingStatus,
+                  {
+                    scriptUri: workflowScriptUri(parsedInput.runId),
+                    lineage,
+                    stopped: false as const,
+                    alreadyTerminal: false as const,
+                    control: {
+                      state: "pending" as const,
+                      operationId: routed.operationId,
+                      requestedAt: routed.requestedAt,
+                      ...(routed.owner === undefined ? {} : { owner: routed.owner }),
+                    },
+                  },
+                  inspectionRetentionMetadata(manager, parsedInput.runId, pendingStatus),
+                );
+                const result: WorkflowStopPendingResult = {
+                  ...projected,
+                  status: pendingStatus.status,
+                };
+                const currentLink = scriptResources
+                  .links(lineage)
+                  .filter((link) => link.uri === workflowScriptUri(parsedInput.runId));
+                return {
+                  structuredContent: { ...result },
+                  content: [{ type: "text", text: formatPendingStopSummary(result) }, ...currentLink],
+                  isError: false,
+                };
+              }
+              stopped = routed.stopped;
+              alreadyTerminal = routed.alreadyTerminal;
+            } else {
+              const cold = manager.stopPersistedRun(parsedInput.runId);
+              stopped = cold.outcome === "stopped";
+              alreadyTerminal = cold.outcome === "already-terminal";
+              if (cold.outcome === "owned-elsewhere") {
+                throw new ProtocolError(
+                  ProtocolErrorCode.InvalidParams,
+                  `Workflow run "${parsedInput.runId}" is persisted as ${persisted.status} and is owned by another live process; this server has no daemon run-control router.`,
+                );
+              }
+              if (cold.outcome === "missing") {
+                throw new ProtocolError(
+                  ProtocolErrorCode.InvalidParams,
+                  `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
+                );
+              }
             }
           } else {
+            stopped = manager.stop(parsedInput.runId);
+            if (!stopped) {
+              const current = manager.getPersistence().load(parsedInput.runId);
+              alreadyTerminal = current !== null && isAlreadyTerminalForStop(current.status);
+              if (!alreadyTerminal) {
+                const cold = manager.stopPersistedRun(parsedInput.runId);
+                stopped = cold.outcome === "stopped";
+                alreadyTerminal = cold.outcome === "already-terminal";
+              }
+              if (!stopped && !alreadyTerminal) {
+                throw new ProtocolError(
+                  ProtocolErrorCode.InvalidParams,
+                  `Workflow run "${parsedInput.runId}" could not be stopped; its persisted status is ${current?.status ?? persisted.status}.`,
+                );
+              }
+            }
+          }
+          if (stopped) {
             scriptResources.cancelPendingElicitation(parsedInput.runId);
             requireDurableStoppedRun(manager, parsedInput.runId);
           }

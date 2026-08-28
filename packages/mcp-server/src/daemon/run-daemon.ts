@@ -5,6 +5,7 @@
  * daemon.log).
  */
 
+import { randomUUID } from "node:crypto";
 import { createAcpRunner } from "@automatalabs/workflows";
 
 import { SERVER_VERSION } from "../server.js";
@@ -67,6 +68,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
   const log = (line: string) => console.error(line);
   const runner = createAcpRunner();
   const supersede = options.supersede ?? false;
+  const instanceId = randomUUID();
 
   let daemon;
   const sessionTtlMs = envInt(SESSION_IDLE_TTL_ENV, SESSION_IDLE_TTL_MS);
@@ -85,7 +87,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
   // tool's no-id break. Its address travels in daemon.json so the shim
   // can fire it out of band.
   const evalBreakChannel = createEvalBreakChannel();
-  const daemonOptions = { runner, log, replDrainBoundMs, evalBreakChannel };
+  const daemonOptions = { runner, log, replDrainBoundMs, evalBreakChannel, ownInstanceId: instanceId };
   if (supersede) {
     // Succession: the stale predecessor may still hold the default port and is left running
     // to finish its in-flight work, so never contend for it — bind the explicitly requested
@@ -133,6 +135,9 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
     url: daemon.url,
     startedAt: daemon.startedAt,
     envFingerprint: envFingerprint(),
+    instanceId: daemon.instanceId,
+    controlUrl: daemon.controlUrl,
+    controlProtocol: 1,
     ...(await evalBreakChannel
       .breakUrl()
       .then((url) => ({ replBreakUrl: url }))

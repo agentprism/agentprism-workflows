@@ -141,6 +141,12 @@ export const workflowToolInputShape = {
     .describe(
       "With action=stop, cancel exactly this in-flight agent call without aborting the run. Forbidden for every other action.",
     ),
+  forceOwner: z
+    .boolean()
+    .optional()
+    .describe(
+      "With whole-run action=stop, explicitly authorize terminating a superseded owner daemon when graceful cross-generation control cannot settle. Forbidden with callIndex and every other action.",
+    ),
   lastN: z.number().int().min(1).max(50).optional().describe("Latest matching calls. Default 20; range 1..50."),
   labelGlob: z
     .string()
@@ -175,6 +181,7 @@ interface WorkflowExecuteToolInputBase {
   background?: boolean;
   runId?: never;
   callIndex?: never;
+  forceOwner?: never;
   waitMs?: never;
   lastN?: never;
   labelGlob?: never;
@@ -198,12 +205,14 @@ export interface WorkflowConfigToolInput {
   script?: never;
   scriptPath?: never;
   runId?: never;
+  forceOwner?: never;
 }
 
 export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
   action: "inspect";
   runId: string;
   callIndex?: never;
+  forceOwner?: never;
   script?: never;
   scriptPath?: never;
   projectDir?: never;
@@ -218,6 +227,7 @@ export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
   action: "await";
   runId: string;
   callIndex?: never;
+  forceOwner?: never;
   /** Default 20_000; integer range 0..25_000. Zero is a non-blocking status read. */
   waitMs?: number;
   script?: never;
@@ -234,6 +244,8 @@ export interface WorkflowStopToolInput extends WorkflowRunInspectionOptions {
   runId: string;
   /** Omitted for whole-run stop; present to cancel exactly one in-flight agent call. */
   callIndex?: number;
+  /** Explicitly authorize terminating a superseded owner daemon. Forbidden with callIndex. */
+  forceOwner?: boolean;
   script?: never;
   scriptPath?: never;
   projectDir?: never;
@@ -271,6 +283,7 @@ interface RawWorkflowToolInput {
   background?: boolean;
   runId?: string;
   callIndex?: number;
+  forceOwner?: boolean;
   lastN?: number;
   labelGlob?: string;
   logLines?: number;
@@ -331,6 +344,7 @@ export function parseWorkflowToolInput(
       raw.background !== undefined ||
       raw.runId !== undefined ||
       raw.callIndex !== undefined ||
+      raw.forceOwner !== undefined ||
       raw.waitMs !== undefined ||
       raw.lastN !== undefined ||
       raw.labelGlob !== undefined ||
@@ -355,7 +369,7 @@ export function parseWorkflowToolInput(
 
   if (raw.action === "inspect") {
     if (!raw.runId) invalid('action="inspect" requires runId');
-    if (hasExecutionFields(raw) || hasConfigFields(raw) || raw.waitMs !== undefined || raw.callIndex !== undefined) {
+    if (hasExecutionFields(raw) || hasConfigFields(raw) || raw.waitMs !== undefined || raw.callIndex !== undefined || raw.forceOwner !== undefined) {
       invalid('action="inspect" cannot include execution fields');
     }
     return {
@@ -369,7 +383,7 @@ export function parseWorkflowToolInput(
 
   if (raw.action === "await") {
     if (!raw.runId) invalid('action="await" requires runId');
-    if (hasExecutionFields(raw) || hasConfigFields(raw) || raw.callIndex !== undefined) {
+    if (hasExecutionFields(raw) || hasConfigFields(raw) || raw.callIndex !== undefined || raw.forceOwner !== undefined) {
       invalid('action="await" cannot include execution fields');
     }
     return {
@@ -387,10 +401,14 @@ export function parseWorkflowToolInput(
     if (hasExecutionFields(raw) || hasConfigFields(raw) || raw.waitMs !== undefined) {
       invalid('action="stop" cannot include execution fields or waitMs');
     }
+    if (raw.callIndex !== undefined && raw.forceOwner !== undefined) {
+      invalid('action="stop" forceOwner is forbidden with callIndex');
+    }
     return {
       action: "stop",
       runId: raw.runId,
       callIndex: raw.callIndex,
+      ...(raw.forceOwner === undefined ? {} : { forceOwner: raw.forceOwner }),
       lastN: raw.lastN,
       labelGlob: raw.labelGlob,
       logLines: raw.logLines,
@@ -400,6 +418,7 @@ export function parseWorkflowToolInput(
   if (
     raw.runId !== undefined ||
     raw.callIndex !== undefined ||
+    raw.forceOwner !== undefined ||
     raw.waitMs !== undefined ||
     raw.lastN !== undefined ||
     raw.labelGlob !== undefined ||

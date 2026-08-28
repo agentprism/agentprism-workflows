@@ -144,6 +144,7 @@ function lineageSourceRunId(state: PersistedRunState): string | undefined {
 export class WorkflowScriptResources {
   private readonly router: RunStoreRouter;
   private readonly detachRunDeleted: () => void;
+  private readonly detachRunStopped: () => void;
   private readonly subscriptions = new Set<string>();
   private readonly externalReaders = new Map<
     string,
@@ -177,11 +178,13 @@ export class WorkflowScriptResources {
   ) {
     this.router = source instanceof WorkflowManager ? singleStoreRouter(source) : source.router;
     this.detachRunDeleted = this.router.onRunDeleted(this.onRunDeleted);
+    this.detachRunStopped = this.router.onRunStopped(({ runId }) => this.cancelPendingElicitation(runId));
     const previousOnClose = this.mcp.server.onclose;
     this.mcp.server.onclose = () => {
       for (const controller of this.elicitationControllers.values()) controller.abort();
       this.elicitationControllers.clear();
       for (const uri of [...this.eventSubscriptions.keys()]) this.closeEventSubscription(uri);
+      this.detachRunStopped();
       this.detachRunDeleted();
       previousOnClose?.();
     };

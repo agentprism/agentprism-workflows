@@ -7,6 +7,7 @@ import type {
   WorkflowRunAwaitResult,
   WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
+  WorkflowStopPendingResult,
   WorkflowStopResult,
 } from "../src/workflow-tool-output.js";
 
@@ -65,6 +66,18 @@ const stopped: WorkflowStopResult = {
   stopped: true,
   alreadyTerminal: false,
 };
+const pendingStop: WorkflowStopPendingResult = {
+  ...inspection,
+  status: "running",
+  stopped: false,
+  alreadyTerminal: false,
+  control: {
+    state: "pending",
+    operationId: "00000000-0000-4000-8000-000000000000",
+    requestedAt: "2026-08-28T00:00:00.000Z",
+    owner: { pid: 42, controlProtocol: 1 },
+  },
+};
 const resourceFields: WorkflowScriptResourceFields = {
   scriptUri: "workflow://runs/aa-bb/script",
   lineage,
@@ -120,6 +133,7 @@ void [
   inspection,
   awaited,
   stopped,
+  pendingStop,
   resourceFields,
   executionWithoutSource,
   executionWithoutLimits,

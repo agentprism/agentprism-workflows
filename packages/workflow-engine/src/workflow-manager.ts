@@ -356,6 +356,8 @@ export interface WorkflowManagerOptions {
   persistence?: RunPersistence;
   /** Default journaling policy for runs created by this manager. Default true. */
   journaling?: boolean;
+  /** Opaque host/process generation identity attached to newly acquired filesystem leases. */
+  leaseOwnerId?: string;
   /** Default non-git environment label for replay provenance diagnostics. */
   environmentKey?: string;
 }
@@ -505,6 +507,11 @@ function isPersistableRunEvent(event: EngineRunEvent): event is PersistableEngin
   return event.type !== "agentHistory";
 }
 
+export interface PersistedRunStopResult {
+  outcome: "stopped" | "already-terminal" | "owned-elsewhere" | "missing";
+  state?: PersistedRunState;
+}
+
 export interface WorkflowManager {
   addListener<Name extends EngineRunEventName>(
     eventName: Name,
@@ -581,7 +588,10 @@ export class WorkflowManager extends EventEmitter {
     this.environmentKey = options.environmentKey;
     this.persistence = options.persistence
       ? withRunEvents(options.persistence)
-      : createRunPersistence(this.cwd, undefined, { persistenceRoot: this.persistenceRoot });
+      : createRunPersistence(this.cwd, undefined, {
+          persistenceRoot: this.persistenceRoot,
+          leaseOwnerId: options.leaseOwnerId,
+        });
     this.liveAgentObservability = new LiveAgentObservability<ManagedRun>({
       eligible: (run) => Boolean(run.journaling && run.lease && !run.eventLogIncomplete),
       publish: (run, event, afterAppend) => {
@@ -655,6 +665,7 @@ export class WorkflowManager extends EventEmitter {
       ) {
         return current;
       }
+      if (this.persistence.validateRunLease?.(lease) === false) return current;
       const reconciled: PersistedRunState = {
         ...current,
         status: "paused",
@@ -1494,7 +1505,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private savePersistedState(state: PersistedRunState, publication: EventPublicationState): boolean {
-    if (!publication.lease) return false;
+    if (!publication.lease || this.persistence.validateRunLease?.(publication.lease) === false) return false;
     try {
       this.persistence.save(state);
       return true;
@@ -1574,6 +1585,9 @@ export class WorkflowManager extends EventEmitter {
       !state.eventLogIncomplete
     ) {
       try {
+        if (this.persistence.validateRunLease?.(state.lease) === false) {
+          throw new Error(`run ${state.runId} no longer owns its persistence lease`);
+        }
         if (state.eventStreamId === undefined || state.eventSeq === undefined) {
           throw new Error(`run ${state.runId} has no event publication watermark`);
         }
@@ -2493,7 +2507,11 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private persistRun(managed: ManagedRun) {
-    if (!managed.journaling || !managed.lease) return;
+    if (
+      !managed.journaling ||
+      !managed.lease ||
+      this.persistence.validateRunLease?.(managed.lease) === false
+    ) return;
     try {
       this.persistence.save(this.persistedState(managed));
     } catch (err) {
@@ -2502,9 +2520,13 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private persistRunOrThrow(managed: ManagedRun): void {
-    if (!managed.journaling || !managed.lease) {
+    if (
+      !managed.journaling ||
+      !managed.lease ||
+      this.persistence.validateRunLease?.(managed.lease) === false
+    ) {
       throw new WorkflowError(
-        `run ${managed.runId} has no persistence lease`,
+        `run ${managed.runId} has no current persistence lease`,
         WorkflowErrorCode.PERSISTENCE_ERROR,
         { recoverable: false },
       );
@@ -2598,6 +2620,9 @@ export class WorkflowManager extends EventEmitter {
     }
     persisted.legacyResume = true;
     try {
+      if (this.persistence.validateRunLease?.(lease) === false) {
+        throw new Error(`run ${runId} no longer owns its persistence lease`);
+      }
       this.persistence.save(persisted);
     } catch (error) {
       this.persistence.releaseRunLease(lease);
@@ -2897,6 +2922,15 @@ export class WorkflowManager extends EventEmitter {
     return attempt.cancellation.promise;
   }
 
+  /** Number of process-local workflow executions that still own live execution state. */
+  activeExecutionCount(): number {
+    let total = 0;
+    for (const run of this.runs.values()) {
+      if (run.status === "running") total += 1;
+    }
+    return total;
+  }
+
   /**
    * Stop a running workflow.
    */
@@ -2965,6 +2999,85 @@ export class WorkflowManager extends EventEmitter {
       },
     );
     return true;
+  }
+
+  /**
+   * Stop a persisted run while holding its cross-process lease. This is the location-
+   * independent counterpart to stop(): it never steals a live owner's lease and lets a
+   * concurrently terminal snapshot win after the under-lease reload.
+   */
+  stopPersistedRun(runId: string): PersistedRunStopResult {
+    const managed = this.runs.get(runId);
+    if (managed) {
+      const current = this.persistence.load(runId);
+      if (current && (current.status === "completed" || current.status === "failed" || current.status === "aborted")) {
+        return { outcome: "already-terminal", state: current };
+      }
+      if (managed.status === "running" || managed.status === "paused") {
+        if (!this.stop(runId)) return { outcome: "owned-elsewhere", ...(current ? { state: current } : {}) };
+        return { outcome: "stopped", state: this.persistence.load(runId) ?? undefined };
+      }
+      // The in-memory execution already settled but its final snapshot did not. Fall through
+      // to the lease-safe cold path; stop() has released its lease and cannot repair it.
+    }
+
+    const lease = this.persistence.acquireRunLease(runId);
+    if (!lease) return { outcome: "owned-elsewhere", state: this.persistence.load(runId) ?? undefined };
+    try {
+      const current = this.persistence.load(runId);
+      if (!current) return { outcome: "missing" };
+      if (current.status === "completed" || current.status === "failed" || current.status === "aborted") {
+        return { outcome: "already-terminal", state: current };
+      }
+
+      const publication = this.prepareEventPublicationState(current, lease);
+      let stoppedEventAlreadyDurable = false;
+      if (
+        publication.eventStreamId !== undefined &&
+        publication.eventSeq !== undefined &&
+        publication.eventSeq > 0
+      ) {
+        try {
+          const tail = this.persistence.readEvents(runId, {
+            streamId: publication.eventStreamId,
+            after: publication.eventSeq - 1,
+            limit: 1,
+          });
+          stoppedEventAlreadyDurable = tail.events.some(
+            (record) => record.seq === publication.eventSeq && record.event.type === "stopped",
+          );
+        } catch {
+          stoppedEventAlreadyDurable = false;
+        }
+      }
+      current.status = "aborted";
+      current.reason = undefined;
+      current.errorCode = undefined;
+      current.pauseReason = undefined;
+      current.resetHint = undefined;
+      current.authContext = undefined;
+      current.checkpointContext = undefined;
+      current.abortSignaled = true;
+
+      const saveStopped = () => {
+        this.syncEventWatermark(publication, current);
+        current.updatedAt = new Date().toISOString();
+        this.savePersistedState(current, publication);
+      };
+      if (stoppedEventAlreadyDurable) {
+        saveStopped();
+      } else {
+        this.publishRunEvent(
+          publication,
+          this.createRunEvent("stopped", { runId, scope: runId }),
+          saveStopped,
+          { afterLive: saveStopped },
+        );
+      }
+      return { outcome: "stopped", state: this.persistence.load(runId) ?? current };
+    } finally {
+      this.persistence.releaseRunLease(lease);
+    }
   }
 
   /**

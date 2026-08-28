@@ -363,10 +363,12 @@ Then long-poll in ordinary bounded tool calls until `outcome` appears:
 A timeout returns the freshest bounded status and partial cumulative token usage; terminal await
 adds the same raw result/log projection a foreground call returns. At most four background runs may
 be active or starting per project. Runs execute in the shared local daemon, so MCP clients
-disconnecting or killing the stdio shim never stops in-flight work — any later session of the same
-project can await/inspect/stop it. Only daemon exit (signals, `daemon stop`, crash, machine loss) —
-or, under `--in-process`, the client-owned process exiting — stops in-flight work, while the durable
-journal prefix remains resumable. Background runs send no request progress and use authored headless
+disconnecting or killing the stdio shim never stops in-flight work — any later session can locate
+and await/inspect/stop it. Across a version upgrade, the successor routes signed stop/cancel control
+to the predecessor holding the run lease; whole-stop intent is durable and can report a nonterminal
+`control.state:"pending"` before final settlement. Owner daemon exit (signals, forced owner stop,
+crash, machine loss) — or, under `--in-process`, the client-owned process exiting — can interrupt
+in-flight work, while the durable journal prefix remains resumable. Background runs send no request progress and use authored headless
 checkpoint behavior. Resume after a pause/crash by starting a new run with `resumeFromRunId`; each
 new background run durably inherits the replay prefix under its new run ID before acknowledgement.
 

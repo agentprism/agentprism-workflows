@@ -10,13 +10,12 @@
  * runner at construction). Different env → different family → different daemon; families never
  * contend, so a host with a custom backend env never flips another host's daemon.
  *
- * Succession inside a family is a TOTAL ORDER on version: a live daemon OLDER than this shim
- * is never adopted (busy or idle) — the shim spawns a successor, which atomically repoints the
- * family pointer at itself, and the shim connects there. The superseded daemon (its pid no
- * longer matches the pointer) becomes a lame duck: it admits no new sessions, migrates its idle
- * sessions to the successor, finishes in-flight work, and exits. A daemon EQUAL to or NEWER than
- * this shim is adopted — an older client migrating off a lame duck must never resurrect its old
- * code, or two clients of different versions would supersede each other forever.
+ * Succession inside a family is a TOTAL ORDER on version: normally a live daemon OLDER than this
+ * shim is superseded, and an equal/newer daemon is adopted. One bootstrap exception protects the
+ * first run-control upgrade: a busy predecessor that does not advertise control v1 is temporarily
+ * adopted until its active runs/requests drain, so repointing discovery cannot strand them. The
+ * pointer is never moved backward, preserving convergence. Once the predecessor is control-capable,
+ * the successor takes the front door immediately while the predecessor remains the execution owner.
  */
 
 import { closeSync, mkdirSync, openSync } from "node:fs";
@@ -60,8 +59,15 @@ interface LiveDaemon {
   info: DaemonInfo;
   sessions: number;
   activeRuns: number;
+  inflightRequests: number;
+  controlProtocol?: 1;
   version: string;
 }
+
+export type EnsuredDaemonInfo = DaemonInfo & {
+  /** This newer shim temporarily adopted a busy predecessor that predates run control. */
+  compatibilityDrain?: true;
+};
 
 /** The family pointer's daemon, if it is alive and answers /healthz as itself. */
 async function probeLiveDaemon(fingerprint: string): Promise<LiveDaemon | undefined> {
@@ -69,7 +75,14 @@ async function probeLiveDaemon(fingerprint: string): Promise<LiveDaemon | undefi
   if (info === undefined || !pidIsAlive(info.pid)) return undefined;
   const health = await probeHealthz(info.port);
   if (health === undefined || health.pid !== info.pid) return undefined;
-  return { info, sessions: health.sessions, activeRuns: health.activeRuns, version: health.version };
+  return {
+    info,
+    sessions: health.sessions,
+    activeRuns: health.activeRuns,
+    inflightRequests: health.inflightRequests ?? 0,
+    controlProtocol: health.controlProtocol === 1 ? 1 : undefined,
+    version: health.version,
+  };
 }
 
 /**
@@ -120,13 +133,13 @@ function spawnDetachedDaemon(args: { bundlePath: string; port?: number; supersed
   closeSync(logFd);
 }
 
-export async function ensureDaemonRunning(options: EnsureDaemonOptions): Promise<DaemonInfo> {
+export async function ensureDaemonRunning(options: EnsureDaemonOptions): Promise<EnsuredDaemonInfo> {
   const fingerprint = envFingerprint();
   const spawnDaemon =
     options.spawn ??
     ((args: { bundlePath: string; port?: number; supersede: boolean }) => spawnDetachedDaemon(args));
 
-  const adopt = (live: LiveDaemon): DaemonInfo => {
+  const adopt = (live: LiveDaemon): EnsuredDaemonInfo => {
     if (compareVersions(live.version, SERVER_VERSION) > 0) {
       options.log(
         `[${DAEMON_NAME}] adopting daemon v${live.version} (pid ${live.info.pid}), newer than this client v${SERVER_VERSION}`,
@@ -139,8 +152,23 @@ export async function ensureDaemonRunning(options: EnsureDaemonOptions): Promise
   // A live daemon at least as new as this shim: adopt it.
   if (live !== undefined && !isStale(live)) return adopt(live);
 
-  // Stale (older) daemon: NEVER adopt it, busy or idle. Spawn a successor, repoint the family
-  // pointer to it, and connect there. The old daemon drains and exits.
+  // Bootstrap bridge: the first control-capable release cannot forward into a predecessor
+  // that predates run control. Keep the newer shim on that predecessor while it owns work;
+  // sessions alone do not defer succession. The shim monitors this marker and re-ensures as
+  // soon as active work drains.
+  if (
+    live !== undefined &&
+    live.controlProtocol !== 1 &&
+    (live.activeRuns > 0 || live.inflightRequests > 0)
+  ) {
+    options.log(
+      `[${DAEMON_NAME}] compatibility drain: temporarily adopting stale daemon pid ${live.info.pid} ` +
+        `(v${live.version}, ${live.activeRuns} run(s), ${live.inflightRequests} request(s) in flight) ` +
+        `because it predates run-control v1`,
+    );
+    return { ...live.info, compatibilityDrain: true };
+  }
+
   if (live !== undefined) {
     options.log(
       `[${DAEMON_NAME}] superseding stale daemon (pid ${live.info.pid}, ${live.sessions} session(s), ` +
@@ -162,6 +190,16 @@ export async function ensureDaemonRunning(options: EnsureDaemonOptions): Promise
     // Re-probe under the lock: another shim may already have installed a current daemon.
     const raced = await probeLiveDaemon(fingerprint);
     if (raced !== undefined && !isStale(raced)) return adopt(raced);
+    if (
+      raced !== undefined &&
+      raced.controlProtocol !== 1 &&
+      (raced.activeRuns > 0 || raced.inflightRequests > 0)
+    ) {
+      options.log(
+        `[${DAEMON_NAME}] compatibility drain retained under the spawn lock for stale daemon pid ${raced.info.pid}`,
+      );
+      return { ...raced.info, compatibilityDrain: true };
+    }
     // Supersede only when a stale daemon still holds the pointer; a cold start takes the
     // default port so `daemon status`/`url` show the canonical endpoint.
     const superseding = raced !== undefined;

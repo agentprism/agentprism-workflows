@@ -1448,6 +1448,25 @@ interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   tokenUsage?: TokenUsage;
   outcome?: WorkflowExecutionToolResult<T>; // present exactly at terminal status
 }
+
+interface WorkflowStopPendingResult extends WorkflowRunStatus {
+  status: "pending" | "running";
+  stopped: false;
+  alreadyTerminal: false;
+  control: {
+    state: "pending";
+    operationId: string;
+    requestedAt: string;
+    owner?: {
+      pid: number;
+      instanceId?: string;
+      version?: string;
+      lameDuck?: boolean;
+      activeRuns?: number;
+      controlProtocol?: 1;
+    };
+  };
+}
 ```
 
 Await returns immediately for terminal runs, is a non-blocking read at `waitMs:0`, and otherwise
@@ -1477,14 +1496,7 @@ loss. The inherited status portion retains its 24,576-byte/redaction bound and a
 8,192-byte cap; raw terminal `outcome` intentionally has no new envelope cap and is never duplicated
 into text.
 
-Runs execute in the shared per-user workflow daemon (the default stdio entry is a thin shim that
-proxies to it and auto-starts it), so a client disconnect, shim kill, or session eviction does not
-stop in-flight work. Daemon exit (signals, `daemon stop`, crash, machine shutdown) — or, under
-`--in-process`, the single client-owned process exiting — can; there is no cross-machine handoff.
-The initial record and completed call prefix remain durable, later writes are best effort, and
-construction or a cold await/inspect/stop/resume preflight reconciles an orphaned
-`pending`/`running` record to `paused` / `interrupted` for an explicit new `resumeFromRunId`
-execution.
+Runs execute in the shared per-user workflow daemon (the default stdio entry is a thin shim that proxies to it and auto-starts it), so a client disconnect, shim kill, or session eviction does not stop in-flight work. During version succession the current daemon is the front door while a predecessor may retain execution ownership under the run lease. Whole-run stop writes an idempotent durable intent and signed internal control forwards stop/cancel to that predecessor. A final stop response still requires a durable aborted snapshot plus its stopped event; a control wait that expires returns a successful nonterminal stop acknowledgement with `control.state:"pending"` and an operation ID. `forceOwner:true` on whole-run stop explicitly authorizes terminating a superseded owner daemon after identity revalidation and may interrupt sibling runs; it is forbidden with `callIndex`. Owner exit (signals, forced stop, crash, machine shutdown) — or, under `--in-process`, the single client-owned process exiting — can interrupt work; there is no cross-machine handoff. If an owner exits with a pending whole-stop intent, the next lease holder cold-stops it; otherwise cold preflights reconcile orphaned `pending`/`running` state to `paused` / `interrupted` for explicit `resumeFromRunId`. A live lease is never stolen because of a timeout.
 The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
 feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 

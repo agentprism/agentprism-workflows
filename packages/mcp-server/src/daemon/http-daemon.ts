@@ -38,6 +38,17 @@ import { envFingerprint, isSupersededBy } from "./daemon-info.js";
 import { BoundedEventStore } from "./event-store.js";
 import { validateRequest } from "./middleware.js";
 import { loadOrCreateRequestStateKey } from "./request-state.js";
+import {
+  loadOrCreateRunControlKey,
+  RUN_CONTROL_PATH,
+  RUN_CONTROL_PROTOCOL,
+  verifyRunControlRequest,
+} from "./run-control-auth.js";
+import {
+  DaemonRunControl,
+  type InternalRunControlRequest,
+  type InternalRunControlResponse,
+} from "./run-control.js";
 import { SessionRegistry } from "./session-registry.js";
 
 export interface CreateDaemonOptions {
@@ -76,6 +87,8 @@ export interface CreateDaemonOptions {
    * to decide lame-duck (superseded) status.
    */
   ownPid?: number;
+  /** Opaque daemon-generation identity used by run leases and control routing. */
+  ownInstanceId?: string;
   /**
    * The version string reported by /healthz. Defaults to `SERVER_VERSION`; injected in tests
    * to simulate a divergent (older/newer) daemon that a current-version shim must supersede.
@@ -94,6 +107,8 @@ export interface DaemonHandle {
   port: number;
   url: string;
   startedAt: string;
+  instanceId: string;
+  controlUrl: string;
   sessions: SessionRegistry;
   projects: WorkflowProjectRegistry;
   activeRunCount(): number;
@@ -115,6 +130,8 @@ export interface DaemonHandle {
    * the closed session ids.
    */
   evictDrainableSessions(): string[];
+  /** Scan durable whole-stop intents; calls coalesce while one scan is in flight. */
+  processPendingControlIntents?(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -136,6 +153,7 @@ function writeJsonRpcError(
 }
 
 const MAX_MCP_BODY_BYTES = 4 * 1024 * 1024;
+const MAX_CONTROL_BODY_BYTES = 64 * 1024;
 const BODY_REJECTED = Symbol("body-rejected");
 
 /** Parse a body once so the official era classifier and either Node handler share it. */
@@ -172,12 +190,119 @@ async function readMcpJsonBody(
   }
 }
 
+function controlHeader(req: http.IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function writeControlResponse(
+  res: http.ServerResponse,
+  status: number,
+  body: InternalRunControlResponse | { ok: false; code: "UNAUTHORIZED" | "INVALID_REQUEST"; message: string },
+): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+function isInternalRunControlRequest(value: unknown): value is InternalRunControlRequest {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const keys = Object.keys(row).sort();
+  if (
+    typeof row.operationId !== "string" ||
+    !/^[0-9a-f-]{36}$/i.test(row.operationId) ||
+    typeof row.runId !== "string" ||
+    !/^[a-z0-9]+-[a-z0-9]+$/.test(row.runId)
+  ) return false;
+  if (row.action === "stop") {
+    return keys.join(",") === "action,operationId,runId";
+  }
+  return row.action === "cancel-agent" &&
+    Number.isSafeInteger(row.callIndex) &&
+    (row.callIndex as number) >= 0 &&
+    keys.join(",") === "action,callIndex,operationId,runId";
+}
+
+async function handleRunControlRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  key: Uint8Array,
+  runControl: DaemonRunControl,
+): Promise<void> {
+  if (req.method !== "POST") {
+    writeControlResponse(res, 405, { ok: false, code: "INVALID_REQUEST", message: "Method Not Allowed" });
+    return;
+  }
+  const contentType = controlHeader(req, "content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") {
+    writeControlResponse(res, 415, { ok: false, code: "INVALID_REQUEST", message: "Content-Type must be application/json" });
+    return;
+  }
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > MAX_CONTROL_BODY_BYTES) {
+      writeControlResponse(res, 413, { ok: false, code: "INVALID_REQUEST", message: "Run-control body exceeds 64 KiB" });
+      return;
+    }
+    chunks.push(buffer);
+  }
+  const body = Buffer.concat(chunks).toString("utf8");
+  const operationId = controlHeader(req, "x-agentprism-control-operation");
+  if (!verifyRunControlRequest(key, {
+    method: req.method,
+    path: RUN_CONTROL_PATH,
+    body,
+    timestamp: controlHeader(req, "x-agentprism-control-timestamp"),
+    operationId,
+    signature: controlHeader(req, "x-agentprism-control-signature"),
+  })) {
+    writeControlResponse(res, 401, { ok: false, code: "UNAUTHORIZED", message: "Invalid run-control signature" });
+    return;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    writeControlResponse(res, 400, { ok: false, code: "INVALID_REQUEST", message: "Invalid JSON" });
+    return;
+  }
+  if (!isInternalRunControlRequest(parsed) || parsed.operationId !== operationId) {
+    writeControlResponse(res, 400, { ok: false, code: "INVALID_REQUEST", message: "Invalid run-control request" });
+    return;
+  }
+  let response: InternalRunControlResponse;
+  try {
+    response = await runControl.applyLocal(parsed);
+  } catch (error) {
+    writeControlResponse(res, 500, {
+      ok: false,
+      code: "INTERNAL_ERROR",
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return;
+  }
+  const status = response.ok
+    ? 200
+    : response.code === "UNKNOWN_RUN"
+      ? 404
+      : response.code === "NOT_OWNER"
+        ? 409
+        : response.code === "INTERNAL_ERROR"
+          ? 500
+          : 400;
+  writeControlResponse(res, status, response);
+}
+
 export async function createDaemon(options: CreateDaemonOptions): Promise<DaemonHandle> {
   const host = options.host ?? "127.0.0.1";
   const env = options.env ?? process.env;
   const log = options.log ?? ((line: string) => console.error(line));
   const startedAt = new Date().toISOString();
   const ownPid = options.ownPid ?? process.pid;
+  const ownInstanceId = options.ownInstanceId ?? randomUUID();
   const version = options.version ?? SERVER_VERSION;
   // A lame duck (a newer daemon owns discovery) admits no new sessions. Re-evaluated per
   // request so that if discovery is ever repointed back at this daemon it resumes service.
@@ -187,7 +312,15 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
   const sessions = new SessionRegistry();
   // ONE registry shared by every session: run calls select their project via the required
   // projectDir tool argument, and all sessions see all projects' runs.
-  const projects = new WorkflowProjectRegistry(options.runner);
+  const projects = new WorkflowProjectRegistry(options.runner, { leaseOwnerId: ownInstanceId });
+  const runControlKey = loadOrCreateRunControlKey();
+  const runControl = new DaemonRunControl({
+    projects,
+    ownPid,
+    ownInstanceId,
+    key: runControlKey,
+    log,
+  });
   // The REPL client-presence ledger: every session touches the projects it addresses; on
   // last-connection-closed a project with no clients left is drained (the doc's
   // client-presence policy; the bound reuses the session-eviction TTL).
@@ -235,6 +368,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
         requestStateCodec,
         disconnectReplClientOnClose: true,
         modernNotifier,
+        runControl,
       });
     },
     {
@@ -328,6 +462,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
       replClientId: () => transport.sessionId,
       replDrainBoundMs,
       replEvalBreakChannel: options.evalBreakChannel,
+      runControl,
     });
     await server.connect(transport);
     // The SDK protocol layer takes ownership of transport.onclose during connect, so chain
@@ -358,6 +493,10 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
         return;
       }
       const url = new URL(req.url ?? "/", `http://${host}:${boundPort}`);
+      if (url.pathname === RUN_CONTROL_PATH) {
+        await handleRunControlRequest(req, res, runControlKey, runControl);
+        return;
+      }
       if (url.pathname === HEALTHZ_PATH && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
@@ -371,6 +510,8 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
             activeRuns: projects.activeRunCount(),
             envFingerprint: familyFingerprint,
             projects: projects.snapshot(),
+            instanceId: ownInstanceId,
+            controlProtocol: RUN_CONTROL_PROTOCOL,
             lameDuck: isSuperseded(),
             inflightRequests: sessions.inflightCount() + modernInflight,
           }),
@@ -405,6 +546,8 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     port: boundPort,
     url: `http://${host}:${boundPort}${MCP_ENDPOINT_PATH}`,
     startedAt,
+    instanceId: ownInstanceId,
+    controlUrl: `http://${host}:${boundPort}${RUN_CONTROL_PATH}`,
     sessions,
     projects,
     activeRunCount: () => projects.activeRunCount(),
@@ -412,6 +555,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     inflightRequestCount: () => sessions.inflightCount() + modernInflight,
     isSuperseded,
     evictDrainableSessions: () => sessions.evictDrainable((sessionId) => replPresence.sessionHasBusyWorkspace(sessionId)),
+    processPendingControlIntents: () => runControl.processPendingIntents(),
     async close() {
       const closed = new Promise<void>((resolvePromise) => {
         httpServer.close(() => resolvePromise());

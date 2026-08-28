@@ -427,6 +427,20 @@ const discoveryOutputFields = [
   "omittedHarnesses",
   "models",
 ] as const;
+const stopControlSchema = z.object({
+  state: z.literal("pending"),
+  operationId: z.string(),
+  requestedAt: z.string(),
+  owner: z.object({
+    pid: z.number().int().positive(),
+    instanceId: z.string().optional(),
+    version: z.string().optional(),
+    lameDuck: z.boolean().optional(),
+    activeRuns: z.number().int().nonnegative().optional(),
+    controlProtocol: z.literal(1).optional(),
+  }).optional(),
+});
+
 const variantOutputFields = [
   ...executionDetailFields,
   "scriptSource",
@@ -435,6 +449,7 @@ const variantOutputFields = [
   "outcome",
   "stopped",
   "alreadyTerminal",
+  "control",
   ...discoveryOutputFields,
 ] as const;
 
@@ -490,6 +505,7 @@ export const workflowToolOutputShape = z
     outcome: executionResultSchema.optional(),
     stopped: z.boolean().optional(),
     alreadyTerminal: z.boolean().optional(),
+    control: stopControlSchema.optional(),
   })
   .superRefine((value, context) => {
     const has = (field: keyof typeof value) => value[field] !== undefined;
@@ -513,6 +529,14 @@ export const workflowToolOutputShape = z
       valid = runCommonComplete && has("limits") && (value.status === "running"
         ? hasOnlyFields(value, ["scriptSource"])
         : terminal && hasOnlyFields(value, ["scriptSource", ...executionDetailFields]));
+    } else if (has("control")) {
+      valid =
+        runCommonComplete &&
+        inspectionComplete &&
+        value.stopped === false &&
+        value.alreadyTerminal === false &&
+        (value.status === "pending" || value.status === "running") &&
+        hasOnlyFields(value, [...inspectionFields, "stopped", "alreadyTerminal", "control"]);
     } else if (has("stopped") || has("alreadyTerminal")) {
       valid =
         runCommonComplete &&
@@ -552,6 +576,7 @@ export const workflowToolOutputShape = z
           "outcome",
           "stopped",
           "alreadyTerminal",
+          "control",
         ),
       },
       {
@@ -572,6 +597,7 @@ export const workflowToolOutputShape = z
           "outcome",
           "stopped",
           "alreadyTerminal",
+          "control",
         ),
       },
       {
@@ -611,6 +637,16 @@ export const workflowToolOutputShape = z
         required: [...runOutputRequired, ...inspectionRequired, "stopped", "alreadyTerminal"],
         properties: { status: { enum: ["completed", "failed", "aborted"] } },
         ...forbidsOutside([...inspectionFields, "stopped", "alreadyTerminal"]),
+      },
+      {
+        title: "Workflow stop pending",
+        required: [...runOutputRequired, ...inspectionRequired, "stopped", "alreadyTerminal", "control"],
+        properties: {
+          status: { enum: nonterminalStatuses },
+          stopped: { const: false },
+          alreadyTerminal: { const: false },
+        },
+        ...forbidsOutside([...inspectionFields, "stopped", "alreadyTerminal", "control"]),
       },
     ],
   });
@@ -720,6 +756,13 @@ export interface WorkflowStopResult extends WorkflowRunStatus, WorkflowScriptRes
   alreadyTerminal: boolean;
 }
 
+export interface WorkflowStopPendingResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
+  status: "pending" | "running";
+  stopped: false;
+  alreadyTerminal: false;
+  control: z.infer<typeof stopControlSchema>;
+}
+
 export type WorkflowToolResult<T = unknown> =
   | WorkflowConfigToolResult
   | WorkflowValidationRejected
@@ -727,7 +770,8 @@ export type WorkflowToolResult<T = unknown> =
   | WorkflowBackgroundAccepted
   | WorkflowInspectionToolResult
   | WorkflowRunAwaitResult<T>
-  | WorkflowStopResult;
+  | WorkflowStopResult
+  | WorkflowStopPendingResult;
 
 export function toWorkflowExecutionOutcome<T>(
   run: WorkflowRunResult<T>,

@@ -1,4 +1,12 @@
-export const FIXTURE_PI_PIN = "0.84.3";
+export const FIXTURE_PI_PIN = "0.84.4";
+// 2026-08-28 bump 0.84.3 -> 0.84.4: the agent-core release changes when
+// prepareNextTurn hooks run, but pi-acp configures neither prepareNextTurn nor shouldStopAfterTurn.
+// Coding-agent changes add UI/RPC capabilities and fix compaction, custom-message ordering,
+// provider streams, and Windows aborts without changing pi-acp's imported session/config APIs.
+// E1 re-verified against the installed v0.84.4 dists: auth-guidance.js and pi-ai
+// dist/utils/{retry,overflow,error-body,provider-retry}.js are byte-identical to 0.84.3; the
+// agent-session auth templates are byte-identical with line shifts only. Fixture strings and
+// pause/retry classifications therefore remain unchanged.
 // 2026-08-25 bump 0.84.2 -> 0.84.3: the release adds PowerShell, model/thinking controls,
 // compaction events, and provider/runtime fixes. AgentSession.setModel now keeps selection
 // session-scoped unless persistence is explicitly requested, which matches pi-acp's per-session
