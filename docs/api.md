@@ -1,8 +1,8 @@
 # API reference
 
-The integrator-facing surface of the `@automatalabs/*` packages, in one place. This documents the supported integration APIs; package barrels also expose lower-level protocol utilities for advanced hosts, which remain typed but are not all repeated here. Version references are current for `workflows` 0.46.2, `acp-agents` 0.35.2, `workflow-engine` 0.35.1, `shared-types` 0.29.1, `mcp-server` 0.25.0, and `agentprism-otel` 0.1.2. `repl-engine` is unreleased (0.0.0); its engine and the `repl` MCP tool that `mcp-server` registers over it are implemented (see [MCP server](#mcp-server)) but ship with a future release.
+The integrator-facing surface of the `@automatalabs/*` packages, in one place. This documents the supported integration APIs; package barrels also expose lower-level protocol utilities for advanced hosts, which remain typed but are not all repeated here. Version references are current for `workflows` 0.54.0, `acp-agents` 0.41.3, `workflow-engine` 0.38.0, `shared-types` 0.32.0, `mcp-server` 0.34.0, `repl-engine` 0.4.6, `agentprism-otel` 0.1.2, `pi-acp` 0.6.1, and `codex-acp` 2.1.1.
 
-Packages (all but `repl-engine` published to npm, Apache-2.0, ESM-only, Node >= 22):
+Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 
 | Package | What it is | Depend on it when |
 |---|---|---|
@@ -1521,7 +1521,7 @@ With `id`, `interrupt` cancels that subagent call (the guest promise rejects rec
 
 ## `@automatalabs/repl-engine`
 
-The engine tier the `repl` tool registers over (unreleased at `0.0.0`; imported by `mcp-server` as `workspace:*`). It is a persistent JavaScript REPL in a capability-free QuickJS-in-WASM VM; the public surface:
+The published engine tier the `repl` tool registers over (imported by `mcp-server` as `workspace:*` in the monorepo and stamped to an exact version at publish time). It is a persistent JavaScript REPL in a capability-free QuickJS-in-WASM VM; the public surface:
 
 - **`Workspace`** / **`WorkspaceRegistry`** (`WorkspaceOptions`, `WorkspaceRegistryOptions`, `WorkspaceManifest`, `WorkspaceBinding`) — one VM per workspace, owning the lifecycle (`create` → `eval` → `drainJobs` → `dispose`) and the manifest surface. `ReplVm` (`loadShippedWasm`, `ReplVmOptions`, `ReplEvalOptions`, `ReplDrainOptions`, `ReplEvalOutcome`, `DrainJobError`) is the raw quickjs-wasi shim tier.
 - **`Broker`** (`DEFAULT_MAX_CONCURRENT_AGENTS`, `DEFAULT_EVAL_TIMEOUT_MS`, `DEFAULT_DISPOSE_BOUND_MS`, `BrokerOptions`, `BrokerRunner`, `ReplEvalResult`, `CheckpointSummary`, `LiveAgentInfo`, `ReconcileReport`, `WorkspaceManifestReport`, …) — drives subagents as ACP sessions, records results by call id, and reconciles on restore. The call store is `InMemoryCallStore` / `JsonlCallStore` (`CallStore`, `CallRecord`, `CallOutcome`, …).

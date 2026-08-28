@@ -187,6 +187,41 @@ test("all seven public guidance files reject the retired Pi channels as whole fi
   assert.match(piReadme, /Client-hosted `acp` transport remains runner-owned/);
 });
 
+test("root agent entrypoints preserve planning freedom and monorepo delivery rules", () => {
+  const agents = readRepoFile("AGENTS.md");
+  const claude = readRepoFile("CLAUDE.md");
+  const contributing = readRepoFile("CONTRIBUTING.md");
+  const codexAgents = readRepoFile("packages/codex-acp/AGENTS.md");
+
+  assert.equal(claude.trim(), "@AGENTS.md", "CLAUDE.md must import the canonical root AGENTS.md");
+  assert.ok(
+    agents.includes("not an untouchable architectural constitution"),
+    "root agent guidance must not fossilize implemented specs during design",
+  );
+  assert.ok(
+    agents.includes("During design and planning") && agents.includes("During implementation"),
+    "root agent guidance must distinguish planning from scoped implementation",
+  );
+  assert.ok(
+    contributing.includes("Planning versus implemented specifications"),
+    "CONTRIBUTING.md must retain the authoritative planning/implementation distinction",
+  );
+  assert.ok(
+    codexAgents.includes("Root monorepo, delivery, attribution, and release rules always win"),
+    "the nested Codex guidance must defer to root repository policy",
+  );
+  assert.ok(codexAgents.includes("pnpm sync:codex-acp --pr"));
+  assert.ok(codexAgents.includes("merge commit"));
+  assert.ok(
+    !codexAgents.includes("Releases are fully automated by release-please"),
+    "upstream release-please instructions must not re-enter the vendored subtree guidance",
+  );
+  assert.ok(
+    !codexAgents.includes("gh pr merge <pr-number> --squash"),
+    "upstream squash-release instructions would destroy subtree ancestry",
+  );
+});
+
 test("public package inventories cover every workspace package", () => {
   const packagesDir = join(repoRoot, "packages");
   const manifests = readdirSync(packagesDir, { withFileTypes: true })
@@ -202,6 +237,15 @@ test("public package inventories cover every workspace package", () => {
     for (const { manifest } of manifests) {
       assert.ok(text.includes(manifest.name), `${path} must inventory ${manifest.name}`);
     }
+  }
+
+  const readme = readRepoFile("README.md");
+  for (const { manifest } of manifests) {
+    assert.match(
+      readme,
+      new RegExp("^\\| \\*\\*`" + escapeRegExp(manifest.name) + "`\\*\\* \\|", "m"),
+      `README.md must render ${manifest.name} in its own package-table row`,
+    );
   }
 
   const contributing = readRepoFile("CONTRIBUTING.md");
