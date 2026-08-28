@@ -400,6 +400,7 @@ export class CodexAcpServer {
             list: { },
             close: { },
             delete: { },
+            fork: { },
             additionalDirectories: {},
             subagents: {},
         };
@@ -644,9 +645,13 @@ export class CodexAcpServer {
         return generation;
     }
 
-    async tryCreateSession(request: acp.NewSessionRequest | acp.ResumeSessionRequest): Promise<[SessionId, LegacySessionModelState, SessionModeState]> {
-        const requestedSessionGeneration = "sessionId" in request
-            ? this.beginSessionOpen(request.sessionId)
+    async tryCreateSession(
+        request: acp.NewSessionRequest | acp.ResumeSessionRequest | acp.ForkSessionRequest,
+        operation: "new" | "resume" | "fork" = "sessionId" in request ? "resume" : "new",
+    ): Promise<[SessionId, LegacySessionModelState, SessionModeState]> {
+        const existingSessionRequest = request as acp.ResumeSessionRequest | acp.ForkSessionRequest;
+        const requestedSessionGeneration = operation === "resume"
+            ? this.beginSessionOpen(existingSessionRequest.sessionId)
             : null;
         await this.checkAuthorization();
         const requestedMcpServers = request.mcpServers ?? [];
@@ -656,23 +661,28 @@ export class CodexAcpServer {
 
         let sessionMetadata: SessionMetadata;
         let resumeSubscribed = false;
-        if ("sessionId" in request) {
-            logger.log(`Resume existing session: ${request.sessionId}...`);
+        if (operation === "resume") {
+            const resumeRequest = request as acp.ResumeSessionRequest;
+            logger.log(`Resume existing session: ${resumeRequest.sessionId}...`);
             try {
                 sessionMetadata = await this.runWithProcessCheck(() =>
-                    this.codexAcpClient.resumeSession(request, () => {
+                    this.codexAcpClient.resumeSession(resumeRequest, () => {
                         resumeSubscribed = true;
                     })
                 );
             } catch (err) {
                 if (resumeSubscribed && requestedSessionGeneration !== null) {
-                    await this.cleanupStaleSessionOpen(request.sessionId, requestedSessionGeneration);
+                    await this.cleanupStaleSessionOpen(resumeRequest.sessionId, requestedSessionGeneration);
                 }
                 throw err;
             }
+        } else if (operation === "fork") {
+            const forkRequest = request as acp.ForkSessionRequest;
+            logger.log(`Fork existing session: ${forkRequest.sessionId}...`);
+            sessionMetadata = await this.runWithProcessCheck(() => this.codexAcpClient.forkSession(forkRequest));
         } else {
             logger.log(`Create new session...`);
-            sessionMetadata = await this.runWithProcessCheck(() => this.codexAcpClient.newSession(request));
+            sessionMetadata = await this.runWithProcessCheck(() => this.codexAcpClient.newSession(request as acp.NewSessionRequest));
         }
 
         const {sessionId, currentModelId, models} = sessionMetadata;
@@ -691,7 +701,7 @@ export class CodexAcpServer {
             resumeSubscribed = false;
             await this.closeStaleSessionOpen(sessionId, sessionGeneration);
         }
-        const sessionMcpServers = this.resolveSessionMcpServers(requestedMcpServers, "sessionId" in request);
+        const sessionMcpServers = this.resolveSessionMcpServers(requestedMcpServers, operation === "resume");
         const currentModel = this.findCurrentModel(models, currentModelId);
         const currentModelSupportsFast = modelSupportsFast(currentModel);
         const sessionState: SessionState = {
@@ -719,7 +729,7 @@ export class CodexAcpServer {
             terminalOutputMode: this.terminalOutputMode,
             goalRevision: 0,
             sessionTitle: null,
-            sessionTitleSource: "sessionId" in request ? "unknown" : "unset",
+            sessionTitleSource: operation === "resume" ? "unknown" : "unset",
             loadedActiveTurnId: null,
             loadedActiveTurnIsAny: false,
             loadedLastTurnStatus: null,
@@ -734,7 +744,8 @@ export class CodexAcpServer {
         this.sessions.set(sessionId, sessionState);
         resumeSubscribed = false;
 
-        if (requestedMcpServers.length > 0 && mcpServerStartupVersion !== null) {
+        const canPublishSessionUpdates = operation !== "fork";
+        if (canPublishSessionUpdates && requestedMcpServers.length > 0 && mcpServerStartupVersion !== null) {
             this.pendingMcpStartupSessions.set(sessionId, {
                 requestedServers: new Set(getRequestedMcpServerNames(requestedMcpServers)),
                 afterVersion: mcpServerStartupVersion,
@@ -742,8 +753,10 @@ export class CodexAcpServer {
             this.publishMcpStartupStatusAsync(sessionId);
         }
 
-        this.publishAvailableCommandsAsync(sessionState, sessionGeneration);
-        if ("sessionId" in request) {
+        if (canPublishSessionUpdates) {
+            this.publishAvailableCommandsAsync(sessionState, sessionGeneration);
+        }
+        if (operation === "resume") {
             this.publishCurrentGoalAsync(sessionState, sessionGeneration);
         }
         const sessionModelState: LegacySessionModelState = this.createModelState(models, currentModelId);
@@ -836,6 +849,26 @@ export class CodexAcpServer {
             modes: modeState,
             ...this.createSessionConfigOptionsResponse(this.getSessionState(sessionId)),
         };
+    }
+
+    async forkSession(params: acp.ForkSessionRequest): Promise<acp.ForkSessionResponse> {
+        if (this.providerUpdate !== null) {
+            await this.providerUpdate;
+        }
+        logger.log("Forking session...", {sessionId: params.sessionId});
+        try {
+            const [sessionId, , modeState] = await this.tryCreateSession(params, "fork");
+            logger.log("Session forked", {sourceSessionId: params.sessionId, sessionId});
+            return {
+                sessionId,
+                modes: modeState,
+                ...this.createSessionConfigOptionsResponse(this.getSessionState(sessionId)),
+            };
+        } catch (e) {
+            const error = e instanceof Error ? e : new Error(String(e));
+            await this.handleError(error);
+            throw e;
+        }
     }
 
     async listSessions(params: acp.ListSessionsRequest): Promise<acp.ListSessionsResponse> {

@@ -53,6 +53,7 @@ describe('CodexACPAgent - initialize', () => {
                     list: {},
                     close: {},
                     delete: {},
+                    fork: {},
                     additionalDirectories: {},
                     subagents: {},
                 },

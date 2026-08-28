@@ -64,6 +64,9 @@ import {
     createUnavailableAgentFileChangeReport,
 } from "./AgentFileChangeReport";
 import {CodexSubagentSubscriptions} from "./subagents/CodexSubagentSubscriptions";
+import {forkSession as runForkSession} from "./SessionFork";
+import type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
+export type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
 
 /**
  * Well-known provider id for the client-configurable custom LLM gateway.
@@ -486,6 +489,21 @@ export class CodexAcpClient {
             currentServiceTier: response.serviceTier as ServiceTier ?? null,
             additionalDirectories,
         }
+    }
+
+    async forkSession(request: acp.ForkSessionRequest): Promise<SessionMetadata> {
+        const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
+        return await runForkSession(request, additionalDirectories, {
+            codexClient: this.codexClient,
+            refreshSkills: (cwd, directories) => this.refreshSkills(cwd, directories),
+            createSessionConfig: (cwd, directories, mcpServers) =>
+                this.createSessionConfig(cwd, directories, mcpServers),
+            getResumeModelProvider: () => this.getResumeModelProvider(),
+            fetchAvailableModels: () => this.fetchAvailableModels(),
+            createCurrentModelId: (models, model, reasoningEffort) =>
+                this.createModelId(models, model, reasoningEffort).toString(),
+            getCollaborationMode: sessionId => this.getCollaborationMode(sessionId),
+        });
     }
 
     async loadSession(request: acp.LoadSessionRequest, onSubscribed?: () => void): Promise<SessionMetadataWithThread> {
@@ -1243,20 +1261,6 @@ class AgentFileChangeReportBudget {
 }
 
 export type JsonObject = { [key in string]?: JsonValue }
-
-export type SessionMetadata = {
-    sessionId: string,
-    currentModelId: string,
-    models: Model[],
-    collaborationMode: ModeKind,
-    modelProvider?: string | null,
-    currentServiceTier?: ServiceTier | null,
-    additionalDirectories: string[],
-}
-
-export type SessionMetadataWithThread = SessionMetadata & {
-    thread: Thread,
-}
 
 function buildPromptItems(prompt: acp.ContentBlock[]): UserInput[] {
     return prompt.map((block): UserInput | null => {

@@ -85,6 +85,11 @@
       "sha": "2b48e9822330fc09f3a94a81563e5c4bb779601a",
       "imported": "2026-08-27",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (chore(main): release 1.7.0 (#420))"
+    },
+    {
+      "sha": "69ca755d9878238aecf0737c0e4568b3bab37be2",
+      "imported": "2026-08-28",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (feat: support ACP session forks (#435))"
     }
   ]
 }

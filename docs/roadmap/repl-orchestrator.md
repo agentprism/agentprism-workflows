@@ -304,8 +304,8 @@ cooperating pieces:
   down → settle from the store; still resumable at the backend → re-attach; lost → re-issue.
   Re-attach is real on every built-in backend: **all four advertise `loadSession: true`**,
   per the live-verified capability matrix in [`docs/api.md`](../api.md) (claude additionally
-  list/delete/resume/close/fork; codex list/delete/resume/close; opencode
-  load/list/resume/close/fork; pi load/list/resume/close). The mechanism is capability-gated
+  list/delete/resume/close/fork; codex list/delete/resume/close/fork; opencode
+  load/list/resume/close/fork; pi load/list/resume/close/fork). The mechanism is capability-gated
   ([`capabilities.ts`](../../packages/acp-agents/src/capabilities.ts)), so a custom backend
   that omits the capability degrades through the same gate — re-issue is the honest fallback,
   surfaced guest-visibly.
