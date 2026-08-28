@@ -1,6 +1,6 @@
 # MCP TypeScript SDK v2 migration — staged path
 
-**Status:** Stage 0 released; split-SDK migration and dual-era serving implemented on `feat/mcp-dual-era` · **Updated:** 2026-08-28
+**Status:** Stage 0 and the split-SDK dual-era migration released in `@automatalabs/mcp-server@0.34.0` · **Updated:** 2026-08-28
 
 **Provenance.** Owner directives: (2026-08-07) "I don't consider us to be spec conformant if
 we're behind on the mcp sdk version. We need a path to upgrade to the latest one"; (2026-08-27)

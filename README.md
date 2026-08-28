@@ -17,7 +17,7 @@ Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipe
 - **As a TypeScript SDK** — `@automatalabs/workflows` — embed the runner in your own program.
 - **As a stdio MCP server** — `@automatalabs/mcp-server`, built on the SDK — expose `workflow` and `repl` tools to any MCP host (Claude Code, Zed, …).
 
-> The `@automatalabs/*` packages are **published on npm** (except `@automatalabs/repl-engine`, unreleased at `0.0.0` while its `repl` tool ships inside `@automatalabs/mcp-server`) — see [Install](#install). Two are user-facing: the `@automatalabs/workflows` SDK and the `@automatalabs/mcp-server` stdio server.
+> All nine `@automatalabs/*` packages are **published on npm** — see [Install](#install). Two are primary user-facing entry points: the `@automatalabs/workflows` SDK and the `@automatalabs/mcp-server` stdio server.
 
 ---
 
@@ -168,7 +168,7 @@ The five packages below are **internal building blocks**. Most are composed by t
 |---|---|
 | **`@automatalabs/acp-agents`** | The ACP client + Claude/Codex/OpenCode/pi/custom backends (the `AgentRunner` implementation, connection pooling, auth/session lifecycle, structured output, permissions, usage). Internal — public entry is `@automatalabs/workflows`. |
 | **`@automatalabs/workflow-engine`** | The deterministic engine: the script realm, `parallel`/`pipeline`, journal/resume, and worktree isolation. Internal — public entry is `@automatalabs/workflows`. |
-| **`@automatalabs/repl-engine`** | The REPL orchestrator engine: a persistent JavaScript REPL in a capability-free QuickJS-in-WASM VM (workspace lifecycle, eval + job drain, per-VM memory limits, per-eval interrupts, trap-free completion reads, the append-only call store and enveloped snapshots). Its `repl` MCP tool is registered in `mcp-server` (the roadmap's `repl-orchestrator`, phase E — implemented; the package itself is unreleased at `0.0.0`); it depends on `workflows`, `acp-agents` (subagents are ACP sessions), and `shared-types`. |
+| **`@automatalabs/repl-engine`** | The published REPL orchestrator engine: a persistent JavaScript REPL in a capability-free QuickJS-in-WASM VM (workspace lifecycle, eval + job drain, per-VM memory limits, per-eval interrupts, trap-free completion reads, the append-only call store and enveloped snapshots). Its `repl` MCP tool is registered in `mcp-server` (the roadmap's `repl-orchestrator`, phase E — implemented); it depends on `workflows`, `acp-agents` (subagents are ACP sessions), and `shared-types`. |
 | **`@automatalabs/codex-acp`** | The workspace fork of `agentclientprotocol/codex-acp` (imported with full history) — the ACP server the Codex backend spawns, baking turn-level `outputSchema` forwarding into its shipped dist. Consumed by `@automatalabs/acp-agents` as `workspace:*`; you never depend on it directly. |
 | **`@automatalabs/shared-types`** | The `AgentRunner` seam + shared types the others compose against. Internal — public entry is `@automatalabs/workflows`. |
 
