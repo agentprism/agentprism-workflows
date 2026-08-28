@@ -1,5 +1,17 @@
 # @automatalabs/mcp-server
 
+## 0.35.0
+
+### Minor Changes
+
+- 2e87092: Automatically select and persist a no-prompt readiness-based default backend for model-less MCP workflow calls when no operator default is configured. Add host-pinned `defaultModel` execution/validation support and a probe-free mock routing-discovery option.
+
+### Patch Changes
+
+- Updated dependencies [2e87092]
+  - @automatalabs/workflows@0.55.0
+  - @automatalabs/repl-engine@0.4.8
+
 ## 0.34.1
 
 ### Patch Changes
