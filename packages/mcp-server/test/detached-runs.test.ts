@@ -104,13 +104,22 @@ test("background acceptance is immediate and await reports immediate, timeout, c
       scriptSource: "inline",
       scriptUri: `workflow://runs/${acceptedRunId}/script`,
       limits: EXPECTED_LIMITS,
+      pendingPermissions: [],
+      interaction: {
+        permissionRequests: "may-block",
+        collectWith: ["await", "inspect"],
+        respondWith: "permissions-response",
+        elicitation: "unavailable",
+      },
     });
     assert.equal(
       textOf(accepted),
       `Workflow "detached-review" started in the background.\n` +
         `runId: ${acceptedRunId}\n` +
         `Call workflow with action="await" and this runId to wait for its result, or ` +
-        `action="inspect" for an immediate status snapshot. If a live run-monitor panel ` +
+        `action="inspect" for an immediate status snapshot. Either action returns early when an ACP ` +
+        `permission needs a response; use the elicitation shown by capable clients or ` +
+        `action="permissions-response" with an exact advertised option. If a live run-monitor panel ` +
         `is shown for this run, it self-updates and reports phase starts, pauses, and terminal outcomes — ` +
         `do not poll inspect for status.`,
     );

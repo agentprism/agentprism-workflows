@@ -235,7 +235,7 @@ test("validate probes each distinct routed backend/model pair and surfaces catal
     assert.equal(report.dryRun?.agentCalls[0].configOptions, undefined);
     const human = formatValidateReport(report);
     assert.match(human, /advertised modes and config options:/);
-    assert.match(human, /reasoning_effort \| select \| "medium" \| "low", "high"/);
+    assert.match(human, /reasoning_effort \| Reasoning effort \| select \| "medium" \| "low", "high"/);
     assert.match(JSON.stringify(report), /reasoning_effort/);
   } finally {
     restore();
@@ -292,7 +292,47 @@ test("session mode validation accepts only an explicitly advertised exact id", a
 
   assert.equal(report.ok, true);
   assert.deepEqual(report.dryRun?.harnessOptions?.[0]?.modes?.availableModes.map((mode) => mode.id), ["default", "plan"]);
-  assert.match(formatValidateReport(report), /modes: current "default" \| advertised "default", "plan"/);
+  assert.match(formatValidateReport(report), /modes: current "default" \| AgentPrism default \(harness current\)/);
+  assert.match(formatValidateReport(report), /"plan" \| Plan/);
+});
+
+test("an omitted mode validates the AgentPrism built-in default against the live catalog", async () => {
+  const script = 'export const meta = { name: "default-mode", description: "d" }; return agent("x", { label: "worker", model: "claude/opus" });';
+  const accepted = await validateWorkflowScript(script, {
+    probeRunner: {
+      async probeConfigOptions() {
+        return {
+          backendId: "claude",
+          defaultModeId: "auto",
+          options: [],
+          modes: {
+            currentModeId: "acceptEdits",
+            availableModes: [{ id: "auto", name: "Auto", description: "Use a model classifier" }],
+          },
+        };
+      },
+    },
+  });
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.dryRun?.harnessOptions?.[0]?.defaultModeId, "auto");
+
+  const rejected = await validateWorkflowScript(script, {
+    probeRunner: {
+      async probeConfigOptions() {
+        return {
+          backendId: "claude",
+          defaultModeId: "auto",
+          options: [],
+          modes: {
+            currentModeId: "acceptEdits",
+            availableModes: [{ id: "acceptEdits", name: "Accept Edits" }],
+          },
+        };
+      },
+    },
+  });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.dryRun?.reason ?? "", /mode AgentPrism default "auto" is not advertised/);
 });
 
 test("config-option error classes make validation INVALID with labels, values, and alternatives", async () => {

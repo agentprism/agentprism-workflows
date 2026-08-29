@@ -10,7 +10,7 @@ Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 | `@automatalabs/workflow-engine` | The deterministic script engine + `WorkflowManager` (no agent construction — the runner is injected) | You bring your own `AgentRunner` and don't want ACP deps |
 | `@automatalabs/acp-agents` | The ACP runner: pooled Claude/Codex/OpenCode/pi ACP processes, model routing, structured output, events, interactive sessions | You want agent execution without the workflow engine |
 | `@automatalabs/shared-types` | The seam contracts: `AgentRunner`, `RunOptions`, `WorkflowError` (+ codes), workflow result/meta types | You implement a custom runner or need `instanceof WorkflowError` across packages |
-| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, bounded await, resume, inspect, stop) and the `repl` tool (a persistent per-project JavaScript REPL for live subagent orchestration) | You drive workflows from Claude Code / an MCP client |
+| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, bounded await, resume, inspect, live permission response, stop) and the `repl` tool (a persistent per-project JavaScript REPL for live subagent orchestration) | You drive workflows from Claude Code / an MCP client |
 | `@automatalabs/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` traces and metrics | Your host owns an OTel SDK and wants run/agent/tool observability |
 | `@automatalabs/pi-acp` | Standalone in-process pi coding-agent ACP server (bin `pi-acp`) with a side-effect-free library entry | You use the first-class `pi` backend or embed the ACP server directly |
 | `@automatalabs/codex-acp` | Fork of `@agentclientprotocol/codex-acp` adding turn-level `outputSchema` forwarding | Installed automatically by `acp-agents`; only pin it directly to override the version |
@@ -1085,7 +1085,7 @@ const runner = createAcpRunner({
 
 One agent call per invocation; returns the assistant text, or the **validated object** when `schema` is set (native/tool-captured structured output + validate-and-re-prompt). Key `RunOptions`:
 
-`label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `configOptions`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), `keepSession` (skip the release-time best-effort `session/close` so the agent-persisted session stays re-openable), resume-only `continueFromSession` (advisory exact-session reattach), callbacks `onUsage`, `onHistory`, `onActivity` (one real backend progress event), `onResultProvenance`, `onModelResolved`, `onModelFallback`, `onSessionOpen`.
+`label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `configOptions`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), `keepSession` (skip the release-time best-effort `session/close` so the agent-persisted session stays re-openable), resume-only `continueFromSession` (advisory exact-session reattach), callbacks `onUsage`, `onHistory`, `onActivity` (one real backend progress event), `onInteractionStateChange` (live permission wait/resume), `onResultProvenance`, `onModelResolved`, `onModelFallback`, `onSessionOpen`.
 
 **Session hand-off.** `run()`'s return value is always the bare result, so the ACP session identity travels out-of-band: `onSessionOpen` fires exactly once for whichever acquisition wins — fresh `session/new`, successful `session/resume`/`session/load`, or the fresh fallback after a reopen failure — and always before that acquisition's prompt. Its `AgentSessionRef` is `{ sessionId, backendId, poolKey?, initializeMeta?, cwd, reopen: { load, resume, list, fork } }`; `poolKey` pins the effective custom-backend spawn identity. `initializeMeta`, when the initialize response supplies non-null `_meta`, is one complete recursively frozen JSON snapshot owned by the session and shared with its event contexts; absent/null metadata omits the key. Pair a successful call with `keepSession: true` when the host intends to reopen it. Usage/auth pause errors keep the session open automatically for managed continuation. With `continueFromSession`, the runner prefers currently advertised resume, falls back to load, and reports reattached/skipped provenance. Every non-cancellation failure through the reopen RPC cleans up and opens a fresh session with the original prompt; after reopen succeeds, the turn is committed and receives a fixed continuation instruction. The ref contains no secrets added by the client and is JSON-round-trippable; agents remain responsible for what they place in `_meta`.
 
@@ -1114,11 +1114,11 @@ routes normally, opens exactly one no-prompt session, optionally applies the rou
 when `selectModel:true`, uses any approved run-scoped `backends` only for that probe, returns `{ backendId, options }` with the verbatim echoed
 `SessionConfigOption[]`, and closes it; spawn/auth/model-selection/session failures throw.
 
-**Session modes (confinement)**: `mode` is an agent-advertised ACP session mode id. Never invent a generic `"default"`: discover the exact backend/model first and use a value only when its `modes.availableModes` lists that id; `modes:null` means omit `mode`. Catalogs vary by backend, model, login, and installed version, so no static example id is authoritative. ACP agents may expose dedicated modes or a select config option with `category:"mode"` / `id:"mode"`; discovery normalizes both into the same effective catalog. This is strict: if the backend advertises neither `modes` nor a mode config-option catalog, does not list the requested id, or rejects the wire call, the run fails before any prompt is sent. When `modes` is present, the runner validates it and calls `session/set_mode`; when `modes` is absent but a mode config option is present, it validates against that option and applies `session/set_config_option`.
+**Session modes**: `mode` is an exact agent-advertised ACP session mode id. Discovery preserves each mode's raw `id`, `name`, `description`, and `_meta`; it never replaces backend prose with a local interpretation. When `mode` is omitted, AgentPrism explicitly applies the first-class default instead of inheriting ambient harness configuration: Claude `auto`, Codex `agent`, OpenCode `build`, and no Pi mode. Custom backends retain their own current mode. Authored and built-in defaults are strict: the selected backend/model must advertise the exact id before prompt. Dedicated modes use `session/set_mode`; the normalized `category:"mode"` config-option fallback uses `session/set_config_option`.
 
-Permission posture changes when `mode` is explicit: if no `onPermissionRequest` resolver is present, the headless permission fallback flips from allow to deny. Explicit `toolNames` allow-list matches still allow; `disallowedToolNames` still deny; a resolver still decides. This prevents read-only/plan modes from being defeated by automatic escalation approval. Plan/read-only modes confine writes and escalation, not reads.
+A mode no longer creates a generic client-side deny overlay. Explicit tool allow/deny lists remain binding; otherwise a configured `PermissionResolver` decides. SDK runners without a resolver retain the ACP-permitted autonomous auto-response path.
 
-**Tool-approval persistence (`_meta.persist`).** A permission *allow* may ask a capable agent to remember the approval for the session or permanently. The auto-responder honors `ToolPolicy.persist` (`"session" | "always"`); a resolver can drive the same at a higher altitude with `resolvePermission(request, { outcome: "allow" | "deny", persist? })` — a `PermissionResolution` mapper — or stamp an existing response with `withPersist(response, persist)`. Either way the directive is echoed as `_meta.persist` on the `RequestPermission` response only on allow (a denial persists nothing); Codex reads it (`allow_session`/`allow_always`), and an agent without the capability ignores the extra `_meta`.
+**Exact permission options.** `session/request_permission` options are ordered and opaque. The selected `optionId` is authoritative; labels, `kind`, and `_meta.permission` are presentation only. `selectPermissionOption(request, optionId)` validates exact membership and fails closed as cancelled. The deprecated `PermissionPersist` / `PermissionResolution.persist` / `ToolPolicy.persist` / `resolvePermission` / `withPersist` compatibility surface could not distinguish session approval, permanent approval, command/network amendments, strict turn review, decline, and cancel when several choices share the same `kind`.
 
 ### Elicitation (agent questions)
 
@@ -1395,6 +1395,15 @@ interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
   waitMs?: number; // default 20_000; integer 0..25_000
 }
 
+interface WorkflowPermissionResponseToolInput {
+  action: "permissions-response";
+  runId: string;
+  permissionId: string;
+  response:
+    | { outcome: { outcome: "selected"; optionId: string }; _meta?: Record<string, unknown> | null }
+    | { outcome: { outcome: "cancelled" }; _meta?: Record<string, unknown> | null };
+}
+
 interface WorkflowExecutionToolResult<T = unknown> {
   runId: string;
   status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -1412,14 +1421,12 @@ interface WorkflowExecutionToolResult<T = unknown> {
 }
 ```
 
-`action:"config"` reuses the server's runner to open bounded no-prompt sessions and returns live model/mode/config catalogs without creating a manager run. Every execution request is statically parsed, mock-executed, and probed before run admission; an invalid preflight returns `{ action:"run", status:"rejected", validation }` with no run ID, persistence record, background reservation, or live `AgentRunner.run()` call.
+`action:"config"` reuses the server's runner to open bounded no-prompt sessions and returns live model/mode/config catalogs without creating a manager run. Mode names, descriptions, and `_meta` are preserved verbatim in structured and human-readable output, alongside `defaultModeId` (`auto` / `agent` / `build` for the three mode-capable first-class backends). Every execution request is statically parsed, mock-executed, and probed before run admission; an invalid preflight returns `{ action:"run", status:"rejected", validation }` with no run ID, persistence record, background reservation, or live `AgentRunner.run()` call.
 
 Mixed/missing branches, invalid run IDs, invalid inspection bounds, and `waitMs` outside 0–25,000
 are MCP Invalid Params (`-32602`). Omitted action/background preserves foreground execution byte for
-byte: it streams progress, honors request cancellation and live checkpoint elicitation, and returns
-`WorkflowExecutionToolResult<T>`. `action:"inspect"` remains immediate and returns exactly the safe
-`WorkflowRunStatus`; it never parses a script, invokes a runner, approves a backend, elicits, reports
-progress, or acquires a lease.
+byte for executions that do not block on an ACP permission: it streams progress, honors request cancellation and live checkpoint elicitation, and returns
+`WorkflowExecutionToolResult<T>`. If a permission blocks first, foreground returns a running admission with `pendingPermissions` and the run stays live. `action:"inspect"` remains immediate for lifecycle state; when a permission is pending it also projects that request and may elicit one exact option from a capable client.
 
 After preflight succeeds, `background:true` reserves one of four process-local active-or-starting slots, performs lease acquisition and the durable initial save, then returns:
 
@@ -1429,6 +1436,13 @@ interface WorkflowBackgroundAccepted {
   status: "running";
   limits: WorkflowRunLimits;
   replayEligibility?: WorkflowReplayEligibility;
+  pendingPermissions?: WorkflowPendingPermission[];
+  interaction: {
+    permissionRequests: "may-block";
+    collectWith: ("await" | "inspect")[];
+    respondWith: "permissions-response";
+    elicitation: "available" | "unavailable";
+  };
 }
 ```
 
@@ -1448,15 +1462,28 @@ persisted records that predate limit storage may omit it. Failed call rows inclu
 `timeoutMs`, `idleTimeoutMs`, and `errorCode`, so an exhausted attempt is directly inspectable as `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`.
 
 ```ts
+interface WorkflowPendingPermission {
+  version: 1;
+  permissionId: string;
+  runId: string;
+  callIndex: number;
+  backendId: string;
+  label?: string;
+  requestedAt: string;
+  request: RequestPermissionRequest; // exact ordered options; oversized tool diagnostics may be omitted
+  requestTruncated: boolean;
+}
+
 interface WorkflowAwaitMetadata {
   requestedMs: number;
   elapsedMs: number;
-  returnedBecause: "terminal" | "timeout" | "immediate";
+  returnedBecause: "terminal" | "timeout" | "immediate" | "action-required" | "permission-resolved";
 }
 
 interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowAwaitMetadata;
   tokenUsage?: TokenUsage;
+  pendingPermissions?: WorkflowPendingPermission[];
   outcome?: WorkflowExecutionToolResult<T>; // present exactly at terminal status
 }
 
@@ -1481,7 +1508,11 @@ interface WorkflowStopPendingResult extends WorkflowRunStatus {
 ```
 
 Await returns immediately for terminal runs, is a non-blocking read at `waitMs:0`, and otherwise
-waits only for terminal lifecycle state for at most the requested duration. For new-format runs it
+waits for terminal lifecycle state **or a live ACP permission** for at most the requested duration.
+A permission returns `action-required` before the bound. Elicitation-capable clients receive the
+backend's exact options; accepting maps to the selected option id, while decline/cancel maps to ACP
+cancelled. Without elicitation, inspect/await return the request for a later `permissions-response`
+call. Selected ids are validated against the still-pending request and each permission settles once. For new-format runs it
 tails the generation-pinned event sidecar. When the **await request** carries a progress token, the
 server emits the existing coarse notification shape after each phase, distinct agent start, and
 first terminal agent end for `(scope, callIndex)`: `progress` is the number of distinct ended calls,
@@ -1490,7 +1521,11 @@ first terminal agent end for `(scope, callIndex)`: `progress` is the number of d
 the snapshot watermark, so a late await neither scans the unbounded history for progress state nor
 double-counts the known prefix.
 
-The local settlement promise may still win the terminal race without disabling tail progress. For
+The local settlement promise may still win the terminal race without disabling tail progress. A live
+permission wait suspends `agentIdleTimeoutMs` but not total `agentTimeoutMs`; the agent call retains
+its concurrency slot and ACP session. Permission inspection/response follows the lease owner over the
+signed daemon control plane. It is not a durable engine pause: owner loss invalidates the original
+ACP request and no successor reconstructs it cold. For
 legacy, incomplete, corrupt, mismatched, or otherwise unsafe event logs, await explicitly falls back
 to 250-ms `inspectRun()` terminal polling and emits no progress notifications even if that await has
 a token. Await cancellation closes its watcher/poller, ends only that request, and returns
@@ -1511,7 +1546,7 @@ Runs execute in the shared per-user workflow daemon (the default stdio entry is 
 The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
 feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 
-Inspect returns exactly `WorkflowRunStatus`. Its JSON structured content is capped at 24,576 bytes
+Inspect returns `WorkflowRunStatus` plus live `pendingPermissions` and interaction guidance when applicable. Its JSON structured content is capped at 24,576 bytes
 and its formatted text at 8,192 bytes. An existing failed or aborted run is still a successful read.
 An unknown/corrupt/unreadable run is `isError:true`, has no structured content, and returns exactly
 `No workflow run found for runId "<runId>" in this server's project-scoped run store.` Execution keeps current error semantics: failed/aborted are tool errors, paused is a successful resumable call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped at 12,288 bytes; rejected preflight scripts instead carry bounded structured validation diagnostics and have no run ID or tail.

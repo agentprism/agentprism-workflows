@@ -185,10 +185,10 @@ test("quotes below the minimum normalized length block", () => {
   }
 });
 
-test("inspect/await/stop actions pass through ungated; missing transcript fails closed", () => {
+test("inspect/await/permissions-response/stop actions pass through ungated; missing transcript fails closed", () => {
   const { dir, current } = makeFixture();
   try {
-    for (const action of ["inspect", "await", "stop"]) {
+    for (const action of ["inspect", "await", "permissions-response", "stop"]) {
       const res = runGate(current, { action, runId: "ab-cd" });
       assert.equal(res.status, 0, `${action} was gated:\n${res.out}`);
     }

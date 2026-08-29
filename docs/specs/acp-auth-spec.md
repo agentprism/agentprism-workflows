@@ -1127,7 +1127,7 @@ client; `C→A` = client sends to / gates agent.
 | Codex | `session _meta.{baseInstructions,developerInstructions}` (`:25685-25706`) | **Supported today** — `backend.ts:34-39` `SessionMetaInputs`; gated `capabilities.ts:47-48` |
 | Codex | `session _meta["additionalRoots"]` legacy (`:25678-25683`) | **Supported today** — first-class `additionalDirectories` sent; `additionalRoots` reachable via generic `sessionRequestMeta` passthrough (`acp-client.ts:1267`) |
 | Codex | `clientCapabilities._meta["terminal_output"]` (read `:22387`) + `session/update _meta.{terminal_output,terminal_output_delta,terminal_exit}` (emit `:22385-22408,23500-23508`) | **Supported today** — terminal handlers route the lifecycle; the `terminal_output` client gate is **deliberately not advertised** (code-block fallback, Principle 3 — stated with rationale, not silent) |
-| Codex | tool-approval `_meta.persist` (`:23952-23975`) | **Supported today** — `persist?` is part of the permission outcome (signature below) |
+| Codex | request/option `_meta.permission` presentation (`permission-extension.md`) | **Supported today** — preserved for hosts to render; exact advertised `optionId` selection is the decision contract |
 | Codex | `clientCapabilities.session.configOptions.boolean` (read `:27235`) | **Supported today** — `client-handlers.ts:124` |
 | Claude | `session/new _meta.claudeCode.options.{outputFormat,tools,env,mcpServers,hooks,…}`, `systemPrompt`, `disableBuiltInTools`, `additionalRoots` (`dist/acp-agent.js:2752-2928`) | **Supported today** — `backends/claude.ts:43-51` (outputFormat) + generic `opts.meta` passthrough `sessionRequestMeta` (`acp-client.ts:1267`) |
 | Claude | `agentCapabilities._meta.claudeCode.promptQueueing` (`:413-417`) | **Supported today** — captured in `NegotiatedCapabilities` (`capabilities.ts`); observational documented no-op (we do not queue) |
@@ -1137,21 +1137,18 @@ client; `C→A` = client sends to / gates agent.
 | OpenCode | `PromptResponse._meta` (`service.ts:825,832`) | **Supported today** — always emitted `{}`; ignored (no payload) |
 | OpenCode | `session/update` notifications carry no opencode `_meta` (`event.ts`) | **Supported today** — nothing to consume; verified absent |
 
-**Permission `_meta.persist` — concrete signature.** The tool-approval persist echo (Codex `dist/index.js:23952-23975`) is implemented by the widened permission-resolver outcome in `packages/acp-agents/src/runner.ts` (the `onPermissionRequest` runner-options pattern at `runner.ts:204-207`) and threaded through to the request-permission response `_meta`:
+**Permission presentation and selection.** Codex's `_meta.permission` is display-only. Command,
+file, additional-sandbox, and MCP requests may advertise several choices with the same ACP `kind`
+but different provider effects. The host must preserve option order and return one exact advertised
+`optionId`; it never reconstructs a scope or provider decision from labels, kind, or response
+metadata. `selectPermissionOption(request, optionId)` is the fail-closed helper. The former
+`PermissionResolution.persist` / `ToolPolicy.persist` / `withPersist` response echo was superseded
+because current Codex decisions encode session/permanent/amendment behavior in distinct option ids.
 
-```ts
-// packages/acp-agents/src/runner.ts — permission outcome widened (echoed to _meta.persist)
-export interface PermissionResolution {
-  outcome: "allow" | "deny";
-  /** Codex tool-approval persistence (dist/index.js:23952). Echoed as _meta.persist on the
-   *  RequestPermission response; agents without the capability ignore it. */
-  persist?: "session" | "always";
-}
-```
-
-This is verified by a dedicated test (§4.6) and completes the `_meta` inventory with **no silent unsupported surface** (Principle 3).
-
-**Implemented files in this section:** `packages/acp-agents/src/auth/auth-profiles.ts` (`AuthProfile`, `TerminalLaunch`, `claudeAuthProfile`, `codexAuthProfile`, `opencodeAuthProfile`), `packages/acp-agents/src/backend.ts` (`Backend.authProfile`), `packages/acp-agents/src/backends/{claude,codex,opencode}.ts` (wiring; `custom.ts` unchanged), `packages/acp-agents/src/runner.ts` (`PermissionResolution.persist`), `packages/acp-agents/src/protocol-coverage.ts` (matrix drift-tripwire assertions), and `packages/acp-agents/test/fixtures/fake-auth-agent.mjs` (conformance fixture).
+**Implemented files in this section:** `packages/acp-agents/src/auth/auth-profiles.ts`,
+`packages/acp-agents/src/backend.ts`, the built-in backend definitions,
+`packages/acp-agents/src/permissions.ts`, `packages/acp-agents/src/protocol-coverage.ts`, and the
+auth/permission conformance fixtures.
 
 ---
 
@@ -1478,6 +1475,6 @@ The implementation was delivered as seven PR-sized stages, error-taxonomy-first,
 | **PR4** | Engine pause-for-auth + cold-resume re-arm (§2.12, §2.13) | `packages/workflow-engine/src/workflow-manager.ts`, `run-persistence.ts`, `packages/shared-types/src/{errors,workflow-result}.ts` (`reason` widen + `authContext`), `auth-pause.test.ts`, `run-persistence.test.ts` | Generalizes the existing `PROVIDER_USAGE_LIMIT` pause branch (`workflow-manager.ts:620-649,675-699`); `PersistedRunState.pauseReason` is already free-form (`run-persistence.ts:43`) so no migration. |
 | **PR5** *(designed, not shipped — §4.3)* | MCP server auth tools (§4.3) | `packages/mcp-server/src/server.ts`, new `auth-tool-io.ts`, new `auth-resolver.ts`, `packages/workflows/src/index.ts` (the §4.2 type re-exports — see the §4.2 sequencing note), `packages/mcp-server/test/auth-tools.test.ts` | Two additive tools + summary branch were designed here, but the shipped server registers **no** auth tools (only `workflow` and `repl`); the SDK type re-exports of §4.2 did land. See the current-state correction at the top. |
 | **PR6** | SDK exports (§4.2) | `packages/workflows/src/index.ts` | Re-exported the `isAuthRequired` value through the facade after the type re-exports described in §4.2; no new behavior. |
-| **PR7** | Per-agent profiles + codex spawn channel + `_meta` matrix tripwire + `permission _meta.persist` (§3, §2.8, §3.6) | new `packages/acp-agents/src/auth/auth-profiles.ts`, `backend.ts` (`authProfile?`), the three built-in backends, `codexAuthProfile.spawnAuthEnv` (`DEFAULT_AUTH_REQUEST`), `protocol-coverage.ts`/`docs-drift.test.ts` (`_meta`-matrix assertions), `permissions.ts` (`PermissionResolver.persist?`), `auth.live.e2e.test.ts` | Profiles are pure data layered on the PR3 base; codex `DEFAULT_AUTH_REQUEST` is an existing spawn-time agent surface consumed client-side (Principle 6 lever note, §3.3) on top of the universal replay (never required for correctness); per-agent live-e2e lands here. |
+| **PR7** | Per-agent profiles + codex spawn channel + `_meta` matrix tripwire + historical permission persist echo (§3, §2.8, §3.6) | auth profiles, built-in wiring, protocol coverage, permissions, auth live e2e | Historical implementation step. Its response `_meta.persist` helper was later superseded by exact advertised option selection; the current contract is §3.6 above. |
 
 The **web app + local runner** bindings (§4.5) consume the PR3 seam in their own repositories and require no change to `packages/acp-agents`.

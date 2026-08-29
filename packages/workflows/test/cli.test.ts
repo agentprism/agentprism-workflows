@@ -37,7 +37,13 @@ function runCli(args: string[]) {
       AGENTPRISM_CODEX_ACP_ARGS: FAKE_AGENT,
       AGENTPRISM_OPENCODE_ACP_CMD: process.execPath,
       AGENTPRISM_OPENCODE_ACP_ARGS: FAKE_AGENT,
-      AGENTPRISM_FAKE_SCENARIO: JSON.stringify({ configOptions: [] }),
+      AGENTPRISM_FAKE_SCENARIO: JSON.stringify({
+        configOptions: [],
+        modes: {
+          currentModeId: "acceptEdits",
+          availableModes: [{ id: "auto", name: "Auto", description: "Use a model classifier" }],
+        },
+      }),
     },
   });
 }
@@ -93,15 +99,23 @@ test("human and --json reports both surface the freshly probed harness catalog",
   const json = runCli([SIMPLE, "--json"]);
   assert.equal(json.status, 0, json.stderr);
   const report = JSON.parse(json.stdout);
-  assert.deepEqual(report.dryRun.harnessOptions, [
-    { backendId: "claude", probed: true, modes: null, options: [] },
-  ]);
+  assert.deepEqual(report.dryRun.harnessOptions, [{
+    backendId: "claude",
+    defaultModeId: "auto",
+    probed: true,
+    modes: {
+      currentModeId: "acceptEdits",
+      availableModes: [{ id: "auto", name: "Auto", description: "Use a model classifier" }],
+    },
+    options: [],
+  }]);
 
   const human = runCli([SIMPLE]);
   assert.equal(human.status, 0, human.stderr);
   assert.match(human.stdout, /advertised modes and config options:/);
   assert.match(human.stdout, /claude:/);
-  assert.match(human.stdout, /\(none advertised\)/);
+  assert.match(human.stdout, /AgentPrism default "auto"/);
+  assert.match(human.stdout, /"auto" \| Auto \| Use a model classifier/);
 });
 
 test("--mock-answers-file reads a two-round sequence and human output uses one-based indexes", () => {

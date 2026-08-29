@@ -6,8 +6,6 @@ import { AcpAgentRunner } from "../src/index.js";
 import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
 const ALLOW: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "allow-1" } };
-const REJECT: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "reject-1" } };
-
 const MODES: SessionModeState = {
   currentModeId: "default",
   availableModes: [
@@ -76,6 +74,7 @@ test("probeConfigOptions returns the dedicated ACP mode catalog without promptin
   const probed = await makeRunner().probeConfigOptions("claude", { cwd });
 
   assert.deepEqual(probed.modes, MODES);
+  assert.equal(probed.defaultModeId, "auto");
   assert.equal(readLog().some((entry) => entry.method === "prompt"), false);
 });
 
@@ -216,14 +215,31 @@ test("current_mode_update updates the exposed mode state", async () => {
   await session.release();
 });
 
-test("explicit mode without a resolver flips unmatched permission fallback to deny", async () => {
+test("an omitted Claude mode explicitly applies AgentPrism's auto default", async () => {
+  const advertised: SessionModeState = {
+    currentModeId: "acceptEdits",
+    availableModes: [
+      { id: "auto", name: "Auto", description: "Use a model classifier" },
+      { id: "acceptEdits", name: "Accept Edits" },
+    ],
+  };
+  const { cwd, readLog } = configure({ modes: advertised, turns: [{ text: "done" }] });
+  const runner = makeRunner();
+  assert.equal(await runner.run("do it", { model: "claude", cwd }), "done");
+  const wire = readLog().filter((entry) => entry.method === "setSessionMode" || entry.method === "prompt");
+  assert.equal(wire[0]?.method, "setSessionMode");
+  assert.equal(wire[0]?.params?.modeId, "auto");
+  assert.equal(wire[1]?.method, "prompt");
+});
+
+test("an explicit harness mode does not invent a client-side deny policy", async () => {
   const withMode = configure({
     modes: MODES,
     turns: [{ toolCall: { title: "Run shell", kind: "execute" }, text: "done" }],
   });
   const runner = makeRunner();
   assert.equal(await runner.run("do it", { model: "claude", cwd: withMode.cwd, mode: "read-only" }), "done");
-  assert.deepEqual(permissionOutcome(withMode.readLog()), REJECT.outcome);
+  assert.deepEqual(permissionOutcome(withMode.readLog()), ALLOW.outcome);
 
   await harness.cleanup();
 

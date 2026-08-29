@@ -5,10 +5,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { PermissionOption, RequestPermissionRequest, ToolKind } from "@agentclientprotocol/sdk";
 import {
+  decideExplicitToolPolicy,
   decidePermission,
-  resolvePermission,
-  withPersist,
-  type PermissionResolution,
+  selectPermissionOption,
   type ToolPolicy,
 } from "../src/index.js";
 
@@ -149,72 +148,84 @@ test("the authoritative _meta.toolName drives the EXACT match over the human tit
   );
 });
 
-// ---- tool-approval `_meta.persist` echo (§3.6/PR7) --------------------------------------------
-// Codex reads a persistence directive to remember an approval (dist/index.js:23952-23975). Both the
-// headless auto-responder (ToolPolicy.persist) and the high-level `resolvePermission` echo it as
-// `_meta.persist` on the RequestPermission response; an agent without the capability ignores it.
+// ---- explicit policy + exact option selection -----------------------------------------------
 
-function persistOf(r: ReturnType<typeof decidePermission>): unknown {
-  return (r as { _meta?: Record<string, unknown> })._meta?.persist;
-}
-
-test("decidePermission echoes ToolPolicy.persist as _meta.persist ONLY when it allows", () => {
-  // Allowed -> persist echoed.
-  const allowed = decidePermission(req({ title: "Read file" }), { persist: "session" });
-  assert.equal(selectedId(allowed), "allow-1");
-  assert.equal(persistOf(allowed), "session");
-
-  // Denied -> no persist echo (a denial remembers nothing).
-  const denied = decidePermission(req({ title: "Run bash" }), { deny: ["bash"], persist: "always" });
-  assert.equal(selectedId(denied), "reject-1");
-  assert.equal(persistOf(denied), undefined);
-
-  // No persist directive -> no `_meta` at all (unchanged default shape).
-  const plain = decidePermission(req({ title: "Read file" }), {});
-  assert.equal((plain as { _meta?: unknown })._meta, undefined);
+test("deny-only policy leaves unrelated requests unresolved for a live resolver", () => {
+  assert.equal(decideExplicitToolPolicy(req({ title: "Read file" }), { deny: ["bash"] }), undefined);
+  assert.equal(decideExplicitToolPolicy(req({ title: "Run bash" }), { deny: ["bash"] }), "deny");
 });
 
-test("decidePermission persist echo rides through the allow_always fallback option too", () => {
-  const r = decidePermission(req({ title: "x" }, [ALLOW_ALWAYS, REJECT_ONCE]), { persist: "always" });
-  assert.equal(selectedId(r), "allow-2");
-  assert.equal(persistOf(r), "always");
+test("a non-empty allow-list authoritatively allows matches and denies nonmatches", () => {
+  assert.equal(decideExplicitToolPolicy(req({ title: "Read file" }), { allow: ["read"] }), "allow");
+  assert.equal(decideExplicitToolPolicy(req({ title: "Run bash" }), { allow: ["read"] }), "deny");
 });
 
-test("resolvePermission maps {outcome,persist} onto a concrete ACP response", () => {
-  const allow: PermissionResolution = { outcome: "allow", persist: "always" };
-  const rAllow = resolvePermission(req({ title: "x" }), allow);
-  assert.equal(selectedId(rAllow), "allow-1");
-  assert.equal(persistOf(rAllow), "always");
-
-  // Deny picks a reject option and never persists.
-  const rDeny = resolvePermission(req({ title: "x" }), { outcome: "deny", persist: "session" });
-  assert.equal(selectedId(rDeny), "reject-1");
-  assert.equal(persistOf(rDeny), undefined);
-
-  // Allow with no persist -> no `_meta`.
-  const rBare = resolvePermission(req({ title: "x" }), { outcome: "allow" });
-  assert.equal((rBare as { _meta?: unknown })._meta, undefined);
+test("selectPermissionOption returns only an exact advertised optionId", () => {
+  const request = req({ title: "x" }, [ALLOW_ONCE, ALLOW_ALWAYS, REJECT_ONCE]);
+  assert.deepEqual(selectPermissionOption(request, "allow-2"), {
+    outcome: { outcome: "selected", optionId: "allow-2" },
+  });
+  assert.deepEqual(selectPermissionOption(request, "stale-option"), {
+    outcome: { outcome: "cancelled" },
+  });
 });
 
-test("resolvePermission cancels when the agent offers no option of the requested polarity", () => {
-  // Wants to deny but only allow options exist -> cancelled (matches the auto-responder contract).
-  const r = resolvePermission(req({ title: "x" }, [ALLOW_ONCE, ALLOW_ALWAYS]), { outcome: "deny" });
-  assert.deepEqual(r.outcome, { outcome: "cancelled" });
+test("exact selection distinguishes options with the same presentation kind", () => {
+  const decline = { optionId: "decline", name: "Continue without it", kind: "reject_once" } as const;
+  const cancel = { optionId: "cancel", name: "Stop this action", kind: "reject_once" } as const;
+  const request = req({ title: "command" }, [ALLOW_ONCE, decline, cancel]);
+  assert.deepEqual(selectPermissionOption(request, "cancel"), {
+    outcome: { outcome: "selected", optionId: "cancel" },
+  });
 });
 
-test("withPersist is a pure, non-mutating echo that leaves cancelled/undirected responses untouched", () => {
-  const selected = { outcome: { outcome: "selected", optionId: "allow-1" } } as const;
-  const stamped = withPersist(selected, "session");
-  assert.equal((stamped as { _meta?: Record<string, unknown> })._meta?.persist, "session");
-  // Input is never mutated.
-  assert.equal((selected as { _meta?: unknown })._meta, undefined);
-  // No directive -> identity.
-  assert.equal(withPersist(selected, undefined), selected);
-  // Cancelled -> identity (cannot persist a refusal).
-  const cancelled = { outcome: { outcome: "cancelled" } } as const;
-  assert.equal(withPersist(cancelled, "always"), cancelled);
-  // Existing `_meta` is preserved alongside the persist key.
-  const withMeta = { outcome: { outcome: "selected", optionId: "allow-1" }, _meta: { keep: 1 } } as const;
-  const merged = withPersist(withMeta, "always") as { _meta: Record<string, unknown> };
-  assert.deepEqual(merged._meta, { keep: 1, persist: "always" });
+test("Codex command, file, additional-permission, and MCP matrices retain exact choices", () => {
+  const fixtures = [
+    {
+      name: "command amendment",
+      options: [
+        { optionId: "allow_once", name: "Proceed", kind: "allow_once" as const },
+        { optionId: "allow_for_session", name: "Session", kind: "allow_always" as const },
+        { optionId: "accept_execpolicy_amendment", name: "Install prefix", kind: "allow_always" as const },
+        { optionId: "cancel", name: "Cancel", kind: "reject_once" as const },
+      ],
+      selected: "accept_execpolicy_amendment",
+    },
+    {
+      name: "file session",
+      options: [
+        { optionId: "allow_once", name: "Proceed", kind: "allow_once" as const },
+        { optionId: "allow_for_session", name: "Remember files", kind: "allow_always" as const },
+        { optionId: "cancel", name: "Cancel", kind: "reject_once" as const },
+      ],
+      selected: "allow_for_session",
+    },
+    {
+      name: "additional permission strict review",
+      options: [
+        { optionId: "allow_permissions_turn", name: "Grant turn", kind: "allow_once" as const },
+        { optionId: "allow_permissions_turn_strict_auto_review", name: "Grant strict", kind: "allow_once" as const },
+        { optionId: "allow_permissions_session", name: "Grant session", kind: "allow_always" as const },
+        { optionId: "reject_permissions", name: "Reject", kind: "reject_once" as const },
+      ],
+      selected: "allow_permissions_turn_strict_auto_review",
+    },
+    {
+      name: "MCP permanent approval",
+      options: [
+        { optionId: "allow_once", name: "Allow", kind: "allow_once" as const },
+        { optionId: "allow_session", name: "Session", kind: "allow_always" as const },
+        { optionId: "allow_always", name: "Always", kind: "allow_always" as const },
+        { optionId: "cancel", name: "Cancel", kind: "reject_once" as const },
+      ],
+      selected: "allow_always",
+    },
+  ];
+  for (const fixture of fixtures) {
+    assert.deepEqual(
+      selectPermissionOption(req({ title: fixture.name }, fixture.options), fixture.selected),
+      { outcome: { outcome: "selected", optionId: fixture.selected } },
+      fixture.name,
+    );
+  }
 });

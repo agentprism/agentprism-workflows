@@ -15,6 +15,7 @@ import {
 import { DaemonRunControl } from "../../src/daemon/run-control.js";
 import { createOrReuseWholeStopIntent } from "../../src/daemon/run-control-store.js";
 import { DAEMON_NAME } from "../../src/daemon/constants.js";
+import { WorkflowPermissionBroker } from "../../src/workflow-permissions.js";
 import "../_harness.js";
 
 const SCRIPT = [
@@ -272,6 +273,81 @@ test("forceOwner terminates only the revalidated superseded owner, then cold-sto
     controlled.resolve("cleanup");
     clearDaemonInfo(successorPid);
     clearDaemonInfo(ownerPid);
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("permission inspection and response route to the predecessor that owns the live ACP request", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "agentprism-permission-route-"));
+  const controlled = controlledRunner();
+  const permissionBroker = new WorkflowPermissionBroker();
+  const ownerInstanceId = "permission-owner-instance";
+  const owner = await createDaemon({
+    runner: controlled.runner,
+    permissionBroker,
+    port: 0,
+    ownInstanceId: ownerInstanceId,
+    log: () => undefined,
+  });
+  writeDaemonInfo({
+    name: DAEMON_NAME,
+    version: "0.99.0",
+    pid: process.pid,
+    port: owner.port,
+    url: owner.url,
+    startedAt: owner.startedAt,
+    envFingerprint: envFingerprint(),
+    instanceId: ownerInstanceId,
+    controlUrl: owner.controlUrl,
+    controlProtocol: 1,
+  });
+  try {
+    const ownerManager = owner.projects.getOrCreate(cwd).manager;
+    const started = ownerManager.startInBackground(SCRIPT, undefined, { runId: "permission-route" });
+    await controlled.ready;
+    const permissionResponse = Promise.resolve(permissionBroker.resolver(
+      {
+        sessionId: "owner-session",
+        toolCall: { toolCallId: "owner-tool", title: "Run command", kind: "execute" },
+        options: [
+          { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+          { optionId: "cancel", name: "Cancel", kind: "reject_once" },
+        ],
+      },
+      { sessionId: "owner-session", backendId: "codex", runId: started.runId, callIndex: 0 },
+    ));
+
+    const successorProjects = new WorkflowProjectRegistry(controlled.runner, { leaseOwnerId: "permission-successor" });
+    const successorManager = successorProjects.getOrCreate(cwd).manager;
+    const successorControl = new DaemonRunControl({
+      projects: successorProjects,
+      ownPid: process.pid,
+      ownInstanceId: "permission-successor",
+      key: loadOrCreateRunControlKey(),
+      log: () => undefined,
+    });
+
+    const pending = await successorControl.listPermissions(successorManager, started.runId);
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0]?.request.options[0]?.optionId, "allow_once");
+    const acknowledgement = await successorControl.respondPermission(successorManager, {
+      runId: started.runId,
+      permissionId: pending[0]!.permissionId,
+      response: { outcome: { outcome: "selected", optionId: "allow_once" } },
+    });
+    assert.equal(acknowledgement.runId, started.runId);
+    assert.deepEqual(await permissionResponse, {
+      outcome: { outcome: "selected", optionId: "allow_once" },
+    });
+
+    assert.equal(ownerManager.stop(started.runId), true);
+    controlled.resolve("cleanup");
+    await started.promise.catch(() => undefined);
+  } finally {
+    controlled.resolve("cleanup");
+    permissionBroker.dispose();
+    clearDaemonInfo(process.pid);
+    await owner.close();
     rmSync(cwd, { recursive: true, force: true });
   }
 });

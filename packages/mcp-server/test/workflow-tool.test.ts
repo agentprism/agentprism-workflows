@@ -197,12 +197,15 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       "harnessOptions",
       "models",
       "control",
+      "pendingPermissions",
+      "interaction",
+      "permissionResponse",
     ]) {
       assert.ok(outProps.includes(k), `output schema exposes ${k}`);
     }
     assert.deepEqual(field(tool.outputSchema, "required"), undefined);
     const variants = field(tool.outputSchema, "oneOf") as Array<Record<string, unknown>>;
-    assert.equal(variants.length, 8);
+    assert.equal(variants.length, 9);
     assert.deepEqual(variants.map((variant) => variant.required), [
       ["action", "ok", "harnessOptions", "omittedHarnesses", "models"],
       ["action", "status", "validation"],
@@ -210,6 +213,19 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       ["runId", "status", "scriptUri", "scriptSource", "limits"],
       ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage"],
       ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage", "wait"],
+      [
+        "runId",
+        "status",
+        "scriptUri",
+        "workflowName",
+        "phases",
+        "logTail",
+        "calls",
+        "filter",
+        "truncation",
+        "lineage",
+        "permissionResponse",
+      ],
       [
         "runId",
         "status",
@@ -312,7 +328,7 @@ test("action=config discovers the live runner catalog without creating or execut
     assert.equal(agentRuns, 0, "config never calls AgentRunner.run");
     assert.equal(field(output, "runId"), undefined, "config creates no run ID");
     assert.match(textOf(result), /no workflow was started/);
-    assert.match(textOf(result), /modes: current "default" \| advertised "default", "plan"/);
+    assert.match(textOf(result), /modes: current "default" \| AgentPrism default \(harness current\)/);
 
     const selected = await client.callTool({
       name: "workflow",

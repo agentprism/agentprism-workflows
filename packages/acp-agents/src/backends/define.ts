@@ -44,6 +44,8 @@ export type ThoughtLevelDomainSemantics = "ordered" | "exact-set";
 
 export interface BuiltinBackendDefinition<Id extends string> {
   readonly id: Id;
+  /** AgentPrism-owned default mode id; undefined only for a permissionless/no-mode backend. */
+  readonly defaultModeId?: string;
   readonly thoughtLevelDomainSemantics: ThoughtLevelDomainSemantics;
   readonly authProfile: AuthProfile;
   readonly create: () => Backend & {
@@ -56,6 +58,7 @@ export interface BuiltinBackendDefinition<Id extends string> {
 
 export interface DefineBuiltinBackendOptions<Id extends string> {
   readonly id: Id;
+  readonly defaultModeId?: string;
   readonly thoughtLevelDomainSemantics: ThoughtLevelDomainSemantics;
   readonly authProfile: AuthProfile;
   readonly create: (authProfile: AuthProfile) => Backend & {
@@ -79,6 +82,7 @@ export function defineBuiltinBackend<const Id extends string>(
   const release = cloneAndFreeze(options.release);
   const definition: BuiltinBackendDefinition<Id> = {
     id: options.id,
+    ...(options.defaultModeId === undefined ? {} : { defaultModeId: options.defaultModeId }),
     thoughtLevelDomainSemantics: options.thoughtLevelDomainSemantics,
     authProfile: options.authProfile,
     release,
@@ -93,6 +97,11 @@ export function defineBuiltinBackend<const Id extends string>(
       if (backend.authProfile !== options.authProfile) {
         throw new Error(
           `Built-in backend factory for "${options.id}" did not attach its exact auth profile object`,
+        );
+      }
+      if (backend.defaultModeId !== options.defaultModeId) {
+        throw new Error(
+          `Built-in backend factory for "${options.id}" did not attach default mode ${JSON.stringify(options.defaultModeId)}`,
         );
       }
       return backend;

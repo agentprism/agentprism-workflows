@@ -32,6 +32,7 @@ export const claudeAuthProfile: AuthProfile = {
 
 export class ClaudeBackend implements Backend {
   readonly id = "claude" as const;
+  readonly defaultModeId = "auto" as const;
 
   constructor(readonly authProfile: AuthProfile = claudeAuthProfile) {}
 
@@ -98,6 +99,7 @@ export class ClaudeBackend implements Backend {
 
 export const claudeBackendDefinition = defineBuiltinBackend({
   id: "claude",
+  defaultModeId: "auto",
   thoughtLevelDomainSemantics: "ordered",
   authProfile: claudeAuthProfile,
   create: (authProfile) => new ClaudeBackend(authProfile),

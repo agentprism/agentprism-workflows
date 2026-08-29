@@ -5,6 +5,12 @@ import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import type { WorkflowProjectRegistry } from "../project-registry.js";
 import { requireDurableStoppedRun } from "../workflow-stop.js";
 import {
+  WorkflowPermissionBroker,
+  type WorkflowPendingPermission,
+  type WorkflowPermissionResponseAcknowledgement,
+} from "../workflow-permissions.js";
+import type { RequestPermissionResponse } from "@automatalabs/workflows";
+import {
   pidIsAlive,
   probeHealthz,
   readDaemonInfo,
@@ -54,15 +60,34 @@ export interface WorkflowRunControlRouter {
     manager: WorkflowManager,
     input: { runId: string; callIndex?: number; forceOwner?: boolean },
   ): Promise<RoutedRunControlResult>;
+  listPermissions(manager: WorkflowManager, runId: string): Promise<WorkflowPendingPermission[]>;
+  respondPermission(
+    manager: WorkflowManager,
+    input: { runId: string; permissionId: string; response: RequestPermissionResponse },
+  ): Promise<WorkflowPermissionResponseAcknowledgement>;
 }
 
 export type InternalRunControlRequest =
   | { operationId: string; runId: string; action: "stop" }
-  | { operationId: string; runId: string; action: "cancel-agent"; callIndex: number };
+  | { operationId: string; runId: string; action: "cancel-agent"; callIndex: number }
+  | { operationId: string; runId: string; action: "list-permissions" }
+  | {
+      operationId: string;
+      runId: string;
+      action: "respond-permission";
+      permissionId: string;
+      response: RequestPermissionResponse;
+    };
 
 export type InternalRunControlResponse =
   | { ok: true; outcome: "stopped" | "already-terminal" }
   | { ok: true; outcome: "agent-cancelled"; cancellation: WorkflowAgentCallCancellation }
+  | { ok: true; outcome: "permissions-listed"; permissions: WorkflowPendingPermission[] }
+  | {
+      ok: true;
+      outcome: "permission-responded";
+      acknowledgement: WorkflowPermissionResponseAcknowledgement;
+    }
   | { ok: false; code: "UNKNOWN_RUN" | "NOT_OWNER" | "INVALID_OPERATION" | "INTERNAL_ERROR"; message: string };
 
 interface ResolvedOwner {
@@ -77,6 +102,7 @@ export interface DaemonRunControlOptions {
   ownPid: number;
   ownInstanceId: string;
   key: Uint8Array;
+  permissionBroker?: WorkflowPermissionBroker;
   log?: (line: string) => void;
   fetch?: typeof fetch;
   kill?: (pid: number, signal: NodeJS.Signals) => void;
@@ -121,6 +147,7 @@ export class DaemonRunControl implements WorkflowRunControlRouter {
   private readonly fetchImpl: typeof fetch;
   private readonly killProcess: (pid: number, signal: NodeJS.Signals) => void;
   private readonly isPidAlive: (pid: number) => boolean;
+  private readonly permissionBroker: WorkflowPermissionBroker;
   private processingPending: Promise<void> | undefined;
 
   constructor(private readonly options: DaemonRunControlOptions) {
@@ -128,6 +155,7 @@ export class DaemonRunControl implements WorkflowRunControlRouter {
     this.fetchImpl = options.fetch ?? fetch;
     this.killProcess = options.kill ?? ((pid, signal) => process.kill(pid, signal));
     this.isPidAlive = options.isPidAlive ?? pidIsAlive;
+    this.permissionBroker = options.permissionBroker ?? new WorkflowPermissionBroker();
   }
 
   private async resolveOwner(manager: WorkflowManager, runId: string): Promise<ResolvedOwner | undefined> {
@@ -229,6 +257,24 @@ export class DaemonRunControl implements WorkflowRunControlRouter {
       return { ok: false, code: "NOT_OWNER", message: `Daemon has no live run ${request.runId}` };
     }
     try {
+      if (request.action === "list-permissions") {
+        return {
+          ok: true,
+          outcome: "permissions-listed",
+          permissions: this.permissionBroker.list(request.runId),
+        };
+      }
+      if (request.action === "respond-permission") {
+        return {
+          ok: true,
+          outcome: "permission-responded",
+          acknowledgement: this.permissionBroker.respond(
+            request.runId,
+            request.permissionId,
+            request.response,
+          ),
+        };
+      }
       const cancellation = await manager.cancelAgentCall(request.runId, request.callIndex);
       return { ok: true, outcome: "agent-cancelled", cancellation };
     } catch (error) {
@@ -296,6 +342,82 @@ export class DaemonRunControl implements WorkflowRunControlRouter {
         throw new ProtocolError(ProtocolErrorCode.InternalError, `Forced owner pid ${owner.pid} did not exit.`);
       }
     }
+  }
+
+  async listPermissions(manager: WorkflowManager, runId: string): Promise<WorkflowPendingPermission[]> {
+    if (manager.getRun(runId)) return this.permissionBroker.list(runId);
+    const owner = await this.resolveOwner(manager, runId);
+    if (!owner) return [];
+    if (!this.controlCapable(owner)) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        `${actionableOwnerMessage(runId, owner, "permission inspection")} ` +
+          "Pending permissions are live execution state and require a control-capable owner.",
+      );
+    }
+    let response: InternalRunControlResponse;
+    try {
+      response = await this.post(owner, {
+        operationId: randomUUID(),
+        runId,
+        action: "list-permissions",
+      });
+    } catch (error) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InternalError,
+        `${actionableOwnerMessage(runId, owner, "permission inspection")} ${String(error)}`,
+      );
+    }
+    if (!response.ok || response.outcome !== "permissions-listed") {
+      throw new ProtocolError(
+        response.ok || response.code === "INTERNAL_ERROR"
+          ? ProtocolErrorCode.InternalError
+          : ProtocolErrorCode.InvalidParams,
+        response.ok ? "Owner returned an invalid permission-list response." : response.message,
+      );
+    }
+    return response.permissions;
+  }
+
+  async respondPermission(
+    manager: WorkflowManager,
+    input: { runId: string; permissionId: string; response: RequestPermissionResponse },
+  ): Promise<WorkflowPermissionResponseAcknowledgement> {
+    if (manager.getRun(input.runId) && this.permissionBroker.has(input.runId, input.permissionId)) {
+      return this.permissionBroker.respond(input.runId, input.permissionId, input.response);
+    }
+    const owner = await this.resolveOwner(manager, input.runId);
+    if (!owner || !this.controlCapable(owner)) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        `${actionableOwnerMessage(input.runId, owner, "permission response")} ` +
+          "A permission response cannot be reconstructed after owner loss.",
+      );
+    }
+    let response: InternalRunControlResponse;
+    try {
+      response = await this.post(owner, {
+        operationId: randomUUID(),
+        runId: input.runId,
+        action: "respond-permission",
+        permissionId: input.permissionId,
+        response: input.response,
+      });
+    } catch (error) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InternalError,
+        `${actionableOwnerMessage(input.runId, owner, "permission response")} ${String(error)}`,
+      );
+    }
+    if (!response.ok || response.outcome !== "permission-responded") {
+      throw new ProtocolError(
+        response.ok || response.code === "INTERNAL_ERROR"
+          ? ProtocolErrorCode.InternalError
+          : ProtocolErrorCode.InvalidParams,
+        response.ok ? "Owner returned an invalid permission-response acknowledgement." : response.message,
+      );
+    }
+    return response.acknowledgement;
   }
 
   async control(

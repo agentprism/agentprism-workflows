@@ -33,6 +33,7 @@ import { createWorkflowServer, SERVER_VERSION } from "../server.js";
 import { workflowRunEventsUri } from "../workflow-resources.js";
 import { WorkflowProjectRegistry } from "../project-registry.js";
 import { ReplPresenceLedger } from "../repl-presence.js";
+import { WorkflowPermissionBroker } from "../workflow-permissions.js";
 import { DAEMON_NAME, HEALTHZ_PATH, MCP_ENDPOINT_PATH, REPL_DRAIN_BOUND_MS } from "./constants.js";
 import { envFingerprint, isSupersededBy } from "./daemon-info.js";
 import { BoundedEventStore } from "./event-store.js";
@@ -53,6 +54,8 @@ import { SessionRegistry } from "./session-registry.js";
 
 export interface CreateDaemonOptions {
   runner: AgentRunner;
+  /** Live ACP permission broker installed on runner.onPermissionRequest by the composition root. */
+  permissionBroker?: WorkflowPermissionBroker;
   /** 0 binds an ephemeral port (tests); the actually bound port is on the handle. */
   port: number;
   host?: string;
@@ -204,6 +207,22 @@ function writeControlResponse(
   res.end(JSON.stringify(body));
 }
 
+function isPermissionResponse(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const keys = Object.keys(row).sort();
+  if (!keys.every((key) => key === "_meta" || key === "outcome")) return false;
+  const outcome = row.outcome;
+  if (outcome === null || typeof outcome !== "object" || Array.isArray(outcome)) return false;
+  const decision = outcome as Record<string, unknown>;
+  const decisionKeys = Object.keys(decision).sort().join(",");
+  if (decision.outcome === "cancelled") return decisionKeys === "outcome";
+  return decision.outcome === "selected" &&
+    typeof decision.optionId === "string" &&
+    decision.optionId.length > 0 &&
+    decisionKeys === "optionId,outcome";
+}
+
 function isInternalRunControlRequest(value: unknown): value is InternalRunControlRequest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
@@ -214,8 +233,14 @@ function isInternalRunControlRequest(value: unknown): value is InternalRunContro
     typeof row.runId !== "string" ||
     !/^[a-z0-9]+-[a-z0-9]+$/.test(row.runId)
   ) return false;
-  if (row.action === "stop") {
+  if (row.action === "stop" || row.action === "list-permissions") {
     return keys.join(",") === "action,operationId,runId";
+  }
+  if (row.action === "respond-permission") {
+    return typeof row.permissionId === "string" &&
+      /^[0-9a-f-]{36}$/i.test(row.permissionId) &&
+      isPermissionResponse(row.response) &&
+      keys.join(",") === "action,operationId,permissionId,response,runId";
   }
   return row.action === "cancel-agent" &&
     Number.isSafeInteger(row.callIndex) &&
@@ -310,6 +335,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
   const familyFingerprint = envFingerprint(env);
 
   const sessions = new SessionRegistry();
+  const permissionBroker = options.permissionBroker ?? new WorkflowPermissionBroker();
   // ONE registry shared by every session: run calls select their project via the required
   // projectDir tool argument, and all sessions see all projects' runs.
   const projects = new WorkflowProjectRegistry(options.runner, { leaseOwnerId: ownInstanceId });
@@ -319,6 +345,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     ownPid,
     ownInstanceId,
     key: runControlKey,
+    permissionBroker,
     log,
   });
   // The REPL client-presence ledger: every session touches the projects it addresses; on
@@ -369,6 +396,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
         disconnectReplClientOnClose: true,
         modernNotifier,
         runControl,
+        permissionBroker,
       });
     },
     {
@@ -463,6 +491,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
       replDrainBoundMs,
       replEvalBreakChannel: options.evalBreakChannel,
       runControl,
+      permissionBroker,
     });
     await server.connect(transport);
     // The SDK protocol layer takes ownership of transport.onclose during connect, so chain
@@ -570,6 +599,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
       detachModernRunEvent();
       detachModernRunDeleted();
       await modernHandler.close();
+      permissionBroker.dispose();
       httpServer.closeAllConnections();
       await closed;
     },

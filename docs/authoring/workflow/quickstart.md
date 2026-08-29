@@ -54,7 +54,7 @@ const results = (await parallel([
 
 ## Model selection
 
-Omit `model` for the server default, or use a backend-only value such as `"codex"` to retain that backend's configured default model. When `AGENTPRISM_DEFAULT_BACKEND` is truly unset, the MCP server probes backend readiness without prompting, pins one project default before validation/execution, and keeps that backend for the run and resume; an explicit environment default always wins. Before pinning a model id, `mode`, or `configOptions`, call `workflow` with `action:"config"`. After choosing a model, use `modelSpecs` to read that exact model's option domain. Set `mode` only when that selected harness entry's `modes.availableModes` explicitly lists the exact id; `modes:null` means the backend/model supports no modes, so omit `mode`. Never infer a generic `"default"` and never guess model or option ids.
+Omit `model` for the server default, or use a backend-only value such as `"codex"` to retain that backend's configured default model. When `AGENTPRISM_DEFAULT_BACKEND` is truly unset, the MCP server probes backend readiness without prompting, pins one project default before validation/execution, and keeps that backend for the run and resume; an explicit environment default always wins. Before pinning a model id, `mode`, or `configOptions`, call `workflow` with `action:"config"`. After choosing a model, use `modelSpecs` to read that exact model's option domain. Config preserves each advertised mode's id, name, description, and `_meta`, plus `defaultModeId`. When mode is omitted, AgentPrism applies Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode. Pin only exact advertised ids and never guess model or option ids.
 
 ## Validation and execution
 

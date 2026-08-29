@@ -20,6 +20,7 @@ import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "../src/mcp-apps.js";
 import type { AgentRunner, RunOptions } from "@automatalabs/shared-types";
 
 import { createWorkflowServer } from "../src/index.js";
+import type { WorkflowPermissionBroker } from "../src/workflow-permissions.js";
 
 // Redirect run-state persistence into a disposable home BEFORE any WorkflowManager is
 // constructed. os.homedir() reads $HOME on POSIX, and workflowProjectPaths() derives
@@ -127,11 +128,19 @@ export function uiClientCapabilities(mode: UiCapabilityMode): Record<string, unk
  */
 export async function connect(
   runner: AgentRunner,
-  opts: { listTools?: boolean; uiCapability?: UiCapabilityMode } = {},
+  opts: {
+    listTools?: boolean;
+    uiCapability?: UiCapabilityMode;
+    permissionBroker?: WorkflowPermissionBroker;
+    elicitation?: boolean;
+  } = {},
 ): Promise<Connected> {
-  const server = createWorkflowServer(runner);
+  const server = createWorkflowServer(runner, { permissionBroker: opts.permissionBroker });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const capabilities = uiClientCapabilities(opts.uiCapability ?? "matching");
+  const capabilities = {
+    ...uiClientCapabilities(opts.uiCapability ?? "matching"),
+    ...(opts.elicitation ? { elicitation: { form: {} } } : {}),
+  };
   const client = new Client({ name: "mcp-server-test", version: "0.0.0" }, { capabilities });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   if (opts.listTools) await client.listTools();

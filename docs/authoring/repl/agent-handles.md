@@ -22,7 +22,7 @@ Use `backend/model-id` only after model discovery:
 const worker = agent("claude/verified-model-id", "Review the implementation");
 ```
 
-The known built-ins are Claude, Codex, OpenCode, and pi, plus host-registered custom backends. Unknown backend names reject and enumerate known backends. Use the `workflow` tool's `action:"config"` with `harnesses`/`modelFilter`, then `modelSpecs`, before pinning model, mode, or config-option values. Set `mode` only when the selected entry's `modes.availableModes` explicitly lists that exact id; `modes:null` means omit it, and a generic `"default"` must never be inferred.
+The known built-ins are Claude, Codex, OpenCode, and pi, plus host-registered custom backends. Unknown backend names reject and enumerate known backends. Use the `workflow` tool's `action:"config"` with `harnesses`/`modelFilter`, then `modelSpecs`, before pinning model, mode, or config-option values. Read the selected entry's harness-owned mode names/descriptions before pinning an exact advertised id. Omission uses `defaultModeId` (Claude auto, Codex agent, OpenCode build; none for Pi).
 
 ## Exact option vocabulary
 

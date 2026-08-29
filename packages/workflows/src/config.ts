@@ -96,6 +96,7 @@ export async function probeHarnessConfig(
         );
         harnessOptions.push({
           backendId: result.backendId,
+          ...(result.defaultModeId === undefined ? {} : { defaultModeId: result.defaultModeId }),
           ...(target.selectModel ? { model: target.spec } : {}),
           probed: true,
           modes: result.modes ?? null,

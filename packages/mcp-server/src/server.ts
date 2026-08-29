@@ -123,6 +123,11 @@ import {
   workflowScriptUri,
 } from "./workflow-resources.js";
 import { requireDurableStoppedRun } from "./workflow-stop.js";
+import {
+  WorkflowPermissionBroker,
+  type WorkflowPendingPermission,
+  type WorkflowPermissionResponseAcknowledgement,
+} from "./workflow-permissions.js";
 
 const SERVER_NAME = "agentprism-workflow";
 const DEFAULT_REQUEST_STATE_CODEC = createRequestStateCodec<unknown>({
@@ -158,7 +163,8 @@ export const SERVER_INSTRUCTIONS = [
   "• workflow — DETERMINISTIC BATCH orchestration. Supply a JavaScript workflow script (inline or " +
     "by absolute scriptPath) that fans out agent() subagents and optional checkpoint() gates; it " +
     "runs to completion in the foreground, or background:true returns a durable runId for bounded " +
-    "action:\"await\"/\"inspect\"/\"stop\" calls, with journaling, replay, and resumeFromRunId. Reach " +
+    "action:\"await\"/\"inspect\"/\"permissions-response\"/\"stop\" calls, with journaling, replay, and resumeFromRunId. " +
+    "Await/inspect surface exact live ACP permission options when an agent needs external action. Reach " +
     "for it when the orchestration is known up front and you want it repeatable and resumable. " +
     "action:\"config\" discovers the live backend/model option catalog without starting a run, and " +
     "every run is statically checked, mock-executed, and config-probed before admission. Read docs topic workflow/quickstart first when authoring is unfamiliar.",
@@ -206,6 +212,43 @@ function isTerminalStatus(status: WorkflowRunStatus["status"]): boolean {
 
 function isAlreadyTerminalForStop(status: WorkflowRunStatus["status"]): boolean {
   return status === "completed" || status === "failed" || status === "aborted";
+}
+
+function permissionInteraction(canElicit: boolean) {
+  return {
+    permissionRequests: "may-block" as const,
+    collectWith: ["await", "inspect"] as Array<"await" | "inspect">,
+    respondWith: "permissions-response" as const,
+    elicitation: canElicit ? "available" as const : "unavailable" as const,
+  };
+}
+
+async function pendingPermissionsForRun(
+  manager: WorkflowManager,
+  runId: string,
+  broker: WorkflowPermissionBroker,
+  router: WorkflowRunControlRouter | undefined,
+): Promise<WorkflowPendingPermission[]> {
+  if (manager.getRun(runId)) return broker.list(runId);
+  return router ? await router.listPermissions(manager, runId) : [];
+}
+
+async function respondToPermission(
+  manager: WorkflowManager,
+  input: { runId: string; permissionId: string; response: Parameters<WorkflowPermissionBroker["respond"]>[2] },
+  broker: WorkflowPermissionBroker,
+  router: WorkflowRunControlRouter | undefined,
+): Promise<WorkflowPermissionResponseAcknowledgement> {
+  if (manager.getRun(input.runId) && broker.has(input.runId, input.permissionId)) {
+    return broker.respond(input.runId, input.permissionId, input.response);
+  }
+  if (!router) {
+    throw new ProtocolError(
+      ProtocolErrorCode.InvalidParams,
+      `Permission request "${input.permissionId}" is not pending in this server process.`,
+    );
+  }
+  return await router.respondPermission(manager, input);
 }
 
 /**
@@ -322,6 +365,64 @@ function createCheckpointElicitation(
       required: ["approve"],
     },
   };
+}
+
+function createPermissionElicitation(permission: WorkflowPendingPermission): ElicitRequestFormParams {
+  const tool = permission.request.toolCall;
+  const title = typeof tool.title === "string" && tool.title.trim() !== ""
+    ? tool.title
+    : `${tool.kind ?? "tool"} request`;
+  const optionLines = permission.request.options.map((option) =>
+    `- ${option.optionId}: ${option.name} (${option.kind})`
+  );
+  return {
+    mode: "form",
+    message:
+      `Workflow agent ${permission.label ? JSON.stringify(permission.label) : `call ${permission.callIndex}`} ` +
+      `on ${permission.backendId} requests permission for: ${title}\n\n` +
+      `${optionLines.join("\n")}\n\nSelect one exact advertised option.`,
+    requestedSchema: {
+      type: "object",
+      properties: {
+        optionId: {
+          type: "string",
+          title: "Permission decision",
+          description: "Exact option advertised by the ACP backend.",
+          enum: permission.request.options.map((option) => option.optionId),
+        },
+      },
+      required: ["optionId"],
+    },
+  };
+}
+
+function formatPendingPermissions(permissions: WorkflowPendingPermission[]): string {
+  if (permissions.length === 0) return "";
+  const lines = [
+    `${permissions.length} workflow permission request(s) require a response:`,
+    ...permissions.map((permission) => {
+      const title = permission.request.toolCall.title ?? permission.request.toolCall.kind ?? "tool request";
+      const options = permission.request.options.map((option) => option.optionId).join(", ");
+      return `- ${permission.permissionId} call ${permission.callIndex} (${permission.backendId}) ${title}; options: ${options}`;
+    }),
+    `Use action="permissions-response" with runId, permissionId, and an exact selected optionId or cancelled outcome.`,
+  ];
+  return `\n${lines.join("\n")}`;
+}
+
+function permissionResponseFromElicitation(
+  permission: WorkflowPendingPermission,
+  response: { action: "accept" | "decline" | "cancel"; content?: Record<string, unknown> },
+): Parameters<WorkflowPermissionBroker["respond"]>[2] {
+  if (response.action !== "accept") return { outcome: { outcome: "cancelled" } };
+  const optionId = response.content?.optionId;
+  if (
+    typeof optionId !== "string" ||
+    !permission.request.options.some((option) => option.optionId === optionId)
+  ) {
+    return { outcome: { outcome: "cancelled" } };
+  }
+  return { outcome: { outcome: "selected", optionId } };
 }
 
 function acceptedCheckpointReply(
@@ -458,6 +559,14 @@ type WorkflowMcpRequestState =
     }
   | {
       version: 1;
+      flow: "permission";
+      inputHash: string;
+      scriptHash: string;
+      runId: string;
+      permissionId: string;
+    }
+  | {
+      version: 1;
       flow: "checkpoint";
       inputHash: string;
       scriptHash: string;
@@ -524,6 +633,24 @@ function parseWorkflowRequestState(value: unknown, inputHash: string): WorkflowM
       scriptHash: state.scriptHash as string,
       approvedKeys: [...new Set(state.approvedKeys)],
       pendingKey: state.pendingKey,
+    };
+  }
+  if (state.flow === "permission") {
+    if (
+      typeof state.runId !== "string" ||
+      !/^[a-z0-9]+-[a-z0-9]+$/.test(state.runId) ||
+      typeof state.permissionId !== "string" ||
+      !/^[0-9a-f-]{36}$/i.test(state.permissionId)
+    ) {
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid workflow permission requestState");
+    }
+    return {
+      version: 1,
+      flow: "permission",
+      inputHash,
+      scriptHash: state.scriptHash as string,
+      runId: state.runId,
+      permissionId: state.permissionId,
     };
   }
   if (state.flow === "checkpoint") {
@@ -1098,6 +1225,18 @@ async function settleForegroundRun(
   }
 }
 
+async function settleForegroundRunOrPermission(
+  manager: WorkflowManager,
+  started: { runId: string; promise: Promise<WorkflowRunResult> },
+  broker: WorkflowPermissionBroker,
+): Promise<{ kind: "terminal"; run: WorkflowRunResult } | { kind: "permission" }> {
+  if (broker.has(started.runId)) return { kind: "permission" };
+  return await Promise.race([
+    settleForegroundRun(manager, started).then((run) => ({ kind: "terminal" as const, run })),
+    broker.waitForPending(started.runId).then(() => ({ kind: "permission" as const })),
+  ]);
+}
+
 function normalizeTokenUsage(
   usage:
     | {
@@ -1194,20 +1333,25 @@ async function waitForTerminal(
   signal: AbortSignal,
   localPromise: Promise<WorkflowRunResult> | undefined,
   progress: AwaitProgressReporter,
-): Promise<"settled" | "timeout" | typeof AWAIT_CANCELLED | typeof AWAIT_UNKNOWN_RUN> {
+  permissionWait?: Promise<void>,
+  permissionProbe?: () => Promise<boolean>,
+): Promise<"settled" | "timeout" | "action-required" | typeof AWAIT_CANCELLED | typeof AWAIT_UNKNOWN_RUN> {
   return await new Promise((resolve, reject) => {
     let timer: NodeJS.Timeout | undefined;
     let poller: NodeJS.Timeout | undefined;
+    let permissionPoller: NodeJS.Timeout | undefined;
+    let permissionProbeActive = false;
     let stream: ReturnType<ReturnType<WorkflowManager["getPersistence"]>["watchEvents"]> | undefined;
     let done = false;
 
     const cleanup = () => {
       if (timer) clearTimeout(timer);
       if (poller) clearInterval(poller);
+      if (permissionPoller) clearInterval(permissionPoller);
       stream?.close();
       signal.removeEventListener("abort", cancelled);
     };
-    const finish = (result: "settled" | "timeout" | typeof AWAIT_CANCELLED | typeof AWAIT_UNKNOWN_RUN) => {
+    const finish = (result: "settled" | "timeout" | "action-required" | typeof AWAIT_CANCELLED | typeof AWAIT_UNKNOWN_RUN) => {
       if (done) return;
       done = true;
       cleanup();
@@ -1260,6 +1404,25 @@ async function waitForTerminal(
         () => finish("settled"),
         () => finish("settled"),
       );
+    }
+    if (permissionWait) {
+      void permissionWait.then(() => finish("action-required"), () => undefined);
+    }
+    if (permissionProbe) {
+      const probe = async () => {
+        if (done || permissionProbeActive) return;
+        permissionProbeActive = true;
+        try {
+          if (await permissionProbe()) finish("action-required");
+        } catch {
+          // The event stream/timeout still owns await settlement; a transient owner-control
+          // failure is retried on the next bounded probe.
+        } finally {
+          permissionProbeActive = false;
+        }
+      };
+      permissionPoller = setInterval(() => void probe(), 1_000);
+      void probe();
     }
 
     try {
@@ -1429,6 +1592,8 @@ export interface CreateWorkflowServerOptions {
   modernNotifier?: ServerNotifier;
   /** Daemon-only location-transparent run-control router. */
   runControl?: WorkflowRunControlRouter;
+  /** Process-local broker whose resolver is installed on the shared ACP runner. */
+  permissionBroker?: WorkflowPermissionBroker;
 }
 
 export interface WorkflowServer extends McpServer, WorkflowServerControl {}
@@ -1438,6 +1603,7 @@ export function createWorkflowServer(
   options: CreateWorkflowServerOptions = {},
 ): WorkflowServer {
   const requestStateCodec = options.requestStateCodec ?? DEFAULT_REQUEST_STATE_CODEC;
+  const permissionBroker = options.permissionBroker ?? new WorkflowPermissionBroker();
   const mcp = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
@@ -1519,7 +1685,12 @@ export function createWorkflowServer(
 
   /** Route a parsed input to its project context; undefined = runId found in no known store. */
   const resolveContext = (input: ReturnType<typeof parseWorkflowToolInput>): ProjectContext | undefined => {
-    if (input.action === "inspect" || input.action === "await" || input.action === "stop") {
+    if (
+      input.action === "inspect" ||
+      input.action === "await" ||
+      input.action === "stop" ||
+      input.action === "permissions-response"
+    ) {
       return projects.storeFor(input.runId) ?? defaultContext;
     }
     if (input.projectDir !== undefined) {
@@ -1556,7 +1727,7 @@ export function createWorkflowServer(
   const workflowToolInputSchema = z.object(workflowToolInputShape);
   const workflowToolOutputSchema = workflowToolOutputShape;
   const workflowToolConfig = {
-    title: "Discover, validate, run, inspect, await, stop, or narrow-cancel an agent workflow",
+    title: "Discover, validate, run, inspect, await, answer permissions, stop, or narrow-cancel a workflow",
     description:
         "Author and operate JavaScript agent workflows through one project-scoped tool. " +
         "A script's first statement must be `export const meta = { name, description, phases? }`. When present, phases must be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings. " +
@@ -1569,18 +1740,18 @@ export function createWorkflowServer(
         "Minimal script: `export const meta = { name: \"review\", description: \"Review a target\", phases: [{ title: \"Review\" }] }; phase(\"Review\"); const report = await agent(\"Review \" + args.target, { label: \"review\" }); return { report };`. " +
         "Omit model for the server default (explicit AGENTPRISM_DEFAULT_BACKEND, else a zero-token auto-selected project pin), or use a backend name alone to preserve that backend's configured default. " +
         "Before choosing a pinned model, mode, or configOptions, call action:\"config\" with projectDir and optional harnesses/modelFilter; after choosing a model, pass modelSpecs to read its model-specific options. " +
-        "Set mode only when that selected harness entry's modes.availableModes explicitly lists the exact id; modes:null means unsupported, so omit mode—never infer a default from an absent value. " +
+        "Config returns every harness-advertised mode name, description, and metadata plus AgentPrism's omitted-mode default: Claude auto, Codex agent, OpenCode build, and no Pi mode. Pin only exact advertised ids. " +
         "Config opens no-prompt sessions, spends zero tokens, and starts no workflow. " +
         "action:\"run\" automatically performs static validation, a mocked dry run, and routed config checks before admission. " +
         "Invalid scripts return bounded diagnostics with status:\"rejected\" and create no run ID, reserve no background slot, and spend no tokens. " +
-        "Run, resume, inspect, await, or stop an admitted workflow through the same tool. The " +
+        "Run, resume, inspect, await, answer a live ACP permission, or stop an admitted workflow through the same tool. The " +
         "script orchestrates agent() subagents (and optional checkpoint() gates) over registry built-ins—currently Claude, Codex, OpenCode, and pi—" +
         "ACP backends, plus registered custom agents. Supply exactly one of inline script or absolute scriptPath; path content is " +
         "read once and snapshotted at admission. " +
         (requireProjectDir
           ? "config and run REQUIRE projectDir (absolute): it is the discovery cwd and selects the project-scoped run store/default execution cwd. "
           : "run optionally takes projectDir (absolute) to select the project-scoped run store; default is this server's own project. ") +
-        "inspect/await/stop locate the project store from runId and never accept projectDir. " +
+        "inspect/await/stop/permissions-response locate the project store from runId and never accept projectDir. " +
         "Foreground is the default and streams progress; background:true returns " +
         "a durable runId for bounded action:\"await\" calls. run and await honor _meta.progressToken " +
         "with notifications/progress while they block. Pass resumeFromRunId to execute a new " +
@@ -1588,7 +1759,7 @@ export function createWorkflowServer(
         "In hosts that render MCP Apps, every call of this tool shows a live self-updating run-monitor " +
         "panel and the panel reports phase starts, pauses, and terminal outcomes on its own — do NOT poll " +
         'action:"inspect" to check on a run there; prefer a single bounded action:"await". ' +
-        'Use action:"inspect" with a runId when you need machine-readable status data: a safe bounded status, log tail, and attributed call previews. ' +
+        'Use action:"inspect" with a runId when you need machine-readable status data: a safe bounded status, log tail, attributed call previews, and pending ACP permissions. Await returns early with action-required when one appears. Elicitation-capable hosts can present the exact backend options; otherwise use action:"permissions-response" with the returned permissionId and an exact advertised optionId or cancelled outcome. ' +
         'Use action:"stop" to durably abort through the run\'s execution owner; cross-generation control may return a durable pending operationId before final settlement. Add callIndex to cancel only that live agent and keep the run live. forceOwner explicitly authorizes terminating a superseded owner and is forbidden with callIndex. ' +
         "labelGlob remains an output filter. A final whole-run stop makes resume safe immediately; pending control must be retried or observed with inspect/await. " +
         "Every admitted script is readable at workflow://runs/{runId}/script and results include resource links. " +
@@ -1613,7 +1784,7 @@ export function createWorkflowServer(
       let parsedInput = parseWorkflowToolInput(args, { requireProjectDir });
       const approvedBackendKeys = new Set<string>();
       let declinedBackendKey: string | undefined;
-      if (requestState !== undefined) {
+      if (requestState !== undefined && "approvedKeys" in requestState) {
         for (const key of requestState.approvedKeys) approvedBackendKeys.add(key);
       }
       if (requestState?.flow === "backend-approval") {
@@ -1698,6 +1869,85 @@ export function createWorkflowServer(
       replPresence.touch(context.repl, options.replClientId?.() ?? "unknown");
       const manager = context.manager;
       const backgroundRuns = context.backgroundRuns;
+
+      if (requestState?.flow === "permission") {
+        if (
+          (parsedInput.action !== "inspect" && parsedInput.action !== "await") ||
+          parsedInput.runId !== requestState.runId
+        ) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            "Invalid workflow permission retry: the original inspect/await arguments must be replayed unchanged",
+          );
+        }
+        const pending = await pendingPermissionsForRun(
+          manager,
+          requestState.runId,
+          permissionBroker,
+          options.runControl,
+        );
+        const permission = pending.find((entry) => entry.permissionId === requestState.permissionId);
+        if (!permission) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            `Permission request "${requestState.permissionId}" is no longer pending for run "${requestState.runId}"`,
+          );
+        }
+        const input = inputResponse(ctx.mcpReq.inputResponses, "permission");
+        if (input.kind !== "elicit") {
+          return inputRequired({
+            inputRequests: { permission: inputRequired.elicit(createPermissionElicitation(permission)) },
+            requestState: await requestStateCodec.mint(requestState, ctx),
+          });
+        }
+        const response = permissionResponseFromElicitation(permission, input);
+        const acknowledgement = await respondToPermission(
+          manager,
+          { runId: requestState.runId, permissionId: requestState.permissionId, response },
+          permissionBroker,
+          options.runControl,
+        );
+        const status = manager.inspectRun(requestState.runId, {
+          lastN: parsedInput.lastN,
+          labelGlob: parsedInput.labelGlob,
+          logLines: parsedInput.logLines,
+        });
+        if (!status) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            `No workflow run found for runId "${requestState.runId}" after its permission response.`,
+          );
+        }
+        const lineage = scriptResources.lineage(requestState.runId);
+        const remaining = await pendingPermissionsForRun(
+          manager,
+          requestState.runId,
+          permissionBroker,
+          options.runControl,
+        );
+        const projected = addInspectionResourceFields(
+          status,
+          { scriptUri: workflowScriptUri(requestState.runId), lineage, pendingPermissions: remaining },
+          inspectionRetentionMetadata(manager, requestState.runId, status),
+        );
+        return {
+          structuredContent: {
+            ...projected,
+            permissionResponse: acknowledgement,
+          },
+          content: [
+            {
+              type: "text",
+              text:
+                `Permission ${acknowledgement.permissionId} resolved for workflow run ${requestState.runId}.\n` +
+                `${formatInspectionSummary(projected)}`,
+              annotations: { audience: ["assistant"] },
+            },
+            ...scriptResources.links(lineage),
+          ],
+          isError: false,
+        };
+      }
 
       if (requestState?.flow === "checkpoint") {
         if (
@@ -1791,7 +2041,108 @@ export function createWorkflowServer(
           }
         }
       }
+      if (parsedInput.action === "permissions-response") {
+        const acknowledgement = await respondToPermission(
+          manager,
+          {
+            runId: parsedInput.runId,
+            permissionId: parsedInput.permissionId,
+            response: parsedInput.response,
+          },
+          permissionBroker,
+          options.runControl,
+        );
+        const status = manager.inspectRun(parsedInput.runId, { lastN: 20, logLines: 20 });
+        if (!status) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            `No workflow run found for runId "${parsedInput.runId}" after its permission response.`,
+          );
+        }
+        const lineage = scriptResources.lineage(parsedInput.runId);
+        const pendingPermissions = await pendingPermissionsForRun(
+          manager,
+          parsedInput.runId,
+          permissionBroker,
+          options.runControl,
+        );
+        const projected = addInspectionResourceFields(
+          status,
+          { scriptUri: workflowScriptUri(parsedInput.runId), lineage, pendingPermissions },
+          inspectionRetentionMetadata(manager, parsedInput.runId, status),
+        );
+        return {
+          structuredContent: {
+            ...projected,
+            permissionResponse: acknowledgement,
+          },
+          content: [
+            {
+              type: "text",
+              text:
+                `Permission ${acknowledgement.permissionId} resolved for workflow run ${parsedInput.runId}.\n` +
+                formatInspectionSummary(projected) +
+                formatPendingPermissions(pendingPermissions),
+              annotations: { audience: ["assistant"] },
+            },
+            ...scriptResources.links(lineage),
+          ],
+          isError: false,
+        };
+      }
+
       if (parsedInput.action === "inspect") {
+        let pendingPermissions = await pendingPermissionsForRun(
+          manager,
+          parsedInput.runId,
+          permissionBroker,
+          options.runControl,
+        );
+        let acknowledgement: WorkflowPermissionResponseAcknowledgement | undefined;
+        const canElicitPermission = Boolean(toolCatalog.clientCapabilities(ctx)?.elicitation);
+        if (pendingPermissions.length > 0 && canElicitPermission) {
+          const permission = pendingPermissions[0]!;
+          if (options.protocolEra === "modern") {
+            const state: WorkflowMcpRequestState = {
+              version: 1,
+              flow: "permission",
+              inputHash,
+              scriptHash: workflowScriptHash(parsedInput.runId),
+              runId: parsedInput.runId,
+              permissionId: permission.permissionId,
+            };
+            return inputRequired({
+              inputRequests: { permission: inputRequired.elicit(createPermissionElicitation(permission)) },
+              requestState: await requestStateCodec.mint(state, ctx),
+            });
+          }
+          try {
+            await primeCancellableServerRequestId(mcp.server);
+            const elicited = await mcp.server.elicitInput(createPermissionElicitation(permission), {
+              signal: ctx.mcpReq.signal,
+            });
+            acknowledgement = await respondToPermission(
+              manager,
+              {
+                runId: parsedInput.runId,
+                permissionId: permission.permissionId,
+                response: permissionResponseFromElicitation(permission, elicited),
+              },
+              permissionBroker,
+              options.runControl,
+            );
+            pendingPermissions = await pendingPermissionsForRun(
+              manager,
+              parsedInput.runId,
+              permissionBroker,
+              options.runControl,
+            );
+          } catch {
+            // A failed elicitation leaves the ACP request pending for a later inspect/await or an
+            // explicit permissions-response action.
+          }
+        }
+
         const status = manager.inspectRun(parsedInput.runId, {
           lastN: parsedInput.lastN,
           labelGlob: parsedInput.labelGlob,
@@ -1814,17 +2165,25 @@ export function createWorkflowServer(
           {
             scriptUri: workflowScriptUri(parsedInput.runId),
             lineage,
+            pendingPermissions,
+            interaction: permissionInteraction(canElicitPermission),
           },
           inspectionRetentionMetadata(manager, parsedInput.runId, status),
         );
         return {
-          structuredContent: { ...projected },
+          structuredContent: {
+            ...projected,
+            ...(acknowledgement === undefined ? {} : { permissionResponse: acknowledgement }),
+          },
           content: [
             // Status summaries are model input, not user-facing chat content (the run-monitor
             // panel is the user's live view) — the audience annotation says so per MCP core.
             {
               type: "text",
-              text: formatInspectionSummary(projected),
+              text:
+                formatInspectionSummary(projected) +
+                (acknowledgement ? `\nPermission ${acknowledgement.permissionId} resolved.` : "") +
+                formatPendingPermissions(pendingPermissions),
               annotations: { audience: ["assistant"] },
             },
             ...scriptResources.links(lineage),
@@ -2088,12 +2447,23 @@ export function createWorkflowServer(
           };
         }
 
+        let pendingPermissions = manager.getRun(parsedInput.runId)
+          ? permissionBroker.list(parsedInput.runId)
+          : await pendingPermissionsForRun(
+              manager,
+              parsedInput.runId,
+              permissionBroker,
+              options.runControl,
+            );
         let returnedBecause: WorkflowRunAwaitResult["wait"]["returnedBecause"];
         if (isTerminalStatus(status.status)) {
           returnedBecause = "terminal";
+        } else if (pendingPermissions.length > 0) {
+          returnedBecause = "action-required";
         } else if (parsedInput.waitMs === 0) {
           returnedBecause = "immediate";
         } else {
+          const local = manager.getRun(parsedInput.runId) !== undefined;
           const waited = await waitForTerminal(
             manager,
             parsedInput.runId,
@@ -2101,6 +2471,10 @@ export function createWorkflowServer(
             ctx.mcpReq.signal,
             backgroundRuns.get(parsedInput.runId),
             createAwaitProgressReporter(ctx),
+            local ? permissionBroker.waitForPending(parsedInput.runId) : undefined,
+            !local && options.runControl
+              ? async () => (await options.runControl!.listPermissions(manager, parsedInput.runId)).length > 0
+              : undefined,
           );
           if (waited === AWAIT_CANCELLED) {
             return {
@@ -2124,6 +2498,12 @@ export function createWorkflowServer(
               isError: true,
             };
           }
+          pendingPermissions = await pendingPermissionsForRun(
+            manager,
+            parsedInput.runId,
+            permissionBroker,
+            options.runControl,
+          );
           status = manager.inspectRun(parsedInput.runId, inspectionOptions);
           if (!status) {
             return {
@@ -2136,7 +2516,55 @@ export function createWorkflowServer(
               isError: true,
             };
           }
-          returnedBecause = isTerminalStatus(status.status) ? "terminal" : "timeout";
+          returnedBecause = isTerminalStatus(status.status)
+            ? "terminal"
+            : waited === "action-required" || pendingPermissions.length > 0
+              ? "action-required"
+              : "timeout";
+        }
+
+        const canElicitPermission = Boolean(toolCatalog.clientCapabilities(ctx)?.elicitation);
+        if (pendingPermissions.length > 0 && canElicitPermission) {
+          const permission = pendingPermissions[0]!;
+          if (options.protocolEra === "modern") {
+            const state: WorkflowMcpRequestState = {
+              version: 1,
+              flow: "permission",
+              inputHash,
+              scriptHash: workflowScriptHash(parsedInput.runId),
+              runId: parsedInput.runId,
+              permissionId: permission.permissionId,
+            };
+            return inputRequired({
+              inputRequests: { permission: inputRequired.elicit(createPermissionElicitation(permission)) },
+              requestState: await requestStateCodec.mint(state, ctx),
+            });
+          }
+          try {
+            await primeCancellableServerRequestId(mcp.server);
+            const elicited = await mcp.server.elicitInput(createPermissionElicitation(permission), {
+              signal: ctx.mcpReq.signal,
+            });
+            await respondToPermission(
+              manager,
+              {
+                runId: parsedInput.runId,
+                permissionId: permission.permissionId,
+                response: permissionResponseFromElicitation(permission, elicited),
+              },
+              permissionBroker,
+              options.runControl,
+            );
+            pendingPermissions = await pendingPermissionsForRun(
+              manager,
+              parsedInput.runId,
+              permissionBroker,
+              options.runControl,
+            );
+            returnedBecause = "permission-resolved";
+          } catch {
+            // Leave the request pending for an explicit response or a later elicitation attempt.
+          }
         }
 
         const tokenUsage = currentTokenUsage(manager, parsedInput.runId);
@@ -2155,6 +2583,8 @@ export function createWorkflowServer(
           {
             wait,
             ...(tokenUsage === undefined ? {} : { tokenUsage }),
+            pendingPermissions,
+            interaction: permissionInteraction(canElicitPermission),
             scriptUri: workflowScriptUri(parsedInput.runId),
             lineage,
           },
@@ -2170,7 +2600,7 @@ export function createWorkflowServer(
             // Same audience hint as inspect: the await summary is for the model.
             {
               type: "text",
-              text: formatAwaitSummary(result),
+              text: formatAwaitSummary(result) + formatPendingPermissions(pendingPermissions),
               annotations: { audience: ["assistant"] },
             },
             ...scriptResources.links(lineage),
@@ -2442,6 +2872,8 @@ export function createWorkflowServer(
               ...(admittedRun.replayEligibility === undefined
                 ? {}
                 : { replayEligibility: admittedRun.replayEligibility }),
+              pendingPermissions: permissionBroker.list(started.runId),
+              interaction: permissionInteraction(Boolean(toolCatalog.clientCapabilities(ctx)?.elicitation)),
             },
             content: [
               {
@@ -2454,7 +2886,9 @@ export function createWorkflowServer(
                     ? `${formatResumeSummary(admittedRun.replayEligibility)}\n`
                     : "") +
                   `Call workflow with action="await" and this runId to wait for its result, or ` +
-                  `action="inspect" for an immediate status snapshot. If a live run-monitor panel ` +
+                  `action="inspect" for an immediate status snapshot. Either action returns early when an ACP ` +
+                  `permission needs a response; use the elicitation shown by capable clients or ` +
+                  `action="permissions-response" with an exact advertised option. If a live run-monitor panel ` +
                   `is shown for this run, it self-updates and reports phase starts, pauses, and terminal outcomes — ` +
                   `do not poll inspect for status.`,
               },
@@ -2481,7 +2915,45 @@ export function createWorkflowServer(
           },
         );
         executionLatch.admit();
-        const run = await settleForegroundRun(manager, started);
+        const settled = await settleForegroundRunOrPermission(manager, started, permissionBroker);
+        if (settled.kind === "permission") {
+          const admittedRun = manager.getRun(started.runId);
+          if (!admittedRun?.limits) {
+            throw new ProtocolError(ProtocolErrorCode.InternalError, "Workflow permission wait lost its live run limits");
+          }
+          backgroundRuns.track(started.runId, started.promise);
+          const pendingPermissions = permissionBroker.list(started.runId);
+          const scriptUri = workflowScriptUri(started.runId);
+          const canElicitPermission = Boolean(toolCatalog.clientCapabilities(ctx)?.elicitation);
+          return {
+            structuredContent: {
+              runId: started.runId,
+              status: "running" as const,
+              scriptSource,
+              scriptUri,
+              limits: admittedRun.limits,
+              pendingPermissions,
+              interaction: permissionInteraction(canElicitPermission),
+              ...(admittedRun.replayEligibility === undefined
+                ? {}
+                : { replayEligibility: admittedRun.replayEligibility }),
+            },
+            content: [
+              {
+                type: "text",
+                text:
+                  `Workflow "${admittedRun.snapshot.name}" is still running but requires a permission response.\n` +
+                  `runId: ${started.runId}\n` +
+                  formatPendingPermissions(pendingPermissions).trimStart() +
+                  `\nCall workflow with action="await" or action="inspect"; elicitation-capable clients will ` +
+                  `present the pending choice, and other clients can use action="permissions-response".`,
+              },
+              ...scriptResources.links([{ runId: started.runId, uri: scriptUri, available: true }]),
+            ],
+            isError: false,
+          };
+        }
+        const run = settled.run;
         if (
           options.protocolEra === "modern" &&
           toolCatalog.clientCapabilities(ctx)?.elicitation &&

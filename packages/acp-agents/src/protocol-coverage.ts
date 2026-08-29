@@ -185,7 +185,7 @@ export interface AuthMetaMatrixRow {
 
 /** The §3.6 auth `_meta` matrix as executable rows — the exact surfaces §4.6.4 item 4 enumerates
  *  (claude gateway/terminal-auth, codex api-key/gateway/DEFAULT_AUTH_REQUEST, opencode terminal-auth),
- *  plus the codex tool-approval `persist` and the cross-agent provider-env passthrough. The
+ *  plus Codex permission-presentation metadata and the cross-agent provider-env passthrough. The
  *  loaded-turn extension rows (turn-terminal state for loaded sessions) record which servers
  *  SERVE the extension: claude and opencode do not advertise it, and the re-attach seam's
  *  observation path classifies their loaded turns authoritatively instead (see
@@ -203,7 +203,7 @@ const AUTH_META_MATRIX_ROWS = [
   { agent: "codex", capability: "api-key", direction: "A→C", status: "supported-today", distProbe: "codex" },
   { agent: "codex", capability: "gateway", direction: "C↔A", status: "supported-today", distProbe: "codex" },
   { agent: "codex", capability: "DEFAULT_AUTH_REQUEST", direction: "C→A", status: "supported-today", distProbe: "codex" },
-  { agent: "codex", capability: "persist", direction: "C→A", status: "supported-today", distProbe: "codex" },
+  { agent: "codex", capability: "permission", direction: "A→C", status: "supported-today", distProbe: "codex" },
   { agent: "opencode", capability: "terminal-auth", direction: "C↔A", status: "supported-today" },
   { agent: "all", capability: "provider env keys", direction: "C→A", status: "supported-today" },
 ] satisfies readonly AuthMetaMatrixRow[];

@@ -76,6 +76,12 @@ test("registry order, ids, profiles, factories, and central coverage are exactly
     opencode: OpenCodeBackend,
     pi: PiBackend,
   } as const;
+  const defaultModes = {
+    claude: "auto",
+    codex: "agent",
+    opencode: "build",
+    pi: undefined,
+  } as const;
   const thoughtLevelDomains = {
     claude: "ordered",
     codex: "ordered",
@@ -87,6 +93,8 @@ test("registry order, ids, profiles, factories, and central coverage are exactly
     const definition = BUILTIN_BACKENDS[id];
     const backend = definition.create();
     assert.equal(definition.id, id);
+    assert.equal(definition.defaultModeId, defaultModes[id]);
+    assert.equal(backend.defaultModeId, defaultModes[id]);
     assert.equal(definition.thoughtLevelDomainSemantics, thoughtLevelDomains[id]);
     assert.equal(builtinThoughtLevelDomainSemantics(id), thoughtLevelDomains[id]);
     assert.equal(definition.authProfile.backendId, id);
