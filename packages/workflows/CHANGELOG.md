@@ -1,5 +1,19 @@
 # @automatalabs/workflows
 
+## 0.57.0
+
+### Minor Changes
+
+- 1452e15: Add an opt-in per-attempt idle watchdog that resets on real backend activity, cancels wedged turns through the existing wind-down path, retries with a fresh clock, and reports `AGENT_IDLE_TIMEOUT` distinctly across SDK, persistence, inspection, and MCP surfaces.
+
+### Patch Changes
+
+- Updated dependencies [1452e15]
+  - @automatalabs/shared-types@0.33.0
+  - @automatalabs/workflow-engine@0.41.0
+  - @automatalabs/acp-agents@0.42.0
+  - @automatalabs/repl-engine@0.4.10
+
 ## 0.56.0
 
 ### Minor Changes
