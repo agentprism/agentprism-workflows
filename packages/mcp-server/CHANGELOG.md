@@ -1,5 +1,18 @@
 # @automatalabs/mcp-server
 
+## 0.37.0
+
+### Minor Changes
+
+- 1452e15: Add an opt-in per-attempt idle watchdog that resets on real backend activity, cancels wedged turns through the existing wind-down path, retries with a fresh clock, and reports `AGENT_IDLE_TIMEOUT` distinctly across SDK, persistence, inspection, and MCP surfaces.
+
+### Patch Changes
+
+- Updated dependencies [1452e15]
+  - @automatalabs/shared-types@0.33.0
+  - @automatalabs/workflows@0.57.0
+  - @automatalabs/repl-engine@0.4.10
+
 ## 0.36.0
 
 ### Minor Changes

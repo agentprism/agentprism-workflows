@@ -1,5 +1,11 @@
 # @automatalabs/shared-types
 
+## 0.33.0
+
+### Minor Changes
+
+- 1452e15: Add an opt-in per-attempt idle watchdog that resets on real backend activity, cancels wedged turns through the existing wind-down path, retries with a fresh clock, and reports `AGENT_IDLE_TIMEOUT` distinctly across SDK, persistence, inspection, and MCP surfaces.
+
 ## 0.32.0
 
 ### Minor Changes
