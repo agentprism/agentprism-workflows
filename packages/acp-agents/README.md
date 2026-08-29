@@ -48,7 +48,7 @@ try {
 }
 ```
 
-`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, `baseInstructions` / `developerInstructions` (Codex-only, see below), `keepSession`, the resume-only `continueFromSession` directive, `onSessionOpen`, `onUsage`, `onResultProvenance`, `onModelResolved`, `onModelFallback`, and `onHistory`. See `@automatalabs/shared-types` for the field-by-field contract.
+`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, `baseInstructions` / `developerInstructions` (Codex-only, see below), `keepSession`, the resume-only `continueFromSession` directive, `onSessionOpen`, `onUsage`, `onResultProvenance`, `onModelResolved`, `onModelFallback`, `onHistory`, and `onActivity`. `onActivity` fires once for every real ACP `session/update` so an engine-owned opt-in idle watchdog can re-arm; synthetic host heartbeats never pass through it. See `@automatalabs/shared-types` for the field-by-field contract.
 
 Aborting `signal` sends ACP `session/cancel` for that session. If its active turn does not settle
 within five seconds, the client sends `session/close` when the agent advertised it and quarantines

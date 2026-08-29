@@ -176,11 +176,17 @@ test("agentStart path passes through verbatim and an oversized path is dropped, 
     scope: "scope-projection",
     label: "label",
     prompt: "prompt",
+    timeoutMs: 900_000,
+    idleTimeoutMs: 300_000,
     callIndex: 0,
   };
   const kept = projectRunEventForPersistence({ ...base, path: "3:14<7:9" });
   assert.equal(kept.event.type, "agentStart");
-  if (kept.event.type === "agentStart") assert.equal(kept.event.path, "3:14<7:9");
+  if (kept.event.type === "agentStart") {
+    assert.equal(kept.event.path, "3:14<7:9");
+    assert.equal(kept.event.timeoutMs, 900_000);
+    assert.equal(kept.event.idleTimeoutMs, 300_000);
+  }
 
   const oversized = projectRunEventForPersistence({
     ...base,

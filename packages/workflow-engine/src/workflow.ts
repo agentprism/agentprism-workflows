@@ -35,7 +35,13 @@ import {
   loadAgentRegistry,
   resolveAgentType,
 } from "./agent-registry.js";
-import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
+import {
+  DEFAULT_AGENT_IDLE_TIMEOUT_MS,
+  DEFAULT_AGENT_TIMEOUT_MS,
+  MAX_AGENT_RETRIES,
+  MAX_AGENTS_PER_RUN,
+  MAX_CONCURRENCY,
+} from "./config.js";
 import {
   errorMessage,
   isAuthRequired,
@@ -171,6 +177,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   maxAgents?: number;
   /** Host total-wall-clock ceiling per attempt. null/omitted means the host imposes no ceiling. */
   agentTimeoutMs?: number | null;
+  /** Host no-backend-activity ceiling per attempt. null/omitted disables the idle watchdog. */
+  agentIdleTimeoutMs?: number | null;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
   /** Absolute workflow persistence root for log persistence; explicit value wins over AGENTPRISM_PERSISTENCE_ROOT. */
@@ -252,6 +260,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     configOptions?: Record<string, string | boolean>;
     /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
     timeoutMs?: number | null;
+    /** Resolved no-backend-activity deadline for each attempt; null means disabled. */
+    idleTimeoutMs?: number | null;
     callIndex: number;
     /** The structural call-path key (same value as WorkflowCallRecord.path), when captured. */
     path?: string;
@@ -310,6 +320,7 @@ const AGENT_OPTION_KEYS = [
   "resume",
   "agentType",
   "timeoutMs",
+  "idleTimeoutMs",
   "retries",
   "cwd",
   "mcpServers",
@@ -362,8 +373,10 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * and falls back to default tools/model (with the name as a prose hint).
    */
   agentType?: string;
-  /** Per-call deadline. It may tighten, but cannot disable or raise, a finite host ceiling. */
+  /** Per-call total-wall deadline. It may tighten, but cannot disable or raise, a finite host ceiling. */
   timeoutMs?: number | null;
+  /** Per-call no-backend-activity deadline. It may tighten, but cannot disable or raise, a finite host ceiling. */
+  idleTimeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
   /**
@@ -520,6 +533,7 @@ export interface WorkflowRunLimitOptions {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number | null;
+  agentIdleTimeoutMs?: number | null;
 }
 
 /** Resolve the run limits once so admission, persistence, and execution report the same values.
@@ -536,6 +550,9 @@ export function resolveWorkflowRunLimits(options: WorkflowRunLimitOptions): Work
     agentTimeoutMs: options.agentTimeoutMs !== undefined
       ? options.agentTimeoutMs
       : DEFAULT_AGENT_TIMEOUT_MS,
+    agentIdleTimeoutMs: options.agentIdleTimeoutMs !== undefined
+      ? options.agentIdleTimeoutMs
+      : DEFAULT_AGENT_IDLE_TIMEOUT_MS,
   };
 }
 
@@ -547,6 +564,14 @@ export function resolveAgentTimeoutMs(
   if (hostTimeoutMs === null) return callTimeoutMs ?? null;
   if (callTimeoutMs === null || callTimeoutMs === undefined) return hostTimeoutMs;
   return Math.min(hostTimeoutMs, callTimeoutMs);
+}
+
+/** A script may shorten the host's idle ceiling, but cannot bypass a finite host watchdog. */
+export function resolveAgentIdleTimeoutMs(
+  hostTimeoutMs: number | null,
+  callTimeoutMs: number | null | undefined,
+): number | null {
+  return resolveAgentTimeoutMs(hostTimeoutMs, callTimeoutMs);
 }
 
 /** Convert a workflow name into the path-free base used for its vm filename. */
@@ -586,6 +611,7 @@ export async function runWorkflow<T = unknown>(
     agentRetries: runAgentRetries,
     agentTimeoutMs,
   } = effectiveLimits;
+  const agentIdleTimeoutMs = effectiveLimits.agentIdleTimeoutMs ?? null;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const callbackContext: WorkflowCallbackContext = { scope: runId };
   const baseCwd = options.cwd ?? process.cwd();
@@ -701,8 +727,9 @@ export async function runWorkflow<T = unknown>(
 
   if (options.sharedRuntime === undefined) {
     log(
-      `agent timeout admission: host ceiling ${agentTimeoutMs === null ? "none" : `${agentTimeoutMs}ms`} ` +
-        "total wall-clock per attempt; each retry re-arms the clock",
+      `agent timeout admission: total-wall ceiling ${agentTimeoutMs === null ? "none" : `${agentTimeoutMs}ms`}; ` +
+        `idle ceiling ${agentIdleTimeoutMs === null ? "disabled" : `${agentIdleTimeoutMs}ms without backend activity`}; ` +
+        "each retry re-arms both clocks",
     );
   }
 
@@ -1055,6 +1082,7 @@ export async function runWorkflow<T = unknown>(
 
     const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
     const timeout = resolveAgentTimeoutMs(agentTimeoutMs, agentOptions.timeoutMs);
+    const idleTimeout = resolveAgentIdleTimeoutMs(agentIdleTimeoutMs, agentOptions.idleTimeoutMs);
     const retryAttempts =
       agentOptions.retries !== undefined ? normalizeAgentRetries(agentOptions.retries) : runAgentRetries;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
@@ -1146,6 +1174,7 @@ export async function runWorkflow<T = unknown>(
         model: displayModel,
         configOptions: agentOptions.configOptions,
         timeoutMs: timeout,
+        idleTimeoutMs: idleTimeout,
         callIndex,
         path: callPath,
         scope: runId,
@@ -1418,8 +1447,13 @@ export async function runWorkflow<T = unknown>(
               }
             }
             let result: unknown;
+            let idleWatchdog: AgentIdleWatchdog | undefined;
             try {
               let rawRunnerPromise: Promise<unknown>;
+              idleWatchdog = createAgentIdleWatchdog(idleTimeout, label, (error) => {
+                sealAttempt(slot);
+                attemptController?.abort(error);
+              });
               beginResumeActivity();
               try {
                 rawRunnerPromise = agentRunner.run(prompt, {
@@ -1492,6 +1526,7 @@ export async function runWorkflow<T = unknown>(
                     const copied = cloneTelemetry(reported);
                     if (copied) slot.provenance = copied;
                   },
+                  ...(idleWatchdog === undefined ? {} : { onActivity: () => idleWatchdog?.activity() }),
                   onHistory: (history: AgentHistoryEntry[]) => {
                     if (slot.sealed) return;
                     const copied = cloneTelemetry(history);
@@ -1522,11 +1557,13 @@ export async function runWorkflow<T = unknown>(
                   sealAttempt(slot);
                   attemptController?.abort();
                 },
+                idleWatchdog?.promise,
               );
               result = hostAttemptRegistered
                 ? await withAgentCancellation(boundedRunnerPromise, attemptController.signal)
                 : await boundedRunnerPromise;
             } finally {
+              idleWatchdog?.dispose();
               sealAttempt(slot);
               if (continueFromSession !== undefined && !signal.aborted) {
                 const continuation = slot.provenance?.source === "live"
@@ -3508,38 +3545,95 @@ function bestEffortDebug(message: string): void {
   }
 }
 
+interface AgentIdleWatchdog {
+  promise: Promise<never>;
+  activity(): void;
+  dispose(): void;
+}
+
+/** Per-attempt no-backend-activity race. Only real runner activity re-arms it. */
+function createAgentIdleWatchdog(
+  ms: number | null,
+  label: string,
+  onTimeout: (error: WorkflowError) => void,
+): AgentIdleWatchdog | undefined {
+  if (ms === null) return undefined;
+
+  let timer: NodeJS.Timeout | undefined;
+  let disposed = false;
+  let rejectTimeout!: (error: WorkflowError) => void;
+  const promise = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject;
+  });
+  const arm = () => {
+    if (disposed) return;
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = undefined;
+      if (disposed) return;
+      const error = new WorkflowError(
+        `Agent "${label}" received no backend activity for ${ms}ms in this attempt`,
+        WorkflowErrorCode.AGENT_IDLE_TIMEOUT,
+        { recoverable: true, agentLabel: label },
+      );
+      // Latch classification before cancellation: a runner may reject synchronously from abort.
+      rejectTimeout(error);
+      try {
+        onTimeout(error);
+      } catch {
+        // Attempt cancellation is best-effort; idle-timeout classification still wins.
+      }
+    }, ms);
+  };
+  arm();
+
+  return {
+    promise,
+    activity: arm,
+    dispose() {
+      disposed = true;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    },
+  };
+}
+
 /**
- * Run a promise with a timeout.
+ * Run a promise with a total-wall timeout.
  */
 async function withTimeout<T>(
   promise: Promise<T>,
   ms: number | null,
   label: string,
   onTimeout?: () => void,
+  competingDeadline?: Promise<never>,
 ): Promise<T> {
-  if (ms === null) return promise;
+  if (ms === null && competingDeadline === undefined) return promise;
 
   let timeoutId: NodeJS.Timeout | undefined;
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => {
-      try {
-        onTimeout?.();
-      } catch {
-        // Attempt cancellation is best-effort; timeout classification still wins.
-      }
-      reject(
-        new WorkflowError(
+  const races: Array<Promise<T> | Promise<never>> = [promise];
+  if (competingDeadline !== undefined) races.push(competingDeadline);
+  if (ms !== null) {
+    races.push(new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        const error = new WorkflowError(
           `Agent "${label}" timed out after ${ms}ms of total wall-clock time in this attempt`,
           WorkflowErrorCode.AGENT_TIMEOUT,
           { recoverable: true },
-        ),
-      );
-    }, ms);
-  });
+        );
+        // Latch classification before cancellation: a runner may reject synchronously from abort.
+        reject(error);
+        try {
+          onTimeout?.();
+        } catch {
+          // Attempt cancellation is best-effort; timeout classification still wins.
+        }
+      }, ms);
+    }));
+  }
 
   try {
-    return await Promise.race([promise, timeoutPromise]);
+    return await Promise.race(races);
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
   }

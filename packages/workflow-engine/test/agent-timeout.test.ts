@@ -125,7 +125,7 @@ test("a streaming abort-ignoring runner settles at the engine wall-clock cap", a
     assert.equal(ends[0]?.recoverable, true);
     assert.equal(
       result.logs.filter((line) =>
-        line.includes("host ceiling 30ms total wall-clock per attempt; each retry re-arms the clock")
+        line.includes("total-wall ceiling 30ms; idle ceiling disabled; each retry re-arms both clocks")
       ).length,
       1,
     );
@@ -203,6 +203,7 @@ test("WorkflowManager.startInBackground persists and inspects timeout limits and
       concurrency: 2,
       agentRetries: 0,
       agentTimeoutMs: 30,
+      agentIdleTimeoutMs: null,
     });
     const status = manager.inspectRun(started.runId, { lastN: 10, logLines: 10 });
     assert.deepEqual(status?.limits, result.effectiveLimits);

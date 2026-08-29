@@ -81,6 +81,7 @@ manager.stop(runId);                    // whole-run terminal abort
 | `persistenceRoot` | `AGENTPRISM_PERSISTENCE_ROOT` env, else `~/.agentprism/workflows` | Absolute root for run state/logs. Relative paths throw. |
 | `persistence` | filesystem persistence | Custom `RunPersistence` implementation. Omit it for the default `createRunPersistence(cwd, ..., { persistenceRoot })` path. |
 | `defaultAgentTimeoutMs` | `null` (none) | Host total-wall-clock ceiling for each agent attempt. |
+| `defaultAgentIdleTimeoutMs` | `null` (disabled) | Host no-backend-activity ceiling for each agent attempt. |
 | `defaultAgentRetries` | 0 | Retries after *recoverable* agent failures. |
 | `mainModel` | — | Session model spec (registered harness prefix + verbatim id, or backend-only name) used to auto-tier explore-style agents. |
 | `sessionId` | — | Tag for new runs; `listRuns()` filters by it (`listAllRuns()` doesn't). Update via `setSessionId()`. |
@@ -108,6 +109,7 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `environmentKey` | Host-supplied non-git environment label used for replay provenance diagnostics. It never gates journal replay; git workspaces report measured HEAD + dirty digest instead. |
 | `maxAgents` | Cap on total agent calls for the run. |
 | `agentTimeoutMs` | Host total-wall-clock ceiling for each agent attempt (`null` = no host ceiling). |
+| `agentIdleTimeoutMs` | Host no-backend-activity ceiling for each attempt (`null` = watchdog disabled). |
 | `concurrency`, `agentRetries` | Per-run overrides of the manager defaults. |
 | `defaultModel` | Host-pinned backend/model for calls with no authored model, agent-definition model, tier, or phase/meta route. It is persisted, passed as the resolved model, and enters call identity. Primarily used by the MCP composition root's automatic default selection. |
 | `confirm` | `(promptText, options) => Promise<reply>` — live human channel for `checkpoint()`. When present it wins over every headless mode, including `"pause"`. |
@@ -118,15 +120,20 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `scriptBackends` | APPROVED script-declared custom backends (`meta.backends`). Omitting leaves them inert — approval belongs to the composition root. |
 | `resumeJournal` | Low-level legacy positional channel. Mutually exclusive with `resumeFromRunId`/`resumePolicy`; manual use permanently marks the result legacy. Prefer manager-owned `resumeFromRunId`. |
 
-A finite `agentTimeoutMs` is an unbypassable host ceiling. An `agent({ timeoutMs })` value may
-shorten it; per-call `null` or omission means uncapped only when the host supplied no ceiling. The
-clock covers the complete attempt rather than idle time, and every retry starts a new clock. Since
-retries are clamped at 3, the maximum timeout envelope is `(resolved retries + 1) × resolved timeout`.
-An exhausted timeout settles the call to `null` with recoverable `AGENT_TIMEOUT` and frees its
-concurrency slot. The runner cancels the ACP turn; after a five-second grace, an uncooperative turn
-is closed where supported and its pooled child is quarantined and recycled after sibling sessions
-drain. A new resume execution does not inherit operational limits from its source; pass the desired
-timeout, retry, concurrency, and agent-count values again.
+A finite `agentTimeoutMs` is an unbypassable host total-wall ceiling. An `agent({ timeoutMs })`
+value may shorten it; per-call `null` or omission means uncapped only when the host supplied no
+ceiling. It covers the complete attempt and is **not** an idle timer. The separate opt-in
+`agentIdleTimeoutMs` / per-call `idleTimeoutMs` pair uses the same ceiling rules and fires only when
+the runner reports no real backend activity for that duration. The ACP runner reports every
+`session/update`; synthetic 15-second progress heartbeats never reset the watchdog. Size an idle
+bound above the longest expected backend-silent local tool operation (typically 5–10 minutes).
+
+Every retry starts fresh total-wall and idle clocks. Exhaustion settles the call to `null` with
+recoverable `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT` and frees its concurrency slot. The runner
+cancels the ACP turn; after a five-second grace, an uncooperative turn is closed where supported and
+its pooled child is quarantined and recycled after sibling sessions drain. A new resume execution
+does not inherit operational limits from its source; pass the desired timeout, idle-timeout, retry,
+concurrency, and agent-count values again.
 
 ### `CheckpointOptions` — in-script human gates
 
@@ -279,7 +286,7 @@ type WorkflowResumeReport = WorkflowResumeReportBase &
   );
 
 interface WorkflowReplayOperationalChange {
-  option: "agentTimeoutMs" | "agentRetries" | "concurrency";
+  option: "agentTimeoutMs" | "agentIdleTimeoutMs" | "agentRetries" | "concurrency";
   source: number | null;
   current: number | null;
   detail: string;
@@ -356,8 +363,8 @@ correspondence rule.
 An agent call's identity hash covers prompt, resolved model, authored mode/config options/tier,
 phase, agent type and resolved definition, and schema. Its separate input fingerprint covers the
 resolved label, per-call cwd, resolved isolation, `keepSession`, images, MCP servers, metadata,
-prompt metadata, and the approved script-backend digest. Host `agentTimeoutMs`, `agentRetries`, and
-`concurrency`, plus per-call `timeoutMs` and `retries`, are operational bounds and enter neither
+prompt metadata, and the approved script-backend digest. Host `agentTimeoutMs`, `agentIdleTimeoutMs`, `agentRetries`, and
+`concurrency`, plus per-call `timeoutMs`, `idleTimeoutMs`, and `retries`, are operational bounds and enter neither
 hash. They may change on a new-run resume or an interrupted-turn continuation without rejecting an
 otherwise matching call.
 
@@ -507,6 +514,7 @@ interface WorkflowRunCallStatus {
   model?: string;
   backendId?: string;
   timeoutMs?: number | null;
+  idleTimeoutMs?: number | null;
   errorCode?: WorkflowErrorCode;
   /** Present only while the call is in flight on a live run; settled calls omit it. */
   status?: "queued" | "running";
@@ -537,6 +545,7 @@ interface WorkflowRunLimits {
   concurrency: number;
   agentRetries: number;
   agentTimeoutMs: number | null;
+  agentIdleTimeoutMs: number | null;
 }
 ```
 
@@ -1076,7 +1085,7 @@ const runner = createAcpRunner({
 
 One agent call per invocation; returns the assistant text, or the **validated object** when `schema` is set (native/tool-captured structured output + validate-and-re-prompt). Key `RunOptions`:
 
-`label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `configOptions`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), `keepSession` (skip the release-time best-effort `session/close` so the agent-persisted session stays re-openable), resume-only `continueFromSession` (advisory exact-session reattach), callbacks `onUsage`, `onHistory`, `onResultProvenance`, `onModelResolved`, `onModelFallback`, `onSessionOpen`.
+`label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `configOptions`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), `keepSession` (skip the release-time best-effort `session/close` so the agent-persisted session stays re-openable), resume-only `continueFromSession` (advisory exact-session reattach), callbacks `onUsage`, `onHistory`, `onActivity` (one real backend progress event), `onResultProvenance`, `onModelResolved`, `onModelFallback`, `onSessionOpen`.
 
 **Session hand-off.** `run()`'s return value is always the bare result, so the ACP session identity travels out-of-band: `onSessionOpen` fires exactly once for whichever acquisition wins — fresh `session/new`, successful `session/resume`/`session/load`, or the fresh fallback after a reopen failure — and always before that acquisition's prompt. Its `AgentSessionRef` is `{ sessionId, backendId, poolKey?, initializeMeta?, cwd, reopen: { load, resume, list, fork } }`; `poolKey` pins the effective custom-backend spawn identity. `initializeMeta`, when the initialize response supplies non-null `_meta`, is one complete recursively frozen JSON snapshot owned by the session and shared with its event contexts; absent/null metadata omits the key. Pair a successful call with `keepSession: true` when the host intends to reopen it. Usage/auth pause errors keep the session open automatically for managed continuation. With `continueFromSession`, the runner prefers currently advertised resume, falls back to load, and reports reattached/skipped provenance. Every non-cancellation failure through the reopen RPC cleans up and opens a fresh session with the original prompt; after reopen succeeds, the turn is committed and receives a fixed continuation instruction. The ref contains no secrets added by the client and is JSON-round-trippable; agents remain responsible for what they place in `_meta`.
 
@@ -1324,6 +1333,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `SCRIPT_ERROR` | no | The script **crashed at runtime**: uncaught throw or unhandled promise rejection in the script body. Run fails. |
 | `WORKFLOW_ABORTED` | — | Actual cancellation (pause/stop/signal). Never used for crashes. |
 | `AGENT_TIMEOUT` | yes | Total wall-clock attempt cap exhausted. Each retry gets a fresh clock; after exhaustion the call settles to `null`, and an ACP turn that ignores cancel is closed/recycled after its grace period. |
+| `AGENT_IDLE_TIMEOUT` | yes | Opt-in no-backend-activity cap exhausted. Real backend events re-arm it; retries and cancellation match `AGENT_TIMEOUT`. |
 | `AGENT_CANCELLED` | yes | The host selected one in-flight agent. It settles to `null`, skips retries, leaves the run and siblings live, and creates a failed call record but no replayable journal result. |
 | `AGENT_EMPTY_OUTPUT` | yes | No assistant text on a schema-less call. |
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the repair ladder. |
@@ -1367,6 +1377,7 @@ interface WorkflowExecuteToolInput {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number | null;
+  agentIdleTimeoutMs?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
@@ -1434,7 +1445,7 @@ admission-time `replayEligibility` prediction before the script body is allowed 
 Every newly admitted response reports its resolved `limits`. The same object appears on foreground
 results, background acknowledgements, inspect/await status, and terminal await `outcome`; legacy
 persisted records that predate limit storage may omit it. Failed call rows include their resolved
-`timeoutMs` and `errorCode`, so an exhausted attempt is directly inspectable as `AGENT_TIMEOUT`.
+`timeoutMs`, `idleTimeoutMs`, and `errorCode`, so an exhausted attempt is directly inspectable as `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`.
 
 ```ts
 interface WorkflowAwaitMetadata {
@@ -1553,7 +1564,7 @@ The full engine contract (guest library, host-call surface, FORMAT.md preview ru
 
 Scripts run in a deterministic `vm` realm (`Date.now`/`Math.random`/argless `new Date()` throw — the journal/resume identity depends on it; the realm is a determinism boundary, **not** a security boundary). Realm globals:
 
-`agent(prompt, { label?, schema?, model?, mode?, configOptions?, tier?, phase?, isolation?, resume?, cwd?, timeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` (unknown option keys reject before call allocation or runner invocation) · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title)` · `log(msg)` · `args` · `cwd`.
+`agent(prompt, { label?, schema?, model?, mode?, configOptions?, tier?, phase?, isolation?, resume?, cwd?, timeoutMs?, idleTimeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` (unknown option keys reject before call allocation or runner invocation) · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title)` · `log(msg)` · `args` · `cwd`.
 
 `gate()` validators may return `{ ok: boolean, feedback?: string, ... }`, a bare boolean, or
 `null`. A fulfilled gate returns exactly `{ ok, value, verdict, attempts }`: `value` is the final

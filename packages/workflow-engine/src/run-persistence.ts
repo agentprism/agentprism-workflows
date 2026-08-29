@@ -63,6 +63,8 @@ export interface PersistedAgentState {
   model?: string;
   /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
   timeoutMs?: number | null;
+  /** Resolved no-backend-activity deadline for each attempt; null means disabled. */
+  idleTimeoutMs?: number | null;
   /** This logical call's aggregate token debit (provider total or estimate). */
   tokens?: number;
   callIndex?: number;

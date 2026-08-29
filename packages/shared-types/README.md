@@ -79,7 +79,8 @@ From [`src/index.ts`](./src/index.ts):
   `mode`, `tier`, `cwd`, `toolNames`, `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`,
   `images`, `runId`, `backends`, `meta`, `promptMeta`, the Codex-only `baseInstructions` /
   `developerInstructions`, `keepSession`, and the out-of-band callbacks `onUsage`,
-  `onModelResolved`, `onModelFallback`, `onHistory`, `onSessionOpen`. The resume-only
+  `onModelResolved`, `onModelFallback`, `onHistory`, `onActivity`, `onSessionOpen`. `onActivity`
+  reports real backend progress for an engine-owned opt-in idle watchdog. The resume-only
   `continueFromSession` directive is advisory: a capable runner reopens that exact session and
   reports the attempt through `AgentResultProvenance.continuation`; otherwise it runs fresh.
   `onSessionOpen` fires exactly once for whichever acquisition wins (fresh, resumed, or loaded).
@@ -92,6 +93,8 @@ From [`src/index.ts`](./src/index.ts):
 - `AGENT_TIMEOUT` identifies exhaustion of a recoverable total-wall-clock attempt cap. The engine
   retries only within its configured bound, then settles the call to `null`; every retry gets a
   fresh clock.
+- `AGENT_IDLE_TIMEOUT` identifies exhaustion of a recoverable no-backend-activity cap. Real
+  backend events re-arm it; synthetic host heartbeats do not.
 - `AGENT_CANCELLED` identifies a host-selected in-flight call. The engine settles that call to
   `null` without retrying or aborting the owning run; the failed row is observable but is not a
   replayable journal result.
@@ -143,14 +146,15 @@ From [`src/index.ts`](./src/index.ts):
   remain valid.
 - `WorkflowRunInspectionOptions`, `WorkflowLogTail`, `WorkflowRunCallStatus`,
   `WorkflowRunStatusTruncation`, and `WorkflowRunStatus` — the shared bounded status contract used
-  by SDK and MCP polling/inspection hosts. Agent call status can carry its resolved total-wall-clock
-  `timeoutMs` and terminal `errorCode`, including `AGENT_TIMEOUT` and `AGENT_CANCELLED` for
+  by SDK and MCP polling/inspection hosts. Agent call status can carry its resolved total-wall and
+  no-activity `timeoutMs` / `idleTimeoutMs` plus terminal `errorCode`, including `AGENT_TIMEOUT`,
+  `AGENT_IDLE_TIMEOUT`, and `AGENT_CANCELLED` for
   recoverable calls that have no journal result. Resumed results/statuses can carry
   `replayEligibility`, a bounded admission and
   progress summary with the predicted/observed prefix, first non-replay, engine/input-format
   diagnostics, and non-gating operational changes.
 - `WorkflowRunLimits` — resolved `maxAgents`, `tokenBudget`, `concurrency`, `agentRetries`, and
-  per-attempt `agentTimeoutMs`; it is returned as `WorkflowRunResult.effectiveLimits` and as
+  per-attempt `agentTimeoutMs` / `agentIdleTimeoutMs`; it is returned as `WorkflowRunResult.effectiveLimits` and as
   `WorkflowRunStatus.limits` (optional only for legacy persisted records).
 
 **MCP config**

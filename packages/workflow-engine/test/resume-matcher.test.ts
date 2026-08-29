@@ -413,6 +413,7 @@ return { first, second };`;
       const variants = [
         { runId: "timeout-dropped", agentTimeoutMs: null },
         { runId: "timeout-changed", agentTimeoutMs: 450 },
+        { runId: "idle-enabled", agentIdleTimeoutMs: 900 },
         { runId: "retries-changed", agentRetries: 0 },
         { runId: "concurrency-changed", concurrency: 7 },
       ] as const;
@@ -425,6 +426,14 @@ return { first, second };`;
         assert.equal(resumed.resumeReport?.replayed, 2, variant.runId);
         assert.equal(resumed.resumeReport?.live, 0, variant.runId);
         assert.equal(resumed.replayEligibility?.engineVersionComparison, "different", variant.runId);
+        if (variant.runId === "idle-enabled") {
+          assert.equal(
+            resumed.replayEligibility?.operationalChanges.find((change) =>
+              change.option === "agentIdleTimeoutMs"
+            )?.detail,
+            "source recorded agentIdleTimeoutMs=none; this run: 900",
+          );
+        }
       }
       assert.equal(liveCalls, 2, "operational changes never invoke the runner for completed calls");
 

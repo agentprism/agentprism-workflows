@@ -86,6 +86,19 @@ function persisted(runId: string, status: PersistedRunState["status"]): Persiste
   };
 }
 
+test("inspection normalizes pre-watchdog limits to an explicitly disabled idle bound", () => {
+  const source = persisted("legacy-limits", "completed");
+  source.limits = {
+    maxAgents: 10,
+    tokenBudget: null,
+    concurrency: 2,
+    agentRetries: 1,
+    agentTimeoutMs: null,
+  };
+  const status = projectWorkflowRunStatus(source);
+  assert.equal(status.limits?.agentIdleTimeoutMs, null);
+});
+
 test("inspection is live-first, cold-readable, ordered, missing-safe, and read-only", async () => {
   const store = memoryPersistence();
   const held = deferred<unknown>();
@@ -437,7 +450,7 @@ test("multibyte previews and the whole structured status obey deterministic hard
 test("terminal results get exact redacted final-20 tails while completed results retain only full logs", async () => {
   const token = "ghp_abcdefgh12345678";
   const admissionLog =
-    "agent timeout admission: host ceiling none total wall-clock per attempt; each retry re-arms the clock";
+    "agent timeout admission: total-wall ceiling none; idle ceiling disabled; each retry re-arms both clocks";
   const loggingPrefix =
     'for (let i = 1; i <= 25; i++) log(i === 10 ? `line-${i} ghp_abcdefgh12345678` : i === 11 ? `line-${i} ${"😀".repeat(1000)}` : `line-${i}`);';
   const manager = new WorkflowManager({ persistence: memoryPersistence().persistence, agent: runnerFrom(() => "ok") });

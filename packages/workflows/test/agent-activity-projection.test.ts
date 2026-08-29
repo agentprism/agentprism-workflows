@@ -79,6 +79,29 @@ test("multiple text content blocks are joined in order", () => {
   assert.equal(activity.toolName, undefined);
 });
 
+test("non-content ACP session updates still advance backend activity counters", () => {
+  for (const name of [
+    "available_commands_update",
+    "compaction_summary_chunk",
+    "compaction_update",
+    "config_option_update",
+    "current_mode_update",
+    "session_info_update",
+  ] as const) {
+    const activity = projectWorkflowAgentActivity({
+      name,
+      event: {},
+      backendId: "claude",
+      sessionId: "session-1",
+      runId: "run-1",
+      scope: "run-1",
+      callIndex: 0,
+    } as Parameters<typeof projectWorkflowAgentActivity>[0]);
+    assert.ok(activity, name);
+    assert.equal(activity.kind, "activity", name);
+  }
+});
+
 test("steering remains a live observation and never becomes durable workflow activity", () => {
   const activity = projectWorkflowAgentActivity({
     name: "steering",

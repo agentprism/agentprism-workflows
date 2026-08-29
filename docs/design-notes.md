@@ -292,7 +292,7 @@ The `workflow` tool grew from Pi's single-form input
   defaulting to the server's own project under `--in-process`. Agent-less deterministic scripts are
   valid; the validator warns when a script has neither `agent()` nor `checkpoint()`. Other run
   fields: `args`, `maxAgents` (default 1000), `concurrency` (clamped to 16), `agentRetries`
-  (clamped to ≤3), `agentTimeoutMs` (default none), the explicit-resume
+  (clamped to ≤3), `agentTimeoutMs` (total-wall, default none), `agentIdleTimeoutMs` (no backend activity, default disabled), the explicit-resume
   trio `resumeFromRunId` / `resumePolicy` / `checkpointReplies`, and `background`.
 - **Inspect / await / stop** — take a `runId` and never execution fields; `await` adds `waitMs` (default 20 000). Whole-run stop is location-independent across daemon generations: the successor persists an idempotent intent, routes signed control to the lease owner, and may return a nonterminal pending-control acknowledgement before final settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and cancellation is never reconstructed after owner loss. All three actions accept the `lastN` / `labelGlob` / `logLines` projection bounds.
 - **Bounds clamp, don't reject:** accept `concurrency`/`agentRetries` as plain numbers in the tool
@@ -301,6 +301,13 @@ The `workflow` tool grew from Pi's single-form input
   `MAX_AGENT_RETRIES` 3), so defer to it and keep the "clamped" semantics above (matches Pi). The
   inspection *bounds* (`lastN`/`logLines`/`waitMs`), by contrast, are wire-contract limits rejected
   at the Zod boundary.
+
+**Two independent attempt clocks.** `agentTimeoutMs` / per-call `timeoutMs` cap total wall time;
+`agentIdleTimeoutMs` / per-call `idleTimeoutMs` are opt-in wedge detection. The idle clock starts
+fresh for each retry and re-arms only on real backend activity (`session/update` for ACP runners),
+never on the engine's synthetic progress heartbeat. Either expiry cancels through the existing ACP
+turn wind-down and is recoverable (`AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`), so retries apply and
+final exhaustion resolves the call to `null`. Both are replay-neutral operational bounds.
 
 **Background execution, not just synchronous.** Pi's "return immediately, deliver the result into a
 *later* turn" affordance (`installResultDelivery`) has no MCP equivalent, so a **foreground** run

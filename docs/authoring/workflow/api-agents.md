@@ -20,6 +20,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `resume` | `{ filesystem: "read-only" }` | Deprecated compatibility annotation. It is recorded as legacy diagnostic provenance, is not sent to the runner or hashed, and has no effect on replay. New scripts should omit it. |
 | `cwd` | `string` | Per-session working directory; relative resolves against the run's base cwd. Overridden by worktree isolation. Not hashed. |
 | `timeoutMs` | `number \| null` | Total wall-clock cap for each attempt. A finite value may tighten a finite host `agentTimeoutMs` ceiling but cannot raise or disable it. With no host ceiling, a finite value applies and `null`/omitted is uncapped. |
+| `idleTimeoutMs` | `number \| null` | No-backend-activity cap for each attempt. It may tighten a finite host `agentIdleTimeoutMs` ceiling but cannot raise or disable it. |
 | `retries` | `number` | Retries after *recoverable* failures (default 0, host-overridable). Exhausted retries ⇒ the call resolves `null`. |
 | `mcpServers` | `McpServerConfig[]` | MCP servers attached to this session. Stdio shape: `{ name, command, args: [], env: [{ name, value }] }` (`args`/`env` required, `env` is name/value pairs, not a map); `{ type: "http" \| "sse", name, url, headers: [] }` also accepted. Not hashed. |
 | `images` | `PromptImage[]` | Base64 image blocks appended to the prompt; backends without image support get a bracketed text note. Not hashed. |
@@ -27,16 +28,17 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `promptMeta` | `object` | ACP `_meta` merged into `session/prompt` — turn-scoped passthrough. Backend-computed keys win on conflict. Not hashed. |
 | `keepSession` | `boolean` | Skip release-time best-effort `session/close`; the non-secret re-attach record lands in `WorkflowRunResult.agentSessions` for host-side `loadSession()` / `resumeSession()`. Usage/auth pause failures are kept open automatically for managed continuation. Not identity-hashed; included in the input fingerprint. |
 
-The timeout clock measures the whole attempt, including backend startup, model/config setup, tool
-work, and streamed output; it is not an idle timer. Each retry starts a fresh clock, so the maximum
-timeout envelope is `(retries + 1) × resolved timeoutMs` (retries are clamped to 3). An exhausted
-timeout is recoverable `AGENT_TIMEOUT`: the call resolves to `null`, releases its concurrency slot,
-and asks the ACP session to cancel. A session that keeps running after the cancellation grace is
-closed where supported and its pooled child is recycled.
+The total-wall clock measures the whole attempt, including backend startup, model/config setup,
+tool work, and streamed output; it is not an idle timer. The separate idle clock is opt-in and
+re-arms on real backend activity (every ACP `session/update`), never synthetic progress heartbeats.
+Size it above the longest expected backend-silent local tool call. Each retry starts fresh clocks.
+Exhaustion is recoverable `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`: the call resolves to `null`,
+releases its concurrency slot, and asks the ACP session to cancel. A session that keeps running
+after the cancellation grace is closed where supported and its pooled child is recycled.
 
 Every new run, including one admitted with `resumeFromRunId`, resolves host limits from that run's
-request. It does not inherit `agentTimeoutMs`, retries, concurrency, or agent-count values from
-its source, so pass every operational bound the resumed execution should use.
+request. It does not inherit `agentTimeoutMs`, `agentIdleTimeoutMs`, retries, concurrency, or
+agent-count values from its source, so pass every operational bound the resumed execution should use.
 
 ## Model specs & routing
 

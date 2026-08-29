@@ -46,13 +46,14 @@ export interface AgentRunner {
    *      AGENT_EMPTY_OUTPUT     (recoverable)      no assistant text on a no-schema call
    *      SCHEMA_NONCOMPLIANCE   (non-recoverable)  schema never satisfied after the ladder
    *      PROVIDER_USAGE_LIMIT   (non-recoverable)  quota/rate wall -> engine PAUSES, carries resetHint
-   *    (AGENT_TIMEOUT + AGENT_CANCELLED + WORKFLOW_ABORTED + SCRIPT_ERROR are added by the ENGINE, not the runner.)
+   *    (AGENT_TIMEOUT + AGENT_IDLE_TIMEOUT + AGENT_CANCELLED + WORKFLOW_ABORTED + SCRIPT_ERROR are added by the ENGINE, not the runner.)
    *
    *  - TIMEOUT and ABORT are the ENGINE's responsibility, not the runner's:
-   *    withTimeout (:464) races a setTimeout throwing AGENT_TIMEOUT; the engine passes
-   *    options.signal and calls throwIfAborted() before/after. The runner SHOULD honor
-   *    options.signal (wire it to the backend session cancel -> ACP session/cancel) but
-   *    MUST NOT implement its own timeout.
+   *    the engine owns the total-wall and idle watchdog races, passes options.signal, and calls
+   *    throwIfAborted() before/after. The runner SHOULD honor options.signal (wire it to the
+   *    backend session cancel -> ACP session/cancel), MUST NOT implement its own timeout, and
+   *    SHOULD invoke options.onActivity for real backend progress so an opted-in idle watchdog
+   *    can distinguish a live stream from a wedge.
    *
    *  - There is NO checkpoint method: human-in-the-loop is the engine's options.confirm
    *    callback (workflow.ts:798-829), not a runner concern.

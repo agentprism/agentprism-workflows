@@ -250,6 +250,7 @@ return [a, b]`,
         concurrency: 3,
         agentRetries: 3,
         agentTimeoutMs: 123,
+        agentIdleTimeoutMs: null,
       });
       assert.equal(result.calls?.[0].budgetDebit, 11);
       assert.equal(result.calls?.[1].budgetDebit, Math.ceil(JSON.stringify("four").length / 4) + Math.ceil(JSON.stringify("long prompt").length / 4));

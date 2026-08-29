@@ -133,6 +133,27 @@ function nestedToolName(meta: unknown): string | undefined {
   return undefined;
 }
 
+type ProjectedAcpUpdateKind =
+  | "agent_message_chunk"
+  | "tool_call"
+  | "usage_update"
+  | "tool_call_update"
+  | "user_message_chunk"
+  | "agent_thought_chunk"
+  | "plan"
+  | "plan_update"
+  | "plan_removed"
+  | "available_commands_update"
+  | "compaction_summary_chunk"
+  | "compaction_update"
+  | "config_option_update"
+  | "current_mode_update"
+  | "session_info_update";
+type Assert<T extends true> = T;
+type IsNever<T> = [T] extends [never] ? true : false;
+type _EveryAcpUpdateProjectsToActivity = Assert<IsNever<Exclude<AcpUpdateKind, ProjectedAcpUpdateKind>>>;
+type _EveryProjectedActivityIsAcp = Assert<IsNever<Exclude<ProjectedAcpUpdateKind, AcpUpdateKind>>>;
+
 /** Pure ACP-to-engine adapter. Unknown or unsafe activity stays on the raw event bus only. */
 export function projectWorkflowAgentActivity(
   event: WorkflowAgentEventPayload,
@@ -202,6 +223,16 @@ export function projectWorkflowAgentActivity(
   if (event.name === "user_message_chunk" || event.name === "agent_thought_chunk" ||
       event.name === "plan" || event.name === "plan_update" ||
       event.name === "plan_removed") return { ...base, kind: "content-boundary" };
+  if (
+    event.name === "available_commands_update" ||
+    event.name === "compaction_summary_chunk" ||
+    event.name === "compaction_update" ||
+    event.name === "config_option_update" ||
+    event.name === "current_mode_update" ||
+    event.name === "session_info_update"
+  ) {
+    return { ...base, kind: "activity" };
+  }
   return undefined;
 }
 

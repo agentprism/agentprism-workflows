@@ -30,12 +30,20 @@ const replayEligibility = {
     current: "v24.17.1",
     detail: "source recorded runtime.node=v24.16.0; this run: v24.17.1",
   }],
-  operationalChanges: [{
-    option: "agentTimeoutMs",
-    source: 900_000,
-    current: null,
-    detail: "source recorded agentTimeoutMs=900000; this run: none",
-  }],
+  operationalChanges: [
+    {
+      option: "agentTimeoutMs",
+      source: 900_000,
+      current: null,
+      detail: "source recorded agentTimeoutMs=900000; this run: none",
+    },
+    {
+      option: "agentIdleTimeoutMs",
+      source: null,
+      current: 300_000,
+      detail: "source recorded agentIdleTimeoutMs=none; this run: 300000",
+    },
+  ],
 } as const satisfies WorkflowReplayEligibility;
 
 const baseRun: WorkflowRunResult<null> = {
@@ -54,6 +62,7 @@ const baseRun: WorkflowRunResult<null> = {
     concurrency: 3,
     agentRetries: 2,
     agentTimeoutMs: 45_000,
+    agentIdleTimeoutMs: 300_000,
   },
 };
 
