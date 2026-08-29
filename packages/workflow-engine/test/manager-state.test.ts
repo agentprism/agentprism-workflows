@@ -259,6 +259,7 @@ return { count: args.count, answer }`,
         concurrency: 8,
         agentRetries: 0,
         agentTimeoutMs: null,
+        agentIdleTimeoutMs: null,
       });
     } finally {
       dirs.cleanup();

@@ -107,7 +107,14 @@ export const workflowToolInputShape = {
     .positive()
     .nullable()
     .optional()
-    .describe("Per-agent timeout in ms. Omit/null for no hard timeout (the engine owns the timeout)."),
+    .describe("Per-agent total-wall timeout in ms. Omit/null for no hard timeout (the engine owns the timeout)."),
+  agentIdleTimeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .nullable()
+    .optional()
+    .describe("Per-agent no-backend-activity timeout in ms. Omit/null to disable the idle watchdog."),
   resumeFromRunId: z
     .string()
     .min(1)
@@ -174,6 +181,7 @@ interface WorkflowExecuteToolInputBase {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number | null;
+  agentIdleTimeoutMs?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
@@ -277,6 +285,7 @@ interface RawWorkflowToolInput {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number | null;
+  agentIdleTimeoutMs?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<string, unknown>;
@@ -304,6 +313,7 @@ function hasExecutionFields(raw: RawWorkflowToolInput): boolean {
     raw.concurrency !== undefined ||
     raw.agentRetries !== undefined ||
     raw.agentTimeoutMs !== undefined ||
+    raw.agentIdleTimeoutMs !== undefined ||
     raw.resumeFromRunId !== undefined ||
     raw.resumePolicy !== undefined ||
     raw.checkpointReplies !== undefined ||
@@ -338,6 +348,7 @@ export function parseWorkflowToolInput(
       raw.concurrency !== undefined ||
       raw.agentRetries !== undefined ||
       raw.agentTimeoutMs !== undefined ||
+      raw.agentIdleTimeoutMs !== undefined ||
       raw.resumeFromRunId !== undefined ||
       raw.resumePolicy !== undefined ||
       raw.checkpointReplies !== undefined ||
@@ -449,6 +460,7 @@ export function parseWorkflowToolInput(
     concurrency: raw.concurrency,
     agentRetries: raw.agentRetries,
     agentTimeoutMs: raw.agentTimeoutMs,
+    agentIdleTimeoutMs: raw.agentIdleTimeoutMs,
     resumeFromRunId: raw.resumeFromRunId,
     resumePolicy: raw.resumePolicy,
     checkpointReplies: raw.checkpointReplies === undefined

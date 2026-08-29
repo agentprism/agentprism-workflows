@@ -83,7 +83,7 @@ Every client-side ACP method is served (`fs/*`, `terminal/*`, permission request
 
 ### Controls for unattended runs
 
-Per-run agent and concurrency limits, per-call git **worktree isolation**, per-call timeouts and retries, and `checkpoint()` — a deterministic, journaled human gate with three modes. A live SDK `confirm` callback or MCP elicitation collects the reply immediately; without a live channel, the default mode takes `default ?? true` (or `headless: "abort"` aborts), so detached runs never hang by default. Authors can opt into a durable pause with `headless: "pause"`: the run returns `status: "paused"` plus `checkpointContext`, the host resumes with `checkpointReplies`, and the decision is journaled and replayed without re-asking. For watching those runs from the outside, `@automatalabs/agentprism-otel` attaches to any `WorkflowManager` and exports OpenTelemetry traces (run → agent → tool call) plus token, cost, and duration metrics.
+Per-run agent and concurrency limits, per-call git **worktree isolation**, total-wall and no-activity timeouts, retries, and `checkpoint()` — a deterministic, journaled human gate with three modes. A live SDK `confirm` callback or MCP elicitation collects the reply immediately; without a live channel, the default mode takes `default ?? true` (or `headless: "abort"` aborts), so detached runs never hang by default. Authors can opt into a durable pause with `headless: "pause"`: the run returns `status: "paused"` plus `checkpointContext`, the host resumes with `checkpointReplies`, and the decision is journaled and replayed without re-asking. For watching those runs from the outside, `@automatalabs/agentprism-otel` attaches to any `WorkflowManager` and exports OpenTelemetry traces (run → agent → tool call) plus token, cost, and duration metrics.
 
 ---
 
@@ -331,7 +331,8 @@ reference host's generic core client must advertise.
 | `maxAgents` | number | Default 1000. |
 | `concurrency` | number | **Clamped** to 16 (not rejected). |
 | `agentRetries` | number | **Clamped** to 3. |
-| `agentTimeoutMs` | number \| null | Per-agent timeout; omit for none. |
+| `agentTimeoutMs` | number \| null | Per-attempt total-wall timeout; omit/null for none. |
+| `agentIdleTimeoutMs` | number \| null | Per-attempt no-backend-activity timeout; omit/null to disable. |
 | `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
 | `resumePolicy` | `"auto" \| "positional"` | Default `"auto"`; positional requests index/prefix matching but cannot bypass new-format format, metadata, manifest, input, or safety checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to its decision. Keys must be canonical non-negative integer strings on the JSON wire. |
@@ -456,7 +457,7 @@ The model-facing surface is `docs`, `workflow`, and `repl`. `docs` embeds one se
 
 A script is plain JavaScript whose **first statement** is the `meta` literal. Inside it, these globals are available (injected into the run's realm — they are not importable functions; `@automatalabs/workflows` ships an ambient `.d.ts` so your editor knows them):
 
-- `agent(prompt, opts?)` — run one subagent. With `opts.schema` (a JSON Schema) you get a validated object back; without it, the assistant's text. Other opts: `label`, `phase`, `model`/`tier`, `mode`, `configOptions`, `agentType`, `isolation`, `cwd`, `timeoutMs`, `retries`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`, plus the deprecated replay-neutral `resume` annotation. (`configOptions` is the selected harness's exact ACP option id/value bag; `keepSession` preserves the agent-side session for host re-attachment and records it in `WorkflowRunResult.agentSessions`; `meta`/`promptMeta` are generic ACP `_meta` passthroughs merged into `session/new` / `session/prompt`. Tool policy and instructions come from the `agentType` definition; `toolNames`/`instructions` remain lower-level `createAcpRunner().run()` API options.)
+- `agent(prompt, opts?)` — run one subagent. With `opts.schema` (a JSON Schema) you get a validated object back; without it, the assistant's text. Other opts: `label`, `phase`, `model`/`tier`, `mode`, `configOptions`, `agentType`, `isolation`, `cwd`, `timeoutMs`, `idleTimeoutMs`, `retries`, `mcpServers`, `images`, `meta`, `promptMeta`, `keepSession`, plus the deprecated replay-neutral `resume` annotation. (`configOptions` is the selected harness's exact ACP option id/value bag; `keepSession` preserves the agent-side session for host re-attachment and records it in `WorkflowRunResult.agentSessions`; `meta`/`promptMeta` are generic ACP `_meta` passthroughs merged into `session/new` / `session/prompt`. Tool policy and instructions come from the `agentType` definition; `toolNames`/`instructions` remain lower-level `createAcpRunner().run()` API options.)
 - `parallel([fn, …])` — run thunks concurrently; **barrier** (awaits all).
 - `pipeline(items, stage1, stage2, …)` — stream each item through stages independently (no inter-stage barrier).
 - `phase(title)`, `log(msg)` — progress grouping + narration.

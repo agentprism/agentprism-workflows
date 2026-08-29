@@ -43,6 +43,7 @@ export {
   workflowMayUseDefaultModel,
   hashCheckpointInputs,
   resolveAgentTimeoutMs,
+  resolveAgentIdleTimeoutMs,
   resolveWorkflowRunLimits,
   redactText,
   truncateUtf8,

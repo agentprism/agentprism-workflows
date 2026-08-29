@@ -197,7 +197,8 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `maxAgents` | integer > 0 | no | `1000` | Max agents allowed in this run (engine cap `MAX_AGENTS_PER_RUN`). Values below 1 are clamped up to 1. |
 | `concurrency` | integer > 0 | no | engine default | Max concurrent agents. **Clamped to 16** (the runtime max) by the engine — never rejected. |
 | `agentRetries` | integer ≥ 0 | no | engine default | Retry attempts for recoverable agent failures. **Clamped to 3** (the runtime max). |
-| `agentTimeoutMs` | integer > 0 \| null | no | none | Total wall-clock ceiling in ms for each attempt. A per-call `timeoutMs` may tighten but cannot escape a finite ceiling. Omit/pass `null` for no host ceiling. Every retry re-arms the clock. |
+| `agentTimeoutMs` | integer > 0 \| null | no | none | Total wall-clock ceiling in ms for each attempt. A per-call `timeoutMs` may tighten but cannot escape a finite ceiling. Omit/pass `null` for no host ceiling. |
+| `agentIdleTimeoutMs` | integer > 0 \| null | no | disabled | No-backend-activity ceiling in ms for each attempt. A per-call `idleTimeoutMs` may tighten but cannot escape a finite ceiling. |
 | `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits compatible format/metadata/manifest/cwd state and replays only eligible calls; current-environment and Node/V8 drift are reported provenance. Pre-input-format-2 sources use the named positional bridge. If the source paused mid-agent on usage/auth, an unchanged, reopenable root occurrence continues from its recorded ACP session; every failed continuation gate runs fresh. |
 | `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format format/metadata/manifest/input checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. This works under the default policy and does not require `resumePolicy: "positional"`. The JSON decision is returned verbatim (`kind: "confirm"` normally uses a boolean). Wire keys must be canonical non-negative safe integers. |
@@ -207,14 +208,15 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `labelGlob` | string | inspect/await/stop only | all calls | Non-empty, at most 128 Unicode code points. Case-sensitive whole-label `*`/`?` glob with backslash escaping; trailing backslash is literal. Only known agent labels match. |
 | `logLines` | integer 0–50 | inspect/await/stop only | `20` | Latest run-log lines. |
 
-The timeout is not an idle timer: it covers the complete attempt, including backend startup,
-configuration, tool work, and streamed output. Each retry receives a fresh clock, so the maximum
-envelope is `(resolved retries + 1) × resolved timeout` and retries are clamped to 3. Exhaustion
-settles the call to `null` with recoverable `AGENT_TIMEOUT`, frees its concurrency slot, and cancels
-the ACP session; a turn that ignores cancel is closed where supported and its pooled child is
-recycled after sibling sessions drain. With no finite run-level ceiling, per-call `timeoutMs: null`
-or omission is uncapped. Resume requests resolve their own limits, so pass the intended
-timeout/retry/concurrency values again.
+`agentTimeoutMs` is not an idle timer: it covers the complete attempt, including backend startup,
+configuration, tool work, and streamed output. `agentIdleTimeoutMs` is the separate opt-in wedge
+watchdog. Real ACP `session/update` traffic re-arms it; synthetic progress heartbeats do not. Size
+it above the longest expected backend-silent local tool operation (typically 5–10 minutes). Each
+retry receives fresh clocks. Exhaustion settles the call to `null` with recoverable `AGENT_TIMEOUT`
+or `AGENT_IDLE_TIMEOUT`, frees its concurrency slot, and cancels the ACP session; a turn that
+ignores cancel is closed where supported and its pooled child is recycled after sibling sessions
+drain. Resume requests resolve their own limits, so pass the intended timeout/idle-timeout/retry/
+concurrency values again.
 
 Discover a backend's live catalog before pinning model, mode, or `configOptions`:
 
@@ -292,7 +294,8 @@ Background start and bounded collection:
     "tokenBudget": null,
     "concurrency": 4,
     "agentRetries": 0,
-    "agentTimeoutMs": null
+    "agentTimeoutMs": null,
+    "agentIdleTimeoutMs": null
   }
 }
 ```
@@ -470,11 +473,11 @@ interface WorkflowRunStatus {
 ```
 
 Each call has its deterministic index, known agent/checkpoint attribution, a compact JSON
-`resultPreview`, and redaction/truncation flags. Agent rows also expose resolved `timeoutMs` and a
-terminal `errorCode`; timed-out and host-cancelled calls therefore remain visible as
-`AGENT_TIMEOUT` and `AGENT_CANCELLED`. `limits`
-contains `maxAgents`, `tokenBudget` (a persisted-shape compatibility field that is always `null`
-for new runs), `concurrency`, `agentRetries`, and `agentTimeoutMs` as resolved for
+`resultPreview`, and redaction/truncation flags. Agent rows also expose resolved `timeoutMs`,
+`idleTimeoutMs`, and a terminal `errorCode`; timed-out and host-cancelled calls therefore remain
+visible as `AGENT_TIMEOUT`, `AGENT_IDLE_TIMEOUT`, and `AGENT_CANCELLED`. `limits` contains
+`maxAgents`, `tokenBudget` (a persisted-shape compatibility field that is always `null` for new
+runs), `concurrency`, `agentRetries`, `agentTimeoutMs`, and `agentIdleTimeoutMs` as resolved for
 this run (legacy persisted rows may omit it). Inspection never returns script, args, prompts,
 histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results. Sensitive
 keys and credential-shaped strings are redacted before results are structurally compacted; every
@@ -605,7 +608,7 @@ client `resources` capability to gate these server-offered primitives.
   redacted final-20 `logTail` even when empty. The text response renders `recent run log (last X of
   Y):` before resume guidance. The terminal text is capped at 12,288 UTF-8 bytes; completed results
   omit this extra tail and preserve the existing full `logs` field.
-- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Completed calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed or ambiguous calls run live. Filesystem/world state, read/write behavior, safety annotations, nested workflows, and earlier live calls do not gate a match or clear later candidates. Identity hits cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `replayEligibility`; its background acknowledgement predicts the prefix, while run/await/inspect text names the observed prefix, first non-replay, runtime/environment provenance changes, and operational changes. Terminal results also return the full `resumeReport`. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentRetries`, and `concurrency` again when they matter. Those host knobs and per-call `timeoutMs`/`retries` enter neither identity nor the input fingerprint and may change without rejecting replay. Sources below input format 2 use the named `inputs-format-legacy` positional bridge; current-format crash snapshots use identity even without terminal-environment capture. ≤0.23 carried ancestor rows replay only while the ancestor record remains persisted. Workflow-engine, Node, V8, filesystem, and environment differences are diagnostics, never gates. Unsupported call-path/input/checkpoint formats remain named runtime mismatches.
+- **Explicit incremental resume.** A run can pause for a provider usage limit, missing authentication, or an opted-in durable checkpoint, and failed/completed/aborted terminal runs retain their completed journal too. Call `workflow` again with the current content via `script` or `scriptPath`, the desired `args`, and `resumeFromRunId` set to the prior `runId`. Completed calls match by exact path/hash or a unique hash+input fingerprint, so unchanged independent calls may replay after insertions while changed or ambiguous calls run live. Filesystem/world state, read/write behavior, safety annotations, nested workflows, and earlier live calls do not gate a match or clear later candidates. Identity hits cost zero current provider tokens. An empty ID is invalid and an unknown source is a pre-run `PERSISTENCE_ERROR`; neither silently starts fresh. Resume never silently falls back to stored content. The new request creates a new run ID and returns `replayEligibility`; its background acknowledgement predicts the prefix, while run/await/inspect text names the observed prefix, first non-replay, runtime/environment provenance changes, and operational changes. Terminal results also return the full `resumeReport`. Operational limits are resolved from the new request rather than inherited from the source, so pass `agentTimeoutMs`, `agentIdleTimeoutMs`, `agentRetries`, and `concurrency` again when they matter. Those host knobs and per-call `timeoutMs`/`idleTimeoutMs`/`retries` enter neither identity nor the input fingerprint and may change without rejecting replay. Sources below input format 2 use the named `inputs-format-legacy` positional bridge; current-format crash snapshots use identity even without terminal-environment capture. ≤0.23 carried ancestor rows replay only while the ancestor record remains persisted. Workflow-engine, Node, V8, filesystem, and environment differences are diagnostics, never gates. Unsupported call-path/input/checkpoint formats remain named runtime mismatches.
 - **Authoritative stop.** `action:"stop"` without `callIndex` is location-independent. A local live run uses its abort controller; a lease-free persisted run is cold-stopped under the lease; a predecessor-owned run gets an idempotent durable stop intent plus signed forwarding to that owner. Final success still requires persisted `aborted` plus a readable matching `stopped` event, then releases the lease and returns the final inspection projection. If the owner does not settle inside the bounded control wait, the successful nonterminal result carries `control:{state:"pending",operationId,requestedAt,owner?}`; retry stop, inspect, or await. Repeating stop on a terminal run is a successful no-op (`stopped:false`, `alreadyTerminal:true`). `forceOwner:true` explicitly authorizes terminating a superseded owner daemon after identity revalidation; it may interrupt sibling runs in that process and is never inferred from a timeout. Stop retains the journal, record, and script resource, so the kill-patch-resume loop remains stop, edit, then run with `scriptPath` plus `resumeFromRunId`.
 - **Targeted agent cancellation.** Adding `callIndex` to `action:"stop"` synchronously routes to the live execution owner, selects one uniquely matching in-flight agent, settles it to `null` with `AGENT_CANCELLED`, and returns a live status. Siblings and the run continue, retries are bypassed, and `labelGlob` remains only an output filter. The cancelled call has a durable failed record but no journal result, so a later resume executes that occurrence live. Call cancellation is not stored as a cross-owner pending intent and is never fabricated after owner loss. `forceOwner` is forbidden with `callIndex`.
 - **Checkpoints.** Foreground uses MCP elicitation when advertised. Legacy clients use the established

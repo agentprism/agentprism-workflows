@@ -76,6 +76,7 @@ const EXPECTED_LIMITS = {
   concurrency: 3,
   agentRetries: 1,
   agentTimeoutMs: 50_000,
+  agentIdleTimeoutMs: null,
 } as const;
 
 test("background acceptance is immediate and await reports immediate, timeout, cancellation, partial usage, and terminal outcome", async () => {
@@ -242,6 +243,7 @@ test("MCP await and inspect expose the resolved timeout and AGENT_TIMEOUT call f
     concurrency: 2,
     agentRetries: 0,
     agentTimeoutMs: 25,
+    agentIdleTimeoutMs: null,
   } as const;
   try {
     const accepted = await client.callTool({
@@ -278,6 +280,62 @@ test("MCP await and inspect expose the resolved timeout and AGENT_TIMEOUT call f
     assert.equal(calls[0]?.errorCode, WorkflowErrorCode.AGENT_TIMEOUT);
     assert.equal(calls[0]?.resultPreview, "null");
     assert.deepEqual(structured(inspected)?.limits, expectedLimits);
+  } finally {
+    await dispose();
+  }
+});
+
+test("MCP idle watchdog cancels a silent attempt and exposes AGENT_IDLE_TIMEOUT", async () => {
+  let attempts = 0;
+  let aborts = 0;
+  const runner = makeRunner(
+    (_prompt, options) => {
+      attempts += 1;
+      options.signal?.addEventListener("abort", () => { aborts += 1; }, { once: true });
+      return new Promise(() => {
+        // Deliberately silent and abort-ignoring: the engine race must settle independently.
+      });
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  const expectedLimits = {
+    maxAgents: 1_000,
+    tokenBudget: null,
+    concurrency: 8,
+    agentRetries: 0,
+    agentTimeoutMs: null,
+    agentIdleTimeoutMs: 35,
+  } as const;
+  try {
+    const accepted = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script:
+          'export const meta = { name: "idle", description: "idle" };\n' +
+          'return await agent("silent", { label: "silent" });',
+        background: true,
+        agentIdleTimeoutMs: 35,
+      },
+    });
+    const runId = runIdOf(accepted);
+    assert.deepEqual(structured(accepted)?.limits, expectedLimits);
+
+    const awaited = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId, waitMs: 1_000 },
+    });
+    assert.equal(structured(awaited)?.status, "completed");
+    assert.deepEqual(structured(awaited)?.limits, expectedLimits);
+
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId },
+    });
+    const calls = structured(inspected)?.calls as Array<Record<string, unknown>>;
+    assert.equal(attempts, 1);
+    assert.equal(aborts, 1);
+    assert.equal(calls[0]?.idleTimeoutMs, 35);
+    assert.equal(calls[0]?.errorCode, WorkflowErrorCode.AGENT_IDLE_TIMEOUT);
   } finally {
     await dispose();
   }

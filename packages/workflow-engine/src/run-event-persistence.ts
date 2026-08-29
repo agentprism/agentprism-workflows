@@ -606,6 +606,7 @@ function isPersistableInputEvent(value: unknown): value is PersistableEngineRunE
         hasOptional(value, "model", isString) &&
         hasOptional(value, "configOptions", (candidate) => isConfigOptions(candidate, false)) &&
         hasOptional(value, "timeoutMs", (candidate) => candidate === null || isNonNegativeFinite(candidate)) &&
+        hasOptional(value, "idleTimeoutMs", (candidate) => candidate === null || isNonNegativeFinite(candidate)) &&
         hasRequired(value, "callIndex", isNonNegativeSafeInteger) &&
         hasOptional(value, "path", isString)
       );
@@ -680,6 +681,7 @@ function isPersistedEvent(value: unknown): boolean {
         hasOptional(value, "model", isProjectedText) &&
         hasOptional(value, "configOptions", (candidate) => isConfigOptions(candidate, true)) &&
         hasOptional(value, "timeoutMs", (candidate) => candidate === null || isNonNegativeFinite(candidate)) &&
+        hasOptional(value, "idleTimeoutMs", (candidate) => candidate === null || isNonNegativeFinite(candidate)) &&
         hasRequired(value, "callIndex", isNonNegativeSafeInteger) &&
         hasOptional(value, "path", isProjectedText)
       );

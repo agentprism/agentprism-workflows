@@ -101,7 +101,7 @@ Options (`RunDynamicWorkflowOptions`):
 | `args`   | `unknown`      | The value handed to the script's `args` global. |
 | `cwd`    | `string`       | Base working directory for the run (e.g. the project root): every subagent session runs here (a per-agent `agent({ cwd })` or worktree isolation overrides it), worktrees branch from it, and `agentType` definitions are scanned from it. Omitted ⇒ `process.cwd()`. |
 | `runner` | `AgentRunner`  | Swap the backend (or stub it in tests). Omitted ⇒ `createAcpRunner()`. |
-| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: total-wall-clock-per-attempt `agentTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … |
+| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: total-wall `agentTimeoutMs`, no-activity `agentIdleTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … |
 | `allowScriptBackends` | `boolean \| callback` | Approve the commands declared in `meta.backends`; declarations are inert without host approval. |
 | `workflows` | `string \| string[] \| WorkflowDir` | Resolve the first argument and nested `workflow("name")` calls from one or more directories. |
 
@@ -189,7 +189,7 @@ try {
 `backends`, `meta` / `promptMeta` (generic ACP `_meta` passthroughs merged into `session/new` /
 `session/prompt`), `baseInstructions` / `developerInstructions` (Codex-only), `keepSession`, and
 the out-of-band callbacks `onUsage` / `onModelResolved` / `onModelFallback` / `onHistory` /
-`onSessionOpen`. Token/cost usage is delivered via `onUsage` (it may never fire — ACP usage is
+`onActivity` / `onSessionOpen`. `onActivity` reports real backend progress for the opt-in idle watchdog. Token/cost usage is delivered via `onUsage` (it may never fire — ACP usage is
 experimental), never via the return value.
 
 > **Codex session instructions.** When the run routes to the Codex backend, `baseInstructions`
@@ -313,15 +313,15 @@ decision bound to changing content should interpolate that content into the chec
 participates in the checkpoint's hashed replay identity and a divergence re-asks instead of
 injecting.
 
-`WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence` implementation, per-agent timeout/retry defaults, and an optional opaque `leaseOwnerId` for multi-process hosts. Default filesystem persistence exposes read-only lease-owner inspection/validation. `stopPersistedRun(runId)` cold-stops only after acquiring the lease, returning `owned-elsewhere` rather than stealing a live writer's lock.
+`WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence` implementation, per-agent total-wall/idle timeout and retry defaults, and an optional opaque `leaseOwnerId` for multi-process hosts. Default filesystem persistence exposes read-only lease-owner inspection/validation. `stopPersistedRun(runId)` cold-stops only after acquiring the lease, returning `owned-elsewhere` rather than stealing a live writer's lock.
 
-A finite run-level `agentTimeoutMs` is the ceiling for every attempt. Script-level `timeoutMs` may
-tighten it but cannot raise or disable it; without a host ceiling, per-call `null`/omission is
-uncapped. The clock covers total attempt wall time rather than idle time. Retries each get a fresh
-clock, so the maximum envelope is `(resolved retries + 1) × resolved timeout` (retries are clamped
-at 3). After the final timeout, the call resolves to `null` with recoverable `AGENT_TIMEOUT`,
-releases its concurrency slot, and the ACP runner closes/recycles a backend session that ignores
-cancellation.
+A finite run-level `agentTimeoutMs` is the total-wall ceiling for every attempt. Script-level
+`timeoutMs` may tighten it but cannot raise or disable it. It is not an idle timer. The separate
+opt-in `agentIdleTimeoutMs` / per-call `idleTimeoutMs` pair uses the same ceiling rules and fires
+after that long without real backend activity. ACP `session/update` traffic re-arms the idle clock;
+synthetic progress heartbeats do not. Retries get fresh clocks. Final exhaustion resolves `null`
+with recoverable `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`, releases the concurrency slot, and the
+ACP runner closes/recycles a backend session that ignores cancellation.
 
 `cancelAgentCall(runId, callIndex)` is the stateful host seam for a single live attempt. It returns
 `WorkflowAgentCallCancellation` after the failed record and agent-end state are committed, while
@@ -349,7 +349,7 @@ per-execution `exec.agent` until that promise settles, including rejection. Read
 `getRun()`, `getSnapshot()`, or `inspectRun()`, and subscribe to cumulative `tokenUsage` events while
 work is running. Live attempts update `snapshot.tokenUsage` monotonically; replayed calls add zero.
 Run results expose `effectiveLimits`; inspect status exposes the same values as `limits`, and failed
-agent rows carry their resolved `timeoutMs` plus `errorCode`.
+agent rows carry their resolved `timeoutMs` / `idleTimeoutMs` plus `errorCode`.
 
 `exec.resumeFromRunId` asks the manager to admit a terminal source, persist a self-contained seed
 under a new run ID, and match completed calls by exact path/hash or unique hash+input fingerprint.
@@ -363,8 +363,8 @@ index/prefix matching but cannot bypass new-format format/metadata/manifest/inpu
 same-ID `resume()` and low-level `resumeJournal` paths remain permanently legacy positional and
 emit no `resumeReport`. See the [full contract](../../docs/api.md#content-addressed-incremental-resume).
 Operational limits are resolved from the new execution's `exec` options and manager defaults, not
-copied from the source run; pass the desired timeout/retry/concurrency values again. Host
-`agentTimeoutMs`, `agentRetries`, and `concurrency`, plus per-call `timeoutMs` and `retries`, enter
+copied from the source run; pass the desired timeout/idle-timeout/retry/concurrency values again. Host
+`agentTimeoutMs`, `agentIdleTimeoutMs`, `agentRetries`, and `concurrency`, plus per-call `timeoutMs`, `idleTimeoutMs`, and `retries`, enter
 neither replay identity nor the execution-input fingerprint and may change without invalidating
 completed calls or interrupted-turn continuation.
 
@@ -501,7 +501,8 @@ const run = await runDynamicWorkflow(script, { runner: echoRunner });
 
 Seam contract (summarized): `run()` returns the **raw** value (schema ⇒ validated object, no schema
 ⇒ string) — never an envelope; usage flows out-of-band via `options.onUsage`; on failure **throw**
-(ideally a `WorkflowError` so `instanceof` holds across packages); honor `options.signal` but do
+(ideally a `WorkflowError` so `instanceof` holds across packages); honor `options.signal`, invoke
+`options.onActivity` for real backend progress when supporting the opt-in idle watchdog, and do
 **not** implement your own timeout (the engine owns timeout/abort). This makes the SDK fully
 testable without a live agent — pass a stub runner.
 

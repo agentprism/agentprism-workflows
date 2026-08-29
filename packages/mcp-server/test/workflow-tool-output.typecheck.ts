@@ -19,6 +19,7 @@ const limits = {
   concurrency: 6,
   agentRetries: 0,
   agentTimeoutMs: null,
+  agentIdleTimeoutMs: null,
 };
 const replayEligibility: WorkflowReplayEligibility = {
   strategy: "identity-v1",

@@ -449,8 +449,18 @@ class SessionState {
     modes?: SessionModeState | null,
     readonly mcpServerIds: readonly string[] = [],
     private readonly retainSessionLog = true,
+    private readonly onActivity?: () => void,
   ) {
     this.modes = modes;
+  }
+
+  /** Report one real session/update to the engine-owned attempt watchdog. */
+  observeActivity(): void {
+    try {
+      this.onActivity?.();
+    } catch {
+      // Liveness telemetry is best-effort and never perturbs the ACP update drain.
+    }
   }
 
   /** Mark the start of a new turn so currentTurnText()/structured_output read only this turn.
@@ -1180,6 +1190,7 @@ class MultiplexClient {
     const state = this.sessions.get(params.sessionId);
     // Fold into the accumulator FIRST (the drain contract), THEN bubble the event up unchanged.
     state?.applyUpdate(params.update);
+    state?.observeActivity();
     if (this.onEvent) {
       emitSessionUpdate(this.onEvent, params.update, this.contextFor(params.sessionId));
     }
@@ -1510,6 +1521,8 @@ export interface AcpSessionOptions {
   label?: string;
   /** `RunOptions.callIndex`, propagated onto emitted events as context. NOT sent on the wire. */
   callIndex?: number;
+  /** Backend-neutral attempt liveness callback. Invoked for every routed session/update. */
+  onActivity?: () => void;
   /** CODEX-ONLY session instruction overrides. The backend folds these into session/new `_meta`
    *  (bare keys) for the codex-acp adapter; the Claude backend ignores them. Omitted => unset. */
   baseInstructions?: string;
@@ -2192,6 +2205,7 @@ export class PooledConnection {
       response.modes,
       acpMcpServerIds(opts.mcpServers),
       opts.retainSessionLog ?? true,
+      opts.onActivity,
     );
     this.client.register(response.sessionId, state);
     return new SessionHandle(this, response.sessionId, state, response.configOptions ?? [], opts, onReleased);
@@ -2227,6 +2241,7 @@ export class PooledConnection {
         undefined,
         acpMcpServerIds(opts.mcpServers),
         opts.retainSessionLog ?? true,
+        opts.onActivity,
       );
       const meta = this.sessionRequestMeta(opts);
       const request = {
@@ -2303,6 +2318,7 @@ export class PooledConnection {
         undefined,
         acpMcpServerIds(opts.mcpServers),
         opts.retainSessionLog ?? true,
+        opts.onActivity,
       );
       const meta = this.sessionRequestMeta(opts);
       const request = {

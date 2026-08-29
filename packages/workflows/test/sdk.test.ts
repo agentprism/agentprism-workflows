@@ -932,15 +932,18 @@ test("createAcpRunner exposes a typed ACP event bus (on/once/off/listenerCount) 
   }
 });
 
-test("RunOptions exposes Codex baseInstructions/developerInstructions through the SDK barrel", () => {
-  // Compile-gate: the two additive Codex-only seam fields are typed on RunOptions as re-exported
-  // by @automatalabs/workflows, so SDK users get createAcpRunner().run(p, { baseInstructions }).
+test("RunOptions exposes Codex instructions and backend activity through the SDK barrel", () => {
+  // Compile-gate: additive seam fields are typed on RunOptions as re-exported by the facade.
+  let activities = 0;
   const opts: RunOptions = {
     baseInstructions: "You only write Rust.",
     developerInstructions: "Prefer iterators.",
+    onActivity: () => { activities += 1; },
   };
+  opts.onActivity?.();
   assert.equal(opts.baseInstructions, "You only write Rust.");
   assert.equal(opts.developerInstructions, "Prefer iterators.");
+  assert.equal(activities, 1);
 });
 
 test("runDynamicWorkflow runs a 1-agent script through a stub runner", async () => {

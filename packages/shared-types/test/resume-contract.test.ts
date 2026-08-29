@@ -170,6 +170,12 @@ const operationalChange: WorkflowReplayOperationalChange = {
   current: null,
   detail: "source recorded agentTimeoutMs=900000; this run: none",
 };
+const idleOperationalChange: WorkflowReplayOperationalChange = {
+  option: "agentIdleTimeoutMs",
+  source: null,
+  current: 300_000,
+  detail: "source recorded agentIdleTimeoutMs=none; this run: 300000",
+};
 const provenanceChange: WorkflowReplayProvenanceChange = {
   field: "runtime.node",
   source: "v24.16.0",
@@ -192,7 +198,7 @@ const replayEligibility: WorkflowReplayEligibility = {
   sourceInputsFormat: 1,
   currentInputsFormat: 2,
   provenanceChanges: [provenanceChange],
-  operationalChanges: [operationalChange],
+  operationalChanges: [operationalChange, idleOperationalChange],
 };
 
 const legacyJournal: JournalEntry = { index: 0, hash: "legacy", result: "cached" };
@@ -240,6 +246,7 @@ test("incremental resume shared type fixtures cover every public branch", () => 
   assert.equal(replayEligibility.fallbackReason, "inputs-format-legacy");
   assert.equal(replayEligibility.predictedReplayablePrefix, 2);
   assert.equal(replayEligibility.operationalChanges[0]?.option, "agentTimeoutMs");
+  assert.equal(replayEligibility.operationalChanges[1]?.option, "agentIdleTimeoutMs");
 });
 
 test("legacy object literals omit every additive resume field", () => {

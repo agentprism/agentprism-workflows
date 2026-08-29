@@ -9,6 +9,7 @@ export {
   workflowMayUseDefaultModel,
   hashCheckpointInputs,
   resolveAgentTimeoutMs,
+  resolveAgentIdleTimeoutMs,
   resolveWorkflowRunLimits,
   CALL_PATH_FORMAT,
   CALL_INPUTS_FORMAT,
@@ -116,6 +117,7 @@ export {
   MAX_CONCURRENCY,
   MAX_AGENT_RETRIES,
   DEFAULT_AGENT_TIMEOUT_MS,
+  DEFAULT_AGENT_IDLE_TIMEOUT_MS,
   AGENTS_DIR,
 } from "./config.js";
 

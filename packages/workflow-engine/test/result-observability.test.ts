@@ -63,7 +63,7 @@ test("run result records compatibility fallback callbacks without parsing modifi
   ]);
   assert.equal(
     result.logs[0],
-    "agent timeout admission: host ceiling none total wall-clock per attempt; each retry re-arms the clock",
+    "agent timeout admission: total-wall ceiling none; idle ceiling disabled; each retry re-arms both clocks",
   );
   assert.deepEqual(result.logs.slice(1, 3), result.fallbacks?.map((entry) => entry.message));
   assert.equal(result.logs.length, 4, "deduplication does not change the existing log channel");

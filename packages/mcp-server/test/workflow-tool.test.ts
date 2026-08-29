@@ -28,9 +28,10 @@ const LIMITS = {
   concurrency: 6,
   agentRetries: 0,
   agentTimeoutMs: null,
+  agentIdleTimeoutMs: null,
 } as const;
 const ADMISSION_LOG =
-  "agent timeout admission: host ceiling none total wall-clock per attempt; each retry re-arms the clock";
+  "agent timeout admission: total-wall ceiling none; idle ceiling disabled; each retry re-arms both clocks";
 
 function inspectionFixture(status: "running" | "completed" | "aborted" = "running") {
   return {
@@ -151,7 +152,7 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     assert.match(tool.description ?? "", /Every parallel entry must be a thunk/);
     assert.match(tool.description ?? "", /phases must be an array of objects shaped `\{ title: string, detail\?: string, model\?: string \}`, never an array of strings/);
     assert.match(tool.description ?? "", /Minimal script:.*phases: \[\{ title: \"Review\" \}\].*phase\(\"Review\"\)/);
-    assert.match(tool.description ?? "", /configOptions, schema, cwd, timeoutMs, retries/);
+    assert.match(tool.description ?? "", /configOptions, schema, cwd, timeoutMs, idleTimeoutMs, retries/);
     assert.doesNotMatch(tool.description ?? "", /npx|CLI|shell out/i);
 
     assert.deepEqual(tool.inputSchema.required, undefined, "the raw shape leaves branch requirements to the discriminator");

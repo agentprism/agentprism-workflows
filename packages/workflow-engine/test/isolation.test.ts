@@ -93,6 +93,7 @@ function recording(overrides: Partial<PersistedRunState> = {}): PersistedRunStat
       concurrency: 2,
       agentRetries: 0,
       agentTimeoutMs: null,
+      agentIdleTimeoutMs: null,
     },
     startedAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",

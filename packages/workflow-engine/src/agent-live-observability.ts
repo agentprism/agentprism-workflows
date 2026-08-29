@@ -26,6 +26,7 @@ export type WorkflowAgentActivity = WorkflowAgentActivityBase & (
   | { kind: "tool-call"; title: string; toolName: string }
   | { kind: "tool-result"; text: string; toolName?: string; isError?: boolean }
   | { kind: "content-boundary" }
+  | { kind: "activity" }
   | { kind: "usage"; tokensObserved?: number }
 );
 
@@ -151,7 +152,9 @@ export class LiveAgentObservability<Run extends object> {
       else if (activity.kind === "tool-call") this.observeTool(owner, activity.title, activity.toolName);
       else if (activity.kind === "tool-result") this.observeToolResult(owner, activity.text, activity.toolName, activity.isError);
       else if (activity.kind === "content-boundary") this.closeSegment(owner);
-      else if (activity.tokensObserved !== undefined) owner.tokensObserved = activity.tokensObserved;
+      else if (activity.kind === "usage" && activity.tokensObserved !== undefined) {
+        owner.tokensObserved = activity.tokensObserved;
+      }
 
       if (owner.latestText !== undefined || owner.lastToolName !== undefined) {
         const candidate = this.projectedProgress(owner, "activity");

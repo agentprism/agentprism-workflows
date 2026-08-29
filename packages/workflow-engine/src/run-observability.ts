@@ -54,6 +54,7 @@ export interface RunObservabilityAgent {
   callIndex?: number;
   scope?: string;
   timeoutMs?: number | null;
+  idleTimeoutMs?: number | null;
   errorCode?: WorkflowErrorCode;
 }
 
@@ -312,6 +313,7 @@ function callStatus(entry: JournalEntry, agent?: RunObservabilityAgent): Workflo
     ...(model === undefined ? {} : { model: scalar(model) }),
     ...(backendId === undefined ? {} : { backendId: scalar(backendId) }),
     ...(agent?.timeoutMs === undefined ? {} : { timeoutMs: agent.timeoutMs }),
+    ...(agent?.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: agent.idleTimeoutMs }),
     ...(agent?.errorCode === undefined ? {} : { errorCode: agent.errorCode }),
     ...resultPreview(entry.result),
   };
@@ -326,6 +328,7 @@ function agentCallStatus(agent: RunObservabilityAgent): WorkflowRunCallStatus {
     ...(agent.phase === undefined ? {} : { phase: scalar(agent.phase) }),
     ...(agent.model === undefined ? {} : { model: scalar(agent.model) }),
     ...(agent.timeoutMs === undefined ? {} : { timeoutMs: agent.timeoutMs }),
+    ...(agent.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: agent.idleTimeoutMs }),
     ...(agent.errorCode === undefined ? {} : { errorCode: agent.errorCode }),
     ...(agent.status === "queued" || agent.status === "running" ? { status: agent.status } : {}),
     ...resultPreview(null),
@@ -413,7 +416,9 @@ export function projectWorkflowRunStatus(
     ...(source.currentPhase === undefined ? {} : { currentPhase: sanitizeText(source.currentPhase).value }),
     ...(source.reason === undefined ? {} : { reason: sanitizeText(source.reason).value }),
     ...(source.errorCode === undefined ? {} : { errorCode: source.errorCode }),
-    ...(source.limits === undefined ? {} : { limits: { ...source.limits } }),
+    ...(source.limits === undefined
+      ? {}
+      : { limits: { ...source.limits, agentIdleTimeoutMs: source.limits.agentIdleTimeoutMs ?? null } }),
     ...(source.replayEligibility === undefined
       ? {}
       : { replayEligibility: source.replayEligibility }),
@@ -733,6 +738,7 @@ export function projectRunEventForPersistence(
           ? {}
           : { configOptions: projectConfigOptions(event.configOptions, state) }),
         ...(event.timeoutMs === undefined ? {} : { timeoutMs: event.timeoutMs }),
+        ...(event.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: event.idleTimeoutMs }),
         callIndex: event.callIndex,
         // Never truncated: a partial call-path key is worse than none for consumers that
         // join on it, so an oversized capture is dropped instead of projected.

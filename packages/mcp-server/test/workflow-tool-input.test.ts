@@ -44,6 +44,7 @@ test("input shape: one tool advertises the exact config, run, inspect, await, an
     Object.keys(workflowToolInputShape).sort(),
     [
       "action",
+      "agentIdleTimeoutMs",
       "agentRetries",
       "agentTimeoutMs",
       "args",
@@ -70,6 +71,14 @@ test("input shape: one tool advertises the exact config, run, inspect, await, an
     ],
     "the exact config/run/inspect/await/stop wire fields",
   );
+});
+
+test("idle watchdog input is opt-in, nullable, positive, and run-only", () => {
+  assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x" })).agentIdleTimeoutMs, undefined);
+  assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", agentIdleTimeoutMs: null })).agentIdleTimeoutMs, null);
+  assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", agentIdleTimeoutMs: 300_000 })).agentIdleTimeoutMs, 300_000);
+  assert.throws(() => Schema.parse({ script: "x", agentIdleTimeoutMs: 0 }));
+  assert.throws(() => Schema.parse({ script: "x", agentIdleTimeoutMs: 1.5 }));
 });
 
 test("resume inputs advertise manager-owned fail-to-live admission", () => {
@@ -288,6 +297,7 @@ test("the discriminator rejects every missing or mixed run/inspect/await branch"
     { action: "await", runId: "a-b", concurrency: 1 },
     { action: "await", runId: "a-b", agentRetries: 1 },
     { action: "await", runId: "a-b", agentTimeoutMs: 1 },
+    { action: "await", runId: "a-b", agentIdleTimeoutMs: 1 },
     { action: "await", runId: "a-b", resumeFromRunId: "c-d" },
     { action: "await", runId: "a-b", resumePolicy: "auto" },
     { action: "await", runId: "a-b", checkpointReplies: { 0: true } },
