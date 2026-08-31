@@ -125,6 +125,7 @@ import {
 import {CodexSubagentEventRouter} from "./subagents/CodexSubagentEventRouter";
 import {nameFromAgentPath} from "./subagents/CodexAgentPath";
 import {randomUUID} from "node:crypto";
+import {TitleGenerator} from "./TitleGenerator";
 import {once} from "node:events";
 import {
     AIR_AGENT_FILE_CHANGE_REPORT_KEY,
@@ -222,6 +223,7 @@ export interface SessionState {
      *  Null otherwise. */
     loadedTurnEndedBeforeWatch: TurnCompletedNotification | null;
     sessionFailure?: SessionFailure;
+    titleGen?: TitleGenerator;
     subagents: CodexSubagentEventRouter;
 }
 
@@ -741,6 +743,12 @@ export class CodexAcpServer {
                 new ACPSessionConnection(this.connection, sessionId),
             ),
         };
+        sessionState.titleGen = new TitleGenerator(
+            this.codexAcpClient.appServerClient,
+            sessionId,
+            sessionState.cwd,
+            () => sessionState.sessionTitleSource,
+        );
         this.sessions.set(sessionId, sessionState);
         resumeSubscribed = false;
 
@@ -1996,6 +2004,12 @@ export class CodexAcpServer {
                 new ACPSessionConnection(this.connection, sessionId),
             ),
         };
+        sessionState.titleGen = new TitleGenerator(
+            this.codexAcpClient.appServerClient,
+            sessionId,
+            sessionState.cwd,
+            () => sessionState.sessionTitleSource,
+        );
         this.sessions.set(sessionId, sessionState);
         if (loadedActiveTurnId !== null || loadedActiveTurnIsAny) {
             this.watchLoadedTurn(sessionState, loadedActiveTurnId, loadedActiveTurnIsAny);
@@ -2165,6 +2179,7 @@ export class CodexAcpServer {
         if (explicitTitle) {
             sessionState.sessionTitle = explicitTitle;
             sessionState.sessionTitleSource = "explicit";
+            sessionState.titleGen?.markExistingTitle();
             await session.update({
                 sessionUpdate: "session_info_update",
                 title: explicitTitle,
@@ -3112,6 +3127,19 @@ export class CodexAcpServer {
             }
 
             await clearRecoveredSessionFailure(eventHandler);
+
+            // Fire-and-forget: generate an AI title from the first turn.
+            // Never await — must not block the prompt response.
+            // Note: turn.items contains only agent output, not the user message —
+            // extract prompt text from params instead.
+            if (sessionState.titleGen) {
+                const promptText = params.prompt
+                    .filter((b): b is Extract<acp.ContentBlock, { type: "text" }> => b.type === "text")
+                    .map(b => b.text)
+                    .join(" ")
+                    .trim();
+                sessionState.titleGen.onTurnCompleted(promptText);
+            }
 
             await this.publishFallbackSessionTitle(
                 sessionState,
