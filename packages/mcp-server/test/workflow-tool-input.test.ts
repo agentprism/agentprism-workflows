@@ -38,7 +38,7 @@ test("input shape: args is OPTIONAL and accepts an arbitrary JSON value", () => 
   assert.equal(Schema.parse({ script: "x", args: 7 }).args, 7);
 });
 
-test("input shape: one tool advertises the exact config, run, inspect, await, and stop field superset", () => {
+test("input shape: one tool advertises the exact config, run, inspect, await, permission, and stop field superset", () => {
   assert.ok(!("startInBackground" in workflowToolInputShape), "startInBackground must not be a tool input");
   assert.deepEqual(
     Object.keys(workflowToolInputShape).sort(),
@@ -60,8 +60,10 @@ test("input shape: one tool advertises the exact config, run, inspect, await, an
       "maxAgents",
       "modelFilter",
       "modelSpecs",
+      "permissionId",
       "probeTimeoutMs",
       "projectDir",
+      "response",
       "resumeFromRunId",
       "resumePolicy",
       "runId",
@@ -69,7 +71,7 @@ test("input shape: one tool advertises the exact config, run, inspect, await, an
       "scriptPath",
       "waitMs",
     ],
-    "the exact config/run/inspect/await/stop wire fields",
+    "the exact config/run/inspect/await/permission/stop wire fields",
   );
 });
 
@@ -272,6 +274,43 @@ test("stop requires runId, accepts an optional per-agent callIndex, and rejects 
   ]) {
     assert.throws(() => parseWorkflowToolInput(Schema.parse(input)), /Invalid workflow tool input/);
   }
+});
+
+test("permissions-response accepts only an exact pending id and ACP response", () => {
+  const selected = parseWorkflowToolInput(Schema.parse({
+    action: "permissions-response",
+    runId: "abc-def",
+    permissionId: "123e4567-e89b-12d3-a456-426614174000",
+    response: { outcome: { outcome: "selected", optionId: "allow_once" } },
+  }));
+  assert.equal(selected.action, "permissions-response");
+  assert.equal(selected.response.outcome.outcome, "selected");
+  assert.throws(() => parseWorkflowToolInput(Schema.parse({
+    action: "permissions-response",
+    runId: "abc-def",
+  })));
+  assert.throws(() => Schema.parse({
+    action: "permissions-response",
+    runId: "abc-def",
+    permissionId: "not-a-uuid",
+    response: { outcome: { outcome: "cancelled" } },
+  }));
+  assert.throws(() => parseWorkflowToolInput(Schema.parse({
+    action: "permissions-response",
+    runId: "abc-def",
+    permissionId: "123e4567-e89b-12d3-a456-426614174000",
+    response: { outcome: { outcome: "cancelled" } },
+    waitMs: 1,
+  })));
+  assert.throws(() => Schema.parse({
+    action: "permissions-response",
+    runId: "abc-def",
+    permissionId: "123e4567-e89b-12d3-a456-426614174000",
+    response: {
+      outcome: { outcome: "selected", optionId: "allow_once" },
+      _meta: { persist: "always" },
+    },
+  }), "provider effects must come only from the exact advertised optionId");
 });
 
 test("the discriminator rejects every missing or mixed run/inspect/await branch", () => {

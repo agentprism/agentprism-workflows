@@ -268,10 +268,10 @@ test("formatHarnessConfigReport renders validate's table format plus a probe sum
   assert.match(human, /^  claude:$/m);
   assert.match(human, /^    modes: \(none advertised — omit mode\)$/m);
   assert.match(human, /^    config options:$/m);
-  assert.match(human, /^    id \| type \| current \| choices$/m);
-  assert.match(human, /^    model \| select \| "default-model" \| "default-model", "opus\[1m\]"$/m);
-  assert.match(human, /^    reasoning_effort \| select \| "medium" \| "low", "xhigh"$/m);
-  assert.match(human, /^    fast_mode \| boolean \| false \| true, false$/m);
+  assert.match(human, /^    id \| name \| type \| current \| choices \| description$/m);
+  assert.match(human, /^    model \| Model \| select \| "default-model" \| "default-model", "opus\[1m\]" \| $/m);
+  assert.match(human, /^    reasoning_effort \| Reasoning effort \| select \| "medium" \| "low", "xhigh" \| $/m);
+  assert.match(human, /^    fast_mode \| Fast mode \| boolean \| false \| true, false \| $/m);
   assert.match(human, /^  codex: probe failed — spawn failed$/m);
   assert.match(human, /^result: 1\/2 harness\(es\) probed$/m);
 });
@@ -298,6 +298,31 @@ function runCli(args: string[], env: Record<string, string | undefined> = {}) {
     },
   });
 }
+
+test("formatHarnessConfigReport preserves harness mode names, descriptions, metadata, and AgentPrism default", () => {
+  const human = formatHarnessConfigReport({
+    ok: true,
+    exitCode: 0,
+    harnessOptions: [{
+      backendId: "codex",
+      defaultModeId: "agent",
+      probed: true,
+      modes: {
+        currentModeId: "read-only",
+        availableModes: [{
+          id: "agent",
+          name: "Approve for me",
+          description: "Only ask for actions detected as potentially unsafe",
+          _meta: { kind: "auto_review" },
+        }],
+      },
+      options: [],
+    }],
+  });
+  assert.match(human, /current "read-only" \| AgentPrism default "agent"/);
+  assert.match(human, /"agent" \| Approve for me \| Only ask for actions detected as potentially unsafe/);
+  assert.match(human, /_meta=\{"kind":"auto_review"\}/);
+});
 
 test("CLI: no-arg config probes every built-in harness and exits 0", () => {
   const result = runCli(["--json"]);

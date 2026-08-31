@@ -137,6 +137,8 @@ export interface ValidatedAgentCall {
 
 export interface ValidateHarnessOptions {
   backendId: string;
+  /** AgentPrism's explicit mode when the call omits mode; absent for no-mode/custom backends. */
+  defaultModeId?: string;
   /** The call's verbatim selected model; absent means the harness/session default. */
   model?: string;
   probed: boolean;
@@ -819,6 +821,7 @@ interface ProbeStageResult {
   harnessOptions: ValidateHarnessOptions[];
   catalogs: Map<string, SessionConfigOption[]>;
   modes: Map<string, SessionModeState | null>;
+  defaultModes: Map<string, string | undefined>;
 }
 
 interface ConfigProbeTarget {
@@ -875,7 +878,8 @@ async function probeHarnessConfigOptions(
   const harnessOptions: ValidateHarnessOptions[] = [];
   const catalogs = new Map<string, SessionConfigOption[]>();
   const modes = new Map<string, SessionModeState | null>();
-  if (targets.length === 0) return { harnessOptions, catalogs, modes };
+  const defaultModes = new Map<string, string | undefined>();
+  if (targets.length === 0) return { harnessOptions, catalogs, modes, defaultModes };
 
   let runner: ValidateProbeRunner;
   const ownsRunner = probeRunner === undefined;
@@ -894,7 +898,7 @@ async function probeHarnessConfigOptions(
         error: reason,
       });
     }
-    return { harnessOptions, catalogs, modes };
+    return { harnessOptions, catalogs, modes, defaultModes };
   }
 
   try {
@@ -919,9 +923,11 @@ async function probeHarnessConfigOptions(
         );
         catalogs.set(key, result.options);
         modes.set(key, result.modes ?? null);
+        defaultModes.set(key, result.defaultModeId);
         if (reportHarness) {
           harnessOptions.push({
             backendId: result.backendId,
+            ...(result.defaultModeId === undefined ? {} : { defaultModeId: result.defaultModeId }),
             ...(target.model === undefined ? {} : { model: target.model }),
             probed: true,
             modes: result.modes ?? null,
@@ -979,7 +985,7 @@ async function probeHarnessConfigOptions(
       }
     }
   }
-  return { harnessOptions, catalogs, modes };
+  return { harnessOptions, catalogs, modes, defaultModes };
 }
 
 function withValidationProbeTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
@@ -1188,22 +1194,27 @@ function errorMessage(error: unknown): string {
 function sessionModeErrors(
   calls: ValidatedAgentCall[],
   modes: Map<string, SessionModeState | null>,
+  defaultModes: Map<string, string | undefined>,
   registry: BackendRegistry,
   hostRegistry: BackendRegistry,
   declared: Record<string, CustomBackendConfig> | undefined,
 ): string[] {
   const errors: string[] = [];
   for (const call of calls) {
-    if (call.mode === undefined) continue;
     const backendId = routeBackend(call.model, call.tier, registry, hostRegistry, declared).backendId;
     const key = configCatalogKey(backendId, call.model);
     if (!modes.has(key)) continue;
+    const effectiveMode = call.mode ?? defaultModes.get(key);
+    if (effectiveMode === undefined) continue;
     const advertised = modes.get(key)?.availableModes.map((mode) => mode.id) ?? [];
-    if (advertised.includes(call.mode)) continue;
+    if (advertised.includes(effectiveMode)) continue;
+    const source = call.mode === undefined ? "AgentPrism default" : "authored value";
     errors.push(
-      `agent "${call.label}" mode authored value ${JSON.stringify(call.mode)} is not advertised by ` +
+      `agent "${call.label}" mode ${source} ${JSON.stringify(effectiveMode)} is not advertised by ` +
         `${callModelName(backendId, call.model)}; advertised modes: ${displayAlternatives(advertised)}; ` +
-        "omit mode unless action:\"config\" explicitly lists the exact id",
+        (call.mode === undefined
+          ? "the built-in default and live harness catalog are incompatible"
+          : "omit mode unless action:\"config\" explicitly lists the exact id"),
     );
   }
   return errors;
@@ -1435,6 +1446,18 @@ function displayValue(value: unknown): string {
 
 function displayAlternatives(values: readonly string[]): string {
   return values.length > 0 ? values.map((value) => JSON.stringify(value)).join(", ") : "(none advertised)";
+}
+
+function displayDescription(value: string | null | undefined): string {
+  if (value === undefined || value === null || value.trim() === "") return "";
+  const oneLine = value.replace(/\s+/g, " ").trim();
+  return oneLine.length <= 320 ? oneLine : `${oneLine.slice(0, 319)}…`;
+}
+
+function displayMeta(value: Record<string, unknown> | null | undefined): string {
+  return value === undefined || value === null || Object.keys(value).length === 0
+    ? ""
+    : JSON.stringify(value);
 }
 
 /** The choices-cell text for a select: verbatim when small, summarized when oversized. */
@@ -1725,7 +1748,7 @@ export async function validateWorkflowScript(
     const mockAnswers = mockAnswerState ? buildMockAnswersReport(mockAnswerState) : undefined;
     if (mockAnswerState && mockAnswers) appendMockAnswerWarnings(mockAnswerState, mockAnswers, warnings);
     const probed = options.probeConfig === false
-      ? { harnessOptions: [], catalogs: new Map<string, SessionConfigOption[]>(), modes: new Map<string, SessionModeState | null>() }
+      ? { harnessOptions: [], catalogs: new Map<string, SessionConfigOption[]>(), modes: new Map<string, SessionModeState | null>(), defaultModes: new Map<string, string | undefined>() }
       : await probeHarnessConfigOptions(
           agentCalls,
           baseCwd,
@@ -1751,6 +1774,7 @@ export async function validateWorkflowScript(
       : sessionModeErrors(
           agentCalls,
           probed.modes,
+          probed.defaultModes,
           backendRegistry,
           hostRegistry,
           declaredBackends,
@@ -1830,12 +1854,22 @@ export function renderHarnessOptionLines(
       lines.push(`${indent}  modes: (catalog unavailable — omit mode)`);
     } else {
       lines.push(
-        `${indent}  modes: current ${displayValue(modes.currentModeId)} | advertised ` +
-          displayAlternatives(modes.availableModes.map((mode) => mode.id)),
+        `${indent}  modes: current ${displayValue(modes.currentModeId)} | AgentPrism default ` +
+          `${harness.defaultModeId === undefined ? "(harness current)" : displayValue(harness.defaultModeId)}`,
       );
+      lines.push(`${indent}  advertised mode details (verbatim from harness):`);
+      for (const mode of modes.availableModes) {
+        const description = displayDescription(mode.description);
+        const meta = displayMeta(mode._meta);
+        lines.push(
+          `${indent}    ${displayValue(mode.id)} | ${mode.name}` +
+            (description ? ` | ${description}` : "") +
+            (meta ? ` | _meta=${meta}` : ""),
+        );
+      }
     }
     lines.push(`${indent}  config options:`);
-    lines.push(`${indent}  id | type | current | choices`);
+    lines.push(`${indent}  id | name | type | current | choices | description`);
     if ((harness.options ?? []).length === 0) {
       lines.push(`${indent}  (none advertised)`);
       continue;
@@ -1843,7 +1877,8 @@ export function renderHarnessOptionLines(
     for (const option of harness.options ?? []) {
       const choices = option.type === "select" ? selectChoicesCell(option, harness.backendId) : "true, false";
       lines.push(
-        `${indent}  ${option.id} | ${option.type} | ${displayValue(option.currentValue)} | ${choices}`,
+        `${indent}  ${option.id} | ${option.name} | ${option.type} | ${displayValue(option.currentValue)} | ` +
+          `${choices} | ${displayDescription(option.description)}`,
       );
     }
   }

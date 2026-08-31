@@ -59,6 +59,10 @@ export type ProviderErrorClassification = {
 
 export interface Backend {
   readonly id: BackendId;
+  /** AgentPrism's explicit mode when a caller omits RunOptions.mode. Built-ins pin this so
+   *  unattended behavior never depends on a user's ambient harness setting; custom backends
+   *  leave it undefined and retain their advertised current mode. */
+  readonly defaultModeId?: string;
   /** Pool identity for this backend's long-lived processes. Defaults to `id` — but a CUSTOM
    *  backend sets it to id + a spawn-config hash, because two runs may declare the SAME name
    *  with DIFFERENT commands (script-declared `meta.backends`): keying the pool by name alone

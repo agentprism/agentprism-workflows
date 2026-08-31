@@ -18,6 +18,7 @@ import {
 } from "./_http-harness.js";
 import { EXTENSION_ID } from "../src/mcp-apps.js";
 import { workflowRunEventsUri } from "../src/workflow-resources.js";
+import { WorkflowPermissionBroker } from "../src/workflow-permissions.js";
 import { makeRunner, okRunner } from "./_harness.js";
 
 const SCRIPT = `export const meta = { name: "dual-era", description: "dual era smoke" }; return { ok: true };`;
@@ -156,6 +157,64 @@ return await checkpoint("Pick one", { kind: "select", choices: ["alpha", "beta"]
     const request = connected.elicitations[0];
     assert.ok(request && "requestedSchema" in request.params);
     assert.deepEqual(request.params.requestedSchema.properties.choice?.enum, ["alpha", "beta"]);
+  } finally {
+    await connected.dispose();
+    await daemon.close();
+  }
+});
+
+test("modern input_required resolves a live workflow permission with the exact optionId", async () => {
+  const broker = new WorkflowPermissionBroker();
+  const runner = makeRunner(async (_prompt, options) => {
+    const response = await broker.resolver(
+      {
+        sessionId: "modern-permission-session",
+        toolCall: { toolCallId: "modern-permission-tool", title: "Run tests", kind: "execute" },
+        options: [
+          { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+          { optionId: "allow_for_session", name: "Allow for session", kind: "allow_always" },
+        ],
+      },
+      {
+        sessionId: "modern-permission-session",
+        backendId: "codex",
+        runId: options.runId,
+        callIndex: options.callIndex,
+      },
+    );
+    return response.outcome.outcome === "selected" ? response.outcome.optionId : "cancelled";
+  });
+  const daemon = await startDaemon(runner, broker);
+  const projectDir = makeProjectDir("dual-era-permission");
+  const connected = await connectHttp(daemon.url, {
+    protocolMode: "modern",
+    uiCapability: "absent",
+    elicit: () => ({ action: "accept", content: { optionId: "allow_for_session" } }),
+  });
+  try {
+    const script = `export const meta = { name: "modern-permission", description: "modern permission" };
+return await agent("work", { label: "worker", model: "codex" });`;
+    const accepted = await connected.client.callTool({
+      name: "workflow",
+      arguments: { script, projectDir, background: true },
+    });
+    const runId = structured(accepted)?.runId;
+    assert.equal(typeof runId, "string");
+    await waitUntil(() => broker.has(runId as string), "modern permission request");
+
+    const resolved = await connected.client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId, waitMs: 5_000 },
+    });
+    assert.equal(resolved.isError, false);
+    assert.equal(structured(resolved)?.permissionResponse?.outcome?.optionId, "allow_for_session");
+    assert.equal(connected.elicitations.length, 1);
+
+    const terminal = await connected.client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId, waitMs: 5_000 },
+    });
+    assert.equal(structured(terminal)?.outcome?.result, "allow_for_session");
   } finally {
     await connected.dispose();
     await daemon.close();

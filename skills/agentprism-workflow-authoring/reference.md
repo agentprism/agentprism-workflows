@@ -13,7 +13,7 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `schema` | JSON Schema object | Structured output. Plain object literal only — no schema builders exist in the realm. Part of the resume hash. |
 | `model` | `string` | Model spec: optional registered harness prefix plus a verbatim id, or a backend-only name. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
 | `tier` | `"small" \| "medium" \| "big"` | Coarse tier resolved from host config; beats phase/meta model, loses to explicit `model`. Part of the resume hash. |
-| `mode` | `string` | ACP session mode id advertised by the selected backend/model. **Strict**: unsupported/unadvertised ids fail before prompting (and automatic workflow preflight rejects them before admission). Read the selected `action:"config"` entry's `modes.availableModes` and copy only an exact id; `modes:null` means omit this field. Never infer a generic `"default"`. Part of the resume hash when set. |
+| `mode` | `string` | Exact advertised ACP mode. Config preserves raw names/descriptions/metadata. Omission applies Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode; `defaultModeId` reports it. Authored/default ids are validated before prompt. Part of the resume hash only when authored. |
 | `configOptions` | `Record<string, string \| boolean>` | Exact ACP session option ids and authored values. Applied in ascending id order after model and before the prompt, with no aliases or coercion. `"model"` is reserved for the dedicated `model` field. Part of the resume hash only when non-empty, with sorted keys. With MCP, read the advertised-options table from `workflow` action `config` before choosing values. |
 | `agentType` | `string` | Bind a named subagent definition (tools allow/deny, model, isolation, role prompt). See [agentType definitions](#agenttype-definitions). Part of the resume hash. |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree branched from the run cwd. **Always removed (worktree + branch) when the call ends** — edits are discarded; return work as data. Degrades to the shared tree outside a git repo (logged). |
@@ -203,7 +203,7 @@ The body is prepended to the agent's task as role guidance. An unknown `agentTyp
 
 ## How hosts run scripts (what authors can assume)
 
-The connected MCP `workflow` tool is the canonical way an agent runs an authored script; the per-action contracts are in the Running workflows guide section. The tool is self-contained: `config` discovers live backend options and `run` validates automatically before admission. The `workflow` tool is the server's whole *workflow* surface: config/run/resume/inspect/await/stop
+The connected MCP `workflow` tool is the canonical way an agent runs an authored script; the per-action contracts are in the Running workflows guide section. The tool is self-contained: `config` discovers live backend options and `run` validates automatically before admission. The `workflow` tool is the server's whole *workflow* surface: config/run/resume/inspect/await/permissions-response/stop
 are action branches, not separate tools, and this input does not resolve a saved workflow name.
 The server also registers model-facing `docs` for selective version-matched workflow/REPL reference topics and `repl` for interactive orchestration. This optional skill remains a standalone guide for non-MCP or skills-first hosts. A
 run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is
@@ -255,7 +255,7 @@ type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase & (
 // WorkflowExecuteToolInputBase also carries projectDir?: string — the absolute project
 // directory selecting the project-scoped run store and default execution cwd. REQUIRED for
 // config/run on the shared workflow daemon (one registration serves every project); optional on a
-// single-project (--in-process) server. inspect/await/stop never take it: a runId locates
+// single-project (--in-process) server. inspect/await/permissions-response/stop never take it: a runId locates
 // its project store automatically.
 
 interface WorkflowAwaitToolInput {
@@ -267,10 +267,17 @@ interface WorkflowAwaitToolInput {
   logLines?: number;    // default 20; integer 0..50
 }
 
+interface WorkflowPermissionResponseToolInput {
+  action: "permissions-response";
+  runId: string;
+  permissionId: string;
+  response: { outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" } };
+}
+
 interface WorkflowConfigToolResult {
   action: "config";
   ok: boolean;
-  harnessOptions: Array<{ backendId: string; model?: string; probed: boolean; options?: unknown[]; error?: string }>;
+  harnessOptions: Array<{ backendId: string; defaultModeId?: string; model?: string; probed: boolean; modes?: object | null; options?: unknown[]; error?: string }>;
   models: Array<{ backendId: string; hasModelOption: boolean; matches: string[] }>;
 }
 
@@ -287,17 +294,20 @@ interface WorkflowBackgroundAccepted {
   scriptUri: string;
   limits: WorkflowRunLimits;
   replayEligibility?: WorkflowReplayEligibility;
+  pendingPermissions?: WorkflowPendingPermission[];
+  interaction: { permissionRequests: "may-block"; collectWith: ("await" | "inspect")[]; respondWith: "permissions-response"; elicitation: "available" | "unavailable" };
 }
 
 interface WorkflowAwaitMetadata {
   requestedMs: number;
   elapsedMs: number;
-  returnedBecause: "terminal" | "timeout" | "immediate";
+  returnedBecause: "terminal" | "timeout" | "immediate" | "action-required" | "permission-resolved";
 }
 
 interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowAwaitMetadata;
   tokenUsage?: TokenUsage;
+  pendingPermissions?: WorkflowPendingPermission[];
   outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">; // exactly when terminal
   scriptUri: string;
   lineage: Array<{ runId: string; uri: string; available: boolean }>;

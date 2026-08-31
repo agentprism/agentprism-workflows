@@ -17,7 +17,7 @@ export function buildAuthoringPromptText(task?: string): string {
     "",
     "Use the connected `docs` tool for version-matched authoring guidance. Read topic `workflow/quickstart` first, then read only the related workflow topics needed for this task; do not load every topic. Workflow scripts and REPL evals have different `agent()` signatures, so use only `workflow/*` topics here.",
     "",
-    "When the script pins a model, mode, or configOptions, call the `workflow` tool with `action:\"config\"` first; after choosing a model, use `modelSpecs` to read its exact option domain. Set mode only when that selected entry's `modes.availableModes` explicitly lists the exact id; `modes:null` means omit it, and never infer a generic `default`. The run action automatically performs static validation, a mocked dry run, and routed no-prompt config checks before admission. Correct any direct rejection diagnostic and re-run.",
+    "When the script pins a model, mode, or configOptions, call the `workflow` tool with `action:\"config\"` first; after choosing a model, use `modelSpecs` to read its exact option domain. Read the harness-owned mode names and descriptions before pinning an exact advertised id. Omission uses the reported `defaultModeId` (Claude auto, Codex agent, OpenCode build; none for Pi). The run action automatically performs static validation, a mocked dry run, and routed no-prompt config checks before admission. Correct any direct rejection diagnostic and re-run.",
     "",
     taskSection,
     "",

@@ -48,7 +48,7 @@ try {
 }
 ```
 
-`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, `baseInstructions` / `developerInstructions` (Codex-only, see below), `keepSession`, the resume-only `continueFromSession` directive, `onSessionOpen`, `onUsage`, `onResultProvenance`, `onModelResolved`, `onModelFallback`, `onHistory`, and `onActivity`. `onActivity` fires once for every real ACP `session/update` so an engine-owned opt-in idle watchdog can re-arm; synthetic host heartbeats never pass through it. See `@automatalabs/shared-types` for the field-by-field contract.
+`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, base/developer instructions, session hand-off fields, and telemetry callbacks. `onActivity` reports real ACP updates; `onInteractionStateChange` reports permission wait/resume so an engine can suspend only its idle watchdog. See `@automatalabs/shared-types` for the field-by-field contract.
 
 Aborting `signal` sends ACP `session/cancel` for that session. If its active turn does not settle
 within five seconds, the client sends `session/close` when the agent advertised it and quarantines
@@ -78,7 +78,7 @@ const selected = await runner.probeConfigOptions("pi/openrouter/vendor/model-id"
 ```
 
 `probeConfigOptions()` uses the normal first-segment routing and pool, opens exactly one session,
-returns the advertised `SessionConfigOption[]` shapes verbatim plus the effective `modes` catalog, then closes that session. Dedicated ACP modes and the `category:"mode"` config-option fallback normalize to `SessionModeState`; `modes:null` explicitly means unsupported, so callers must omit `mode` rather than infer a generic default. By
+returns the advertised `SessionConfigOption[]` shapes verbatim plus the effective `modes` catalog and `defaultModeId`, then closes that session. Dedicated ACP modes and the `category:"mode"` config-option fallback normalize to `SessionModeState`. When a caller omits mode, AgentPrism explicitly applies Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi/custom mode; the default is applied only when the live catalog advertises it. By
 default it reads the session-default catalog without making a model config request. With
 `selectModel: true`, it first sends the routed model remainder verbatim and returns the echoed,
 model-specific catalog; no prompt is sent in either mode. Spawn, authentication, model-selection,
@@ -301,7 +301,7 @@ From [`src/index.ts`](./src/index.ts):
 - **`ClaudeBackend` / `CodexBackend` / `OpenCodeBackend` / `PiBackend`** — the four built-in backend strategies (spawn config + per-backend schema/auth wiring). OpenCode is host-resolved rather than bundled; pi uses bundled `@automatalabs/pi-acp`.
 - **`CustomAcpBackend` / `resolveBackendRegistry` / `BACKENDS_ENV`** — the custom-backend registry: run **any** ACP agent as a named backend via `createAcpRunner({ backends: { name: { command, args?, env?, sessionMeta?, structuredOutputTool? } } })` or the `AGENTPRISM_BACKENDS` env var (JSON, same shape; the option wins per name; names may shadow built-ins). Custom backends carry a `schema` as turn-level `_meta.outputSchema` and read the result off the final message as JSON. No host-side vendor capability declaration is required.
 - **Auth contracts and lifecycle** — `AuthStore`, `BackendAuthMachine`, `buildAuthDescriptors`, the built-in auth profiles, and the `AuthContext` / `AuthResolution` / `AuthMethodDescriptor` / `AuthCapableRunner` types.
-- **`PermissionResolver`** — async human-in-the-loop permission resolution for runner-wide or interactive sessions.
+- **Permission APIs** — `PermissionResolver` parks a request for an async host decision; `selectPermissionOption(request, optionId)` validates one exact advertised option. `decidePermission` remains the SDK/headless auto-policy. Provider effects and persistence are never inferred from labels, `kind`, or response metadata.
 - **`clientCapabilitiesFor` + the `ClientHandlers` / `FsHandlers` / `TerminalHandlers` / `AcpSessionContext` types** — the client-side fs/terminal interposition surface (see above).
 - **`negotiateCapabilities` / `adaptPromptContent` / `unsupportedMcpServer` + `NegotiatedCapabilities`** — the standard ACP capability-negotiation primitives; the negotiated record for a live connection is exposed on `PooledConnection.capabilities`, with vendor initialize metadata retained only as raw `initializeMeta`.
 - **`AGENT_METHOD_COVERAGE` / `CLIENT_METHOD_COVERAGE` / `ACP_EXTENSION_SUPPORT_MATRIX`** — manifests classifying the installed ACP SDK method surface and documenting built-in vendor-extension advertisements. The extension matrix is evidence for probes and never routes runtime behavior.

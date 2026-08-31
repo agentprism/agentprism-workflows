@@ -108,6 +108,43 @@ test("real backend activity re-arms the watchdog while synthetic wall time keeps
   assert.equal(result.calls?.[0]?.outcome, "result");
 });
 
+test("a live permission wait suspends only the idle watchdog", async () => {
+  const result = await runWorkflow(script(), {
+    agent: {
+      run(_prompt, options) {
+        return new Promise<string>((resolve) => {
+          options?.onInteractionStateChange?.({ kind: "permission", state: "waiting" });
+          setTimeout(() => {
+            options?.onInteractionStateChange?.({ kind: "permission", state: "running" });
+            setTimeout(() => resolve("approved"), 15);
+          }, 100);
+        });
+      },
+    },
+    agentIdleTimeoutMs: 35,
+    agentTimeoutMs: 500,
+    persistLogs: false,
+  });
+
+  assert.equal(result.result, "approved");
+  assert.equal(result.calls?.[0]?.outcome, "result");
+});
+
+test("total wall-clock timeout continues while permission waits suspend idle time", async () => {
+  const result = await runWorkflow(script(), {
+    agent: {
+      run(_prompt, options) {
+        options?.onInteractionStateChange?.({ kind: "permission", state: "waiting" });
+        return new Promise<string>(() => {});
+      },
+    },
+    agentIdleTimeoutMs: 20,
+    agentTimeoutMs: 60,
+    persistLogs: false,
+  });
+  assert.equal(result.calls?.[0]?.error?.code, WorkflowErrorCode.AGENT_TIMEOUT);
+});
+
 test("the tighter of total-wall and idle deadlines wins with a distinct error code", async () => {
   const wallFirst = await runWorkflow(script(), {
     agent: silentAbortIgnoringRunner().runner,

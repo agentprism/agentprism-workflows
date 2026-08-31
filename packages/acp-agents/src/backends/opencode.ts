@@ -87,6 +87,7 @@ export const opencodeAuthProfile: AuthProfile = {
 
 export class OpenCodeBackend implements Backend {
   readonly id = "opencode" as const;
+  readonly defaultModeId = "build" as const;
 
   constructor(readonly authProfile: AuthProfile = opencodeAuthProfile) {}
 
@@ -155,6 +156,7 @@ export class OpenCodeBackend implements Backend {
 
 export const opencodeBackendDefinition = defineBuiltinBackend({
   id: "opencode",
+  defaultModeId: "build",
   thoughtLevelDomainSemantics: "exact-set",
   authProfile: opencodeAuthProfile,
   create: (authProfile) => new OpenCodeBackend(authProfile),

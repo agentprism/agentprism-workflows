@@ -49,6 +49,7 @@ export const codexAuthProfile: AuthProfile = {
 
 export class CodexBackend implements Backend {
   readonly id = "codex" as const;
+  readonly defaultModeId = "agent" as const;
 
   constructor(readonly authProfile: AuthProfile = codexAuthProfile) {}
 
@@ -119,6 +120,7 @@ export class CodexBackend implements Backend {
 
 export const codexBackendDefinition = defineBuiltinBackend({
   id: "codex",
+  defaultModeId: "agent",
   thoughtLevelDomainSemantics: "ordered",
   authProfile: codexAuthProfile,
   create: (authProfile) => new CodexBackend(authProfile),

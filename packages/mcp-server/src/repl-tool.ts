@@ -412,7 +412,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         "is \"backend/model\" (a bare \"backend\" runs its default model); an unknown backend rejects the call " +
         "immediately, naming the known backends. The opts keys are schema (a structured-output JSON schema, " +
         "validated per call), cwd, configOptions (backend-specific knobs, validated at admission), and mode. " +
-        "Before setting mode, use workflow action:\"config\" for that exact modelSpec and copy only an id explicitly listed in modes.availableModes; modes:null means omit mode, never infer \"default\". " +
+        "Before setting mode, use workflow action:\"config\" for that exact modelSpec and read the harness-owned mode descriptions. Omission uses defaultModeId (Claude auto, Codex agent, OpenCode build; none for Pi); pin only an exact advertised id. " +
         "Unknown option keys reject synchronously. agent() returns a persistent promise-handle. Assign the handle " +
         "before awaiting it: `const a = agent(\"codex\", \"inspect the failure\"); const first = await a`. " +
         "a.steer(text) targets only the currently running turn. It never starts or queues another turn and resolves " +

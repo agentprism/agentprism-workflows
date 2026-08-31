@@ -15,10 +15,15 @@ import {
   type UiCapabilityMode,
 } from "./_harness.js";
 import { createDaemon, type DaemonHandle } from "../src/daemon/http-daemon.js";
+import type { WorkflowPermissionBroker } from "../src/workflow-permissions.js";
 
-export async function startDaemon(runner: AgentRunner): Promise<DaemonHandle> {
+export async function startDaemon(
+  runner: AgentRunner,
+  permissionBroker?: WorkflowPermissionBroker,
+): Promise<DaemonHandle> {
   return createDaemon({
     runner,
+    permissionBroker,
     port: 0,
     env: {},
     log: () => undefined,

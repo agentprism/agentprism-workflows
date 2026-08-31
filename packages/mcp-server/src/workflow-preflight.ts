@@ -266,6 +266,7 @@ function projectHarnessOptions(harnesses: readonly unknown[]): {
   const harnessOptions = collapsed.slice(0, MAX_HARNESSES).map((raw) => {
     const harness = raw as {
       backendId: string;
+      defaultModeId?: string;
       model?: string;
       probed: boolean;
       error?: string;
@@ -275,6 +276,7 @@ function projectHarnessOptions(harnesses: readonly unknown[]): {
     const options = harness.options ?? [];
     return boundValue({
       backendId: harness.backendId,
+      defaultModeId: harness.defaultModeId,
       model: harness.model,
       probed: harness.probed,
       error: harness.error,

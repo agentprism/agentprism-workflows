@@ -83,7 +83,7 @@ Every client-side ACP method is served (`fs/*`, `terminal/*`, permission request
 
 ### Controls for unattended runs
 
-Per-run agent and concurrency limits, per-call git **worktree isolation**, total-wall and no-activity timeouts, retries, and `checkpoint()` — a deterministic, journaled human gate with three modes. A live SDK `confirm` callback or MCP elicitation collects the reply immediately; without a live channel, the default mode takes `default ?? true` (or `headless: "abort"` aborts), so detached runs never hang by default. Authors can opt into a durable pause with `headless: "pause"`: the run returns `status: "paused"` plus `checkpointContext`, the host resumes with `checkpointReplies`, and the decision is journaled and replayed without re-asking. For watching those runs from the outside, `@automatalabs/agentprism-otel` attaches to any `WorkflowManager` and exports OpenTelemetry traces (run → agent → tool call) plus token, cost, and duration metrics.
+Per-run agent and concurrency limits, per-call git **worktree isolation**, total-wall and no-activity timeouts, retries, and `checkpoint()` — a deterministic, journaled human gate with three modes. A live SDK `confirm` callback or MCP elicitation collects the reply immediately; without a live channel, the default mode takes `default ?? true` (or `headless: "abort"` aborts), so detached runs never hang by default. Authors can opt into a durable pause with `headless: "pause"`: the run returns `status: "paused"` plus `checkpointContext`, the host resumes with `checkpointReplies`, and the decision is journaled and replayed without re-asking. Separately, an unresolved ACP permission keeps its live agent call running-but-waiting; MCP inspect/await surface the exact options and `permissions-response` routes the decision back to the execution owner. For watching those runs from the outside, `@automatalabs/agentprism-otel` attaches to any `WorkflowManager` and exports OpenTelemetry traces (run → agent → tool call) plus token, cost, and duration metrics.
 
 ---
 
@@ -153,7 +153,7 @@ These are the packages you interact with directly. The first two are the primary
 | Package | What it is |
 |---|---|
 | **`@automatalabs/workflows`** | The canonical public **SDK** — a thin facade that runs workflow scripts programmatically over the default ACP backend, and re-exports the supported engine + backend integration surface. Start here. |
-| **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, await, resume, inspect, stop) and the `repl` tool (a persistent JavaScript REPL for live subagent orchestration) — built on `@automatalabs/workflows` and `@automatalabs/repl-engine`. |
+| **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, await, resume, inspect, permission response, stop) and the `repl` tool (a persistent JavaScript REPL for live subagent orchestration) — built on `@automatalabs/workflows` and `@automatalabs/repl-engine`. |
 | **`@automatalabs/pi-acp`** | The standalone stdio **ACP server** (bin: `pi-acp`) embedding the pi coding agent in-process; exact-pinned and spawned by the first-class `pi` backend. |
 
 One optional integration package attaches to the SDK's manager surface:
@@ -238,8 +238,9 @@ await runner.dispose();   // closes pooled backend processes
 
 The `workflow` tool runs in the foreground by default, can acknowledge long work with
 `background: true`, waits for it with bounded `action: "await"` calls, and safely inspects any known
-project-scoped run by ID. Foreground execution streams `notifications/progress` and returns the
-terminal structured result.
+project-scoped run by ID. Foreground execution streams `notifications/progress` and normally returns
+the terminal structured result; if a live ACP permission needs an answer, it returns the still-running
+run plus `pendingPermissions` so the same run can be continued through another tool call.
 
 Register the MCP entry in your host's config (the same command as before — it is now a thin
 stdio shim that auto-starts a shared local **workflow daemon**, so runs survive the host
@@ -318,9 +319,9 @@ reference host's generic core client must advertise.
 
 | Param | Type | Notes |
 |---|---|---|
-| `action` | `"config" \| "run" \| "inspect" \| "await" \| "stop"` | `"config"` performs zero-token live backend discovery. Omit or use `"run"` for automatic pre-admission validation followed by execution. The remaining actions operate on an admitted run. |
-| `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/stop. |
-| `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for inspect/await/stop. |
+| `action` | `"config" \| "run" \| "inspect" \| "await" \| "permissions-response" \| "stop"` | `"config"` performs zero-token live backend discovery. Omit or use `"run"` for validation plus execution. `permissions-response` resolves one live ACP request using an exact advertised option. |
+| `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/permissions-response/stop. |
+| `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for inspect/await/permissions-response/stop. |
 | `projectDir` | absolute path string | Config/run: project-sensitive discovery cwd and the run's project store/default cwd. Required for both on the shared daemon; defaults to the server's project under `--in-process`. |
 | `harnesses` | string[] | Config only: optional backend names to probe; omission discovers every registered backend. |
 | `modelSpecs` | string[] | Config only: select exact routed models before reading their model-specific options. |
@@ -336,7 +337,9 @@ reference host's generic core client must advertise.
 | `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
 | `resumePolicy` | `"auto" \| "positional"` | Default `"auto"`; positional requests index/prefix matching but cannot bypass new-format format, metadata, manifest, input, or safety checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to its decision. Keys must be canonical non-negative integer strings on the JSON wire. |
-| `runId` | string | Required for inspect/await/stop; the project-scoped run capability returned by execution. |
+| `runId` | string | Required for inspect/await/permissions-response/stop; the project-scoped run capability returned by execution. |
+| `permissionId` | UUID string | Permissions-response only: opaque pending request id returned by inspect/await. |
+| `response` | ACP permission response | Permissions-response only: `{ outcome:{ outcome:"selected", optionId } }` using an exact advertised option, or `{ outcome:{ outcome:"cancelled" } }`. |
 | `callIndex` | integer | Stop only: cancel exactly that one in-flight agent call (its slot settles to `null` with `AGENT_CANCELLED`) without aborting the run. Forbidden for every other action. |
 | `waitMs` | integer | Await only: default 20,000, range 0–25,000; zero is a non-blocking status read. |
 | `lastN` | integer | Inspect/await/stop: latest matching calls, default 20, range 1–50. |
@@ -348,6 +351,10 @@ When pinning a model, mode, or `configOptions`, discover exact live values first
 ```json
 { "action": "config", "projectDir": "/absolute/project", "harnesses": ["codex"], "modelFilter": "gpt" }
 ```
+
+The config response preserves each harness's raw mode id, name, description, and `_meta`, and reports
+AgentPrism's explicit omitted-mode defaults: Claude `auto`, Codex `agent`, OpenCode `build`, and no Pi
+mode. These defaults are applied at session start instead of inheriting ambient harness settings.
 
 Every run is statically checked, mock-executed, and config-probed before admission. Invalid scripts return `status:"rejected"` diagnostics without a run ID, background reservation, or token spend. Foreground remains the default. For long work, start it and retain the new run ID:
 
@@ -362,7 +369,25 @@ Then long-poll in ordinary bounded tool calls until `outcome` appears:
 ```
 
 A timeout returns the freshest bounded status and partial cumulative token usage; terminal await
-adds the same raw result/log projection a foreground call returns. At most four background runs may
+adds the same raw result/log projection a foreground call returns. Await returns early with
+`wait.returnedBecause:"action-required"` when an ACP permission is pending. Inspect and await include
+the complete ordered exact option ids with credential-redacted, bounded diagnostics and no private ACP
+session id; requests that cannot fit safely fail closed. Elicitation-capable clients present them to
+the user; other clients answer
+through:
+
+```json
+{
+  "action": "permissions-response",
+  "runId": "mabc1234-k9x2pq",
+  "permissionId": "00000000-0000-4000-8000-000000000000",
+  "response": { "outcome": { "outcome": "selected", "optionId": "allow_for_session" } }
+}
+```
+
+The request remains live in its owning daemon while waiting. Permission responses accept only an exact
+advertised option id or cancellation—caller-supplied response `_meta` is forbidden—and route across
+daemon upgrades to that owner, but cannot be reconstructed after owner loss. At most four background runs may
 be active or starting per project. Runs execute in the shared local daemon, so MCP clients
 disconnecting or killing the stdio shim never stops in-flight work — any later session can locate
 and await/inspect/stop it. Across a version upgrade, the successor routes signed stop/cancel control
@@ -491,9 +516,10 @@ for file fixtures, precedence, validation, limits, and reports.
 
 Discover what a harness will negotiate **before** authoring: `npx @automatalabs/workflows config`
 probes each routable harness (built-ins + registered customs) with one no-prompt, zero-token
-session and prints its advertised modes plus config-option catalog — model ids (including bracket variants
-like `opus[1m]`) and effort levels. A successful result reports mode support explicitly: only ids in
-`modes.availableModes` may be authored; `modes:null` means omit `mode`, never infer `"default"`.
+session and prints its advertised modes plus config-option catalog — including each raw mode name,
+description, and `_meta`, model ids, and effort levels. A successful result also reports
+`defaultModeId`: omitted modes use Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode.
+Authored and built-in defaults must appear in `modes.availableModes`.
 Name harnesses to scope it (`config codex`), `--json` for machines; it is the same table every validate report includes.
 
 ---

@@ -179,15 +179,15 @@ Canonical MCP topic sources live under `docs/authoring/` in the repository and a
 
 ### Input parameters
 
-The tool uses a config/run/inspect/await/stop union. `config` performs zero-token, no-prompt discovery, and every run performs static validation, a mocked dry run, and routed model/config checks before admission. Invalid scripts return bounded `status:"rejected"` diagnostics without creating a run ID or reserving background capacity. Execution resource maxima remain runtime clamps;
+The tool uses a config/run/inspect/await/permissions-response/stop union. `config` performs zero-token, no-prompt discovery, and every run performs static validation, a mocked dry run, and routed model/config checks before admission. Invalid scripts return bounded `status:"rejected"` diagnostics without creating a run ID or reserving background capacity. Execution resource maxima remain runtime clamps;
 inspection/await limits are contract bounds and invalid values are MCP Invalid Params (`-32602`).
 
 | Param | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `action` | `"config" \| "run" \| "inspect" \| "await" \| "stop"` | no | run | `"config"` discovers live backend/model/mode/config options without starting a workflow. Omit or use `"run"` for automatic validation followed by execution. The remaining actions operate on an admitted `runId`. |
-| `script` | string (non-empty) | run XOR | — | Raw JavaScript workflow script (no Markdown fences). Exactly one of `script`/`scriptPath` is required for run. The first statement **must** be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/stop. |
-| `scriptPath` | absolute path string | run XOR | — | Absolute path on the **server's filesystem**. Read once as UTF-8 before admission; the content is snapshotted, and later file edits do not change that run. Relative paths and unreadable files are Invalid Params. Forbidden for inspect/await/stop. |
-| `projectDir` | absolute path string | config/run (daemon) | in-process: the server's own project | Project cwd for discovery and the run store/default execution cwd for execution. Required for config and run on the shared daemon. Forbidden for inspect/await/stop. |
+| `action` | `"config" \| "run" \| "inspect" \| "await" \| "permissions-response" \| "stop"` | no | run | `"config"` discovers live backend/model/mode/config options without starting a workflow. Omit or use `"run"` for automatic validation followed by execution. The remaining actions operate on an admitted `runId`. |
+| `script` | string (non-empty) | run XOR | — | Raw JavaScript workflow script (no Markdown fences). Exactly one of `script`/`scriptPath` is required for run. The first statement **must** be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/permissions-response/stop. |
+| `scriptPath` | absolute path string | run XOR | — | Absolute path on the **server's filesystem**. Read once as UTF-8 before admission; the content is snapshotted, and later file edits do not change that run. Relative paths and unreadable files are Invalid Params. Forbidden for inspect/await/permissions-response/stop. |
+| `projectDir` | absolute path string | config/run (daemon) | in-process: the server's own project | Project cwd for discovery and the run store/default execution cwd for execution. Required for config and run on the shared daemon. Forbidden for inspect/await/permissions-response/stop. |
 | `harnesses` | backend-name array (1–16) | config only | every registered backend | Limit no-prompt discovery to these backends. |
 | `modelSpecs` | model-spec array (1–16) | config only | — | Select these exact routed models before reading their model-specific mode and config-option catalogs. |
 | `modelFilter` | string (1–128) | config only | provider/group summaries | Case-insensitive substring or `/regular expression/` used to return bounded matching model ids. |
@@ -202,7 +202,9 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits compatible format/metadata/manifest/cwd state and replays only eligible calls; current-environment and Node/V8 drift are reported provenance. Pre-input-format-2 sources use the named positional bridge. If the source paused mid-agent on usage/auth, an unchanged, reopenable root occurrence continues from its recorded ACP session; every failed continuation gate runs fresh. |
 | `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format format/metadata/manifest/input checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. This works under the default policy and does not require `resumePolicy: "positional"`. The JSON decision is returned verbatim (`kind: "confirm"` normally uses a boolean). Wire keys must be canonical non-negative safe integers. |
-| `runId` | engine run ID | inspect/await/stop only | — | Required for inspect/await/stop; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
+| `runId` | engine run ID | inspect/await/permissions-response/stop | — | Project-scoped run capability; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
+| `permissionId` | UUID | permissions-response | — | Opaque live request id from inspect/await. |
+| `response` | ACP permission response | permissions-response | — | Exact advertised `{ outcome:{ outcome:"selected", optionId } }`, or `{ outcome:{ outcome:"cancelled" } }`. |
 | `waitMs` | integer 0–25,000 | await only | `20,000` | Zero is a non-blocking status read. Values are rejected, never clamped. |
 | `lastN` | integer 1–50 | inspect/await/stop only | `20` | Latest matching journal calls. Filtering happens before this selection. |
 | `labelGlob` | string | inspect/await/stop only | all calls | Non-empty, at most 128 Unicode code points. Case-sensitive whole-label `*`/`?` glob with backslash escaping; trailing backslash is literal. Only known agent labels match. |
@@ -210,7 +212,8 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 
 `agentTimeoutMs` is not an idle timer: it covers the complete attempt, including backend startup,
 configuration, tool work, and streamed output. `agentIdleTimeoutMs` is the separate opt-in wedge
-watchdog. Real ACP `session/update` traffic re-arms it; synthetic progress heartbeats do not. Size
+watchdog. Real ACP `session/update` traffic re-arms it; synthetic progress heartbeats do not. A live
+permission resolver wait suspends only the idle watchdog; total wall time continues. Size
 it above the longest expected backend-silent local tool operation (typically 5–10 minutes). Each
 retry receives fresh clocks. Exhaustion settles the call to `null` with recoverable `AGENT_TIMEOUT`
 or `AGENT_IDLE_TIMEOUT`, frees its concurrency slot, and cancels the ACP session; a turn that
@@ -224,7 +227,7 @@ Discover a backend's live catalog before pinning model, mode, or `configOptions`
 { "action": "config", "projectDir": "/absolute/project", "harnesses": ["claude"], "modelFilter": "opus" }
 ```
 
-After choosing a model, inspect its exact option domain with `{ "action": "config", "projectDir": "/absolute/project", "modelSpecs": ["claude/opus[1m]"] }`. Every successful harness entry reports `modes` explicitly: copy a mode only from `modes.availableModes`; `modes:null` means the backend/model supports none, so omit `mode`. Never infer a generic `"default"`. No workflow is started and no prompt is sent. If `model` is omitted, or only a backend name is used, discovery is optional.
+After choosing a model, inspect its exact option domain with `{ "action": "config", "projectDir": "/absolute/project", "modelSpecs": ["claude/opus[1m]"] }`. Every successful harness entry preserves the backend's raw mode ids, names, descriptions, and `_meta`, and reports `defaultModeId`. Omitted modes explicitly use Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode. Authored/default ids must be advertised. No workflow is started and no prompt is sent.
 
 Example run arguments (validation is automatic):
 
@@ -375,6 +378,18 @@ interface WorkflowExecutionToolResult {
   scriptUri: string;
 }
 
+interface WorkflowPendingPermission {
+  version: 1;
+  permissionId: string;
+  runId: string;
+  callIndex: number;
+  backendId: string;
+  label?: string;
+  requestedAt: string;
+  request: RequestPermissionRequest;
+  requestTruncated: boolean;
+}
+
 interface WorkflowBackgroundAccepted {
   runId: string;
   status: "running";
@@ -382,17 +397,20 @@ interface WorkflowBackgroundAccepted {
   scriptUri: string;
   limits: WorkflowRunLimits;
   replayEligibility?: WorkflowReplayEligibility;
+  pendingPermissions?: WorkflowPendingPermission[];
+  interaction: { permissionRequests: "may-block"; collectWith: ("await" | "inspect")[]; respondWith: "permissions-response"; elicitation: "available" | "unavailable" };
 }
 
 interface WorkflowAwaitMetadata {
   requestedMs: number;
   elapsedMs: number;
-  returnedBecause: "terminal" | "timeout" | "immediate";
+  returnedBecause: "terminal" | "timeout" | "immediate" | "action-required" | "permission-resolved";
 }
 
 interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowAwaitMetadata;
   tokenUsage?: TokenUsage;
+  pendingPermissions?: WorkflowPendingPermission[];
   outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">; // exactly when terminal
   scriptUri: string;
   lineage: WorkflowScriptLineageEntry[];
@@ -404,6 +422,13 @@ interface WorkflowScriptLineageEntry {
   available: boolean;
 }
 
+interface WorkflowPermissionResponseResult extends WorkflowRunStatus {
+  pendingPermissions?: WorkflowPendingPermission[];
+  permissionResponse: { permissionId: string; runId: string; callIndex: number; outcome: object; respondedAt: string };
+  scriptUri: string;
+  lineage: WorkflowScriptLineageEntry[];
+}
+
 interface WorkflowStopResult extends WorkflowRunStatus {
   stopped: boolean;
   alreadyTerminal: boolean;
@@ -412,6 +437,7 @@ interface WorkflowStopResult extends WorkflowRunStatus {
 }
 
 interface WorkflowInspectionToolResult extends WorkflowRunStatus {
+  pendingPermissions?: WorkflowPendingPermission[];
   scriptUri: string;
   lineage: WorkflowScriptLineageEntry[];
 }
@@ -421,6 +447,7 @@ type WorkflowToolResult =
   | WorkflowBackgroundAccepted
   | WorkflowInspectionToolResult
   | WorkflowRunAwaitResult
+  | WorkflowPermissionResponseResult
   | WorkflowStopResult;
 ```
 
@@ -478,9 +505,13 @@ Each call has its deterministic index, known agent/checkpoint attribution, a com
 visible as `AGENT_TIMEOUT`, `AGENT_IDLE_TIMEOUT`, and `AGENT_CANCELLED`. `limits` contains
 `maxAgents`, `tokenBudget` (a persisted-shape compatibility field that is always `null` for new
 runs), `concurrency`, `agentRetries`, `agentTimeoutMs`, and `agentIdleTimeoutMs` as resolved for
-this run (legacy persisted rows may omit it). Inspection never returns script, args, prompts,
-histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results. Sensitive
-keys and credential-shaped strings are redacted before results are structurally compacted; every
+this run (legacy persisted rows may omit it). Ordinary call-status projection never returns script,
+args, prompts, histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results;
+a live `pendingPermissions` entry carries a safe ACP projection so the caller can make the decision.
+The private ACP session id is omitted; diagnostic values are credential-redacted and scalar-bounded,
+and the complete ordered exact option-id set must fit within the 64 KiB permission envelope or the
+request is cancelled rather than exposed partially. Sensitive keys and credential-shaped strings are
+redacted before ordinary results are structurally compacted; every
 text scalar and preview is at most 512 UTF-8 bytes. The inherited structured status is at most
 24,576 bytes, retaining newest diagnostics by dropping oldest calls, logs, then phases. The full
 oldest-to-newest script lineage is mandatory: if that lineage alone makes the augmented envelope
@@ -497,7 +528,16 @@ No workflow run found for runId "<runId>" in this server's project-scoped run st
 Inspecting an existing failed/aborted run is still a successful read (`isError: false`); branch on
 the payload `status`.
 
-Await inherits that exact safe status projection. Its status fields retain the 24,576-byte bound,
+Await inherits that safe status projection and returns early with `action-required` when a live ACP
+permission is pending. Inspect/await attach the request's exact ordered option ids with bounded,
+redacted presentation metadata. Elicitation-capable clients present one choice; other clients answer
+with `permissions-response`. The response accepts only the selected exact optionId or cancellation—
+caller-supplied response `_meta` is forbidden—and routes to the daemon generation holding the run lease. The workflow remains running
+and keeps its ACP session/concurrency slot; the idle watchdog is suspended while total wall time
+continues. This state is execution-affine, not a durable pause, and cannot be reconstructed after
+owner loss.
+
+Await's status fields retain the 24,576-byte bound,
 redaction, compaction, filtering, and truncation counters, and its text is capped at 8,192 bytes.
 Before terminal state, optional `tokenUsage` is the cumulative live work observed in this execution;
 replayed calls add zero. At terminal state, `outcome` is the foreground-equivalent execution result:
@@ -874,12 +914,17 @@ console.log(run.status, run.result);
 This MCP-server package does export its own building blocks, for hosts that want to mount the same tools on a transport they control rather than the default stdio one. `createWorkflowServer(runner)` registers the `docs`, `workflow`, and `repl` tools (plus the app-only `workflow-events` poller and the `author-workflow` prompt); the `repl` workspaces default to a private client-presence ledger and a server-owned eval-break channel. `CreateWorkflowServerOptions` exposes `protocolEra` for SDK serving factories, `requestStateCodec` for deployments that need a durable/shared modern multi-round-trip key, plus `replRunner`, `replPresence`, `replClientId`, `replEvalBreakChannel`, and `replDrainBoundMs` for host lifecycle integration (the daemon passes shared instances):
 
 ```ts
-import { createWorkflowServer } from "@automatalabs/mcp-server";
+import { createWorkflowServer, WorkflowPermissionBroker } from "@automatalabs/mcp-server";
 import { createAcpRunner } from "@automatalabs/workflows";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
-const runner = createAcpRunner();
-await serveStdio(({ era }) => createWorkflowServer(runner, { protocolEra: era }));
+const permissionBroker = new WorkflowPermissionBroker();
+const runner = createAcpRunner({
+  onPermissionRequest: permissionBroker.resolver,
+  enforceToolPolicyBeforePermissionResolver: true,
+});
+permissionBroker.attach(runner);
+await serveStdio(({ era }) => createWorkflowServer(runner, { protocolEra: era, permissionBroker }));
 ```
 
 > **Use an SDK serving entry for dual-era hosting.** A hand-constructed server connected directly to `StdioServerTransport` intentionally serves only the legacy era. `serveStdio(factory)` performs the official modern/legacy arbitration while registering each tool once through the factory. The bundled `main()` additionally supplies its internal relay transport, whose worker-thread stdin reader can fire the out-of-band eval-break for a fully synchronous runaway; a vanilla stdio transport remains bounded by the per-eval deadline for that case.
@@ -887,10 +932,10 @@ await serveStdio(({ era }) => createWorkflowServer(runner, { protocolEra: era })
 The REPL-specific exports are `replToolInputShape` / `replToolOutputShape` (the tool's Zod input/output schemas), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). Other workflow-side exports include `workflowToolInputShape` / `parseWorkflowToolInput` /
 `clampWorkflowInput` (primitive schema, action discriminator, execution clamp),
 `CreateWorkflowServerOptions`,
-`WorkflowExecuteToolInput`, `WorkflowInspectToolInput`, `WorkflowAwaitToolInput`, `WorkflowStopToolInput`,
+`WorkflowExecuteToolInput`, `WorkflowInspectToolInput`, `WorkflowAwaitToolInput`, `WorkflowPermissionResponseToolInput`, `WorkflowStopToolInput`,
 `WorkflowExecutionToolResult`, `WorkflowBackgroundAccepted`, `WorkflowAwaitMetadata`,
-`WorkflowInspectionToolResult`, `WorkflowRunAwaitResult`, `WorkflowStopResult`,
-`WorkflowScriptLineageEntry`, `WorkflowToolResult`, `MAX_BACKGROUND_RUNS`,
+`WorkflowInspectionToolResult`, `WorkflowRunAwaitResult`, `WorkflowPermissionResponseResult`, `WorkflowStopResult`,
+`WorkflowScriptLineageEntry`, `WorkflowToolResult`, `WorkflowPermissionBroker`, `WorkflowPendingPermission`, `MAX_BACKGROUND_RUNS`,
 `workflowToolOutputShape` / `toWorkflowToolResult`,
 `createProgressReporter`, `installMcpServerLifecycle` / `SHUTDOWN_DEADLINE_MS`, and lifecycle
 types `McpServerLifecycle`, `McpServerLifecycleOptions`, `McpServerShutdownReason`, and

@@ -189,7 +189,7 @@ try {
 `backends`, `meta` / `promptMeta` (generic ACP `_meta` passthroughs merged into `session/new` /
 `session/prompt`), `baseInstructions` / `developerInstructions` (Codex-only), `keepSession`, and
 the out-of-band callbacks `onUsage` / `onModelResolved` / `onModelFallback` / `onHistory` /
-`onActivity` / `onSessionOpen`. `onActivity` reports real backend progress for the opt-in idle watchdog. Token/cost usage is delivered via `onUsage` (it may never fire — ACP usage is
+`onActivity` / `onInteractionStateChange` / `onSessionOpen`. `onActivity` reports real backend progress; a live permission wait reports waiting/running through `onInteractionStateChange` so only the idle watchdog is suspended. Omitted modes explicitly apply Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi/custom mode. Token/cost usage is delivered via `onUsage` (it may never fire — ACP usage is
 experimental), never via the return value.
 
 > **Codex session instructions.** When the run routes to the Codex backend, `baseInstructions`
@@ -657,8 +657,7 @@ results. The dry run catches what a parse can't: thunk-vs-promise mistakes, refe
 broken plumbing between calls. Finally, validation opens one no-prompt session for every distinct
 routed backend/model target, selects that call's model verbatim when one was authored, surfaces
 the echoed model-specific ACP modes and config-option catalog, and checks every authored `mode`
-and `configOptions` bag against it. Only exact ids in `modes.availableModes` pass; `modes:null`
-means omit `mode`, never infer `"default"`. This probe uses zero tokens. A target that cannot spawn,
+and `configOptions` bag against it. Mode ids, names, descriptions, and `_meta` remain verbatim. `defaultModeId` reports the omitted-mode choice (Claude `auto`, Codex `agent`, OpenCode `build`; none for Pi), and both authored/default ids must be advertised. This probe uses zero tokens. A target that cannot spawn,
 authenticate, select its model, or open a session contributes one warning and `probed:false`; only
 that target's configuration checks are skipped, so probe failure alone never invalidates the script.
 There is no cached catalog. Programmatic hosts may set `probeConfig:false` for a mock routing-discovery
@@ -763,8 +762,7 @@ Harness names are the routing names: built-in `claude` / `codex` / `opencode` / 
 backend registered via `AGENTPRISM_BACKENDS` (registered customs also join the no-argument
 default set). Each harness opens one session without a prompt — zero tokens — and reports its
 advertised ACP modes plus its config-option catalog: model ids (including bracket variants), effort
-levels, and boolean knobs. A non-null `modes` object contains `currentModeId` and `availableModes`;
-only exact listed ids may be authored. `modes: null` means omit `mode`, never infer `"default"`.
+levels, and boolean knobs. A non-null `modes` object contains `currentModeId` and the raw `availableModes` descriptions/metadata; `defaultModeId` reports AgentPrism's omitted-mode choice. Only exact listed ids may be authored or applied. `modes:null` means no mode.
 A harness that reports spawn/session/auth failure during `session/new` produces
 `probed: false` with the reason and never blocks the others. A successful row proves only that
 session/config discovery completed; some agents defer credential validation until the first prompt,
@@ -956,6 +954,7 @@ ClaudeBackend, CodexBackend, OpenCodeBackend, PiBackend, CustomAcpBackend,
 resolveBackendRegistry, BACKENDS_ENV,
 AGENT_METHODS, CLIENT_METHODS, ACP_AUTH_REQUIRED_ERROR_CODE,
 clientCapabilitiesFor, adaptPromptContent,
+decidePermission, selectPermissionOption,
 toJsonSchema, toStrictJsonSchema,
 TypedEventEmitter,            // the tiny typed emitter backing runner.on(...)
 
@@ -988,7 +987,7 @@ WorkflowPathOptions, RunPersistence, RunPersistenceOptions, RunLeaseOwner,
 AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig, WorkflowCallRecord, WorkflowRecordedError,
 InteractiveSessionOptions, InteractiveTurn, SteeringOutcome, ProbeConfigOptionsOptions, ProbedConfigOptions, SessionConfigOption,
-PermissionResolver,
+PermissionResolver, RequestPermissionRequest, RequestPermissionResponse,
 AuthResolver, AuthContext, AuthResolution, AuthMethodDescriptor, AuthCapableRunner,
 ProviderCapableRunner,        // duck-type gate for the MCP provider tools (providers/list|set|disable)
 ClientHandlers, FsHandlers, TerminalHandlers, McpHandlers, AcpSessionContext, NegotiatedCapabilities,

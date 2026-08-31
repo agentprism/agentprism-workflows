@@ -1526,7 +1526,16 @@ export async function runWorkflow<T = unknown>(
                     const copied = cloneTelemetry(reported);
                     if (copied) slot.provenance = copied;
                   },
-                  ...(idleWatchdog === undefined ? {} : { onActivity: () => idleWatchdog?.activity() }),
+                  ...(idleWatchdog === undefined
+                    ? {}
+                    : {
+                        onActivity: () => idleWatchdog?.activity(),
+                        onInteractionStateChange: (interaction: { kind: "permission"; state: "waiting" | "running" }) => {
+                          if (interaction.kind !== "permission") return;
+                          if (interaction.state === "waiting") idleWatchdog?.pause();
+                          else idleWatchdog?.resume();
+                        },
+                      }),
                   onHistory: (history: AgentHistoryEntry[]) => {
                     if (slot.sealed) return;
                     const copied = cloneTelemetry(history);
@@ -3548,6 +3557,8 @@ function bestEffortDebug(message: string): void {
 interface AgentIdleWatchdog {
   promise: Promise<never>;
   activity(): void;
+  pause(): void;
+  resume(): void;
   dispose(): void;
 }
 
@@ -3561,12 +3572,13 @@ function createAgentIdleWatchdog(
 
   let timer: NodeJS.Timeout | undefined;
   let disposed = false;
+  let paused = false;
   let rejectTimeout!: (error: WorkflowError) => void;
   const promise = new Promise<never>((_resolve, reject) => {
     rejectTimeout = reject;
   });
   const arm = () => {
-    if (disposed) return;
+    if (disposed || paused) return;
     if (timer !== undefined) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = undefined;
@@ -3590,6 +3602,17 @@ function createAgentIdleWatchdog(
   return {
     promise,
     activity: arm,
+    pause() {
+      if (disposed || paused) return;
+      paused = true;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    },
+    resume() {
+      if (disposed || !paused) return;
+      paused = false;
+      arm();
+    },
     dispose() {
       disposed = true;
       if (timer !== undefined) clearTimeout(timer);

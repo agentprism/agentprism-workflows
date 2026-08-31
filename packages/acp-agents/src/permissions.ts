@@ -1,29 +1,13 @@
 // toolNames / disallowedToolNames -> ACP session/request_permission auto-responses.
 //
-// ACP lets a client auto-respond to permission requests without user interaction
-// (§5.5). The runner is headless, so we DECIDE allow/deny at that boundary from the
-// agentType's allow-list (toolNames) and deny-list (disallowedToolNames). The ACP
-// permission request does not carry a first-class tool NAME, so we match best-effort
-// against the request's title, kind, and any vendor `_meta.*.toolName` (Claude stamps it).
-// Default is ALLOW so a headless subagent can do real work; a matched deny-rule, or a
-// non-empty allow-list with no match, rejects. When the host explicitly requests an ACP
-// session mode and no human resolver is present, the runner flips the no-match default to
-// DENY so a sandboxed mode cannot be defeated by auto-approving escalations.
+// ACP lets a client auto-respond to permission requests without user interaction. The runner's
+// headless SDK path still does that from the agentType allow/deny lists. MCP-hosted workflows install
+// a resolver instead: unresolved requests remain live until the MCP permission broker returns one of
+// the agent's exact advertised optionIds.
 //
-// MATCH PRECEDENCE LADDER (tightened from the old bidirectional substring, which both
-// silently over-allowed — 'read' ⊂ 'thread-reader' — and ignored the authoritative tool
-// id when matching a human title):
-//   (a) EXACT (case-insensitive): prefer the authoritative tool identity — the vendor
-//       `_meta.*.toolName` when present, else the title/kind. If ANY policy entry exactly
-//       equals such a candidate, the tool is PRECISELY identified and we decide on exact
-//       matches ALONE, suppressing loose substring matches entirely. This is what stops a
-//       deny `read` from also catching an exactly-allowed `thread-reader` tool.
-//   (b) SUBSTRING fallback: only when NO policy entry exactly matches the request do we
-//       fall back to the prior best-effort bidirectional substring over all candidates.
-// RESIDUAL AMBIGUITY (deliberately kept for back-compat / unnamed-tool cases): absent any
-// exact entry, a short pattern can still substring-match an unrelated longer name (e.g.
-// `read` still matches `thread-reader`, and `read` still matches `ReadFileTool`). The
-// exact tier removes this only once a precise name pins the tool.
+// The permission option's optionId and order are authoritative. `kind` is used only by the legacy
+// headless auto-policy to find an allow/reject polarity; it is never interpreted as a provider
+// decision or persistence scope.
 import type {
   CreateElicitationRequest,
   CreateElicitationResponse,
@@ -34,109 +18,85 @@ import type {
 } from "@agentclientprotocol/sdk";
 import type { AcpEventContext } from "./events.js";
 
-/** Async human-in-the-loop decider for ACP permission requests. When present, it REPLACES the
- *  synchronous ToolPolicy path for the sessions it applies to: the agent turn parks until this
- *  resolver selects an ACP permission outcome. It may resolve arbitrarily later (seconds or
- *  minutes); the library guarantees every parked request is settled with the ACP
- *  `{ outcome: { outcome: "cancelled" } }` response when its session is released, its turn is
- *  cancelled via session/cancel, or its connection dies, so teardown can never leave an agent
- *  turn hung behind an unanswered permission prompt. */
+/** Async human-in-the-loop decider for ACP permission requests. When present, it handles requests
+ * that an explicit ToolPolicy did not already settle. It may resolve arbitrarily later; session
+ * teardown still settles the wire request as cancelled, so a dead turn never remains hung. */
 export type PermissionResolver = (
   params: RequestPermissionRequest,
   ctx: AcpEventContext,
 ) => Promise<RequestPermissionResponse> | RequestPermissionResponse;
 
 /** Async human-in-the-loop responder for ACP elicitation/create. ACP marks elicitation
- *  UNSTABLE/@experimental; this library deliberately exposes the SDK request/response types
- *  directly so regular SDK bumps and wire tests catch drift instead of freezing a local copy. */
+ * UNSTABLE/@experimental; expose the SDK types directly so upgrades catch drift. */
 export type ElicitationResolver = (
   request: CreateElicitationRequest,
   context: AcpEventContext,
 ) => Promise<CreateElicitationResponse> | CreateElicitationResponse;
 
-/** Codex tool-approval persistence directive (codex-acp `dist/index.js:23952-23975`, §3.6). A
- *  permission decision may ask the agent to REMEMBER the approval for the rest of the session
- *  ("session") or permanently ("always"). It is echoed as `_meta.persist` on the RequestPermission
- *  response; an agent WITHOUT the capability ignores the extra `_meta` (Principle 3 — no silent
- *  unsupported surface). */
+/** @deprecated Opaque legacy response metadata. It does not select a provider decision or promise
+ *  a persistence scope. Choose an exact advertised optionId instead. */
 export type PermissionPersist = "session" | "always";
 
-/** High-level permission decision (§3.6). Mirrors the spec's `PermissionResolution`: a host says
- *  allow/deny and, on allow, MAY request persistence. `resolvePermission` maps it onto a concrete ACP
- *  `RequestPermissionResponse` (option selection + the `_meta.persist` echo), so a host can drive
- *  `onPermissionRequest` at this altitude instead of hand-building the SDK response. */
+/** @deprecated Coarse compatibility input for resolvePermission. It cannot distinguish multiple
+ *  same-kind provider decisions; interactive hosts must select an exact advertised optionId. */
 export interface PermissionResolution {
   outcome: "allow" | "deny";
   persist?: PermissionPersist;
 }
 
 export interface ToolPolicy {
-  /** Allow-list (agentType `tools`). When non-empty, a tool that matches NOTHING is denied. */
+  /** Allow-list (agentType `tools`). When non-empty, a tool that matches nothing is denied. */
   allow?: string[];
   /** Deny-list (agentType `disallowedTools`), applied after the allow-list. */
   deny?: string[];
-  /** No-match fallback for the headless auto-responder. Default "allow" preserves historical
-   *  behavior. Explicit ACP session modes set this to "deny" unless a permission resolver is
-   *  present, otherwise read-only/plan confinement can be bypassed by auto-approved escalations. */
+  /** No-match fallback for the SDK/headless auto-responder. Default allow. A live resolver handles
+   * unmatched requests before this fallback is consulted. */
   defaultOutcome?: "allow" | "deny";
-  /** Codex tool-approval persistence (§3.6): when the auto-responder ALLOWS a tool, echo this as
-   *  `_meta.persist` on the response so a capable agent remembers the approval. Ignored on deny and by
-   *  agents without the capability. */
+  /** @deprecated Opaque legacy response metadata with no provider-effect guarantee. */
   persist?: PermissionPersist;
 }
 
-const ALLOW_KIND_ORDER: PermissionOptionKind[] = ["allow_once", "allow_always"];
-const REJECT_KIND_ORDER: PermissionOptionKind[] = ["reject_once", "reject_always"];
+export type ExplicitToolPolicyDecision = "allow" | "deny";
 
-/** Decide the auto-response for one permission request given the tool policy. */
+/** Return the decision imposed by an explicitly authored allow/deny list, or undefined when the
+ * request remains unresolved and a live resolver should decide. A deny match always wins; a
+ * non-empty allow-list denies nonmatches; a deny-only policy leaves nonmatches unresolved. */
+export function decideExplicitToolPolicy(
+  request: RequestPermissionRequest,
+  policy: ToolPolicy,
+): ExplicitToolPolicyDecision | undefined {
+  const evaluated = evaluatePolicy(request, policy);
+  if (evaluated.denied) return "deny";
+  if (evaluated.hasAllowList) return evaluated.allowedByList ? "allow" : "deny";
+  return undefined;
+}
+
+/** Decide the SDK/headless auto-response for one permission request. */
 export function decidePermission(
   request: RequestPermissionRequest,
   policy: ToolPolicy,
 ): RequestPermissionResponse {
-  const { toolNames, decoration } = candidateNames(request);
-  // (a) EXACT pool: the authoritative tool id (vendor _meta.toolName) when present, else
-  //     the human title/kind. The substring pool is everything, used only as a fallback.
-  const exactPool = toolNames.length > 0 ? toolNames : decoration;
-  const allPool = [...toolNames, ...decoration];
-
-  const denyList = policy.deny ?? [];
-  const allowList = policy.allow ?? [];
+  const evaluated = evaluatePolicy(request, policy);
   const defaultOutcome = policy.defaultOutcome ?? "allow";
-  const hasDeny = denyList.length > 0;
-  const hasAllowList = allowList.length > 0;
-
-  const denyExact = hasDeny && exactMatchesAny(exactPool, denyList);
-  const allowExact = hasAllowList && exactMatchesAny(exactPool, allowList);
-
-  let denied: boolean;
-  let allowedByList: boolean;
-  if (denyExact || allowExact) {
-    // The tool is EXACTLY named by some policy entry -> decide on exact matches alone.
-    // (Suppresses loose substring matches: a deny `read` no longer catches an exactly
-    // allow-listed `thread-reader`.)
-    denied = denyExact;
-    allowedByList = hasAllowList ? allowExact : defaultOutcome === "allow";
-  } else {
-    // (b) No exact match in either list -> best-effort bidirectional substring fallback.
-    denied = hasDeny && substringMatchesAny(allPool, denyList);
-    allowedByList = hasAllowList ? substringMatchesAny(allPool, allowList) : defaultOutcome === "allow";
-  }
-  const wantAllow = !denied && allowedByList;
-
-  const option = pickOption(request.options, wantAllow);
-  if (!option) {
-    // No option of the desired polarity exists. Cancelling the permission is the only
-    // remaining way to refuse a tool the server offers no reject option for.
-    return { outcome: { outcome: "cancelled" } };
-  }
-  const response: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: option.optionId } };
-  // Echo the persistence directive (§3.6) only when the auto-responder ALLOWS; a denial persists nothing.
+  const allowed = evaluated.hasAllowList ? evaluated.allowedByList : defaultOutcome === "allow";
+  const wantAllow = !evaluated.denied && allowed;
+  const response = responseForPolarity(request, wantAllow);
   return wantAllow ? withPersist(response, policy.persist) : response;
 }
 
-/** Stamp a persistence directive onto a permission response's top-level `_meta.persist` (§3.6). A
- *  cancelled response, or an absent directive, is returned unchanged. Never mutates the input; a
- *  non-secret structural echo, so it is safe to emit in events. */
+/** Build a response for an exact option advertised by this request. An unknown/stale option fails
+ * closed as cancelled. No label, kind, or metadata is interpreted. */
+export function selectPermissionOption(
+  request: RequestPermissionRequest,
+  optionId: string,
+): RequestPermissionResponse {
+  return request.options.some((option) => option.optionId === optionId)
+    ? { outcome: { outcome: "selected", optionId } }
+    : { outcome: { outcome: "cancelled" } };
+}
+
+/** @deprecated Stamps opaque legacy metadata only. Current first-class backends derive effects from
+ *  the selected advertised optionId and may ignore this field entirely. */
 export function withPersist(
   response: RequestPermissionResponse,
   persist: PermissionPersist | undefined,
@@ -145,25 +105,55 @@ export function withPersist(
   return { ...response, _meta: { ...(response._meta ?? {}), persist } };
 }
 
-/** Map a high-level `PermissionResolution` (§3.6) onto a concrete ACP `RequestPermissionResponse` for
- *  `request`: pick an allow/reject option of the requested polarity and, on allow, echo `_meta.persist`.
- *  Falls back to CANCELLING when the agent offers no option of the requested polarity (the only way to
- *  refuse a tool with no reject option) — identical to the auto-responder's contract. */
+/** @deprecated Coarse polarity selection retained for source compatibility. It preserves the old
+ *  response shape but cannot promise a scope or distinguish same-kind decisions. */
 export function resolvePermission(
   request: RequestPermissionRequest,
   resolution: PermissionResolution,
 ): RequestPermissionResponse {
   const wantAllow = resolution.outcome === "allow";
-  const option = pickOption(request.options, wantAllow);
-  if (!option) return { outcome: { outcome: "cancelled" } };
-  const response: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: option.optionId } };
+  const response = responseForPolarity(request, wantAllow);
   return wantAllow ? withPersist(response, resolution.persist) : response;
 }
 
+interface EvaluatedPolicy {
+  denied: boolean;
+  allowedByList: boolean;
+  hasAllowList: boolean;
+}
+
+function evaluatePolicy(request: RequestPermissionRequest, policy: ToolPolicy): EvaluatedPolicy {
+  const { toolNames, decoration } = candidateNames(request);
+  // Prefer an authoritative vendor toolName when present; title/kind remain a compatibility
+  // fallback for agents that do not expose one.
+  const exactPool = toolNames.length > 0 ? toolNames : decoration;
+  const allPool = [...toolNames, ...decoration];
+
+  const denyList = policy.deny ?? [];
+  const allowList = policy.allow ?? [];
+  const hasDeny = denyList.length > 0;
+  const hasAllowList = allowList.length > 0;
+
+  const denyExact = hasDeny && exactMatchesAny(exactPool, denyList);
+  const allowExact = hasAllowList && exactMatchesAny(exactPool, allowList);
+
+  if (denyExact || allowExact) {
+    return {
+      denied: denyExact,
+      allowedByList: allowExact,
+      hasAllowList,
+    };
+  }
+
+  return {
+    denied: hasDeny && substringMatchesAny(allPool, denyList),
+    allowedByList: hasAllowList && substringMatchesAny(allPool, allowList),
+    hasAllowList,
+  };
+}
+
 interface CandidateNames {
-  /** Authoritative tool identities pulled from vendor `_meta.*.toolName` (Claude stamps it). */
   toolNames: string[];
-  /** Human-readable decoration: the request title and kind. */
   decoration: string[];
 }
 
@@ -185,23 +175,36 @@ function collectMetaToolNames(meta: unknown, out: string[]): void {
   }
 }
 
-/** (a) Does any pattern EXACTLY equal (case-insensitive) any candidate name? */
 function exactMatchesAny(names: string[], patterns: string[]): boolean {
-  const lowered = new Set(names.map((n) => n.toLowerCase()).filter(Boolean));
+  const lowered = new Set(names.map((name) => name.toLowerCase()).filter(Boolean));
   return patterns.some((pattern) => {
-    const p = pattern.toLowerCase();
-    return p.length > 0 && lowered.has(p);
+    const normalized = pattern.toLowerCase();
+    return normalized.length > 0 && lowered.has(normalized);
   });
 }
 
-/** (b) Best-effort bidirectional substring fallback (the prior, looser semantics). */
 function substringMatchesAny(names: string[], patterns: string[]): boolean {
-  const lowered = names.map((n) => n.toLowerCase()).filter(Boolean);
+  const lowered = names.map((name) => name.toLowerCase()).filter(Boolean);
   return patterns.some((pattern) => {
-    const p = pattern.toLowerCase();
-    if (!p) return false;
-    return lowered.some((n) => n === p || n.includes(p) || p.includes(n));
+    const normalized = pattern.toLowerCase();
+    if (!normalized) return false;
+    return lowered.some((name) =>
+      name === normalized || name.includes(normalized) || normalized.includes(name)
+    );
   });
+}
+
+const ALLOW_KIND_ORDER: PermissionOptionKind[] = ["allow_once", "allow_always"];
+const REJECT_KIND_ORDER: PermissionOptionKind[] = ["reject_once", "reject_always"];
+
+function responseForPolarity(
+  request: RequestPermissionRequest,
+  wantAllow: boolean,
+): RequestPermissionResponse {
+  const option = pickOption(request.options, wantAllow);
+  return option
+    ? { outcome: { outcome: "selected", optionId: option.optionId } }
+    : { outcome: { outcome: "cancelled" } };
 }
 
 function pickOption(options: PermissionOption[], wantAllow: boolean): PermissionOption | undefined {

@@ -131,7 +131,8 @@ interface SessionPreparationOptions {
   runId?: string;
   label?: string;
   callIndex?: number;
-  onActivity?: () => void;
+  onActivity?: AnyRunOptions["onActivity"];
+  onInteractionStateChange?: AnyRunOptions["onInteractionStateChange"];
   baseInstructions?: string;
   developerInstructions?: string;
 }
@@ -154,6 +155,8 @@ interface PreparedSession {
 
 export interface ProbedConfigOptions {
   backendId: string;
+  /** AgentPrism's explicit mode when RunOptions.mode is omitted; absent for no-mode/custom backends. */
+  defaultModeId?: string;
   /** The agent-advertised options, verbatim ACP shapes (id, name, type, currentValue, choices). */
   options: SessionConfigOption[];
   /** Effective ACP mode catalog after normalizing the mode config-option fallback; null means unsupported. AcpAgentRunner always returns this field. */
@@ -324,6 +327,10 @@ export interface AcpRunnerOptions extends AcpPoolOptions {
   /** Runner-wide human-in-the-loop permission resolver. When set, it replaces ToolPolicy
    *  auto-decisions for every session that does not provide its own resolver. */
   onPermissionRequest?: PermissionResolver;
+  /** When true, explicitly authored tool allow/deny lists settle before a live resolver. The MCP
+   *  workflow composition root enables this so authored restrictions cannot be widened by a later
+   *  permission response; SDK compatibility defaults false. */
+  enforceToolPolicyBeforePermissionResolver?: boolean;
   /** Runner-wide ACP elicitation responder. When set, initialize advertises unstable
    *  elicitation form/url support on every connection; sessions may override the resolver. */
   onElicitation?: ElicitationResolver;
@@ -377,6 +384,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
    *  so dedicated interactive connections must receive the SAME deps the pool receives. */
   private readonly clientHandlers: ClientHandlers | undefined;
   private readonly permissionResolver: PermissionResolver | undefined;
+  private readonly enforceToolPolicyBeforePermissionResolver: boolean;
   private readonly elicitationResolver: ElicitationResolver | undefined;
   /** Client auth advertisement, derived ONCE at construction and fixed for every connection this
    *  runner opens (pooled and dedicated). Undefined => the `auth` capability is omitted (§1.2). */
@@ -407,6 +415,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
   constructor(options: AcpRunnerOptions = {}) {
     this.clientHandlers = options.clientHandlers;
     this.permissionResolver = options.onPermissionRequest;
+    this.enforceToolPolicyBeforePermissionResolver = options.enforceToolPolicyBeforePermissionResolver === true;
     this.elicitationResolver = options.onElicitation;
     this.onAuth = options.onAuth;
     // Default derivation (§1.2): explicit `authCapabilities` wins; else, when an `onAuth` resolver is
@@ -500,6 +509,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       opts.signal?.throwIfAborted();
       return {
         backendId: prepared.backend.id,
+        ...(prepared.backend.defaultModeId === undefined ? {} : { defaultModeId: prepared.backend.defaultModeId }),
         options: session.advertisedConfigOptions,
         modes: session.modes ?? null,
       };
@@ -972,7 +982,13 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       opts.signal?.throwIfAborted();
       await activeSession.setConfigOptions(opts.configOptions);
       opts.signal?.throwIfAborted();
-      if (opts.mode) await activeSession.setMode(opts.mode);
+      const effectiveMode = opts.mode ?? prepared.backend.defaultModeId;
+      if (
+        effectiveMode &&
+        (opts.mode !== undefined || activeSession.modes?.availableModes.some((mode) => mode.id === effectiveMode))
+      ) {
+        await activeSession.setMode(effectiveMode);
+      }
 
       const text = buildRunPrompt(
         continuationMethod ? CONTINUATION_INSTRUCTION : prompt,
@@ -1162,7 +1178,13 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       opts.signal?.throwIfAborted();
       await session.setConfigOptions(opts.configOptions);
       opts.signal?.throwIfAborted();
-      if (opts.mode) await session.setMode(opts.mode);
+      const effectiveMode = opts.mode ?? prepared.backend.defaultModeId;
+      if (
+        effectiveMode &&
+        (opts.mode !== undefined || session.modes?.availableModes.some((mode) => mode.id === effectiveMode))
+      ) {
+        await session.setMode(effectiveMode);
+      }
       opts.signal?.throwIfAborted();
       if (this.disposed) throw new Error("ACP agent runner is disposed");
 
@@ -1372,11 +1394,9 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
   private prepareSession(opts: SessionPreparationOptions, config: SessionPreparationConfig): PreparedSession {
     const route = resolveModelRoute(opts.model ?? opts.tier, config.registry);
     const backend = route.backend;
-    const hasPermissionResolver = Boolean(config.permissionResolver ?? this.permissionResolver);
     const policy: ToolPolicy = {
       allow: opts.toolNames,
       deny: opts.disallowedToolNames,
-      defaultOutcome: opts.mode && !hasPermissionResolver ? "deny" : undefined,
     };
     return {
       backend,
@@ -1386,6 +1406,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         schema: config.schema,
         policy,
         permissionResolver: config.permissionResolver,
+        enforceToolPolicyBeforePermissionResolver: this.enforceToolPolicyBeforePermissionResolver,
         elicitationResolver: config.elicitationResolver,
         signal: config.signal,
         mcpServers: opts.mcpServers,
@@ -1400,6 +1421,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         callIndex: opts.callIndex,
         // Backend-neutral liveness callback; MultiplexClient invokes it for this session only.
         onActivity: opts.onActivity,
+        onInteractionStateChange: opts.onInteractionStateChange,
         // CODEX-ONLY session instruction overrides -> session/new _meta bare keys. Additive;
         // never hashed. The Claude backend ignores them.
         baseInstructions: opts.baseInstructions,

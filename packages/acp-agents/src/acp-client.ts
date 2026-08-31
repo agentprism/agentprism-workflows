@@ -106,6 +106,7 @@ import {
   WorkflowError,
   WorkflowErrorCode,
   type AgentHistoryEntry,
+  type AgentInteractionState,
   type McpServerConfig,
 } from "@automatalabs/shared-types";
 import type { Backend, BackendId, ProviderErrorMetadata, StructuredSource } from "./backend.js";
@@ -120,6 +121,7 @@ import {
 } from "./capabilities.js";
 import { emitSessionUpdate, type AcpEventContext, type AcpEventSink } from "./events.js";
 import {
+  decideExplicitToolPolicy,
   decidePermission,
   type ElicitationResolver,
   type PermissionResolver,
@@ -441,6 +443,7 @@ class SessionState {
     readonly cwd: string,
     readonly policy: ToolPolicy,
     readonly permissionResolver?: PermissionResolver,
+    readonly enforceToolPolicyBeforePermissionResolver = false,
     readonly elicitationResolver?: ElicitationResolver,
     readonly label?: string,
     readonly runId?: string,
@@ -450,6 +453,7 @@ class SessionState {
     readonly mcpServerIds: readonly string[] = [],
     private readonly retainSessionLog = true,
     private readonly onActivity?: () => void,
+    private readonly onInteractionStateChange?: (state: AgentInteractionState) => void,
   ) {
     this.modes = modes;
   }
@@ -460,6 +464,14 @@ class SessionState {
       this.onActivity?.();
     } catch {
       // Liveness telemetry is best-effort and never perturbs the ACP update drain.
+    }
+  }
+
+  reportPermissionWait(state: "waiting" | "running"): void {
+    try {
+      this.onInteractionStateChange?.({ kind: "permission", state });
+    } catch {
+      // Host wait-state telemetry is best-effort and never changes permission settlement.
     }
   }
 
@@ -987,6 +999,14 @@ class MultiplexClient {
     // Unknown/closed session: refuse rather than silently allow a tool we can't attribute.
     if (!state) return cancelledPermissionResponse();
     const ctx = this.contextFor(params.sessionId);
+    const explicitPolicy = state.enforceToolPolicyBeforePermissionResolver
+      ? decideExplicitToolPolicy(params, state.policy)
+      : undefined;
+    if (explicitPolicy !== undefined) {
+      const outcome = decidePermission(params, { defaultOutcome: explicitPolicy });
+      this.onEvent?.("permission_request", { ...ctx, request: params, outcome });
+      return outcome;
+    }
     const resolver = state.permissionResolver ?? this.permissionResolver;
     if (resolver) return this.requestPermissionViaResolver(params, state, ctx, resolver);
     const outcome = decidePermission(params, state.policy);
@@ -1011,10 +1031,13 @@ class MultiplexClient {
         if (settled) return;
         settled = true;
         state.pendingPermissions.delete(settle);
+        if (state.pendingPermissions.size === 0) state.reportPermissionWait("running");
         this.onEvent?.("permission_request", { ...ctx, request: params, outcome });
         resolve(outcome);
       };
+      const firstPending = state.pendingPermissions.size === 0;
       state.pendingPermissions.add(settle);
+      if (firstPending) state.reportPermissionWait("waiting");
       this.onEvent?.("permission_pending", { ...ctx, request: params });
 
       try {
@@ -1501,9 +1524,10 @@ export interface AcpSessionOptions {
   /** The schema for this run, if any (drives the backend's session/prompt `_meta`). */
   schema: TSchema | undefined;
   policy: ToolPolicy;
-  /** Session-scoped permission resolver. When present it wins over the runner default and
-   *  replaces the synchronous ToolPolicy auto-response path for this session. */
+  /** Session-scoped permission resolver. When present it wins over the runner default. */
   permissionResolver?: PermissionResolver;
+  /** Apply explicitly authored tool allow/deny lists before invoking a resolver. */
+  enforceToolPolicyBeforePermissionResolver?: boolean;
   /** Session-scoped elicitation resolver. When present it wins over the runner default for this
    *  session; initialize-time advertisement still depends on the runner-wide resolver. */
   elicitationResolver?: ElicitationResolver;
@@ -1523,6 +1547,8 @@ export interface AcpSessionOptions {
   callIndex?: number;
   /** Backend-neutral attempt liveness callback. Invoked for every routed session/update. */
   onActivity?: () => void;
+  /** Host-interaction wait callback. Permission resolver waits pause the engine idle watchdog. */
+  onInteractionStateChange?: (state: AgentInteractionState) => void;
   /** CODEX-ONLY session instruction overrides. The backend folds these into session/new `_meta`
    *  (bare keys) for the codex-acp adapter; the Claude backend ignores them. Omitted => unset. */
   baseInstructions?: string;
@@ -2197,6 +2223,7 @@ export class PooledConnection {
       opts.cwd,
       opts.policy,
       opts.permissionResolver,
+      opts.enforceToolPolicyBeforePermissionResolver,
       opts.elicitationResolver,
       opts.label,
       opts.runId,
@@ -2206,6 +2233,7 @@ export class PooledConnection {
       acpMcpServerIds(opts.mcpServers),
       opts.retainSessionLog ?? true,
       opts.onActivity,
+      opts.onInteractionStateChange,
     );
     this.client.register(response.sessionId, state);
     return new SessionHandle(this, response.sessionId, state, response.configOptions ?? [], opts, onReleased);
@@ -2233,6 +2261,7 @@ export class PooledConnection {
         opts.cwd,
         opts.policy,
         opts.permissionResolver,
+        opts.enforceToolPolicyBeforePermissionResolver,
         opts.elicitationResolver,
         opts.label,
         opts.runId,
@@ -2242,6 +2271,7 @@ export class PooledConnection {
         acpMcpServerIds(opts.mcpServers),
         opts.retainSessionLog ?? true,
         opts.onActivity,
+        opts.onInteractionStateChange,
       );
       const meta = this.sessionRequestMeta(opts);
       const request = {
@@ -2310,6 +2340,7 @@ export class PooledConnection {
         opts.cwd,
         opts.policy,
         opts.permissionResolver,
+        opts.enforceToolPolicyBeforePermissionResolver,
         opts.elicitationResolver,
         opts.label,
         opts.runId,
@@ -2319,6 +2350,7 @@ export class PooledConnection {
         acpMcpServerIds(opts.mcpServers),
         opts.retainSessionLog ?? true,
         opts.onActivity,
+        opts.onInteractionStateChange,
       );
       const meta = this.sessionRequestMeta(opts);
       const request = {

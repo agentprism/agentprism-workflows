@@ -79,8 +79,7 @@ From [`src/index.ts`](./src/index.ts):
   `mode`, `tier`, `cwd`, `toolNames`, `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`,
   `images`, `runId`, `backends`, `meta`, `promptMeta`, the Codex-only `baseInstructions` /
   `developerInstructions`, `keepSession`, and the out-of-band callbacks `onUsage`,
-  `onModelResolved`, `onModelFallback`, `onHistory`, `onActivity`, `onSessionOpen`. `onActivity`
-  reports real backend progress for an engine-owned opt-in idle watchdog. The resume-only
+  `onModelResolved`, `onModelFallback`, `onHistory`, `onActivity`, `onInteractionStateChange`, `onSessionOpen`. `onActivity` reports real backend progress; `onInteractionStateChange` lets an engine suspend idle detection while a live permission resolver waits. The resume-only
   `continueFromSession` directive is advisory: a capable runner reopens that exact session and
   reports the attempt through `AgentResultProvenance.continuation`; otherwise it runs fresh.
   `onSessionOpen` fires exactly once for whichever acquisition wins (fresh, resumed, or loaded).

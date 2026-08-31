@@ -149,10 +149,11 @@ test("every dist-probed AUTH_META_MATRIX row's capability literal is present in 
   for (const row of AUTH_META_MATRIX) {
     assert.equal(row.status, "supported-today", `${row.agent}/${row.capability} must describe delivered behavior`);
     assert.ok(!Object.hasOwn(row, "owner"), `${row.agent}/${row.capability} must not publish deferred ownership`);
+    const literal = row.distProbeLiteral ?? row.capability;
     if (row.distProbe === "claude") {
-      assert.ok(CLAUDE_DIST.includes(row.capability), `claude dist must still carry "${row.capability}" (§3.6)`);
+      assert.ok(CLAUDE_DIST.includes(literal), `claude dist must still carry "${literal}" (§3.6)`);
     } else if (row.distProbe === "codex") {
-      assert.ok(CODEX_DIST.includes(row.capability), `codex dist must still carry "${row.capability}" (§3.6)`);
+      assert.ok(CODEX_DIST.includes(literal), `codex dist must still carry "${literal}" (§3.6)`);
     }
   }
   // The matrix covers all four agent buckets and stays non-empty.

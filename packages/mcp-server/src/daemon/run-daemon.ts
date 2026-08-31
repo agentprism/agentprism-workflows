@@ -31,6 +31,7 @@ import {
 import { installDaemonLifecycle } from "./daemon-lifecycle.js";
 import { createDaemon, DaemonPortInUseError } from "./http-daemon.js";
 import { createEvalBreakChannel } from "@automatalabs/repl-engine";
+import { WorkflowPermissionBroker } from "../workflow-permissions.js";
 
 export interface RunDaemonOptions {
   port?: number;
@@ -66,7 +67,12 @@ async function ownDaemonAlreadyRunning(): Promise<boolean> {
 
 export async function runDaemon(options: RunDaemonOptions = {}): Promise<"started" | "already-running"> {
   const log = (line: string) => console.error(line);
-  const runner = createAcpRunner();
+  const permissionBroker = new WorkflowPermissionBroker();
+  const runner = createAcpRunner({
+    onPermissionRequest: permissionBroker.resolver,
+    enforceToolPolicyBeforePermissionResolver: true,
+  });
+  permissionBroker.attach(runner);
   const supersede = options.supersede ?? false;
   const instanceId = randomUUID();
 
@@ -87,7 +93,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
   // tool's no-id break. Its address travels in daemon.json so the shim
   // can fire it out of band.
   const evalBreakChannel = createEvalBreakChannel();
-  const daemonOptions = { runner, log, replDrainBoundMs, evalBreakChannel, ownInstanceId: instanceId };
+  const daemonOptions = { runner, permissionBroker, log, replDrainBoundMs, evalBreakChannel, ownInstanceId: instanceId };
   if (supersede) {
     // Succession: the stale predecessor may still hold the default port and is left running
     // to finish its in-flight work, so never contend for it — bind the explicitly requested

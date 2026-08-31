@@ -283,7 +283,7 @@ All versions below were re-verified from the installed workspace dependency grap
 ## 4. The MCP side — exposing the `workflow` tool
 
 The `workflow` tool grew from Pi's single-form input
-([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into an **action union** — `run` (the default when `action` is omitted), `inspect`, `await`, and `stop` — exposed via the MCP server instead of `defineTool`. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set (inspection fields on a run, or execution fields on an inspect/await/stop, are `InvalidParams`):
+([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into an **action union** — `run` (the default when `action` is omitted), `inspect`, `await`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set (inspection fields on a run, or execution fields on an inspect/await/permissions-response/stop, are `InvalidParams`):
 
 - **Run** — supply **exactly one** of `script` or `scriptPath` (a raw JS string with no Markdown
   fences, or an absolute server-side path read once at admission; the first statement must be
@@ -294,7 +294,7 @@ The `workflow` tool grew from Pi's single-form input
   fields: `args`, `maxAgents` (default 1000), `concurrency` (clamped to 16), `agentRetries`
   (clamped to ≤3), `agentTimeoutMs` (total-wall, default none), `agentIdleTimeoutMs` (no backend activity, default disabled), the explicit-resume
   trio `resumeFromRunId` / `resumePolicy` / `checkpointReplies`, and `background`.
-- **Inspect / await / stop** — take a `runId` and never execution fields; `await` adds `waitMs` (default 20 000). Whole-run stop is location-independent across daemon generations: the successor persists an idempotent intent, routes signed control to the lease owner, and may return a nonterminal pending-control acknowledgement before final settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and cancellation is never reconstructed after owner loss. All three actions accept the `lastN` / `labelGlob` / `logLines` projection bounds.
+- **Inspect / await / permissions-response / stop** — take a `runId` and never execution fields; `await` adds `waitMs` (default 20 000). Inspect/await project live ACP permission requests and await returns early with `action-required`; `permissions-response` names the opaque request id and returns an exact advertised optionId or cancelled outcome. Whole-run stop is location-independent across daemon generations: the successor persists an idempotent intent, routes signed control to the lease owner, and may return a nonterminal pending-control acknowledgement before final settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and cancellation is never reconstructed after owner loss. All three actions accept the `lastN` / `labelGlob` / `logLines` projection bounds.
 - **Bounds clamp, don't reject:** accept `concurrency`/`agentRetries` as plain numbers in the tool
   schema — *not* Zod `.max()`, which rejects out-of-range input with `InvalidParams`. The engine
   already clamps them (`normalizeConcurrency` → `MAX_CONCURRENCY` 16, `normalizeAgentRetries` →
@@ -305,14 +305,17 @@ The `workflow` tool grew from Pi's single-form input
 **Two independent attempt clocks.** `agentTimeoutMs` / per-call `timeoutMs` cap total wall time;
 `agentIdleTimeoutMs` / per-call `idleTimeoutMs` are opt-in wedge detection. The idle clock starts
 fresh for each retry and re-arms only on real backend activity (`session/update` for ACP runners),
-never on the engine's synthetic progress heartbeat. Either expiry cancels through the existing ACP
+never on the engine's synthetic progress heartbeat. A live host-interaction wait suspends the idle
+clock and re-arms it after the response; total wall time continues. Either expiry cancels through the existing ACP
 turn wind-down and is recoverable (`AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`), so retries apply and
 final exhaustion resolves the call to `null`. Both are replay-neutral operational bounds.
 
 **Background execution, not just synchronous.** Pi's "return immediately, deliver the result into a
 *later* turn" affordance (`installResultDelivery`) has no MCP equivalent, so a **foreground** run
-(the default, `background: false`) executes to completion, streams progress via MCP
+(the default, `background: false`) normally executes to completion, streams progress via MCP
 **`notifications/progress`**, and returns the final result — bound to the request and its timeout.
+If an ACP permission blocks the turn first, foreground returns the still-running run and its pending
+request rather than stranding the tool call; that run is then operated like a background run.
 But background support was **not** dropped. Runs execute in a shared per-user **workflow daemon**
 (the stdio entry is a thin shim that auto-starts it), so `background: true` acknowledges after
 durable admission with a `runId` and the run outlives the request — collected later with bounded
@@ -342,7 +345,22 @@ candidate. The resumed live occurrence reopens and continues that session when e
 input, cwd, backend, and capability gate holds; otherwise it opens a fresh session. This channel is
 independent of replay strategy and adds no MCP input.
 
-Human-in-the-loop: `checkpoint()` relied on Pi's `ui.confirm`. Over MCP, elicitation-capable
+Live ACP permission requests are a different, execution-affine human gate. The MCP runner installs a
+resolver that parks the original `session/request_permission` promise and records a bounded live
+projection keyed by run/call/permission id. The projection omits the private ACP session id, redacts
+credential-shaped diagnostics, bounds scalars and structure, and preserves every exact ordered option
+id inside a 64 KiB envelope; an unrepresentable option set is cancelled rather than partially shown.
+Inspect and await expose the exact ordered backend options;
+legacy elicitation-capable clients receive a form immediately, modern clients use an integrity-bound
+`inputRequired` retry, and non-elicitation clients call `permissions-response`. Responses validate the
+selected option against the parked request and route through signed daemon control to the process that
+owns the run lease. Public responses forbid `_meta`, so provider effects come only from the selected
+advertised option id. This is running-but-waiting state, not the engine's durable paused status: owner
+loss invalidates the ACP request and it is never reconstructed cold. Explicit tool allow/deny lists
+settle before the MCP resolver; otherwise AgentPrism does not infer a provider decision from option
+labels, kind, or response metadata.
+
+Human-in-the-loop checkpoints: `checkpoint()` relied on Pi's `ui.confirm`. Over MCP, elicitation-capable
 clients provide the live channel. Without elicitation, the authored headless mode applies:
 `"default"` takes `default ?? true`, `"abort"` aborts, and opt-in `"pause"` persists a
 `checkpoint_required` pause. The host resumes that pause with `resumeFromRunId` plus a decision in
@@ -432,15 +450,24 @@ advertises:
 > `codex-acp`, OpenCode models on `opencode acp`, Pi models on `pi-acp`), so cross-**provider** routing = choosing which server; within a provider,
 > per-call tiering works. This is what the engine's `tier: small/medium/big` maps onto.
 
-### 5.5 Permissions → tool allow/deny — supported
+### 5.5 Permissions and explicit session modes — supported
 
 The agent requests approval per gated tool call via **`session/request_permission`**
-(agent→client), with options whose `kind ∈ {allow_once, allow_always, reject_once,
-reject_always}`. The spec explicitly allows clients to **auto-respond**, so an allow/deny-list
-is implemented by deciding at that boundary (by tool name / command / kind) without user
-interaction. Both servers also expose coarse permission modes (`acceptEdits`, `plan`, `dontAsk`,
-`bypassPermissions`/`agent-full-access`, …).
-Ref: https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission
+(agent→client) and supplies the complete ordered decision set. The selected `optionId` is the sole
+decision contract: labels, `kind`, and `_meta.permission` are presentation, never a source from which
+the client reconstructs provider effects. SDK runners without a resolver retain the ACP-permitted
+auto-policy; MCP workflows park unresolved requests for the live permission broker described in §4.
+Explicitly authored tool allow/deny lists remain binding before that broker.
+
+When a call omits `mode`, AgentPrism explicitly applies the first-class default rather than inheriting
+ambient harness settings: Claude `auto`, Codex `agent` (Codex Auto-review), OpenCode `build`, and no
+mode for Pi. Custom backends retain their own current mode. Config discovery returns the raw mode
+`id`, `name`, `description`, and `_meta`, plus AgentPrism's default id; both authored and built-in
+defaults are validated against the live advertised catalog before a prompt. No local replacement
+descriptions are maintained.
+
+Ref: https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission ·
+https://learn.chatgpt.com/docs/sandboxing/auto-review.md
 
 ### 5.6 Usage / token accounting — supported
 
@@ -810,7 +837,7 @@ run(prompt, { schema?, model?, tier?, cwd?, signal?, toolNames?, … }) →
        custom → generic outputSchema plus optional StructuredOutput MCP tool
   6. session/prompt(continued ? CONTINUATION_INSTRUCTION : prompt); drain session/update:
        • agent_message_chunk → assistant text
-       • tool_call / request_permission → enforce allow/deny (§5.5)
+       • tool_call / request_permission → exact option selection or live host wait (§5.5)
        • usage_update → token accounting (§5.6)
   7. on stopReason:
        schema set → extract structured result

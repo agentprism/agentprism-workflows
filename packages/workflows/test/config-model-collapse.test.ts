@@ -148,20 +148,20 @@ test("formatHarnessConfigReport collapses an oversized model list and keeps smal
     ],
   });
   // The model line is summarized, NOT a 100-id dump.
-  assert.match(human, /^    model \| select \| "anthropic\/model-0" \| 100 choices across 4 group\(s\): /m);
+  assert.match(human, /^    model \| Model \| select \| "anthropic\/model-0" \| 100 choices across 4 group\(s\): /m);
   assert.match(human, /list with `config opencode --models\[=<filter>\]`/);
   assert.doesNotMatch(human, /"anthropic\/model-24"/); // no leaf ids leaked into the table
   // The small effort option is untouched.
-  assert.match(human, /^    effort \| select \| "medium" \| "low", "xhigh"$/m);
+  assert.match(human, /^    effort \| Effort \| select \| "medium" \| "low", "xhigh" \| $/m);
 });
 
-test("a below-threshold catalog renders exactly as before (byte-identical cell)", () => {
+test("a below-threshold catalog keeps every advertised choice inline", () => {
   const human = formatHarnessConfigReport({
     ok: true,
     exitCode: 0,
     harnessOptions: [{ backendId: "claude", probed: true, options: SMALL_OPTIONS }],
   });
-  assert.match(human, /^    model \| select \| "default" \| "default", "opus\[1m\]"$/m);
+  assert.match(human, /^    model \| Model \| select \| "default" \| "default", "opus\[1m\]" \| $/m);
 });
 
 // ── serialized (--json) collapse ─────────────────────────────────────────────

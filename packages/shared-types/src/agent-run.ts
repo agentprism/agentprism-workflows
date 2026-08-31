@@ -60,6 +60,11 @@ export type AgentResultProvenance =
       hashMatched?: boolean;
     };
 
+export interface AgentInteractionState {
+  kind: "permission";
+  state: "waiting" | "running";
+}
+
 export interface PromptImage {
   readonly data: string;
   readonly mimeType: string;
@@ -79,8 +84,9 @@ export interface PromptImage {
  * (workflow.ts:488), so a renamed field would NOT raise a compile error — it would
  * mis-bind at runtime. Engine-passed core fields (16): label, schema, signal, instructions,
  * images, model, mode, tier, toolNames, disallowedToolNames, cwd, onModelResolved, onModelFallback,
- * onUsage, onHistory, onActivity. `onActivity` is the backend-neutral liveness signal for opt-in
- * idle watchdogs and is likewise telemetry, not identity. Plus ADDITIVE run inputs that wire
+ * onUsage, onHistory, onActivity, onInteractionStateChange. `onActivity` is the backend-neutral
+ * liveness signal; interaction state suspends idle detection during a live host wait. Both are
+ * telemetry, not identity. Plus ADDITIVE run inputs that wire
  * infrastructure / shape the backend, so none enters the resume identity hash (hashAgentCall): `mcpServers`,
  * `runId`, the generic ACP `_meta` passthroughs `meta` / `promptMeta`, the run-scoped custom
  * backend registry `backends`, the Codex-only `baseInstructions` / `developerInstructions`,
@@ -112,13 +118,11 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  (`session/set_config_option`, surfaced as SessionHandle.selectModel()).
    *  Omitted => session default. */
   model?: string;
-  /** Agent-advertised ACP session mode id, e.g. "plan" on Claude-family agents or "read-only"
-   *  on Codex-family agents. STRICT confinement lever: if the agent advertises no modes, does
-   *  not list this id, or rejects `session/set_mode`, the run fails before any prompt is sent.
-   *  Permission posture: when a mode is explicitly requested and no permission resolver is
-   *  present, the headless permission fallback flips from allow to deny; explicit allow-list
-   *  matches still allow, and a resolver still decides. Agent modes confine writes/escalations,
-   *  not reads. */
+  /** Exact agent-advertised ACP session mode id. When omitted, AgentPrism explicitly applies the
+   *  built-in default (Claude `auto`, Codex `agent`, OpenCode `build`; Pi/custom retain no host
+   *  default). An authored or built-in default must be advertised or the run fails before prompt.
+   *  A mode does not silently invent a client-side allow/deny policy: live permission requests are
+   *  handled by the host resolver, while explicitly authored tool allow/deny lists remain binding. */
   mode?: string;
   /** Agent-advertised ACP session config options, set verbatim after model selection and before
    *  the prompt. Option ids are applied in ascending lexicographic order. The reserved `model`
@@ -154,6 +158,9 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  Best-effort telemetry: throwing callbacks are isolated by runners. Custom runners that
    *  support the engine's idle watchdog should invoke it whenever their backend makes progress. */
   onActivity?: () => void;
+  /** Report that this attempt entered or left a live host-interaction wait. The engine suspends
+   *  its no-backend-activity watchdog while waiting; total wall-clock limits continue. */
+  onInteractionStateChange?: (state: AgentInteractionState) => void;
   /** Client-provided MCP servers to attach to this run (ACP `session/new { mcpServers }`).
    *  ADDITIVE and NOT part of the resume identity hash (hashAgentCall) — it wires tools,
    *  not the logical call. Omitted/empty => the runner sends `mcpServers: []` (the default). */

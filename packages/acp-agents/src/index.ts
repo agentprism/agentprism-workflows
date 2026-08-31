@@ -118,6 +118,11 @@ export type {
   MessageMcpNotification,
   MessageMcpRequest,
   MessageMcpResponse,
+  PermissionOption,
+  PermissionOptionId,
+  PermissionOptionKind,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
   ResumeSessionRequest,
   ResumeSessionResponse,
   ProviderCurrentConfig,
@@ -255,9 +260,16 @@ export { OpenCodeBackend } from "./backends/opencode.js";
 export { PiBackend } from "./backends/pi.js";
 export { CustomAcpBackend } from "./backends/custom.js";
 
-export { decidePermission, resolvePermission, withPersist } from "./permissions.js";
+export {
+  decideExplicitToolPolicy,
+  decidePermission,
+  resolvePermission,
+  selectPermissionOption,
+  withPersist,
+} from "./permissions.js";
 export type {
   ElicitationResolver,
+  ExplicitToolPolicyDecision,
   PermissionPersist,
   PermissionResolution,
   PermissionResolver,

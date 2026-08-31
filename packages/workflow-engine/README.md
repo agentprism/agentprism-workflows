@@ -231,7 +231,8 @@ journal rows without a filesystem-safety declaration.
 ceiling for each attempt; `agentIdleTimeoutMs` is a separate opt-in no-backend-activity ceiling. The
 per-call `timeoutMs` / `idleTimeoutMs` counterparts can tighten but cannot raise or disable a finite
 host ceiling. ACP `session/update` traffic re-arms the idle clock; synthetic progress heartbeats do
-not. Size it above the longest expected backend-silent local tool call. Every retry gets fresh
+not. A runner-reported live permission wait suspends the idle clock and re-arms it after the response,
+while total wall time continues. Size it above the longest expected backend-silent local tool call. Every retry gets fresh
 clocks. Exhaustion is recoverable `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`, so the call settles to
 `null` and frees its concurrency slot. The ACP runner cancels the session and closes/recycles a
 child that does not honor cancellation. Defaults are exported as `MAX_AGENTS_PER_RUN`,

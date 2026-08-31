@@ -18,8 +18,16 @@ import { ReplPresenceLedger } from "./repl-presence.js";
 import { ReplRelayStdioTransport } from "./repl-stdio-transport.js";
 import { createWorkflowServer, type WorkflowServer } from "./server.js";
 import { workflowRunEventsUri } from "./workflow-resources.js";
+import { WorkflowPermissionBroker } from "./workflow-permissions.js";
 
 export { BackgroundRunRegistry, createWorkflowServer, MAX_BACKGROUND_RUNS } from "./server.js";
+export { WorkflowPermissionBroker } from "./workflow-permissions.js";
+export type {
+  WorkflowPendingPermission,
+  WorkflowPermissionDecisionResponse,
+  WorkflowPermissionRequestProjection,
+  WorkflowPermissionResponseAcknowledgement,
+} from "./workflow-permissions.js";
 export type {
   CreateWorkflowServerOptions,
   WorkflowConfirmCallback,
@@ -32,6 +40,7 @@ export type {
   WorkflowConfigToolInput,
   WorkflowExecuteToolInput,
   WorkflowInspectToolInput,
+  WorkflowPermissionResponseToolInput,
   WorkflowStopToolInput,
   WorkflowToolInput,
 } from "./workflow-tool-input.js";
@@ -48,6 +57,8 @@ export type {
   WorkflowExecutionScriptResourceFields,
   WorkflowExecutionToolResult,
   WorkflowInspectionToolResult,
+  WorkflowPermissionInteraction,
+  WorkflowPermissionResponseResult,
   WorkflowRunAwaitResult,
   WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
@@ -131,7 +142,12 @@ export type {
  * process).
  */
 export async function main(): Promise<void> {
-  const runner = createAcpRunner();
+  const permissionBroker = new WorkflowPermissionBroker();
+  const runner = createAcpRunner({
+    onPermissionRequest: permissionBroker.resolver,
+    enforceToolPolicyBeforePermissionResolver: true,
+  });
+  permissionBroker.attach(runner);
   const projects = new WorkflowProjectRegistry(runner);
   const defaultContext = projects.getOrCreate(process.cwd());
   const replPresence = new ReplPresenceLedger(REPL_DRAIN_BOUND_MS);
@@ -162,6 +178,7 @@ export async function main(): Promise<void> {
         replEvalBreakChannel: evalBreakChannel,
         protocolEra: era,
         disconnectReplClientOnClose: true,
+        permissionBroker,
       });
       activeServer = server;
       activeEra = era;
@@ -181,6 +198,7 @@ export async function main(): Promise<void> {
       replDefaultProjectDir: () => defaultContext.projectDir,
       async disposeReplEvalBreakChannel() {
         detachModernEvents();
+        permissionBroker.dispose();
         await projects.disposeReplStates();
         replPresence.disconnectAll();
         await evalBreakChannel.dispose();
