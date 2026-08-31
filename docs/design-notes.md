@@ -283,7 +283,7 @@ All versions below were re-verified from the installed workspace dependency grap
 ## 4. The MCP side — exposing the `workflow` tool
 
 The `workflow` tool grew from Pi's single-form input
-([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into an **action union** — `run` (the default when `action` is omitted), `inspect`, `await`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set (inspection fields on a run, or execution fields on an inspect/await/permissions-response/stop, are `InvalidParams`):
+([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into an **action union** — `run` (the default when `action` is omitted), `inspect`, `await`, `result`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set (inspection fields on a run, or execution fields on an inspect/await/result/permissions-response/stop, are `InvalidParams`):
 
 - **Run** — supply **exactly one** of `script` or `scriptPath` (a raw JS string with no Markdown
   fences, or an absolute server-side path read once at admission; the first statement must be
@@ -294,7 +294,7 @@ The `workflow` tool grew from Pi's single-form input
   fields: `args`, `maxAgents` (default 1000), `concurrency` (clamped to 16), `agentRetries`
   (clamped to ≤3), `agentTimeoutMs` (total-wall, default none), `agentIdleTimeoutMs` (no backend activity, default disabled), the explicit-resume
   trio `resumeFromRunId` / `resumePolicy` / `checkpointReplies`, and `background`.
-- **Inspect / await / permissions-response / stop** — take a `runId` and never execution fields; `await` adds `waitMs` (default 20 000). Inspect/await project live ACP permission requests and await returns early with `action-required`; `permissions-response` names the opaque request id and returns an exact advertised optionId or cancelled outcome. Whole-run stop is location-independent across daemon generations: the successor persists an idempotent intent, routes signed control to the lease owner, and may return a nonterminal pending-control acknowledgement before final settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and cancellation is never reconstructed after owner loss. All three actions accept the `lastN` / `labelGlob` / `logLines` projection bounds.
+- **Inspect / await / result / permissions-response / stop** — take a `runId` and never execution fields; `await` adds `waitMs` (default 20 000). `result` reads the authoritative completed value from persistence and returns at most 16,384 exact UTF-8 JSON bytes plus `endOffset`/`hasMore`; boundaries never split a code point and interior offsets fail closed. Inspect/await project live ACP permission requests and await returns early with `action-required`; `permissions-response` names the opaque request id and returns an exact advertised optionId or cancelled outcome. Whole-run stop is location-independent across daemon generations: the successor persists an idempotent intent, routes signed control to the lease owner, and may return a nonterminal pending-control acknowledgement before final settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and cancellation is never reconstructed after owner loss. Inspect, await, and stop accept the `lastN` / `labelGlob` / `logLines` projection bounds.
 - **Bounds clamp, don't reject:** accept `concurrency`/`agentRetries` as plain numbers in the tool
   schema — *not* Zod `.max()`, which rejects out-of-range input with `InvalidParams`. The engine
   already clamps them (`normalizeConcurrency` → `MAX_CONCURRENCY` 16, `normalizeAgentRetries` →
@@ -309,6 +309,16 @@ never on the engine's synthetic progress heartbeat. A live host-interaction wait
 clock and re-arms it after the response; total wall time continues. Either expiry cancels through the existing ACP
 turn wind-down and is recoverable (`AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`), so retries apply and
 final exhaustion resolves the call to `null`. Both are replay-neutral operational bounds.
+
+**Exact result discovery is separate from observability.** Completed runs with a persisted JSON
+value expose `workflow://runs/{runId}/result`, distinct from the immutable `/script` resource and the
+bounded/redacted `/events` stream. Foreground, inspect, and await identify that URI and link with an
+explicit result label; script links are labelled separately. Exact JSON up to 4,096 UTF-8 bytes is
+also copied into foreground/await text for content-first hosts. Larger results stay out of summary
+text and can be read as an unbounded resource or reconstructed from bounded `action:"result"` pages.
+All paths read the existing persisted snapshot, add no engine format, and fail closed for runs without
+a completed authored value. Events remain observability and are never promoted into a result
+reconstruction format.
 
 **Background execution, not just synchronous.** Pi's "return immediately, deliver the result into a
 *later* turn" affordance (`installResultDelivery`) has no MCP equivalent, so a **foreground** run

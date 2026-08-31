@@ -57,7 +57,7 @@ async function waitUntil(predicate: () => boolean, message: string): Promise<voi
 
 function saveFaultPersistence(
   root: string,
-  failSave: (attempt: number) => boolean,
+  failSave: (attempt: number, state: PersistedRunState) => boolean,
 ): {
   persistence: RunPersistence;
   durable: RunPersistence;
@@ -94,7 +94,7 @@ function saveFaultPersistence(
   const persistence: RunPersistence = {
     save(state) {
       saveAttempts++;
-      if (failSave(saveAttempts)) throw new Error(`injected save failure ${saveAttempts}`);
+      if (failSave(saveAttempts, state)) throw new Error(`injected save failure ${saveAttempts}`);
       durable.save(state);
     },
     load: (runId) => durable.load(runId),
@@ -142,7 +142,10 @@ test("initialize advertises full resources capabilities and scriptPath snapshots
     assert.equal(result.isError, false);
     assert.equal(structured(result)?.scriptSource, "path");
     assert.equal(structured(result)?.scriptUri, uri);
-    assert.deepEqual(resourceLinks(result).map((link) => link.uri), [uri]);
+    assert.deepEqual(resourceLinks(result).map((link) => link.uri), [
+      `workflow://runs/${runId}/result`,
+      uri,
+    ]);
 
     writeFileSync(scriptPath, `${NO_AGENT_SCRIPT}\n// later edit`, "utf8");
     assert.equal(resourceText(await client.readResource({ uri })), NO_AGENT_SCRIPT);
@@ -223,6 +226,48 @@ test("readback rejects a transient initial save failure before execution can res
     const lease = fault.durable.acquireRunLease(runId);
     assert.ok(lease);
     fault.durable.releaseRunLease(lease);
+  } finally {
+    await client.close();
+    await server.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed terminal snapshot save never advertises exact-result availability", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-result-save-failure-"));
+  const fault = saveFaultPersistence(root, (_attempt, state) => state.status === "completed");
+  const runner = okRunner();
+  const manager = new WorkflowManager({ cwd: root, agent: runner, persistence: fault.persistence });
+  const server = createWorkflowServer(runner, { manager });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "result-save-failure-client", version: "0.0.0" }, { capabilities: {} });
+  let listChanged = 0;
+  client.setNotificationHandler('notifications/resources/list_changed', () => {
+    listChanged++;
+  });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+  try {
+    const completed = await client.callTool({ name: "workflow", arguments: { script: NO_AGENT_SCRIPT } });
+    const runId = String(structured(completed)?.runId);
+    assert.equal(structured(completed)?.status, "completed");
+    assert.equal(structured(completed)?.resultUri, undefined);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(listChanged, 1, "only durable admission changes the list; the unsaved result does not");
+
+    const unavailable = await client.callTool({
+      name: "workflow",
+      arguments: { action: "result", runId },
+    });
+    assert.equal(unavailable.isError, true);
+    assert.match(
+      String((unavailable.content as Array<{ text?: string }>)[0]?.text),
+      /unavailable while the run is running/,
+    );
+    await assert.rejects(
+      client.readResource({ uri: `workflow://runs/${runId}/result` }),
+      /unavailable|resource not found/i,
+    );
   } finally {
     await client.close();
     await server.close();
@@ -443,7 +488,10 @@ test("path and inline delivery share journal identity and changed path content r
     );
     assert.deepEqual(
       resourceLinks(inspected).map((link) => link.uri),
-      [firstRunId, secondRunId, thirdRunId].map((runId) => `workflow://runs/${runId}/script`),
+      [
+        `workflow://runs/${thirdRunId}/result`,
+        ...[firstRunId, secondRunId, thirdRunId].map((runId) => `workflow://runs/${runId}/script`),
+      ],
     );
   } finally {
     await dispose();
@@ -557,23 +605,34 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
     await waitUntil(() => listChanged >= 55, "every admission should emit resources/list_changed");
 
     const listed = await client.listResources();
-    assert.equal(listed.resources.length, 100);
+    assert.equal(listed.resources.length, 150);
     const expectedNewest = runIds.slice(5).reverse();
     const listedScripts = listed.resources.filter((resource) => resource.uri.endsWith("/script"));
+    const listedResults = listed.resources.filter((resource) => resource.uri.endsWith("/result"));
     const listedEvents = listed.resources.filter((resource) => resource.uri.endsWith("/events"));
     assert.deepEqual(
       listedScripts.map((resource) => resource.uri),
       expectedNewest.map((runId) => `workflow://runs/${runId}/script`),
     );
     assert.deepEqual(
+      listedResults.map((resource) => resource.uri),
+      expectedNewest.map((runId) => `workflow://runs/${runId}/result`),
+    );
+    assert.deepEqual(
       listedEvents.map((resource) => resource.uri),
       expectedNewest.map((runId) => `workflow://runs/${runId}/events`),
     );
-    assert.match(String(listedScripts[0]?.description), /^completed · started /);
+    assert.match(String(listedScripts[0]?.description), /^workflow script · completed · started /);
+    assert.match(String(listedResults[0]?.description), /^exact workflow result · completed /);
     assert.equal(
       resourceText(await client.readResource({ uri: `workflow://runs/${runIds[0]}/script` })),
       NO_AGENT_SCRIPT.replace("no-agent", "resource-0"),
-      "direct reads remain available outside the bounded discovery list",
+      "direct script reads remain available outside the bounded discovery list",
+    );
+    assert.equal(
+      resourceText(await client.readResource({ uri: `workflow://runs/${runIds[0]}/result` })),
+      "42",
+      "direct result reads remain available outside the bounded discovery list",
     );
 
     const newest = expectedNewest[0];
@@ -582,12 +641,24 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
       argument: { name: "runId", value: newest.slice(0, 8) },
     });
     assert.deepEqual(completed.completion.values, [newest]);
+    const completedResult = await client.complete({
+      ref: { type: "ref/resource", uri: "workflow://runs/{runId}/result" },
+      argument: { name: "runId", value: newest.slice(0, 8) },
+    });
+    assert.deepEqual(completedResult.completion.values, [newest]);
 
     const uri = `workflow://runs/${newest}/script`;
+    const resultUri = `workflow://runs/${newest}/result`;
     await client.subscribeResource({ uri });
     await client.unsubscribeResource({ uri });
+    await client.subscribeResource({ uri: resultUri });
+    await client.unsubscribeResource({ uri: resultUri });
     await assert.rejects(
       client.subscribeResource({ uri: "workflow://runs/no-such/script" }),
+      /resource not found/i,
+    );
+    await assert.rejects(
+      client.subscribeResource({ uri: "workflow://runs/no-such/result" }),
       /resource not found/i,
     );
     await assert.rejects(
@@ -613,13 +684,16 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
 
     const beforeDeleteNotifications = listChanged;
     await client.subscribeResource({ uri });
+    await client.subscribeResource({ uri: resultUri });
     assert.equal(resources.deleteRun(newest), true);
     await waitUntil(
       () => listChanged === beforeDeleteNotifications + 1,
       "deletion should emit exactly one resources/list_changed notification",
     );
     await assert.rejects(client.readResource({ uri }), /resource not found/i);
+    await assert.rejects(client.readResource({ uri: resultUri }), /No workflow run found|resource not found/i);
     assert.deepEqual(await client.unsubscribeResource({ uri }), {});
+    assert.deepEqual(await client.unsubscribeResource({ uri: resultUri }), {});
 
     const racedUri = `workflow://runs/${runIds[0]}/script`;
     await client.subscribeResource({ uri: racedUri });
@@ -696,13 +770,17 @@ test("createWorkflowServer observes injected-manager deletion exactly once and k
     });
     const runId = String(structured(admitted)?.runId);
     const uri = `workflow://runs/${runId}/script`;
-    await waitUntil(() => listChanged === 1, "admission should emit one resources/list_changed notification");
+    await waitUntil(() => listChanged >= 2, "admission and completed-result availability should notify the resource list");
     await client.subscribeResource({ uri });
 
+    const beforeDeleteNotifications = listChanged;
     assert.equal(manager.deleteRun(runId), true);
-    await waitUntil(() => listChanged === 2, "manager deletion should emit one resources/list_changed notification");
+    await waitUntil(
+      () => listChanged === beforeDeleteNotifications + 1,
+      "manager deletion should emit one resources/list_changed notification",
+    );
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(listChanged, 2, "manager deletion must not emit duplicate list changes");
+    assert.equal(listChanged, beforeDeleteNotifications + 1, "manager deletion must not emit duplicate list changes");
     await assert.rejects(client.readResource({ uri }), /resource not found/i);
     assert.deepEqual(await client.unsubscribeResource({ uri }), {});
     assert.deepEqual(await client.unsubscribeResource({ uri }), {});
@@ -1018,7 +1096,10 @@ test("a 300-hop public resume lineage remains complete and reports a truthful st
     assert.equal(new Set(lineage.map((entry) => entry.runId)).size, 300);
     assert.deepEqual(
       resourceLinks(inspected).map((link) => link.uri),
-      runIds.map((runId) => `workflow://runs/${runId}/script`),
+      [
+        `workflow://runs/${runIds.at(-1)}/result`,
+        ...runIds.map((runId) => `workflow://runs/${runId}/script`),
+      ],
     );
     assert.ok(Number(truncation.maxStructuredBytes) > 24_576);
     assert.ok(bytes <= Number(truncation.maxStructuredBytes));

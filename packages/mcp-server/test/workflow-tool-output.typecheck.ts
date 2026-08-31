@@ -4,6 +4,7 @@ import type {
   WorkflowBackgroundAccepted,
   WorkflowExecutionToolResult,
   WorkflowInspectionToolResult,
+  WorkflowResultRetrieval,
   WorkflowRunAwaitResult,
   WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
@@ -41,8 +42,22 @@ const execution: WorkflowExecutionToolResult = {
   status: "completed",
   scriptSource: "inline",
   scriptUri: "workflow://runs/aa-bb/script",
+  resultUri: "workflow://runs/aa-bb/result",
   limits,
   replayEligibility,
+};
+const resultRetrieval: WorkflowResultRetrieval = {
+  action: "result",
+  runId: "aa-bb",
+  status: "completed",
+  resultUri: "workflow://runs/aa-bb/result",
+  mimeType: "application/json",
+  encoding: "utf-8",
+  totalBytes: 2,
+  offset: 0,
+  endOffset: 2,
+  hasMore: false,
+  chunk: "42",
 };
 const background: WorkflowBackgroundAccepted = {
   runId: "aa-bb",
@@ -81,9 +96,23 @@ const pendingStop: WorkflowStopPendingResult = {
 };
 const resourceFields: WorkflowScriptResourceFields = {
   scriptUri: "workflow://runs/aa-bb/script",
+  resultUri: "workflow://runs/aa-bb/result",
   lineage,
 };
 
+// @ts-expect-error result retrieval requires the exact chunk
+const resultRetrievalWithoutChunk: WorkflowResultRetrieval = {
+  action: "result",
+  runId: "aa-bb",
+  status: "completed",
+  resultUri: "workflow://runs/aa-bb/result",
+  mimeType: "application/json",
+  encoding: "utf-8",
+  totalBytes: 2,
+  offset: 0,
+  endOffset: 2,
+  hasMore: false,
+};
 // @ts-expect-error execution results require scriptSource
 const executionWithoutSource: WorkflowExecutionToolResult = {
   runId: "aa-bb",
@@ -130,6 +159,8 @@ const fieldsWithoutLineage: WorkflowScriptResourceFields = {
 
 void [
   execution,
+  resultRetrieval,
+  resultRetrievalWithoutChunk,
   background,
   inspection,
   awaited,

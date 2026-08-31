@@ -19,16 +19,18 @@ import { singleStoreRouter, type RunStoreRouter } from "./project-registry.js";
 import type { WorkflowScriptLineageEntry } from "./workflow-tool-output.js";
 
 export const SCRIPT_RESOURCE_MIME_TYPE = "text/javascript";
+export const RESULT_RESOURCE_MIME_TYPE = "application/json";
 export const SCRIPT_RESOURCE_LIST_LIMIT = 50;
 export const EVENTS_RESOURCE_MIME_TYPE = "application/json";
 export const WORKFLOW_RUN_EVENTS_SCHEMA_VERSION = 1 as const;
 
 const SCRIPT_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/script$/;
+const RESULT_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/result$/;
 const EVENTS_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/events(?:\?([^#]*))?$/;
 const STREAM_ID_PATTERN = /^[0-9a-f]{32}$/;
 
 function resourceNotFound(uri: string): never {
-  throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Workflow script resource not found: ${uri}`);
+  throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Workflow resource not found: ${uri}`);
 }
 
 export function workflowScriptUri(runId: string): string {
@@ -39,8 +41,26 @@ export function workflowRunIdFromScriptUri(uri: string): string | undefined {
   return SCRIPT_URI_PATTERN.exec(uri)?.[1];
 }
 
+export function workflowResultUri(runId: string): string {
+  return `workflow://runs/${runId}/result`;
+}
+
+export function workflowRunIdFromResultUri(uri: string): string | undefined {
+  return RESULT_URI_PATTERN.exec(uri)?.[1];
+}
+
 export function workflowRunEventsUri(runId: string): string {
   return `workflow://runs/${runId}/events`;
+}
+
+export interface SerializedWorkflowResult {
+  uri: string;
+  text: string;
+  bytes: number;
+}
+
+function hasExactResult(state: PersistedRunState): boolean {
+  return state.status === "completed" && state.result !== undefined;
 }
 
 export interface WorkflowRunEventsResourceDocument {
@@ -144,6 +164,7 @@ function lineageSourceRunId(state: PersistedRunState): string | undefined {
 export class WorkflowScriptResources {
   private readonly router: RunStoreRouter;
   private readonly detachRunDeleted: () => void;
+  private readonly detachRunEventPersisted: () => void;
   private readonly detachRunStopped: () => void;
   private readonly subscriptions = new Set<string>();
   private readonly externalReaders = new Map<
@@ -159,16 +180,13 @@ export class WorkflowScriptResources {
   private readonly elicitationControllers = new Map<string, AbortController>();
 
   private readonly onRunDeleted = ({ runId }: { runId: string }): void => {
-    const uri = workflowScriptUri(runId);
-    this.subscriptions.delete(uri);
+    this.subscriptions.delete(workflowScriptUri(runId));
+    this.subscriptions.delete(workflowResultUri(runId));
     this.closeEventSubscription(workflowRunEventsUri(runId));
     this.cancelPendingElicitation(runId);
     this.deletedRunIds.add(runId);
     const notify = !this.silentDeletionRunIds.delete(runId);
-    if (notify) {
-      if (this.modernNotifier) this.modernNotifier.resourcesChanged();
-      else void this.mcp.sendResourceListChanged();
-    }
+    if (notify && !this.modernNotifier) void this.mcp.sendResourceListChanged();
   };
 
   constructor(
@@ -178,6 +196,24 @@ export class WorkflowScriptResources {
   ) {
     this.router = source instanceof WorkflowManager ? singleStoreRouter(source) : source.router;
     this.detachRunDeleted = this.router.onRunDeleted(this.onRunDeleted);
+    // Modern stateless requests each construct a short-lived server, so registering the same
+    // global run listener here would fan one completion out once per in-flight request. The
+    // daemon composition root owns the single modern notification listener instead.
+    this.detachRunEventPersisted = this.modernNotifier
+      ? () => undefined
+      : this.router.onRunEventPersisted((record) => {
+          if (record.event.type !== "complete") return;
+          // The engine publishes the durable event before its terminal snapshot save. Defer one
+          // microtask and re-read persistence so list_changed never advertises a result that is
+          // not durably readable (including a failed terminal save).
+          queueMicrotask(() => {
+            try {
+              if (this.availableResultUri(record.runId)) void this.mcp.sendResourceListChanged();
+            } catch {
+              // Corrupt/unreadable state has no result resource and therefore no availability hint.
+            }
+          });
+        });
     this.detachRunStopped = this.router.onRunStopped(({ runId }) => this.cancelPendingElicitation(runId));
     const previousOnClose = this.mcp.server.onclose;
     this.mcp.server.onclose = () => {
@@ -185,6 +221,7 @@ export class WorkflowScriptResources {
       this.elicitationControllers.clear();
       for (const uri of [...this.eventSubscriptions.keys()]) this.closeEventSubscription(uri);
       this.detachRunStopped();
+      this.detachRunEventPersisted();
       this.detachRunDeleted();
       previousOnClose?.();
     };
@@ -293,6 +330,62 @@ export class WorkflowScriptResources {
     return newestToOldest.reverse();
   }
 
+  /** Exact persisted result metadata, available only for completed runs with a JSON value. */
+  serializedResult(runId: string): SerializedWorkflowResult {
+    const state = this.loadState(runId);
+    if (!state) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        `No workflow run found for runId "${runId}" in this server's project-scoped run store.`,
+      );
+    }
+    if (!hasExactResult(state)) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        state.status === "completed"
+          ? `Workflow run "${runId}" completed without a JSON result.`
+          : `Workflow result for runId "${runId}" is unavailable while the run is ${state.status}.`,
+      );
+    }
+    let text: string | undefined;
+    try {
+      text = JSON.stringify(state.result);
+    } catch {
+      throw new ProtocolError(
+        ProtocolErrorCode.InternalError,
+        `Workflow result for runId "${runId}" could not be serialized.`,
+      );
+    }
+    if (text === undefined) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InternalError,
+        `Workflow result for runId "${runId}" could not be serialized.`,
+      );
+    }
+    return {
+      uri: workflowResultUri(runId),
+      text,
+      bytes: Buffer.byteLength(text, "utf8"),
+    };
+  }
+
+  availableResultUri(runId: string): string | undefined {
+    const state = this.loadState(runId);
+    return state && hasExactResult(state) ? workflowResultUri(runId) : undefined;
+  }
+
+  resultLink(runId: string): ResourceLink | undefined {
+    const state = this.loadState(runId);
+    if (!state || !hasExactResult(state)) return undefined;
+    return {
+      type: "resource_link",
+      uri: workflowResultUri(runId),
+      name: `${state.workflowName} result (${state.runId})`,
+      description: `exact workflow result · completed ${state.completedAt ?? state.updatedAt}`,
+      mimeType: RESULT_RESOURCE_MIME_TYPE,
+    };
+  }
+
   links(lineage: WorkflowScriptLineageEntry[]): ResourceLink[] {
     const links: ResourceLink[] = [];
     for (const entry of lineage) {
@@ -302,8 +395,8 @@ export class WorkflowScriptResources {
       links.push({
         type: "resource_link",
         uri: entry.uri,
-        name: `${state.workflowName} (${state.runId})`,
-        description: `${state.status} · started ${state.startedAt}`,
+        name: `${state.workflowName} script (${state.runId})`,
+        description: `workflow script · ${state.status} · started ${state.startedAt}`,
         mimeType: SCRIPT_RESOURCE_MIME_TYPE,
       });
     }
@@ -325,8 +418,8 @@ export class WorkflowScriptResources {
         list: () => ({
           resources: this.recentRuns().map((state) => ({
             uri: workflowScriptUri(state.runId),
-            name: `${state.workflowName} (${state.runId})`,
-            description: `${state.status} · started ${state.startedAt}`,
+            name: `${state.workflowName} script (${state.runId})`,
+            description: `workflow script · ${state.status} · started ${state.startedAt}`,
             mimeType: SCRIPT_RESOURCE_MIME_TYPE,
           })),
         }),
@@ -344,6 +437,36 @@ export class WorkflowScriptResources {
         mimeType: SCRIPT_RESOURCE_MIME_TYPE,
       },
       (uri) => this.readResource(uri.toString()),
+    );
+
+    this.mcp.registerResource(
+      "workflow-run-result",
+      new ResourceTemplate("workflow://runs/{runId}/result", {
+        list: () => ({
+          resources: this.recentRuns()
+            .filter(hasExactResult)
+            .map((state) => ({
+              uri: workflowResultUri(state.runId),
+              name: `${state.workflowName} result (${state.runId})`,
+              description: `exact workflow result · completed ${state.completedAt ?? state.updatedAt}`,
+              mimeType: RESULT_RESOURCE_MIME_TYPE,
+            })),
+        }),
+        complete: {
+          runId: (partial) =>
+            this.recentRuns()
+              .filter(hasExactResult)
+              .map((state) => state.runId)
+              .filter((runId) => runId.startsWith(partial)),
+        },
+      }),
+      {
+        title: "Workflow run results",
+        description:
+          "Exact JSON results for completed workflow runs. Listing is discovery-only and contains at most the 50 newest runs; direct workflow://runs/{runId}/result reads remain available until run deletion.",
+        mimeType: RESULT_RESOURCE_MIME_TYPE,
+      },
+      (uri) => this.readResultResource(uri.toString()),
     );
 
     this.mcp.registerResource(
@@ -386,7 +509,9 @@ export class WorkflowScriptResources {
         if (external.available !== undefined && !external.available(ctx)) resourceNotFound(uri);
         return external.read();
       }
-      return uri.includes("/events") ? this.readEventsResource(uri) : this.readResource(uri);
+      if (uri.includes("/events")) return this.readEventsResource(uri);
+      if (workflowRunIdFromResultUri(uri)) return this.readResultResource(uri);
+      return this.readResource(uri);
     });
 
     this.mcp.server.setRequestHandler('resources/subscribe', (request, ctx) => {
@@ -404,6 +529,12 @@ export class WorkflowScriptResources {
         this.subscriptions.add(uri);
         return {};
       }
+      const resultRunId = workflowRunIdFromResultUri(uri);
+      if (resultRunId) {
+        if (!this.availableResultUri(resultRunId)) resourceNotFound(uri);
+        this.subscriptions.add(uri);
+        return {};
+      }
       if (!uri.includes("/events")) resourceNotFound(uri);
       const parsed = parseWorkflowRunEventsUri(uri);
       if (!parsed) malformedEventsUri();
@@ -417,7 +548,7 @@ export class WorkflowScriptResources {
         if (external.available !== undefined && !external.available(ctx)) resourceNotFound(uri);
         return {};
       }
-      const runId = workflowRunIdFromScriptUri(uri);
+      const runId = workflowRunIdFromScriptUri(uri) ?? workflowRunIdFromResultUri(uri);
       if (runId) {
         if (
           !this.loadState(runId) &&
@@ -614,6 +745,23 @@ export class WorkflowScriptResources {
     } catch (error) {
       mapEventError(error, parsed);
     }
+  }
+
+  private readResultResource(uri: string): {
+    contents: Array<{ uri: string; mimeType: string; text: string }>;
+  } {
+    const runId = workflowRunIdFromResultUri(uri);
+    if (!runId) resourceNotFound(uri);
+    const result = this.serializedResult(runId);
+    return {
+      contents: [
+        {
+          uri: result.uri,
+          mimeType: RESULT_RESOURCE_MIME_TYPE,
+          text: result.text,
+        },
+      ],
+    };
   }
 
   private readResource(uri: string): {

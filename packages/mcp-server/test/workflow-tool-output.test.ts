@@ -69,6 +69,7 @@ const baseRun: WorkflowRunResult<null> = {
 const resources = {
   scriptSource: "inline" as const,
   scriptUri: "workflow://runs/continuation-schema-run/script",
+  resultUri: "workflow://runs/continuation-schema-run/result",
 };
 
 test("resolved run limits survive MCP run-result projection and schema parsing", () => {
@@ -81,6 +82,16 @@ test("resolved run limits survive MCP run-result projection and schema parsing",
   assert.deepEqual(parsed.data.limits, baseRun.effectiveLimits);
   assert.deepEqual(projected.replayEligibility, replayEligibility);
   assert.deepEqual(parsed.data.replayEligibility, replayEligibility);
+  assert.equal(projected.resultUri, resources.resultUri);
+});
+
+test("result URI projection is restricted to completed workflow outcomes", () => {
+  const projected = toWorkflowToolResult(
+    { ...baseRun, status: "paused", result: undefined },
+    resources,
+  );
+  assert.equal(projected.resultUri, undefined);
+  assert.equal(workflowToolOutputShape.safeParse(projected).success, true);
 });
 
 test("continuation fallbacks survive MCP tool-result projection and schema parsing", () => {

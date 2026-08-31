@@ -34,13 +34,21 @@ export type {
   WorkflowCheckpointOptions,
   WorkflowServer,
 } from "./server.js";
-export { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
+export {
+  clampWorkflowInput,
+  parseWorkflowToolInput,
+  workflowToolInputShape,
+  WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT,
+  WORKFLOW_RESULT_CHUNK_BYTES_MAX,
+  WORKFLOW_RESULT_CHUNK_BYTES_MIN,
+} from "./workflow-tool-input.js";
 export type {
   WorkflowAwaitToolInput,
   WorkflowConfigToolInput,
   WorkflowExecuteToolInput,
   WorkflowInspectToolInput,
   WorkflowPermissionResponseToolInput,
+  WorkflowResultToolInput,
   WorkflowStopToolInput,
   WorkflowToolInput,
 } from "./workflow-tool-input.js";
@@ -59,6 +67,7 @@ export type {
   WorkflowInspectionToolResult,
   WorkflowPermissionInteraction,
   WorkflowPermissionResponseResult,
+  WorkflowResultRetrieval,
   WorkflowRunAwaitResult,
   WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
@@ -117,16 +126,20 @@ export { disposeRunnerWithDeadline, installMcpServerLifecycle, SHUTDOWN_DEADLINE
 export type { McpServerLifecycle, McpServerLifecycleOptions, McpServerShutdownReason, WorkflowServerControl } from "./lifecycle.js";
 export {
   EVENTS_RESOURCE_MIME_TYPE,
+  RESULT_RESOURCE_MIME_TYPE,
   SCRIPT_RESOURCE_LIST_LIMIT,
   SCRIPT_RESOURCE_MIME_TYPE,
   WORKFLOW_RUN_EVENTS_SCHEMA_VERSION,
   parseWorkflowRunEventsUri,
   workflowRunEventsUri,
+  workflowRunIdFromResultUri,
   workflowRunIdFromScriptUri,
+  workflowResultUri,
   workflowScriptUri,
 } from "./workflow-resources.js";
 export type {
   ParsedWorkflowRunEventsUri,
+  SerializedWorkflowResult,
   WorkflowRunEventsResourceDocument,
 } from "./workflow-resources.js";
 

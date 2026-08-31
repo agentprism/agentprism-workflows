@@ -179,15 +179,15 @@ Canonical MCP topic sources live under `docs/authoring/` in the repository and a
 
 ### Input parameters
 
-The tool uses a config/run/inspect/await/permissions-response/stop union. `config` performs zero-token, no-prompt discovery, and every run performs static validation, a mocked dry run, and routed model/config checks before admission. Invalid scripts return bounded `status:"rejected"` diagnostics without creating a run ID or reserving background capacity. Execution resource maxima remain runtime clamps;
+The tool uses a config/run/inspect/await/result/permissions-response/stop union. `config` performs zero-token, no-prompt discovery, and every run performs static validation, a mocked dry run, and routed model/config checks before admission. Invalid scripts return bounded `status:"rejected"` diagnostics without creating a run ID or reserving background capacity. Execution resource maxima remain runtime clamps;
 inspection/await limits are contract bounds and invalid values are MCP Invalid Params (`-32602`).
 
 | Param | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `action` | `"config" \| "run" \| "inspect" \| "await" \| "permissions-response" \| "stop"` | no | run | `"config"` discovers live backend/model/mode/config options without starting a workflow. Omit or use `"run"` for automatic validation followed by execution. The remaining actions operate on an admitted `runId`. |
-| `script` | string (non-empty) | run XOR | — | Raw JavaScript workflow script (no Markdown fences). Exactly one of `script`/`scriptPath` is required for run. The first statement **must** be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/permissions-response/stop. |
-| `scriptPath` | absolute path string | run XOR | — | Absolute path on the **server's filesystem**. Read once as UTF-8 before admission; the content is snapshotted, and later file edits do not change that run. Relative paths and unreadable files are Invalid Params. Forbidden for inspect/await/permissions-response/stop. |
-| `projectDir` | absolute path string | config/run (daemon) | in-process: the server's own project | Project cwd for discovery and the run store/default execution cwd for execution. Required for config and run on the shared daemon. Forbidden for inspect/await/permissions-response/stop. |
+| `action` | `"config" \| "run" \| "inspect" \| "await" \| "result" \| "permissions-response" \| "stop"` | no | run | `"config"` discovers live backend/model/mode/config options without starting a workflow. Omit or use `"run"` for automatic validation followed by execution. `"result"` retrieves one bounded UTF-8 page of a completed run's exact JSON result. The remaining actions operate on an admitted `runId`. |
+| `script` | string (non-empty) | run XOR | — | Raw JavaScript workflow script (no Markdown fences). Exactly one of `script`/`scriptPath` is required for run. The first statement **must** be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/result/permissions-response/stop. |
+| `scriptPath` | absolute path string | run XOR | — | Absolute path on the **server's filesystem**. Read once as UTF-8 before admission; the content is snapshotted, and later file edits do not change that run. Relative paths and unreadable files are Invalid Params. Forbidden for inspect/await/result/permissions-response/stop. |
+| `projectDir` | absolute path string | config/run (daemon) | in-process: the server's own project | Project cwd for discovery and the run store/default execution cwd for execution. Required for config and run on the shared daemon. Forbidden for inspect/await/result/permissions-response/stop. |
 | `harnesses` | backend-name array (1–16) | config only | every registered backend | Limit no-prompt discovery to these backends. |
 | `modelSpecs` | model-spec array (1–16) | config only | — | Select these exact routed models before reading their model-specific mode and config-option catalogs. |
 | `modelFilter` | string (1–128) | config only | provider/group summaries | Case-insensitive substring or `/regular expression/` used to return bounded matching model ids. |
@@ -202,10 +202,12 @@ inspection/await limits are contract bounds and invalid values are MCP Invalid P
 | `resumeFromRunId` | string | no | — | Start a new run from this existing persisted source. Re-send content via `script` or `scriptPath`; there is no implicit persisted-script fallback. The manager admits compatible format/metadata/manifest/cwd state and replays only eligible calls; current-environment and Node/V8 drift are reported provenance. Pre-input-format-2 sources use the named positional bridge. If the source paused mid-agent on usage/auth, an unchanged, reopenable root occurrence continues from its recorded ACP session; every failed continuation gate runs fresh. |
 | `resumePolicy` | `"auto" \| "positional"` | no | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format format/metadata/manifest/input checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | no | — | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to the durable decision. This works under the default policy and does not require `resumePolicy: "positional"`. The JSON decision is returned verbatim (`kind: "confirm"` normally uses a boolean). Wire keys must be canonical non-negative safe integers. |
-| `runId` | engine run ID | inspect/await/permissions-response/stop | — | Project-scoped run capability; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
+| `runId` | engine run ID | inspect/await/result/permissions-response/stop | — | Project-scoped run capability; `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. |
 | `permissionId` | UUID | permissions-response | — | Opaque live request id from inspect/await. |
 | `response` | ACP permission response | permissions-response | — | Exact advertised `{ outcome:{ outcome:"selected", optionId } }`, or `{ outcome:{ outcome:"cancelled" } }`. |
 | `waitMs` | integer 0–25,000 | await only | `20,000` | Zero is a non-blocking status read. Values are rejected, never clamped. |
+| `offset` | non-negative safe integer | result only | `0` | UTF-8 byte offset into the exact serialized JSON. Use the previous response's `endOffset`; offsets inside a multi-byte code point fail. |
+| `maxBytes` | integer 4–16,384 | result only | `16,384` | Maximum UTF-8 bytes in one exact result chunk. Values are rejected, never clamped. |
 | `lastN` | integer 1–50 | inspect/await/stop only | `20` | Latest matching journal calls. Filtering happens before this selection. |
 | `labelGlob` | string | inspect/await/stop only | all calls | Non-empty, at most 128 Unicode code points. Case-sensitive whole-label `*`/`?` glob with backslash escaping; trailing backslash is literal. Only known agent labels match. |
 | `logLines` | integer 0–50 | inspect/await/stop only | `20` | Latest run-log lines. |
@@ -376,6 +378,7 @@ interface WorkflowExecutionToolResult {
   resumeReport?: WorkflowResumeReport;     // resumeFromRunId correspondence; otherwise absent
   scriptSource: "inline" | "path";
   scriptUri: string;
+  resultUri?: string; // completed runs with a persisted JSON result
 }
 
 interface WorkflowPendingPermission {
@@ -407,12 +410,27 @@ interface WorkflowAwaitMetadata {
   returnedBecause: "terminal" | "timeout" | "immediate" | "action-required" | "permission-resolved";
 }
 
+interface WorkflowResultRetrieval {
+  action: "result";
+  runId: string;
+  status: "completed";
+  resultUri: string;
+  mimeType: "application/json";
+  encoding: "utf-8";
+  totalBytes: number;
+  offset: number;
+  endOffset: number;
+  hasMore: boolean;
+  chunk: string;
+}
+
 interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowAwaitMetadata;
   tokenUsage?: TokenUsage;
   pendingPermissions?: WorkflowPendingPermission[];
   outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">; // exactly when terminal
   scriptUri: string;
+  resultUri?: string;
   lineage: WorkflowScriptLineageEntry[];
 }
 
@@ -443,6 +461,7 @@ interface WorkflowInspectionToolResult extends WorkflowRunStatus {
 }
 
 type WorkflowToolResult =
+  | WorkflowResultRetrieval
   | WorkflowExecutionToolResult
   | WorkflowBackgroundAccepted
   | WorkflowInspectionToolResult
@@ -541,8 +560,11 @@ Await's status fields retain the 24,576-byte bound,
 redaction, compaction, filtering, and truncation counters, and its text is capped at 8,192 bytes.
 Before terminal state, optional `tokenUsage` is the cumulative live work observed in this execution;
 replayed calls add zero. At terminal state, `outcome` is the foreground-equivalent execution result:
-the authored `result` and full `logs` remain raw and unbounded, and are not duplicated into text.
-It omits the admission-only `scriptSource` while retaining `scriptUri`. Top-level and outcome token
+the authored `result` and full `logs` remain raw and unbounded. Completed foreground and await
+responses add `resultUri`; exact result JSON up to 4,096 UTF-8 bytes is also copied into a text block
+for content-first hosts. Larger results are not duplicated wholesale: the text points to the exact
+result resource and bounded `action:"result"` paging. Await omits the admission-only `scriptSource`
+while retaining `scriptUri`. Top-level and outcome token
 usage are identical. Paused outcomes carry the existing non-secret
 `authContext` or `checkpointContext` used for CLI-login/resume or checkpoint-reply handling. Result
 observability (`fallbacks` and `checkpointsTaken`) stays inside the terminal `outcome`.
@@ -551,28 +573,47 @@ observability (`fallbacks` and `checkpointsTaken`) stays inside the terminal `ou
 
 ## Run resources
 
-Every admitted manager run has one immutable, persistence-backed resource:
+Every admitted manager run has an immutable, persistence-backed script resource, and every
+completed run with a persisted JSON value has an immutable exact-result resource:
 
 ```text
 workflow://runs/{runId}/script
+workflow://runs/{runId}/result
 ```
 
-`resources/read` returns the exact UTF-8 content snapshotted at admission with MIME type
-`text/javascript`. This applies equally to inline and `scriptPath` delivery and works for any
+`resources/read` returns the exact UTF-8 script snapshotted at admission with MIME type
+`text/javascript`, or `JSON.stringify` of the authoritative persisted authored result with MIME type
+`application/json`. This applies equally to inline and `scriptPath` delivery and works for any
 persisted run in the project namespace, across MCP sessions and server processes. The original path
-is not persisted or re-read. A run record deletion removes the resource; stopping a run does not.
+is not persisted or re-read. A result read fails closed while the run is nonterminal, or when a
+paused/failed/aborted/completed-without-value run has no exact authored result. A run record deletion
+removes both resources; stopping a run does not.
 
 The server advertises and implements `resources: { subscribe: true, listChanged: true }`.
-Subscriptions are process-local. Script content never changes after admission, so
-`notifications/resources/updated` never fires. `notifications/resources/list_changed` fires when a
-run is admitted and when a run record is deleted; deletion also drops that URI's subscription.
+Subscriptions are process-local. Script and completed-result content are immutable, so
+`notifications/resources/updated` never fires for them. `notifications/resources/list_changed`
+fires when a run is admitted, when a completed result becomes available, and when a run record is
+deleted; deletion also drops those URIs' subscriptions.
 Unsubscribing after that deletion (including a deletion race) is an idempotent empty success for a
 URI this process knew existed. A malformed resource URI or a run ID that never existed is rejected.
 
-`resources/list` is discovery convenience, not a complete index: it returns at most the **50 newest
-runs by `startedAt` descending**. Resource-template completion uses that same bounded set. Direct
-URI reads are the unbounded retrieval contract, so a known older run ID remains readable even when
+`resources/list` is discovery convenience, not a complete index: each workflow resource template
+returns at most the **50 newest runs by `startedAt` descending** (the result template filters that
+set to completed runs with values). Resource-template completion uses the same bounded set. Direct
+URI reads are the durable retrieval contract, so a known older run ID remains readable even when
 it is absent from the listing.
+
+The result resource has no server-side envelope cap. Hosts that truncate large resource reads can
+page the same exact UTF-8 JSON through the model-facing workflow tool:
+
+```json
+{ "action": "result", "runId": "mabc1234-k9x2pq", "offset": 0, "maxBytes": 16384 }
+```
+
+The response is `{ action:"result", runId, status:"completed", resultUri, mimeType:"application/json",
+encoding:"utf-8", totalBytes, offset, endOffset, hasMore, chunk }`. Concatenate `chunk` values in
+order and continue at each `endOffset`; boundaries never split a UTF-8 code point. An arbitrary
+caller offset inside a multi-byte code point is rejected instead of returning replacement text.
 
 Every journaling run also exposes its redacted append-only event stream:
 
@@ -596,14 +637,16 @@ const pageUri = `workflow://runs/${runId}/events?after=${tail.cursor}&limit=1000
 ```
 
 Notifications are deliberately coalesced to one in-flight promise plus one dirty bit. They are not
-the event queue: a slow/reconnected client catches up without gaps from the durable cursor. Only
-projected records are served; new content strings are credential-redacted and capped at 512 UTF-8
-bytes. Query URIs are readable but not subscribable. Integrity failures are explicit rather than
+the event queue: a slow/reconnected client catches up without gaps from the durable cursor. The
+events document is bounded/redacted observability, not an exact result-reconstruction API; use the
+`/result` resource or `action:"result"` for authored output. Only projected records are served; new
+content strings are credential-redacted and capped at 512 UTF-8 bytes. Query URIs are readable but not subscribable. Integrity failures are explicit rather than
 serving a silently incomplete transcript. See the [API contract](../../docs/api.md#mcp-live-events-resource).
 
-Run/background results contain a `resource_link` for the newly admitted script. Inspect/await
-results contain available links for the full resume lineage, oldest to newest, and duplicate that
-history in structured `lineage`. A deleted revision remains listed as `available: false` without a
+Run/background results contain a clearly labelled `resource_link` for the newly admitted script.
+Completed foreground, inspect, and await results also carry `resultUri` and a clearly labelled exact
+result link. Inspect/await contain available script links for the full resume lineage, oldest to
+newest, and duplicate that history in structured `lineage`. A deleted revision remains listed as `available: false` without a
 fabricated link. Lineage is reconstructed at read time from the engine's durable resume-source
 pointer (`resumeSourceRunId`) and, for deleted ancestors, the engine's content-free lineage
 tombstone; the MCP layer stores no script, args, or synthetic lineage metadata. Every URI is also

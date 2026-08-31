@@ -287,6 +287,7 @@ const scriptLineageEntrySchema = z.object({
 
 const inspectionScriptResourceShape = {
   scriptUri: z.string(),
+  resultUri: z.string().optional(),
   lineage: z.array(scriptLineageEntrySchema),
 } as const;
 
@@ -359,8 +360,26 @@ const executionResultSchema = z
     status: z.enum(["paused", "completed", "failed", "aborted"]),
     ...executionDetailsShape,
     scriptUri: z.string(),
+    resultUri: z.string().optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.resultUri !== undefined && value.status !== "completed") {
+      context.addIssue({
+        code: "custom",
+        path: ["resultUri"],
+        message: "resultUri is available only for completed workflow outcomes",
+      });
+    }
+  })
+  .meta({
+    allOf: [
+      {
+        if: { required: ["resultUri"] },
+        then: { required: ["status"], properties: { status: { const: "completed" } } },
+      },
+    ],
+  });
 
 const waitSchema = z.object({
   requestedMs: z.number().int().nonnegative(),
@@ -447,7 +466,7 @@ const inspectionRequired = [
 
 const terminalStatuses = ["paused", "completed", "failed", "aborted"] as const;
 const nonterminalStatuses = ["pending", "running"] as const;
-const commonOutputFields = ["runId", "status", "scriptUri", "limits", "replayEligibility"] as const;
+const commonOutputFields = ["runId", "status", "scriptUri", "resultUri", "limits", "replayEligibility"] as const;
 const runOutputRequired = ["runId", "status", "scriptUri"] as const;
 const executionDetailFields = [
   "result",
@@ -473,6 +492,15 @@ const discoveryOutputFields = [
   "harnessOptions",
   "omittedHarnesses",
   "models",
+] as const;
+const resultRetrievalFields = [
+  "mimeType",
+  "encoding",
+  "totalBytes",
+  "offset",
+  "endOffset",
+  "hasMore",
+  "chunk",
 ] as const;
 const stopControlSchema = z.object({
   state: z.literal("pending"),
@@ -500,6 +528,7 @@ const variantOutputFields = [
   "pendingPermissions",
   "interaction",
   "permissionResponse",
+  ...resultRetrievalFields,
   ...discoveryOutputFields,
 ] as const;
 
@@ -531,7 +560,7 @@ function hasOnlyFields(value: Record<string, unknown>, allowed: readonly string[
  */
 export const workflowToolOutputShape = z
   .object({
-    action: z.enum(["run", "config"]).optional(),
+    action: z.enum(["run", "config", "result"]).optional(),
     ok: z.boolean().optional(),
     validation: validationSummarySchema.optional(),
     harnessOptions: z.array(harnessDiagnosticSchema).optional(),
@@ -542,6 +571,7 @@ export const workflowToolOutputShape = z
     ...executionDetailsShape,
     scriptSource: scriptSourceSchema.optional(),
     scriptUri: z.string().optional(),
+    resultUri: z.string().optional(),
     lineage: inspectionScriptResourceShape.lineage.optional(),
     workflowName: runStatusShape.workflowName.optional(),
     phases: runStatusShape.phases.optional(),
@@ -559,6 +589,13 @@ export const workflowToolOutputShape = z
     pendingPermissions: z.array(pendingPermissionSchema).optional(),
     interaction: permissionInteractionSchema.optional(),
     permissionResponse: permissionAcknowledgementSchema.optional(),
+    mimeType: z.literal("application/json").optional(),
+    encoding: z.literal("utf-8").optional(),
+    totalBytes: z.number().int().nonnegative().optional(),
+    offset: z.number().int().nonnegative().optional(),
+    endOffset: z.number().int().nonnegative().optional(),
+    hasMore: z.boolean().optional(),
+    chunk: z.string().optional(),
   })
   .superRefine((value, context) => {
     const has = (field: keyof typeof value) => value[field] !== undefined;
@@ -566,7 +603,14 @@ export const workflowToolOutputShape = z
     const runCommonComplete = has("runId") && has("status") && has("scriptUri");
     const terminal = terminalStatuses.includes(value.status as typeof terminalStatuses[number]);
     let valid: boolean;
-    if (value.action === "config") {
+    if (value.action === "result") {
+      valid =
+        value.status === "completed" &&
+        has("runId") &&
+        has("resultUri") &&
+        resultRetrievalFields.every((field) => has(field)) &&
+        hasOnlyExactFields(value, ["action", "runId", "status", "resultUri", ...resultRetrievalFields]);
+    } else if (value.action === "config") {
       valid =
         has("ok") &&
         has("harnessOptions") &&
@@ -612,12 +656,46 @@ export const workflowToolOutputShape = z
     } else {
       valid = runCommonComplete && inspectionComplete && hasOnlyFields(value, [...inspectionFields, "pendingPermissions", "interaction"]);
     }
+    if (has("resultUri") && value.status !== "completed") valid = false;
     if (!valid) {
       context.addIssue({ code: "custom", message: "output does not match a workflow result variant" });
     }
   })
   .meta({
+    allOf: [
+      {
+        if: { required: ["resultUri"] },
+        then: { required: ["status"], properties: { status: { const: "completed" } } },
+      },
+    ],
     oneOf: [
+      {
+        title: "Workflow result retrieval",
+        required: ["action", "runId", "status", "resultUri", ...resultRetrievalFields],
+        properties: { action: { const: "result" }, status: { const: "completed" } },
+        ...forbidsRequired(
+          "ok",
+          "validation",
+          "harnessOptions",
+          "omittedHarnesses",
+          "models",
+          "scriptUri",
+          "scriptSource",
+          "limits",
+          "replayEligibility",
+          ...executionDetailFields,
+          ...inspectionFields,
+          "lineage",
+          "wait",
+          "outcome",
+          "stopped",
+          "alreadyTerminal",
+          "control",
+          "pendingPermissions",
+          "interaction",
+          "permissionResponse",
+        ),
+      },
       {
         title: "Workflow config discovery",
         required: ["action", "ok", "harnessOptions", "omittedHarnesses", "models"],
@@ -742,18 +820,21 @@ export interface WorkflowScriptLineageEntry {
 
 export interface WorkflowScriptResourceFields {
   scriptUri: string;
+  resultUri?: string;
   lineage: WorkflowScriptLineageEntry[];
 }
 
 export interface WorkflowExecutionScriptResourceFields {
   scriptSource: WorkflowScriptSource;
   scriptUri: string;
+  resultUri?: string;
 }
 
 export interface WorkflowExecutionOutcome<T = unknown> {
   runId: string;
   status: Exclude<WorkflowRunResult["status"], "pending" | "running">;
   scriptUri: string;
+  resultUri?: string;
   limits?: WorkflowRunLimits;
   replayEligibility?: WorkflowReplayEligibility;
   result?: T;
@@ -809,6 +890,20 @@ export interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus, 
   outcome?: WorkflowExecutionOutcome<T>;
 }
 
+export interface WorkflowResultRetrieval {
+  action: "result";
+  runId: string;
+  status: "completed";
+  resultUri: string;
+  mimeType: "application/json";
+  encoding: "utf-8";
+  totalBytes: number;
+  offset: number;
+  endOffset: number;
+  hasMore: boolean;
+  chunk: string;
+}
+
 export interface WorkflowConfigToolResult {
   action: "config";
   ok: boolean;
@@ -846,6 +941,7 @@ export interface WorkflowStopPendingResult extends WorkflowRunStatus, WorkflowSc
 }
 
 export type WorkflowToolResult<T = unknown> =
+  | WorkflowResultRetrieval
   | WorkflowConfigToolResult
   | WorkflowValidationRejected
   | WorkflowExecutionToolResult<T>
@@ -858,7 +954,7 @@ export type WorkflowToolResult<T = unknown> =
 
 export function toWorkflowExecutionOutcome<T>(
   run: WorkflowRunResult<T>,
-  resources: Pick<WorkflowExecutionScriptResourceFields, "scriptUri">,
+  resources: Pick<WorkflowExecutionScriptResourceFields, "scriptUri" | "resultUri">,
 ): WorkflowExecutionOutcome<T> {
   if (run.status === "pending" || run.status === "running") {
     throw new TypeError(`Workflow execution result must be terminal, received ${run.status}`);
@@ -877,7 +973,10 @@ export function toWorkflowExecutionOutcome<T>(
     ...(run.fallbacks === undefined ? {} : { fallbacks: run.fallbacks }),
     ...(run.checkpointsTaken === undefined ? {} : { checkpointsTaken: run.checkpointsTaken }),
     ...(run.resumeReport === undefined ? {} : { resumeReport: run.resumeReport }),
-    ...resources,
+    scriptUri: resources.scriptUri,
+    ...(run.status === "completed" && resources.resultUri !== undefined
+      ? { resultUri: resources.resultUri }
+      : {}),
   };
 }
 

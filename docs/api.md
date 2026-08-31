@@ -738,6 +738,27 @@ normally. Watchers stay open across lifecycle events because the same run may re
 closed on deletion, generation replacement, corruption, or inconsistency instead of following a
 different stream.
 
+#### MCP exact workflow result resource
+
+For every completed run with a persisted authored JSON value, the MCP server exposes
+`workflow://runs/{runId}/result` with MIME type `application/json`. The resource text is the exact
+`JSON.stringify` representation of the authoritative persisted value. It is immutable, survives MCP
+server restart, has no server-side envelope cap, and remains readable until run deletion, corruption,
+or store loss. Running, paused, failed, aborted, unknown, deleted, and completed-without-value runs
+fail closed instead of manufacturing output.
+
+Completed foreground, inspect, and await responses expose `resultUri` and a separately labelled
+result `resource_link`; script links are explicitly labelled as scripts. Foreground and await also
+copy exact result JSON up to 4,096 UTF-8 bytes into text for content-first hosts. For larger values,
+use the resource directly or page through `{ action:"result", runId, offset, maxBytes }`. The page is
+`{ action:"result", runId, status:"completed", resultUri, mimeType:"application/json",
+encoding:"utf-8", totalBytes, offset, endOffset, hasMore, chunk }`; `maxBytes` defaults to and is
+capped at 16,384. Concatenate chunks and continue at `endOffset`. Page boundaries never split a UTF-8
+code point; arbitrary interior offsets are invalid.
+
+The events resource below remains bounded/redacted observability. Its projections are not an exact
+result-reconstruction contract.
+
 #### MCP live events resource
 
 The MCP server exposes the same projected log at `workflow://runs/{runId}/events` with MIME type
@@ -1395,13 +1416,34 @@ interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
   waitMs?: number; // default 20_000; integer 0..25_000
 }
 
+interface WorkflowResultToolInput {
+  action: "result";
+  runId: string;
+  offset?: number;   // default 0; UTF-8 byte offset, use the previous endOffset
+  maxBytes?: number; // default/max 16_384; minimum 4
+}
+
 interface WorkflowPermissionResponseToolInput {
   action: "permissions-response";
   runId: string;
   permissionId: string;
   response:
-    | { outcome: { outcome: "selected"; optionId: string }; _meta?: Record<string, unknown> | null }
-    | { outcome: { outcome: "cancelled" }; _meta?: Record<string, unknown> | null };
+    | { outcome: { outcome: "selected"; optionId: string } }
+    | { outcome: { outcome: "cancelled" } };
+}
+
+interface WorkflowResultRetrieval {
+  action: "result";
+  runId: string;
+  status: "completed";
+  resultUri: string;
+  mimeType: "application/json";
+  encoding: "utf-8";
+  totalBytes: number;
+  offset: number;
+  endOffset: number;
+  hasMore: boolean;
+  chunk: string;
 }
 
 interface WorkflowExecutionToolResult<T = unknown> {
@@ -1418,6 +1460,8 @@ interface WorkflowExecutionToolResult<T = unknown> {
   checkpointsTaken?: WorkflowCheckpointTaken[];
   resumeReport?: WorkflowResumeReport;   // resumeFromRunId executions only
   replayEligibility?: WorkflowReplayEligibility;
+  scriptUri: string;
+  resultUri?: string;                     // completed runs with a persisted JSON value
 }
 ```
 
@@ -1451,7 +1495,7 @@ channel, or live checkpoint `confirm`; checkpoints use authored headless behavio
 start request supplied a progress token, it emits no background progress after returning.
 Cancelling the accepted call cannot abort the run. A fifth run fails with
 `Background workflow limit reached (4 active or starting runs). Await an existing run and retry.`
-Foreground, inspect, and await do not consume slots. A background `resumeFromRunId` creates a new run
+Foreground, inspect, await, and result retrieval do not consume slots. A background `resumeFromRunId` creates a new run
 ID and copies the complete inherited journal plus any synthetic checkpoint answer into that new
 run's initial durable record, preserving multi-hop resume safety. Its acknowledgement includes the
 admission-time `replayEligibility` prediction before the script body is allowed to execute.
@@ -1492,6 +1536,8 @@ interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   tokenUsage?: TokenUsage;
   pendingPermissions?: WorkflowPendingPermission[];
   outcome?: WorkflowExecutionToolResult<T>; // present exactly at terminal status
+  scriptUri: string;
+  resultUri?: string;
 }
 
 interface WorkflowStopPendingResult extends WorkflowRunStatus {
@@ -1544,16 +1590,18 @@ top-level and `outcome.tokenUsage` are identical.
 Terminal `outcome` is live-first and reconstructed from project-scoped persistence after restart,
 normalizing legacy missing `cost` to zero. Completed outcomes contain the exact authored result and
 raw full logs; paused outcomes carry existing non-secret `authContext`/`checkpointContext` and resume
-guidance. Retrieval has no TTL and remains available until SDK/manual deletion, corruption, or store
-loss. The inherited status portion retains its 24,576-byte/redaction bound and await text its
-8,192-byte cap; raw terminal `outcome` intentionally has no new envelope cap and is never duplicated
-into text.
+guidance. Completed foreground/await results add `resultUri`. Exact JSON up to 4,096 UTF-8 bytes is
+also copied into model-visible text for content-first hosts; larger values are not duplicated
+wholesale and instead point to the exact result resource plus bounded `action:"result"` paging.
+Retrieval has no TTL and remains available until SDK/manual deletion, corruption, or store loss. The
+inherited status portion retains its 24,576-byte/redaction bound and await text its 8,192-byte cap;
+raw terminal `outcome` intentionally has no new envelope cap.
 
 Runs execute in the shared per-user workflow daemon (the default stdio entry is a thin shim that proxies to it and auto-starts it), so a client disconnect, shim kill, or session eviction does not stop in-flight work. During version succession the current daemon is the front door while a predecessor may retain execution ownership under the run lease. Whole-run stop writes an idempotent durable intent and signed internal control forwards stop/cancel to that predecessor. A final stop response still requires a durable aborted snapshot plus its stopped event; a control wait that expires returns a successful nonterminal stop acknowledgement with `control.state:"pending"` and an operation ID. `forceOwner:true` on whole-run stop explicitly authorizes terminating a superseded owner daemon after identity revalidation and may interrupt sibling runs; it is forbidden with `callIndex`. Owner exit (signals, forced stop, crash, machine shutdown) — or, under `--in-process`, the single client-owned process exiting — can interrupt work; there is no cross-machine handoff. If an owner exits with a pending whole-stop intent, the next lease holder cold-stops it; otherwise cold preflights reconcile orphaned `pending`/`running` state to `paused` / `interrupted` for explicit `resumeFromRunId`. A live lease is never stolen because of a timeout.
 The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
 feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 
-Inspect returns `WorkflowRunStatus` plus live `pendingPermissions` and interaction guidance when applicable. Permission diagnostics are credential-redacted and scalar-bounded, omit the private ACP session id, and preserve the complete ordered exact option-id list inside a separate 64 KiB envelope; an option set that cannot be represented safely is cancelled instead of partially exposed. Permission responses accept only cancellation or an exact selected optionId and forbid caller-supplied response `_meta`. Its JSON structured content is capped at 24,576 bytes
+Inspect returns `WorkflowRunStatus` plus live `pendingPermissions` and interaction guidance when applicable. Completed runs with an authored JSON value also expose `resultUri` and a labelled result resource link without adding that value to the bounded status projection. Permission diagnostics are credential-redacted and scalar-bounded, omit the private ACP session id, and preserve the complete ordered exact option-id list inside a separate 64 KiB envelope; an option set that cannot be represented safely is cancelled instead of partially exposed. Permission responses accept only cancellation or an exact selected optionId and forbid caller-supplied response `_meta`. Its JSON structured content is capped at 24,576 bytes
 and its formatted text at 8,192 bytes. An existing failed or aborted run is still a successful read.
 An unknown/corrupt/unreadable run is `isError:true`, has no structured content, and returns exactly
 `No workflow run found for runId "<runId>" in this server's project-scoped run store.` Execution keeps current error semantics: failed/aborted are tool errors, paused is a successful resumable call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped at 12,288 bytes; rejected preflight scripts instead carry bounded structured validation diagnostics and have no run ID or tail.

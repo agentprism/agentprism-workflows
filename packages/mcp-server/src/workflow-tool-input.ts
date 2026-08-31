@@ -14,6 +14,10 @@ const permissionResponseSchema = z.object({
   ]),
 }).strict();
 
+export const WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT = 16_384;
+export const WORKFLOW_RESULT_CHUNK_BYTES_MAX = 16_384;
+export const WORKFLOW_RESULT_CHUNK_BYTES_MIN = 4;
+
 const checkpointRepliesSchema = z.record(
   z.string().refine(
     (key) => {
@@ -27,17 +31,17 @@ const checkpointRepliesSchema = z.record(
 
 export const workflowToolInputShape = {
   action: z
-    .enum(["run", "config", "inspect", "await", "stop", "permissions-response"])
+    .enum(["run", "config", "inspect", "await", "result", "stop", "permissions-response"])
     .optional()
     .describe(
-      "Operation. Omit or use run to validate then execute; config discovers live backend/model/mode/config options; inspect/await expose live action requirements; permissions-response resolves one pending ACP permission; stop aborts a run or one in-flight agent.",
+      "Operation. Omit or use run to validate then execute; config discovers live backend/model/mode/config options; inspect/await expose lifecycle and action requirements; result pages the exact completed JSON result; permissions-response resolves one pending ACP permission; stop aborts a run or one in-flight agent.",
     ),
   script: z
     .string()
     .min(1)
     .optional()
     .describe(
-      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/stop/permissions-response. First statement MUST be `export const meta = { name, description, phases? }`. When present, phases MUST be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings.",
+      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/result/stop/permissions-response. First statement MUST be `export const meta = { name, description, phases? }`. When present, phases MUST be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings.",
     ),
   scriptPath: z
     .string()
@@ -46,7 +50,7 @@ export const workflowToolInputShape = {
     .optional()
     .describe(
       "Absolute path, on the server's filesystem, to a workflow script file read once at admission. " +
-        "Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/stop/permissions-response. " +
+        "Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/result/stop/permissions-response. " +
         "Relative paths are rejected.",
     ),
   projectDir: z
@@ -58,7 +62,7 @@ export const workflowToolInputShape = {
       "Absolute project directory used as the cwd for config discovery and, for run, the project-scoped store " +
         "(where the runId, journal, and resume state live) plus default execution cwd. " +
         "Required for run and config on the shared workflow daemon; on a single-project (in-process) server it " +
-        "defaults to that server's own project. Forbidden for inspect/await/stop/permissions-response — a runId locates its project.",
+        "defaults to that server's own project. Forbidden for inspect/await/result/stop/permissions-response — a runId locates its project.",
     ),
   harnesses: z
     .array(z.string().regex(/^[a-z][a-z0-9._-]*$/i, "invalid backend name"))
@@ -145,7 +149,7 @@ export const workflowToolInputShape = {
     .max(128)
     .regex(/^[a-z0-9]+-[a-z0-9]+$/, "runId must be an engine-generated run ID")
     .optional()
-    .describe("Project-scoped workflow run ID. Required for inspect/await/stop/permissions-response; forbidden for config/run."),
+    .describe("Project-scoped workflow run ID. Required for inspect/await/result/stop/permissions-response; forbidden for config/run."),
   permissionId: z
     .string()
     .uuid()
@@ -185,6 +189,20 @@ export const workflowToolInputShape = {
     .max(25_000)
     .optional()
     .describe("Await duration in milliseconds. Default 20000; range 0..25000. Zero reads without blocking."),
+  offset: z
+    .number()
+    .int()
+    .nonnegative()
+    .safe()
+    .optional()
+    .describe('With action="result", UTF-8 byte offset into the exact serialized JSON. Default 0; use the previous endOffset.'),
+  maxBytes: z
+    .number()
+    .int()
+    .min(WORKFLOW_RESULT_CHUNK_BYTES_MIN)
+    .max(WORKFLOW_RESULT_CHUNK_BYTES_MAX)
+    .optional()
+    .describe(`With action="result", maximum UTF-8 bytes returned. Default and maximum ${WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT}.`),
 } as const;
 
 interface WorkflowExecuteToolInputBase {
@@ -211,6 +229,8 @@ interface WorkflowExecuteToolInputBase {
   lastN?: never;
   labelGlob?: never;
   logLines?: never;
+  offset?: never;
+  maxBytes?: never;
 }
 
 export type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase &
@@ -233,6 +253,8 @@ export interface WorkflowConfigToolInput {
   permissionId?: never;
   response?: never;
   forceOwner?: never;
+  offset?: never;
+  maxBytes?: never;
 }
 
 export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
@@ -248,6 +270,8 @@ export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
   resumeFromRunId?: never;
   resumePolicy?: never;
   checkpointReplies?: never;
+  offset?: never;
+  maxBytes?: never;
 }
 
 export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
@@ -264,6 +288,32 @@ export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
   resumeFromRunId?: never;
   resumePolicy?: never;
   checkpointReplies?: never;
+  offset?: never;
+  maxBytes?: never;
+}
+
+export interface WorkflowResultToolInput {
+  action: "result";
+  runId: string;
+  /** UTF-8 byte offset; use the previous page's endOffset. */
+  offset?: number;
+  /** Bounded chunk size, 4..16,384 bytes. */
+  maxBytes?: number;
+  script?: never;
+  scriptPath?: never;
+  projectDir?: never;
+  background?: never;
+  waitMs?: never;
+  callIndex?: never;
+  forceOwner?: never;
+  resumeFromRunId?: never;
+  resumePolicy?: never;
+  checkpointReplies?: never;
+  lastN?: never;
+  labelGlob?: never;
+  logLines?: never;
+  permissionId?: never;
+  response?: never;
 }
 
 export interface WorkflowPermissionResponseToolInput {
@@ -284,6 +334,8 @@ export interface WorkflowPermissionResponseToolInput {
   lastN?: never;
   labelGlob?: never;
   logLines?: never;
+  offset?: never;
+  maxBytes?: never;
 }
 
 export interface WorkflowStopToolInput extends WorkflowRunInspectionOptions {
@@ -301,6 +353,8 @@ export interface WorkflowStopToolInput extends WorkflowRunInspectionOptions {
   resumeFromRunId?: never;
   resumePolicy?: never;
   checkpointReplies?: never;
+  offset?: never;
+  maxBytes?: never;
 }
 
 export type WorkflowToolInput =
@@ -308,11 +362,12 @@ export type WorkflowToolInput =
   | WorkflowConfigToolInput
   | WorkflowInspectToolInput
   | WorkflowAwaitToolInput
+  | WorkflowResultToolInput
   | WorkflowStopToolInput
   | WorkflowPermissionResponseToolInput;
 
 interface RawWorkflowToolInput {
-  action?: "run" | "config" | "inspect" | "await" | "stop" | "permissions-response";
+  action?: "run" | "config" | "inspect" | "await" | "result" | "stop" | "permissions-response";
   script?: string;
   scriptPath?: string;
   projectDir?: string;
@@ -339,6 +394,8 @@ interface RawWorkflowToolInput {
   labelGlob?: string;
   logLines?: number;
   waitMs?: number;
+  offset?: number;
+  maxBytes?: number;
 }
 
 function hasConfigFields(raw: RawWorkflowToolInput): boolean {
@@ -347,6 +404,10 @@ function hasConfigFields(raw: RawWorkflowToolInput): boolean {
 
 function hasPermissionFields(raw: RawWorkflowToolInput): boolean {
   return raw.permissionId !== undefined || raw.response !== undefined;
+}
+
+function hasResultFields(raw: RawWorkflowToolInput): boolean {
+  return raw.offset !== undefined || raw.maxBytes !== undefined;
 }
 
 function hasExecutionFields(raw: RawWorkflowToolInput): boolean {
@@ -406,7 +467,8 @@ export function parseWorkflowToolInput(
       raw.waitMs !== undefined ||
       raw.lastN !== undefined ||
       raw.labelGlob !== undefined ||
-      raw.logLines !== undefined
+      raw.logLines !== undefined ||
+      hasResultFields(raw)
     ) {
       invalid('action="config" accepts only projectDir, harnesses, modelSpecs, modelFilter, and probeTimeoutMs');
     }
@@ -425,6 +487,29 @@ export function parseWorkflowToolInput(
     };
   }
 
+  if (raw.action === "result") {
+    if (!raw.runId) invalid('action="result" requires runId');
+    if (
+      hasExecutionFields(raw) ||
+      hasConfigFields(raw) ||
+      hasPermissionFields(raw) ||
+      raw.waitMs !== undefined ||
+      raw.callIndex !== undefined ||
+      raw.forceOwner !== undefined ||
+      raw.lastN !== undefined ||
+      raw.labelGlob !== undefined ||
+      raw.logLines !== undefined
+    ) {
+      invalid('action="result" accepts only runId, offset, and maxBytes');
+    }
+    return {
+      action: "result",
+      runId: raw.runId,
+      offset: raw.offset ?? 0,
+      maxBytes: raw.maxBytes ?? WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT,
+    };
+  }
+
   if (raw.action === "permissions-response") {
     if (!raw.runId) invalid('action="permissions-response" requires runId');
     if (!raw.permissionId || raw.response === undefined) {
@@ -438,7 +523,8 @@ export function parseWorkflowToolInput(
       raw.forceOwner !== undefined ||
       raw.lastN !== undefined ||
       raw.labelGlob !== undefined ||
-      raw.logLines !== undefined
+      raw.logLines !== undefined ||
+      hasResultFields(raw)
     ) {
       invalid('action="permissions-response" accepts only runId, permissionId, and response');
     }
@@ -452,7 +538,7 @@ export function parseWorkflowToolInput(
 
   if (raw.action === "inspect") {
     if (!raw.runId) invalid('action="inspect" requires runId');
-    if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || raw.waitMs !== undefined || raw.callIndex !== undefined || raw.forceOwner !== undefined) {
+    if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || hasResultFields(raw) || raw.waitMs !== undefined || raw.callIndex !== undefined || raw.forceOwner !== undefined) {
       invalid('action="inspect" cannot include execution fields');
     }
     return {
@@ -466,7 +552,7 @@ export function parseWorkflowToolInput(
 
   if (raw.action === "await") {
     if (!raw.runId) invalid('action="await" requires runId');
-    if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || raw.callIndex !== undefined || raw.forceOwner !== undefined) {
+    if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || hasResultFields(raw) || raw.callIndex !== undefined || raw.forceOwner !== undefined) {
       invalid('action="await" cannot include execution fields');
     }
     return {
@@ -481,7 +567,7 @@ export function parseWorkflowToolInput(
 
   if (raw.action === "stop") {
     if (!raw.runId) invalid('action="stop" requires runId');
-    if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || raw.waitMs !== undefined) {
+    if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || hasResultFields(raw) || raw.waitMs !== undefined) {
       invalid('action="stop" cannot include execution fields or waitMs');
     }
     if (raw.callIndex !== undefined && raw.forceOwner !== undefined) {
@@ -507,7 +593,8 @@ export function parseWorkflowToolInput(
     raw.lastN !== undefined ||
     raw.labelGlob !== undefined ||
     raw.logLines !== undefined ||
-    hasConfigFields(raw)
+    hasConfigFields(raw) ||
+    hasResultFields(raw)
   ) {
     invalid("run inputs cannot include inspection fields");
   }

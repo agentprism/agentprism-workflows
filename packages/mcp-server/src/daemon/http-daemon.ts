@@ -410,6 +410,19 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
   const detachModernRunDeleted = projects.onRunDeleted(() => modernNotifier.resourcesChanged());
   const detachModernRunEvent = projects.onRunEventPersisted((record) => {
     modernNotifier.resourceUpdated(workflowRunEventsUri(record.runId));
+    if (record.event.type !== "complete") return;
+    // `runEventPersisted` precedes the engine's terminal snapshot save. Publish availability only
+    // after that stack unwinds and the exact persisted value is actually readable.
+    queueMicrotask(() => {
+      try {
+        const state = projects.storeFor(record.runId)?.manager.getPersistence().load(record.runId);
+        if (state?.status === "completed" && state.result !== undefined) {
+          modernNotifier.resourcesChanged();
+        }
+      } catch {
+        // Corrupt/unreadable state has no result resource and therefore no availability hint.
+      }
+    });
   });
 
   const handleMcpRequest = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
