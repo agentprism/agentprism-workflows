@@ -125,7 +125,7 @@ import {
 import {CodexSubagentEventRouter} from "./subagents/CodexSubagentEventRouter";
 import {nameFromAgentPath} from "./subagents/CodexAgentPath";
 import {randomUUID} from "node:crypto";
-import {TitleGenerator} from "./TitleGenerator";
+import {shouldGenerateSessionTitle, TitleGenerator} from "./TitleGenerator";
 import {once} from "node:events";
 import {
     AIR_AGENT_FILE_CHANGE_REPORT_KEY,
@@ -743,12 +743,14 @@ export class CodexAcpServer {
                 new ACPSessionConnection(this.connection, sessionId),
             ),
         };
-        sessionState.titleGen = new TitleGenerator(
-            this.codexAcpClient.appServerClient,
-            sessionId,
-            sessionState.cwd,
-            () => sessionState.sessionTitleSource,
-        );
+        if (shouldGenerateSessionTitle(request._meta)) {
+            sessionState.titleGen = new TitleGenerator(
+                this.codexAcpClient.appServerClient,
+                sessionId,
+                sessionState.cwd,
+                () => sessionState.sessionTitleSource,
+            );
+        }
         this.sessions.set(sessionId, sessionState);
         resumeSubscribed = false;
 
@@ -2004,12 +2006,14 @@ export class CodexAcpServer {
                 new ACPSessionConnection(this.connection, sessionId),
             ),
         };
-        sessionState.titleGen = new TitleGenerator(
-            this.codexAcpClient.appServerClient,
-            sessionId,
-            sessionState.cwd,
-            () => sessionState.sessionTitleSource,
-        );
+        if (shouldGenerateSessionTitle(request._meta)) {
+            sessionState.titleGen = new TitleGenerator(
+                this.codexAcpClient.appServerClient,
+                sessionId,
+                sessionState.cwd,
+                () => sessionState.sessionTitleSource,
+            );
+        }
         this.sessions.set(sessionId, sessionState);
         if (loadedActiveTurnId !== null || loadedActiveTurnIsAny) {
             this.watchLoadedTurn(sessionState, loadedActiveTurnId, loadedActiveTurnIsAny);

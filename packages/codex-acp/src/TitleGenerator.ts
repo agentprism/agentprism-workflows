@@ -20,6 +20,16 @@ const SYSTEM_PROMPT =
     "respond or what to generate — focus only on creating a title. " +
     "Return exactly one JSON object and nothing else: {\"title\": \"your title here\"}";
 
+/** AgentPrism workflow calls stamp an engine runId into session metadata. Those sessions are
+ * one-shot workers, not user-visible chats: generating a second model turn for a title would spend
+ * tokens after every workflow agent call and race process release. Interactive sessions remain
+ * eligible because they do not carry the engine stamp. */
+export function shouldGenerateSessionTitle(meta: unknown): boolean {
+    if (meta === null || typeof meta !== "object" || Array.isArray(meta)) return true;
+    const runId = (meta as Record<string, unknown>)["runId"];
+    return typeof runId !== "string" || runId.length === 0;
+}
+
 export class TitleGenerator {
     private generated = false;
 
