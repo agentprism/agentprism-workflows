@@ -371,7 +371,9 @@ Then long-poll in ordinary bounded tool calls until `outcome` appears:
 A timeout returns the freshest bounded status and partial cumulative token usage; terminal await
 adds the same raw result/log projection a foreground call returns. Await returns early with
 `wait.returnedBecause:"action-required"` when an ACP permission is pending. Inspect and await include
-the exact ordered options. Elicitation-capable clients present them to the user; other clients answer
+the complete ordered exact option ids with credential-redacted, bounded diagnostics and no private ACP
+session id; requests that cannot fit safely fail closed. Elicitation-capable clients present them to
+the user; other clients answer
 through:
 
 ```json
@@ -383,8 +385,9 @@ through:
 }
 ```
 
-The request remains live in its owning daemon while waiting. Permission responses route across daemon
-upgrades to that owner, but cannot be reconstructed after owner loss. At most four background runs may
+The request remains live in its owning daemon while waiting. Permission responses accept only an exact
+advertised option id or cancellation—caller-supplied response `_meta` is forbidden—and route across
+daemon upgrades to that owner, but cannot be reconstructed after owner loss. At most four background runs may
 be active or starting per project. Runs execute in the shared local daemon, so MCP clients
 disconnecting or killing the stdio shim never stops in-flight work — any later session can locate
 and await/inspect/stop it. Across a version upgrade, the successor routes signed stop/cancel control

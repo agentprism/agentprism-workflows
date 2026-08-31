@@ -302,6 +302,15 @@ test("permissions-response accepts only an exact pending id and ACP response", (
     response: { outcome: { outcome: "cancelled" } },
     waitMs: 1,
   })));
+  assert.throws(() => Schema.parse({
+    action: "permissions-response",
+    runId: "abc-def",
+    permissionId: "123e4567-e89b-12d3-a456-426614174000",
+    response: {
+      outcome: { outcome: "selected", optionId: "allow_once" },
+      _meta: { persist: "always" },
+    },
+  }), "provider effects must come only from the exact advertised optionId");
 });
 
 test("the discriminator rejects every missing or mixed run/inspect/await branch", () => {

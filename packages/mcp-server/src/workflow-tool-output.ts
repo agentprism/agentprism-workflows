@@ -57,7 +57,6 @@ const pendingPermissionSchema = z.object({
   label: z.string().optional(),
   requestedAt: z.string(),
   request: z.object({
-    sessionId: z.string(),
     toolCall: z.record(z.string(), z.unknown()),
     options: z.array(z.object({
       optionId: z.string(),
@@ -68,6 +67,7 @@ const pendingPermissionSchema = z.object({
     _meta: z.record(z.string(), z.unknown()).nullable().optional(),
   }),
   requestTruncated: z.boolean(),
+  requestRedacted: z.boolean(),
 });
 
 const permissionInteractionSchema = z.object({

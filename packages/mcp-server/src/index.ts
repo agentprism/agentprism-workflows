@@ -24,6 +24,8 @@ export { BackgroundRunRegistry, createWorkflowServer, MAX_BACKGROUND_RUNS } from
 export { WorkflowPermissionBroker } from "./workflow-permissions.js";
 export type {
   WorkflowPendingPermission,
+  WorkflowPermissionDecisionResponse,
+  WorkflowPermissionRequestProjection,
   WorkflowPermissionResponseAcknowledgement,
 } from "./workflow-permissions.js";
 export type {

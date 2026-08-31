@@ -407,7 +407,7 @@ function formatPendingPermissions(permissions: WorkflowPendingPermission[]): str
     }),
     `Use action="permissions-response" with runId, permissionId, and an exact selected optionId or cancelled outcome.`,
   ];
-  return `\n${lines.join("\n")}`;
+  return truncateUtf8(`\n${lines.join("\n")}`, 8_192, "…[permission summary truncated]");
 }
 
 function permissionResponseFromElicitation(

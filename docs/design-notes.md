@@ -347,11 +347,15 @@ independent of replay strategy and adds no MCP input.
 
 Live ACP permission requests are a different, execution-affine human gate. The MCP runner installs a
 resolver that parks the original `session/request_permission` promise and records a bounded live
-projection keyed by run/call/permission id. Inspect and await expose the exact ordered backend options;
+projection keyed by run/call/permission id. The projection omits the private ACP session id, redacts
+credential-shaped diagnostics, bounds scalars and structure, and preserves every exact ordered option
+id inside a 64 KiB envelope; an unrepresentable option set is cancelled rather than partially shown.
+Inspect and await expose the exact ordered backend options;
 legacy elicitation-capable clients receive a form immediately, modern clients use an integrity-bound
 `inputRequired` retry, and non-elicitation clients call `permissions-response`. Responses validate the
 selected option against the parked request and route through signed daemon control to the process that
-owns the run lease. This is running-but-waiting state, not the engine's durable paused status: owner
+owns the run lease. Public responses forbid `_meta`, so provider effects come only from the selected
+advertised option id. This is running-but-waiting state, not the engine's durable paused status: owner
 loss invalidates the ACP request and it is never reconstructed cold. Explicit tool allow/deny lists
 settle before the MCP resolver; otherwise AgentPrism does not infer a provider decision from option
 labels, kind, or response metadata.

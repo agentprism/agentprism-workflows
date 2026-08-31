@@ -232,6 +232,24 @@ test("an omitted Claude mode explicitly applies AgentPrism's auto default", asyn
   assert.equal(wire[1]?.method, "prompt");
 });
 
+test("an omitted interactive-session mode also applies the AgentPrism default", async () => {
+  const advertised: SessionModeState = {
+    currentModeId: "acceptEdits",
+    availableModes: [
+      { id: "auto", name: "Auto", description: "Use a model classifier" },
+      { id: "acceptEdits", name: "Accept Edits" },
+    ],
+  };
+  const { cwd, readLog } = configure({ modes: advertised });
+  const session = await makeRunner().openSession({ model: "claude", cwd });
+  assert.equal(session.modes?.currentModeId, "auto");
+  assert.deepEqual(
+    readLog().filter((entry) => entry.method === "setSessionMode").map((entry) => entry.params?.modeId),
+    ["auto"],
+  );
+  await session.release();
+});
+
 test("an explicit harness mode does not invent a client-side deny policy", async () => {
   const withMode = configure({
     modes: MODES,

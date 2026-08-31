@@ -181,6 +181,8 @@ export interface AuthMetaMatrixRow {
   /** When set, the literal is asserted present in this backend's INSTALLED dist (claude/codex only;
    *  opencode ships a compiled binary with no consumable source — §3.4, grounded by live-e2e). */
   readonly distProbe?: "claude" | "codex";
+  /** Exact compiled-source tripwire when the human capability label is too broad. */
+  readonly distProbeLiteral?: string;
 }
 
 /** The §3.6 auth `_meta` matrix as executable rows — the exact surfaces §4.6.4 item 4 enumerates
@@ -193,8 +195,8 @@ export interface AuthMetaMatrixRow {
  *  probe authoritative for the VERIFIED BUILT-INS; phase-F review round 2, restricted to the
  *  built-in instances in round 3). Each
  *  `capability` is a literal that MUST appear in spec §3.6; `docs-drift.test.ts` asserts that lockstep,
- *  and (where `distProbe` is set) `protocol-coverage.test.ts` asserts the literal is still present in
- *  the installed agent dist — so neither the spec nor an agent bump can silently drift a `_meta`
+ *  and (where `distProbe` is set) `protocol-coverage.test.ts` asserts `distProbeLiteral ?? capability`
+ *  is still present in the installed agent dist — so neither the spec nor an agent bump can silently drift a `_meta`
  *  surface. OpenCode ships a compiled binary with no consumable source (§3.4), so its row has no dist
  *  probe (grounded instead by the §4.6.3 live-e2e). */
 const AUTH_META_MATRIX_ROWS = [
@@ -203,7 +205,14 @@ const AUTH_META_MATRIX_ROWS = [
   { agent: "codex", capability: "api-key", direction: "A→C", status: "supported-today", distProbe: "codex" },
   { agent: "codex", capability: "gateway", direction: "C↔A", status: "supported-today", distProbe: "codex" },
   { agent: "codex", capability: "DEFAULT_AUTH_REQUEST", direction: "C→A", status: "supported-today", distProbe: "codex" },
-  { agent: "codex", capability: "permission", direction: "A→C", status: "supported-today", distProbe: "codex" },
+  {
+    agent: "codex",
+    capability: "permission",
+    direction: "A→C",
+    status: "supported-today",
+    distProbe: "codex",
+    distProbeLiteral: "permission:",
+  },
   { agent: "opencode", capability: "terminal-auth", direction: "C↔A", status: "supported-today" },
   { agent: "all", capability: "provider env keys", direction: "C→A", status: "supported-today" },
 ] satisfies readonly AuthMetaMatrixRow[];

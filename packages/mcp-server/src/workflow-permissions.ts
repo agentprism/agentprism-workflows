@@ -3,8 +3,11 @@ import { randomUUID } from "node:crypto";
 
 import {
   decidePermission,
+  redactText,
+  truncateUtf8,
   type AcpEventContext,
   type AcpPermissionEvent,
+  type PermissionOption,
   type PermissionResolver,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
@@ -13,6 +16,43 @@ import {
 const RUN_ID = /^[a-z0-9]+-[a-z0-9]+$/;
 const PERMISSION_ID = /^[0-9a-f-]{36}$/i;
 const MAX_PUBLIC_REQUEST_BYTES = 64 * 1024;
+const MAX_PUBLIC_SCALAR_BYTES = 512;
+const MAX_PERMISSION_OPTIONS = 16;
+const MAX_OPTION_ID_CODE_UNITS = 512;
+const MAX_OPTION_ID_BYTES = 2_048;
+const MAX_PUBLIC_ARRAY_ITEMS = 16;
+const MAX_PUBLIC_OBJECT_KEYS = 20;
+const MAX_PUBLIC_DEPTH = 4;
+const SENSITIVE_KEY_PARTS = [
+  "password",
+  "passwd",
+  "secret",
+  "token",
+  "apikey",
+  "credential",
+  "authorization",
+  "cookie",
+  "privatekey",
+] as const;
+const PERMISSION_OPTION_KINDS = new Set([
+  "allow_once",
+  "allow_always",
+  "reject_once",
+  "reject_always",
+]);
+
+export interface WorkflowPermissionRequestProjection {
+  /** Safe tool-call projection. The private ACP session id is deliberately omitted. */
+  toolCall: RequestPermissionRequest["toolCall"];
+  /** Complete ordered response choices. optionId values are exact; presentation is redacted/bounded. */
+  options: PermissionOption[];
+  /** Redacted/bounded request metadata when it fits the public envelope. */
+  _meta?: Record<string, unknown> | null;
+}
+
+export interface WorkflowPermissionDecisionResponse {
+  outcome: RequestPermissionResponse["outcome"];
+}
 
 export interface WorkflowPendingPermission {
   version: 1;
@@ -22,10 +62,10 @@ export interface WorkflowPendingPermission {
   backendId: string;
   label?: string;
   requestedAt: string;
-  /** Exact ACP request when it fits the public bound. Oversized diagnostic fields are removed,
-   *  while the complete ordered option list and tool identity remain available for response. */
-  request: RequestPermissionRequest;
+  /** Redacted and bounded ACP projection with the complete ordered exact optionId list. */
+  request: WorkflowPermissionRequestProjection;
   requestTruncated: boolean;
+  requestRedacted: boolean;
 }
 
 export interface WorkflowPermissionResponseAcknowledgement {
@@ -46,41 +86,166 @@ interface PermissionEventSource {
   on(name: "permission_request", listener: (event: AcpPermissionEvent) => void): () => void;
 }
 
+interface ProjectionState {
+  redacted: boolean;
+  truncated: boolean;
+}
+
+interface PublicRequestProjection {
+  request: WorkflowPermissionRequestProjection;
+  truncated: boolean;
+  redacted: boolean;
+}
+
 function cloneRequest(request: RequestPermissionRequest): RequestPermissionRequest {
   return structuredClone(request);
 }
 
-function publicRequest(request: RequestPermissionRequest): {
-  request: RequestPermissionRequest;
-  truncated: boolean;
-} {
-  const cloned = cloneRequest(request);
-  if (Buffer.byteLength(JSON.stringify(cloned), "utf8") <= MAX_PUBLIC_REQUEST_BYTES) {
-    return { request: cloned, truncated: false };
+function sensitiveKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return SENSITIVE_KEY_PARTS.some((part) => normalized.includes(part));
+}
+
+function sanitizeString(value: string, state: ProjectionState): string {
+  const redacted = redactText(value);
+  const bounded = truncateUtf8(redacted.value, MAX_PUBLIC_SCALAR_BYTES);
+  state.redacted ||= redacted.redacted;
+  state.truncated ||= bounded !== redacted.value;
+  return bounded;
+}
+
+function sanitizeValue(
+  value: unknown,
+  state: ProjectionState,
+  depth = 0,
+  ancestors: ReadonlySet<object> = new Set(),
+): unknown {
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") return sanitizeString(value, state);
+  if (typeof value !== "object") {
+    state.truncated = true;
+    return null;
+  }
+  if (depth >= MAX_PUBLIC_DEPTH || ancestors.has(value)) {
+    state.truncated = true;
+    return depth >= MAX_PUBLIC_DEPTH ? "[max depth]" : "[cycle]";
   }
 
-  // The response contract depends only on the exact advertised option ids. Keep those plus the
-  // action identity; drop potentially huge tool payloads rather than truncating JSON recursively
-  // into a misleading command or path.
+  const nextAncestors = new Set(ancestors);
+  nextAncestors.add(value);
+  if (Array.isArray(value)) {
+    const kept = value.slice(0, MAX_PUBLIC_ARRAY_ITEMS).map((entry) =>
+      sanitizeValue(entry, state, depth + 1, nextAncestors)
+    );
+    if (value.length > MAX_PUBLIC_ARRAY_ITEMS) state.truncated = true;
+    return kept;
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of entries.slice(0, MAX_PUBLIC_OBJECT_KEYS)) {
+    const outwardKey = sanitizeString(key, state);
+    if (Object.hasOwn(output, outwardKey)) {
+      state.truncated = true;
+      continue;
+    }
+    if (sensitiveKey(key)) {
+      output[outwardKey] = "[REDACTED]";
+      state.redacted = true;
+    } else {
+      output[outwardKey] = sanitizeValue(child, state, depth + 1, nextAncestors);
+    }
+  }
+  if (entries.length > MAX_PUBLIC_OBJECT_KEYS) state.truncated = true;
+  return output;
+}
+
+function validMeta(value: unknown): value is Record<string, unknown> | null | undefined {
+  return value === undefined || value === null || (typeof value === "object" && !Array.isArray(value));
+}
+
+function validOption(option: PermissionOption): boolean {
+  return typeof option.optionId === "string" &&
+    option.optionId.length > 0 &&
+    option.optionId.length <= MAX_OPTION_ID_CODE_UNITS &&
+    Buffer.byteLength(option.optionId, "utf8") <= MAX_OPTION_ID_BYTES &&
+    typeof option.name === "string" &&
+    PERMISSION_OPTION_KINDS.has(option.kind) &&
+    validMeta(option._meta);
+}
+
+function sanitizeOption(option: PermissionOption, state: ProjectionState): PermissionOption {
   return {
-    request: {
-      sessionId: cloned.sessionId,
-      toolCall: {
-        toolCallId: cloned.toolCall.toolCallId,
-        ...(cloned.toolCall.title === undefined ? {} : { title: cloned.toolCall.title }),
-        ...(cloned.toolCall.kind === undefined ? {} : { kind: cloned.toolCall.kind }),
-        ...(cloned.toolCall.status === undefined ? {} : { status: cloned.toolCall.status }),
-      },
-      options: cloned.options,
-      ...(cloned._meta === undefined ? {} : { _meta: cloned._meta }),
-    },
-    truncated: true,
+    optionId: option.optionId,
+    name: sanitizeString(option.name, state),
+    kind: option.kind,
+    ...(option._meta === undefined
+      ? {}
+      : { _meta: sanitizeValue(option._meta, state) as Record<string, unknown> | null }),
   };
 }
 
-function validResponse(response: RequestPermissionResponse): boolean {
+function safeToolCall(
+  toolCall: RequestPermissionRequest["toolCall"],
+  state: ProjectionState,
+): RequestPermissionRequest["toolCall"] | undefined {
+  if (typeof toolCall.toolCallId !== "string" || toolCall.toolCallId.length === 0) return undefined;
+  const sanitized = sanitizeValue(toolCall, state);
+  if (sanitized === null || typeof sanitized !== "object" || Array.isArray(sanitized)) return undefined;
+  return {
+    ...(sanitized as RequestPermissionRequest["toolCall"]),
+    toolCallId: sanitizeString(toolCall.toolCallId, state),
+  };
+}
+
+function publicRequest(request: RequestPermissionRequest): PublicRequestProjection | undefined {
+  if (
+    !Array.isArray(request.options) ||
+    request.options.length === 0 ||
+    request.options.length > MAX_PERMISSION_OPTIONS ||
+    !request.options.every(validOption) ||
+    !validMeta(request._meta)
+  ) return undefined;
+  const optionIds = request.options.map((option) => option.optionId);
+  if (new Set(optionIds).size !== optionIds.length) return undefined;
+
+  const state: ProjectionState = { redacted: false, truncated: false };
+  const toolCall = safeToolCall(request.toolCall, state);
+  if (!toolCall) return undefined;
+  const options = request.options.map((option) => sanitizeOption(option, state));
+  const projected: WorkflowPermissionRequestProjection = {
+    toolCall,
+    options,
+    ...(request._meta === undefined
+      ? {}
+      : { _meta: sanitizeValue(request._meta, state) as Record<string, unknown> | null }),
+  };
+  if (Buffer.byteLength(JSON.stringify(projected), "utf8") <= MAX_PUBLIC_REQUEST_BYTES) {
+    return { request: projected, truncated: state.truncated, redacted: state.redacted };
+  }
+
+  // Preserve exact response ids and useful presentation while dropping optional diagnostics.
+  const minimal: WorkflowPermissionRequestProjection = {
+    toolCall: {
+      toolCallId: projected.toolCall.toolCallId,
+      ...(projected.toolCall.title === undefined ? {} : { title: projected.toolCall.title }),
+      ...(projected.toolCall.name === undefined ? {} : { name: projected.toolCall.name }),
+      ...(projected.toolCall.kind === undefined ? {} : { kind: projected.toolCall.kind }),
+      ...(projected.toolCall.status === undefined ? {} : { status: projected.toolCall.status }),
+    },
+    options: projected.options.map(({ optionId, name, kind }) => ({ optionId, name, kind })),
+  };
+  if (Buffer.byteLength(JSON.stringify(minimal), "utf8") > MAX_PUBLIC_REQUEST_BYTES) return undefined;
+  return { request: minimal, truncated: true, redacted: state.redacted };
+}
+
+function validResponse(response: WorkflowPermissionDecisionResponse): boolean {
+  if ("_meta" in response) return false;
   if (response.outcome.outcome === "cancelled") return true;
-  return typeof response.outcome.optionId === "string" && response.outcome.optionId.length > 0;
+  return typeof response.outcome.optionId === "string" &&
+    response.outcome.optionId.length > 0 &&
+    response.outcome.optionId.length <= MAX_OPTION_ID_CODE_UNITS &&
+    Buffer.byteLength(response.outcome.optionId, "utf8") <= MAX_OPTION_ID_BYTES;
 }
 
 /** Process-local broker for ACP requests that belong to live workflow agent calls. The request
@@ -157,7 +322,7 @@ export class WorkflowPermissionBroker {
   respond(
     runId: string,
     permissionId: string,
-    response: RequestPermissionResponse,
+    response: WorkflowPermissionDecisionResponse,
   ): WorkflowPermissionResponseAcknowledgement {
     if (!RUN_ID.test(runId) || !PERMISSION_ID.test(permissionId)) {
       throw new TypeError("Invalid workflow permission identity");
@@ -191,9 +356,9 @@ export class WorkflowPermissionBroker {
     request: RequestPermissionRequest,
     context: AcpEventContext & { runId: string; callIndex: number },
   ): Promise<RequestPermissionResponse> {
-    if (request.options.length === 0) return Promise.resolve({ outcome: { outcome: "cancelled" } });
-    const permissionId = randomUUID();
     const projection = publicRequest(request);
+    if (!projection) return Promise.resolve({ outcome: { outcome: "cancelled" } });
+    const permissionId = randomUUID();
     return new Promise<RequestPermissionResponse>((resolve) => {
       const entry: PendingEntry = {
         request: cloneRequest(request),
@@ -207,6 +372,7 @@ export class WorkflowPermissionBroker {
           requestedAt: new Date().toISOString(),
           request: projection.request,
           requestTruncated: projection.truncated,
+          requestRedacted: projection.redacted,
         },
         settle: resolve,
       };

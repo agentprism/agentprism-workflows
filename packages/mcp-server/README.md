@@ -507,9 +507,11 @@ visible as `AGENT_TIMEOUT`, `AGENT_IDLE_TIMEOUT`, and `AGENT_CANCELLED`. `limits
 runs), `concurrency`, `agentRetries`, `agentTimeoutMs`, and `agentIdleTimeoutMs` as resolved for
 this run (legacy persisted rows may omit it). Ordinary call-status projection never returns script,
 args, prompts, histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results;
-a live `pendingPermissions` entry deliberately carries its bounded ACP request so the caller can make
-the decision. Sensitive
-keys and credential-shaped strings are redacted before results are structurally compacted; every
+a live `pendingPermissions` entry carries a safe ACP projection so the caller can make the decision.
+The private ACP session id is omitted; diagnostic values are credential-redacted and scalar-bounded,
+and the complete ordered exact option-id set must fit within the 64 KiB permission envelope or the
+request is cancelled rather than exposed partially. Sensitive keys and credential-shaped strings are
+redacted before ordinary results are structurally compacted; every
 text scalar and preview is at most 512 UTF-8 bytes. The inherited structured status is at most
 24,576 bytes, retaining newest diagnostics by dropping oldest calls, logs, then phases. The full
 oldest-to-newest script lineage is mandatory: if that lineage alone makes the augmented envelope
@@ -527,9 +529,10 @@ Inspecting an existing failed/aborted run is still a successful read (`isError: 
 the payload `status`.
 
 Await inherits that safe status projection and returns early with `action-required` when a live ACP
-permission is pending. Inspect/await attach the request's exact ordered options. Elicitation-capable
-clients present one choice; other clients answer with `permissions-response`. The response validates
-its optionId and routes to the daemon generation holding the run lease. The workflow remains running
+permission is pending. Inspect/await attach the request's exact ordered option ids with bounded,
+redacted presentation metadata. Elicitation-capable clients present one choice; other clients answer
+with `permissions-response`. The response accepts only the selected exact optionId or cancellation—
+caller-supplied response `_meta` is forbidden—and routes to the daemon generation holding the run lease. The workflow remains running
 and keeps its ACP session/concurrency slot; the idle watchdog is suspended while total wall time
 continues. This state is execution-affine, not a durable pause, and cannot be reconstructed after
 owner loss.

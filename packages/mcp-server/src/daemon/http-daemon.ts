@@ -211,7 +211,7 @@ function isPermissionResponse(value: unknown): boolean {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
   const keys = Object.keys(row).sort();
-  if (!keys.every((key) => key === "_meta" || key === "outcome")) return false;
+  if (keys.join(",") !== "outcome") return false;
   const outcome = row.outcome;
   if (outcome === null || typeof outcome !== "object" || Array.isArray(outcome)) return false;
   const decision = outcome as Record<string, unknown>;

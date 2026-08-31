@@ -7,9 +7,9 @@ import { requireDurableStoppedRun } from "../workflow-stop.js";
 import {
   WorkflowPermissionBroker,
   type WorkflowPendingPermission,
+  type WorkflowPermissionDecisionResponse,
   type WorkflowPermissionResponseAcknowledgement,
 } from "../workflow-permissions.js";
-import type { RequestPermissionResponse } from "@automatalabs/workflows";
 import {
   pidIsAlive,
   probeHealthz,
@@ -63,7 +63,7 @@ export interface WorkflowRunControlRouter {
   listPermissions(manager: WorkflowManager, runId: string): Promise<WorkflowPendingPermission[]>;
   respondPermission(
     manager: WorkflowManager,
-    input: { runId: string; permissionId: string; response: RequestPermissionResponse },
+    input: { runId: string; permissionId: string; response: WorkflowPermissionDecisionResponse },
   ): Promise<WorkflowPermissionResponseAcknowledgement>;
 }
 
@@ -76,7 +76,7 @@ export type InternalRunControlRequest =
       runId: string;
       action: "respond-permission";
       permissionId: string;
-      response: RequestPermissionResponse;
+      response: WorkflowPermissionDecisionResponse;
     };
 
 export type InternalRunControlResponse =
@@ -381,7 +381,7 @@ export class DaemonRunControl implements WorkflowRunControlRouter {
 
   async respondPermission(
     manager: WorkflowManager,
-    input: { runId: string; permissionId: string; response: RequestPermissionResponse },
+    input: { runId: string; permissionId: string; response: WorkflowPermissionDecisionResponse },
   ): Promise<WorkflowPermissionResponseAcknowledgement> {
     if (manager.getRun(input.runId) && this.permissionBroker.has(input.runId, input.permissionId)) {
       return this.permissionBroker.respond(input.runId, input.permissionId, input.response);

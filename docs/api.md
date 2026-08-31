@@ -1462,6 +1462,12 @@ persisted records that predate limit storage may omit it. Failed call rows inclu
 `timeoutMs`, `idleTimeoutMs`, and `errorCode`, so an exhausted attempt is directly inspectable as `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`.
 
 ```ts
+interface WorkflowPermissionRequestProjection {
+  toolCall: RequestPermissionRequest["toolCall"]; // safe projection; ACP sessionId is omitted
+  options: PermissionOption[]; // complete ordered exact optionIds; presentation is redacted/bounded
+  _meta?: Record<string, unknown> | null; // redacted/bounded when retained
+}
+
 interface WorkflowPendingPermission {
   version: 1;
   permissionId: string;
@@ -1470,8 +1476,9 @@ interface WorkflowPendingPermission {
   backendId: string;
   label?: string;
   requestedAt: string;
-  request: RequestPermissionRequest; // exact ordered options; oversized tool diagnostics may be omitted
+  request: WorkflowPermissionRequestProjection;
   requestTruncated: boolean;
+  requestRedacted: boolean;
 }
 
 interface WorkflowAwaitMetadata {
@@ -1546,7 +1553,7 @@ Runs execute in the shared per-user workflow daemon (the default stdio entry is 
 The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
 feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 
-Inspect returns `WorkflowRunStatus` plus live `pendingPermissions` and interaction guidance when applicable. Its JSON structured content is capped at 24,576 bytes
+Inspect returns `WorkflowRunStatus` plus live `pendingPermissions` and interaction guidance when applicable. Permission diagnostics are credential-redacted and scalar-bounded, omit the private ACP session id, and preserve the complete ordered exact option-id list inside a separate 64 KiB envelope; an option set that cannot be represented safely is cancelled instead of partially exposed. Permission responses accept only cancellation or an exact selected optionId and forbid caller-supplied response `_meta`. Its JSON structured content is capped at 24,576 bytes
 and its formatted text at 8,192 bytes. An existing failed or aborted run is still a successful read.
 An unknown/corrupt/unreadable run is `isError:true`, has no structured content, and returns exactly
 `No workflow run found for runId "<runId>" in this server's project-scoped run store.` Execution keeps current error semantics: failed/aborted are tool errors, paused is a successful resumable call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped at 12,288 bytes; rejected preflight scripts instead carry bounded structured validation diagnostics and have no run ID or tail.

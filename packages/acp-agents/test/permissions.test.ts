@@ -7,7 +7,10 @@ import type { PermissionOption, RequestPermissionRequest, ToolKind } from "@agen
 import {
   decideExplicitToolPolicy,
   decidePermission,
+  resolvePermission,
   selectPermissionOption,
+  withPersist,
+  type PermissionResolution,
   type ToolPolicy,
 } from "../src/index.js";
 
@@ -179,53 +182,28 @@ test("exact selection distinguishes options with the same presentation kind", ()
   });
 });
 
-test("Codex command, file, additional-permission, and MCP matrices retain exact choices", () => {
-  const fixtures = [
-    {
-      name: "command amendment",
-      options: [
-        { optionId: "allow_once", name: "Proceed", kind: "allow_once" as const },
-        { optionId: "allow_for_session", name: "Session", kind: "allow_always" as const },
-        { optionId: "accept_execpolicy_amendment", name: "Install prefix", kind: "allow_always" as const },
-        { optionId: "cancel", name: "Cancel", kind: "reject_once" as const },
-      ],
-      selected: "accept_execpolicy_amendment",
-    },
-    {
-      name: "file session",
-      options: [
-        { optionId: "allow_once", name: "Proceed", kind: "allow_once" as const },
-        { optionId: "allow_for_session", name: "Remember files", kind: "allow_always" as const },
-        { optionId: "cancel", name: "Cancel", kind: "reject_once" as const },
-      ],
-      selected: "allow_for_session",
-    },
-    {
-      name: "additional permission strict review",
-      options: [
-        { optionId: "allow_permissions_turn", name: "Grant turn", kind: "allow_once" as const },
-        { optionId: "allow_permissions_turn_strict_auto_review", name: "Grant strict", kind: "allow_once" as const },
-        { optionId: "allow_permissions_session", name: "Grant session", kind: "allow_always" as const },
-        { optionId: "reject_permissions", name: "Reject", kind: "reject_once" as const },
-      ],
-      selected: "allow_permissions_turn_strict_auto_review",
-    },
-    {
-      name: "MCP permanent approval",
-      options: [
-        { optionId: "allow_once", name: "Allow", kind: "allow_once" as const },
-        { optionId: "allow_session", name: "Session", kind: "allow_always" as const },
-        { optionId: "allow_always", name: "Always", kind: "allow_always" as const },
-        { optionId: "cancel", name: "Cancel", kind: "reject_once" as const },
-      ],
-      selected: "allow_always",
-    },
-  ];
-  for (const fixture of fixtures) {
-    assert.deepEqual(
-      selectPermissionOption(req({ title: fixture.name }, fixture.options), fixture.selected),
-      { outcome: { outcome: "selected", optionId: fixture.selected } },
-      fixture.name,
-    );
-  }
+test("deprecated persistence helpers retain their legacy response shape without promising provider scope", () => {
+  const resolution: PermissionResolution = { outcome: "allow", persist: "session" };
+  const resolved = resolvePermission(req({ title: "read" }), resolution);
+  assert.deepEqual(resolved, {
+    outcome: { outcome: "selected", optionId: "allow-1" },
+    _meta: { persist: "session" },
+  });
+
+  const selected = { outcome: { outcome: "selected", optionId: "allow-1" }, _meta: { keep: 1 } } as const;
+  assert.deepEqual(withPersist(selected, "always"), {
+    outcome: { outcome: "selected", optionId: "allow-1" },
+    _meta: { keep: 1, persist: "always" },
+  });
+  assert.strictEqual(withPersist({ outcome: { outcome: "cancelled" } }, "always").outcome.outcome, "cancelled");
+});
+
+test("legacy ToolPolicy.persist remains an allow-only compatibility echo", () => {
+  assert.deepEqual(decidePermission(req({ title: "read" }), { persist: "always" }), {
+    outcome: { outcome: "selected", optionId: "allow-1" },
+    _meta: { persist: "always" },
+  });
+  assert.deepEqual(decidePermission(req({ title: "bash" }), { deny: ["bash"], persist: "always" }), {
+    outcome: { outcome: "selected", optionId: "reject-1" },
+  });
 });

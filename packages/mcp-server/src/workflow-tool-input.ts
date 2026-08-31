@@ -12,7 +12,6 @@ const permissionResponseSchema = z.object({
     z.object({ outcome: z.literal("cancelled") }).strict(),
     z.object({ outcome: z.literal("selected"), optionId: z.string().min(1).max(512) }).strict(),
   ]),
-  _meta: z.record(z.string(), z.unknown()).nullable().optional(),
 }).strict();
 
 const checkpointRepliesSchema = z.record(

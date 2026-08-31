@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
+import { createAcpRunner } from "@automatalabs/workflows";
 import { WorkflowPermissionBroker } from "../src/workflow-permissions.js";
 import { connect, makeRunner, structured } from "./_harness.js";
 
@@ -47,6 +51,12 @@ test("a foreground call returns action-required without abandoning its live run"
     const runId = result.runId as string;
     const pending = broker.list(runId)[0]!;
     broker.respond(runId, pending.permissionId, { outcome: { outcome: "cancelled" } });
+    const completed = structured(await connected.client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId, waitMs: 2_000 },
+    }));
+    assert.equal(completed.status, "completed");
+    assert.equal((completed.outcome as Record<string, unknown>).result, "done");
   } finally {
     await connected.dispose();
     broker.dispose();
@@ -67,8 +77,8 @@ test("inspect exposes a live permission and permissions-response resumes the wor
         },
         options: [
           { optionId: "allow_once", name: "Yes, proceed", kind: "allow_once" },
-          { optionId: "allow_for_session", name: "Allow for session", kind: "allow_always" },
-          { optionId: "cancel", name: "Cancel", kind: "reject_once" },
+          { optionId: "decline", name: "Continue without running", kind: "reject_once" },
+          { optionId: "cancel", name: "Stop and revise the action", kind: "reject_once" },
         ],
       },
       {
@@ -106,7 +116,7 @@ test("inspect exposes a live permission and permissions-response resumes the wor
         action: "permissions-response",
         runId,
         permissionId,
-        response: { outcome: { outcome: "selected", optionId: "allow_for_session" } },
+        response: { outcome: { outcome: "selected", optionId: "cancel" } },
       },
     }));
     assert.equal((responded.permissionResponse as Record<string, unknown>).permissionId, permissionId);
@@ -116,7 +126,7 @@ test("inspect exposes a live permission and permissions-response resumes the wor
       arguments: { action: "await", runId, waitMs: 2_000 },
     }));
     assert.equal(awaited.status, "completed");
-    assert.equal((awaited.outcome as Record<string, unknown>).result, "selected:allow_for_session");
+    assert.equal((awaited.outcome as Record<string, unknown>).result, "selected:cancel");
   } finally {
     await connected.dispose();
     broker.dispose();
@@ -168,6 +178,105 @@ test("an elicitation-capable inspect presents the exact options and resumes the 
   } finally {
     await connected.dispose();
     broker.dispose();
+  }
+});
+
+test("the real ACP client, broker, and MCP tool preserve a same-kind Codex choice end to end", async () => {
+  const fakeAgent = resolve(import.meta.dirname, "../../acp-agents/test/fixtures/fake-acp-agent.mjs");
+  const tempDir = await mkdtemp(join(tmpdir(), "agentprism-permission-choice-"));
+  const logPath = join(tempDir, "fake-agent.jsonl");
+  const previous = {
+    command: process.env.AGENTPRISM_CODEX_ACP_CMD,
+    args: process.env.AGENTPRISM_CODEX_ACP_ARGS,
+    scenario: process.env.AGENTPRISM_FAKE_SCENARIO,
+    log: process.env.AGENTPRISM_FAKE_LOG,
+  };
+  process.env.AGENTPRISM_CODEX_ACP_CMD = process.execPath;
+  process.env.AGENTPRISM_CODEX_ACP_ARGS = fakeAgent;
+  process.env.AGENTPRISM_FAKE_LOG = logPath;
+  process.env.AGENTPRISM_FAKE_SCENARIO = JSON.stringify({
+    configOptions: [],
+    modes: {
+      currentModeId: "read-only",
+      availableModes: [{ id: "agent", name: "Approve for me" }],
+    },
+    turns: [{
+      toolCall: {
+        title: "Run command",
+        kind: "execute",
+        options: [
+          { optionId: "allow_once", name: "Run", kind: "allow_once" },
+          { optionId: "decline", name: "Continue without it", kind: "reject_once" },
+          { optionId: "cancel", name: "Stop and revise", kind: "reject_once" },
+        ],
+      },
+      text: "provider-finished",
+    }],
+  });
+
+  const broker = new WorkflowPermissionBroker();
+  const runner = createAcpRunner({
+    onPermissionRequest: broker.resolver,
+    enforceToolPolicyBeforePermissionResolver: true,
+  });
+  broker.attach(runner);
+  const connected = await connect(runner, { permissionBroker: broker });
+  try {
+    const started = structured(await connected.client.callTool({
+      name: "workflow",
+      arguments: { script: SCRIPT, background: true },
+    }));
+    const runId = started.runId as string;
+    await eventually(() => broker.has(runId));
+
+    const inspected = structured(await connected.client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId },
+    }));
+    const [permission] = inspected.pendingPermissions as Array<{
+      permissionId: string;
+      request: { options: Array<{ optionId: string }> };
+    }>;
+    assert.ok(permission);
+    assert.deepEqual(
+      permission.request.options.map(({ optionId }) => optionId),
+      ["allow_once", "decline", "cancel"],
+    );
+    await connected.client.callTool({
+      name: "workflow",
+      arguments: {
+        action: "permissions-response",
+        runId,
+        permissionId: permission.permissionId,
+        response: { outcome: { outcome: "selected", optionId: "cancel" } },
+      },
+    });
+    const terminal = structured(await connected.client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId, waitMs: 3_000 },
+    }));
+    assert.equal((terminal.outcome as Record<string, unknown>).result, "provider-finished");
+    const records = (await readFile(logPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { method?: string; outcome?: unknown });
+    assert.deepEqual(
+      records.find(({ method }) => method === "permissionOutcome")?.outcome,
+      { outcome: "selected", optionId: "cancel" },
+    );
+  } finally {
+    await connected.dispose();
+    broker.dispose();
+    await runner.dispose();
+    if (previous.command === undefined) delete process.env.AGENTPRISM_CODEX_ACP_CMD;
+    else process.env.AGENTPRISM_CODEX_ACP_CMD = previous.command;
+    if (previous.args === undefined) delete process.env.AGENTPRISM_CODEX_ACP_ARGS;
+    else process.env.AGENTPRISM_CODEX_ACP_ARGS = previous.args;
+    if (previous.scenario === undefined) delete process.env.AGENTPRISM_FAKE_SCENARIO;
+    else process.env.AGENTPRISM_FAKE_SCENARIO = previous.scenario;
+    if (previous.log === undefined) delete process.env.AGENTPRISM_FAKE_LOG;
+    else process.env.AGENTPRISM_FAKE_LOG = previous.log;
+    await rm(tempDir, { recursive: true, force: true });
   }
 });
 
