@@ -319,9 +319,9 @@ reference host's generic core client must advertise.
 
 | Param | Type | Notes |
 |---|---|---|
-| `action` | `"config" \| "run" \| "inspect" \| "await" \| "permissions-response" \| "stop"` | `"config"` performs zero-token live backend discovery. Omit or use `"run"` for validation plus execution. `permissions-response` resolves one live ACP request using an exact advertised option. |
-| `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/permissions-response/stop. |
-| `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for inspect/await/permissions-response/stop. |
+| `action` | `"config" \| "run" \| "inspect" \| "await" \| "result" \| "permissions-response" \| "stop"` | `"config"` performs zero-token live backend discovery. Omit or use `"run"` for validation plus execution. `"result"` pages a completed exact JSON result. `permissions-response` resolves one live ACP request using an exact advertised option. |
+| `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for inspect/await/result/permissions-response/stop. |
+| `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for inspect/await/result/permissions-response/stop. |
 | `projectDir` | absolute path string | Config/run: project-sensitive discovery cwd and the run's project store/default cwd. Required for both on the shared daemon; defaults to the server's project under `--in-process`. |
 | `harnesses` | string[] | Config only: optional backend names to probe; omission discovers every registered backend. |
 | `modelSpecs` | string[] | Config only: select exact routed models before reading their model-specific options. |
@@ -337,11 +337,13 @@ reference host's generic core client must advertise.
 | `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
 | `resumePolicy` | `"auto" \| "positional"` | Default `"auto"`; positional requests index/prefix matching but cannot bypass new-format format, metadata, manifest, input, or safety checks. Requires `resumeFromRunId`. |
 | `checkpointReplies` | object | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to its decision. Keys must be canonical non-negative integer strings on the JSON wire. |
-| `runId` | string | Required for inspect/await/permissions-response/stop; the project-scoped run capability returned by execution. |
+| `runId` | string | Required for inspect/await/result/permissions-response/stop; the project-scoped run capability returned by execution. |
 | `permissionId` | UUID string | Permissions-response only: opaque pending request id returned by inspect/await. |
 | `response` | ACP permission response | Permissions-response only: `{ outcome:{ outcome:"selected", optionId } }` using an exact advertised option, or `{ outcome:{ outcome:"cancelled" } }`. |
 | `callIndex` | integer | Stop only: cancel exactly that one in-flight agent call (its slot settles to `null` with `AGENT_CANCELLED`) without aborting the run. Forbidden for every other action. |
 | `waitMs` | integer | Await only: default 20,000, range 0–25,000; zero is a non-blocking status read. |
+| `offset` | integer | Result only: UTF-8 byte offset, default zero; continue at the prior `endOffset`. |
+| `maxBytes` | integer | Result only: exact chunk size bound, 4–16,384 bytes; default 16,384. |
 | `lastN` | integer | Inspect/await/stop: latest matching calls, default 20, range 1–50. |
 | `labelGlob` | string | Inspect/await/stop: case-sensitive whole-label glob (`*`, `?`, backslash escaping). |
 | `logLines` | integer | Inspect/await/stop: latest log lines, default 20, range 0–50. |
@@ -369,7 +371,11 @@ Then long-poll in ordinary bounded tool calls until `outcome` appears:
 ```
 
 A timeout returns the freshest bounded status and partial cumulative token usage; terminal await
-adds the same raw result/log projection a foreground call returns. Await returns early with
+adds the same raw result/log projection a foreground call returns. Completed foreground/inspect/await
+responses expose `workflow://runs/{runId}/result` separately from the script resource. Exact JSON up
+to 4,096 UTF-8 bytes is copied into foreground/await text for content-first hosts; larger results
+point to that resource and bounded `action:"result"` paging (`endOffset` + `hasMore`). The
+bounded/redacted events stream is observability, not an exact-result API. Await returns early with
 `wait.returnedBecause:"action-required"` when an ACP permission is pending. Inspect and await include
 the complete ordered exact option ids with credential-redacted, bounded diagnostics and no private ACP
 session id; requests that cannot fit safely fail closed. Elicitation-capable clients present them to

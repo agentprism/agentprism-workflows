@@ -33,7 +33,7 @@ const LIMITS = {
 const ADMISSION_LOG =
   "agent timeout admission: total-wall ceiling none; idle ceiling disabled; each retry re-arms both clocks";
 
-function inspectionFixture(status: "running" | "completed" | "aborted" = "running") {
+function inspectionFixture(status: "running" | "completed" | "failed" | "aborted" = "running") {
   return {
     runId: "fixture-run",
     status,
@@ -109,6 +109,19 @@ function outputVariantFixtures() {
     ...terminalOutcomeFixture,
     scriptSource: "inline" as const,
   };
+  const resultRetrieval = {
+    action: "result" as const,
+    runId: "fixture-run",
+    status: "completed" as const,
+    resultUri: "workflow://runs/fixture-run/result",
+    mimeType: "application/json" as const,
+    encoding: "utf-8" as const,
+    totalBytes: 2,
+    offset: 0,
+    endOffset: 2,
+    hasMore: false,
+    chunk: "42",
+  };
   const config = {
     action: "config" as const,
     ok: true,
@@ -127,7 +140,7 @@ function outputVariantFixtures() {
       omittedWarnings: 0,
     },
   };
-  return { config, rejected, execution, background, inspection, terminalAwait, nonterminalAwait, stop, pendingStop };
+  return { resultRetrieval, config, rejected, execution, background, inspection, terminalAwait, nonterminalAwait, stop, pendingStop };
 }
 
 // Engine-owned run id shape (run-persistence.generateRunId): `${base36ts}-${base36rand}`.
@@ -148,6 +161,7 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     assert.ok(tool, "the workflow tool is registered");
     assert.match(tool.description ?? "", /registry built-ins—currently Claude, Codex, OpenCode, and pi/);
     assert.match(tool.description ?? "", /action:\"config\"/);
+    assert.match(tool.description ?? "", /action:\"result\"/);
     assert.match(tool.description ?? "", /automatically performs static validation, a mocked dry run, and routed config checks/);
     assert.match(tool.description ?? "", /Every parallel entry must be a thunk/);
     assert.match(tool.description ?? "", /phases must be an array of objects shaped `\{ title: string, detail\?: string, model\?: string \}`, never an array of strings/);
@@ -175,6 +189,7 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       "runId",
       "status",
       "result",
+      "resultUri",
       "tokenUsage",
       "logs",
       "authContext",
@@ -200,13 +215,21 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       "pendingPermissions",
       "interaction",
       "permissionResponse",
+      "mimeType",
+      "encoding",
+      "totalBytes",
+      "offset",
+      "endOffset",
+      "hasMore",
+      "chunk",
     ]) {
       assert.ok(outProps.includes(k), `output schema exposes ${k}`);
     }
     assert.deepEqual(field(tool.outputSchema, "required"), undefined);
     const variants = field(tool.outputSchema, "oneOf") as Array<Record<string, unknown>>;
-    assert.equal(variants.length, 9);
+    assert.equal(variants.length, 10);
     assert.deepEqual(variants.map((variant) => variant.required), [
+      ["action", "runId", "status", "resultUri", "mimeType", "encoding", "totalBytes", "offset", "endOffset", "hasMore", "chunk"],
       ["action", "ok", "harnessOptions", "omittedHarnesses", "models"],
       ["action", "status", "validation"],
       ["runId", "status", "scriptUri", "scriptSource", "limits"],
@@ -670,6 +693,25 @@ test("runtime and advertised output schemas enforce exact result branches", asyn
   }
 
   const invalid = {
+    "result retrieval without chunk": (() => {
+      const { chunk: _chunk, ...withoutChunk } = fixtures.resultRetrieval;
+      return withoutChunk;
+    })(),
+    "result retrieval with script URI": { ...fixtures.resultRetrieval, scriptUri: "workflow://runs/fixture-run/script" },
+    "result retrieval with run limits": { ...fixtures.resultRetrieval, limits: LIMITS },
+    "failed inspection with result URI": {
+      ...inspectionFixture("failed"),
+      resultUri: "workflow://runs/fixture-run/result",
+    },
+    "failed await outcome with result URI": {
+      ...inspectionFixture("failed"),
+      wait: { requestedMs: 100, elapsedMs: 5, returnedBecause: "terminal" as const },
+      outcome: {
+        ...terminalOutcomeFixture,
+        status: "failed" as const,
+        resultUri: "workflow://runs/fixture-run/result",
+      },
+    },
     "config with a run id": { ...fixtures.config, runId: "bad-run" },
     "config without models": (() => {
       const { models: _models, ...withoutModels } = fixtures.config;

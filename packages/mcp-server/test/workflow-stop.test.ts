@@ -730,7 +730,7 @@ test("stop cancels an in-flight foreground checkpoint elicitation", async () => 
     });
     await waitUntil(() => elicitationStarted, "the client should receive the checkpoint elicitation");
     const listed = await client.listResources();
-    const resource = listed.resources.find((candidate) => candidate.name.startsWith("elicitation-stop ("));
+    const resource = listed.resources.find((candidate) => candidate.name.startsWith("elicitation-stop script ("));
     assert.ok(resource);
     const runId = resource.uri.split("/").at(-2);
     assert.ok(runId);

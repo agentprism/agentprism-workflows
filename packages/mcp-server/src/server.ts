@@ -13,6 +13,7 @@ import type {
   ServerContext,
   ServerNotifier,
   ToolCallback,
+  ResourceLink,
 } from "@modelcontextprotocol/server";
 
 // packages/mcp-server/src/server.ts
@@ -72,7 +73,12 @@ import {
 
 import { z } from "zod";
 
-import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "./workflow-tool-input.js";
+import {
+  clampWorkflowInput,
+  parseWorkflowToolInput,
+  workflowToolInputShape,
+  WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT,
+} from "./workflow-tool-input.js";
 import {
   DEFAULT_BACKEND_ENV,
   NoAutoDefaultBackendError,
@@ -96,6 +102,7 @@ import {
 } from "./workflow-tool-output.js";
 import type {
   WorkflowExecutionOutcome,
+  WorkflowResultRetrieval,
   WorkflowRunAwaitResult,
   WorkflowStopPendingResult,
   WorkflowStopResult,
@@ -119,7 +126,9 @@ import {
 } from "./workflow-preflight.js";
 import type { WorkflowServerControl } from "./lifecycle.js";
 import {
+  RESULT_RESOURCE_MIME_TYPE,
   WorkflowScriptResources,
+  workflowResultUri,
   workflowScriptUri,
 } from "./workflow-resources.js";
 import { requireDurableStoppedRun } from "./workflow-stop.js";
@@ -1290,6 +1299,9 @@ function persistedOutcome(
       ? {}
       : { replayEligibility: persisted.replayEligibility }),
     scriptUri: workflowScriptUri(persisted.runId),
+    ...(status.status === "completed" && persisted.result !== undefined
+      ? { resultUri: workflowResultUri(persisted.runId) }
+      : {}),
   };
 }
 
@@ -1298,12 +1310,122 @@ function terminalOutcome(
   runId: string,
   status: WorkflowRunStatus,
 ): WorkflowExecutionOutcome | undefined {
+  const persisted = manager.getPersistence().load(runId);
+  const resultUri = persisted?.status === "completed" && persisted.result !== undefined
+    ? workflowResultUri(runId)
+    : undefined;
   const live = manager.getRun(runId)?.result;
   if (live) {
-    return toWorkflowExecutionOutcome(live, { scriptUri: workflowScriptUri(runId) });
+    return toWorkflowExecutionOutcome(live, {
+      scriptUri: workflowScriptUri(runId),
+      ...(resultUri === undefined ? {} : { resultUri }),
+    });
   }
-  const persisted = manager.getPersistence().load(runId);
   return persisted ? persistedOutcome(persisted, status) : undefined;
+}
+
+const INLINE_WORKFLOW_RESULT_MAX_BYTES = 4_096;
+
+type WorkflowResultContentBlock =
+  | { type: "text"; text: string; annotations?: { audience: ["assistant"] } }
+  | ResourceLink;
+
+function resultResourceFields(resources: WorkflowScriptResources, runId: string): { resultUri?: string } {
+  const resultUri = resources.availableResultUri(runId);
+  return resultUri === undefined ? {} : { resultUri };
+}
+
+/**
+ * Compatibility projection for content-first MCP clients. Small results are copied exactly as
+ * JSON; large results stay out of the tool envelope and point to both the exact resource and the
+ * bounded result action.
+ */
+function resultContentBlocks(
+  resources: WorkflowScriptResources,
+  runId: string,
+  inline: boolean,
+): WorkflowResultContentBlock[] {
+  const link = resources.resultLink(runId);
+  if (!link) return [];
+  const resultUri = link.uri;
+  if (inline) {
+    const result = resources.serializedResult(runId);
+    if (result.bytes <= INLINE_WORKFLOW_RESULT_MAX_BYTES) {
+      return [
+        {
+          type: "text",
+          text: `Workflow result (exact JSON):\n${result.text}`,
+          annotations: { audience: ["assistant"] },
+        },
+        link,
+      ];
+    }
+    return [
+      {
+        type: "text",
+        text:
+          `Exact workflow result: ${result.bytes} UTF-8 bytes at ${resultUri}. ` +
+          `Read that resource directly, or call workflow with action="result", runId="${runId}", ` +
+          `offset=0 and follow endOffset while hasMore is true for bounded exact chunks.`,
+        annotations: { audience: ["assistant"] },
+      },
+      link,
+    ];
+  }
+  return [
+    {
+      type: "text",
+      text:
+        `Exact workflow result: ${resultUri}. Read that resource directly, or call workflow with ` +
+        `action="result", runId="${runId}", offset=0 and follow endOffset while hasMore is true ` +
+        `for bounded exact chunks.`,
+      annotations: { audience: ["assistant"] },
+    },
+    link,
+  ];
+}
+
+function isUtf8ContinuationByte(byte: number | undefined): boolean {
+  return byte !== undefined && (byte & 0xc0) === 0x80;
+}
+
+function resultRetrievalPage(
+  resources: WorkflowScriptResources,
+  runId: string,
+  offset: number,
+  maxBytes: number,
+): WorkflowResultRetrieval {
+  const result = resources.serializedResult(runId);
+  const buffer = Buffer.from(result.text, "utf8");
+  if (offset > buffer.length) {
+    throw new ProtocolError(
+      ProtocolErrorCode.InvalidParams,
+      `Workflow result offset ${offset} exceeds totalBytes ${buffer.length} for runId "${runId}".`,
+    );
+  }
+  if (offset < buffer.length && isUtf8ContinuationByte(buffer[offset])) {
+    throw new ProtocolError(
+      ProtocolErrorCode.InvalidParams,
+      `Workflow result offset ${offset} is not a UTF-8 boundary for runId "${runId}"; use the previous endOffset.`,
+    );
+  }
+  let endOffset = Math.min(buffer.length, offset + maxBytes);
+  while (endOffset > offset && endOffset < buffer.length && isUtf8ContinuationByte(buffer[endOffset])) {
+    endOffset--;
+  }
+  return {
+    action: "result",
+    runId,
+    status: "completed",
+    resultUri: result.uri,
+    mimeType: RESULT_RESOURCE_MIME_TYPE,
+    encoding: "utf-8",
+    totalBytes: buffer.length,
+    offset,
+    endOffset,
+    hasMore: endOffset < buffer.length,
+    chunk: buffer.subarray(offset, endOffset).toString("utf8"),
+  };
 }
 
 const AWAIT_CANCELLED = Symbol("await-cancelled");
@@ -1744,14 +1866,14 @@ export function createWorkflowServer(
         "Config opens no-prompt sessions, spends zero tokens, and starts no workflow. " +
         "action:\"run\" automatically performs static validation, a mocked dry run, and routed config checks before admission. " +
         "Invalid scripts return bounded diagnostics with status:\"rejected\" and create no run ID, reserve no background slot, and spend no tokens. " +
-        "Run, resume, inspect, await, answer a live ACP permission, or stop an admitted workflow through the same tool. The " +
+        "Run, resume, inspect, await, retrieve an exact completed result, answer a live ACP permission, or stop an admitted workflow through the same tool. The " +
         "script orchestrates agent() subagents (and optional checkpoint() gates) over registry built-ins—currently Claude, Codex, OpenCode, and pi—" +
         "ACP backends, plus registered custom agents. Supply exactly one of inline script or absolute scriptPath; path content is " +
         "read once and snapshotted at admission. " +
         (requireProjectDir
           ? "config and run REQUIRE projectDir (absolute): it is the discovery cwd and selects the project-scoped run store/default execution cwd. "
           : "run optionally takes projectDir (absolute) to select the project-scoped run store; default is this server's own project. ") +
-        "inspect/await/stop/permissions-response locate the project store from runId and never accept projectDir. " +
+        "inspect/await/result/stop/permissions-response locate the project store from runId and never accept projectDir. " +
         "Foreground is the default and streams progress; background:true returns " +
         "a durable runId for bounded action:\"await\" calls. run and await honor _meta.progressToken " +
         "with notifications/progress while they block. Pass resumeFromRunId to execute a new " +
@@ -1762,7 +1884,7 @@ export function createWorkflowServer(
         'Use action:"inspect" with a runId when you need machine-readable status data: a safe bounded status, log tail, attributed call previews, and pending ACP permissions. Await returns early with action-required when one appears. Elicitation-capable hosts can present the exact backend options; otherwise use action:"permissions-response" with the returned permissionId and an exact advertised optionId or cancelled outcome. ' +
         'Use action:"stop" to durably abort through the run\'s execution owner; cross-generation control may return a durable pending operationId before final settlement. Add callIndex to cancel only that live agent and keep the run live. forceOwner explicitly authorizes terminating a superseded owner and is forbidden with callIndex. ' +
         "labelGlob remains an output filter. A final whole-run stop makes resume safe immediately; pending control must be retried or observed with inspect/await. " +
-        "Every admitted script is readable at workflow://runs/{runId}/script and results include resource links. " +
+        "Every admitted script is readable at workflow://runs/{runId}/script. Completed JSON results are readable at workflow://runs/{runId}/result; small results are also copied into text for content-first hosts, while large results can be paged exactly with action:\"result\", offset, and maxBytes. Result and script resource links are labelled separately. " +
         "Background runs are tracked per project, capped at four active/starting runs, and use " +
         "headless checkpoint semantics; checkpointReplies continue a checkpoint pause in a new run.",
     inputSchema: workflowToolInputSchema,
@@ -1927,7 +2049,12 @@ export function createWorkflowServer(
         );
         const projected = addInspectionResourceFields(
           status,
-          { scriptUri: workflowScriptUri(requestState.runId), lineage, pendingPermissions: remaining },
+          {
+            scriptUri: workflowScriptUri(requestState.runId),
+            ...resultResourceFields(scriptResources, requestState.runId),
+            lineage,
+            pendingPermissions: remaining,
+          },
           inspectionRetentionMetadata(manager, requestState.runId, status),
         );
         return {
@@ -1943,6 +2070,7 @@ export function createWorkflowServer(
                 `${formatInspectionSummary(projected)}`,
               annotations: { audience: ["assistant"] },
             },
+            ...resultContentBlocks(scriptResources, requestState.runId, false),
             ...scriptResources.links(lineage),
           ],
           isError: false,
@@ -2041,6 +2169,36 @@ export function createWorkflowServer(
           }
         }
       }
+      if (parsedInput.action === "result") {
+        try {
+          const page = resultRetrievalPage(
+            scriptResources,
+            parsedInput.runId,
+            parsedInput.offset ?? 0,
+            parsedInput.maxBytes ?? WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT,
+          );
+          const resultLink = scriptResources.resultLink(parsedInput.runId);
+          return {
+            structuredContent: { ...page },
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(page),
+                annotations: { audience: ["assistant"] },
+              },
+              ...(resultLink === undefined ? [] : [resultLink]),
+            ],
+            isError: false,
+          };
+        } catch (error) {
+          if (!(error instanceof ProtocolError)) throw error;
+          return {
+            content: [{ type: "text", text: error.message }],
+            isError: true,
+          };
+        }
+      }
+
       if (parsedInput.action === "permissions-response") {
         const acknowledgement = await respondToPermission(
           manager,
@@ -2068,7 +2226,12 @@ export function createWorkflowServer(
         );
         const projected = addInspectionResourceFields(
           status,
-          { scriptUri: workflowScriptUri(parsedInput.runId), lineage, pendingPermissions },
+          {
+            scriptUri: workflowScriptUri(parsedInput.runId),
+            ...resultResourceFields(scriptResources, parsedInput.runId),
+            lineage,
+            pendingPermissions,
+          },
           inspectionRetentionMetadata(manager, parsedInput.runId, status),
         );
         return {
@@ -2085,6 +2248,7 @@ export function createWorkflowServer(
                 formatPendingPermissions(pendingPermissions),
               annotations: { audience: ["assistant"] },
             },
+            ...resultContentBlocks(scriptResources, parsedInput.runId, false),
             ...scriptResources.links(lineage),
           ],
           isError: false,
@@ -2164,6 +2328,7 @@ export function createWorkflowServer(
           status,
           {
             scriptUri: workflowScriptUri(parsedInput.runId),
+            ...resultResourceFields(scriptResources, parsedInput.runId),
             lineage,
             pendingPermissions,
             interaction: permissionInteraction(canElicitPermission),
@@ -2186,6 +2351,7 @@ export function createWorkflowServer(
                 formatPendingPermissions(pendingPermissions),
               annotations: { audience: ["assistant"] },
             },
+            ...resultContentBlocks(scriptResources, parsedInput.runId, false),
             ...scriptResources.links(lineage),
           ],
           isError: false,
@@ -2395,6 +2561,7 @@ export function createWorkflowServer(
           status,
           {
             scriptUri: workflowScriptUri(parsedInput.runId),
+            ...resultResourceFields(scriptResources, parsedInput.runId),
             lineage,
             stopped,
             alreadyTerminal,
@@ -2407,7 +2574,11 @@ export function createWorkflowServer(
           .filter((link) => link.uri === workflowScriptUri(parsedInput.runId));
         return {
           structuredContent: { ...result },
-          content: [{ type: "text", text: formatStopSummary(result) }, ...currentLink],
+          content: [
+            { type: "text", text: formatStopSummary(result) },
+            ...resultContentBlocks(scriptResources, parsedInput.runId, false),
+            ...currentLink,
+          ],
           isError: false,
         };
       }
@@ -2586,6 +2757,7 @@ export function createWorkflowServer(
             pendingPermissions,
             interaction: permissionInteraction(canElicitPermission),
             scriptUri: workflowScriptUri(parsedInput.runId),
+            ...resultResourceFields(scriptResources, parsedInput.runId),
             lineage,
           },
           inspectionRetentionMetadata(manager, parsedInput.runId, status),
@@ -2603,6 +2775,7 @@ export function createWorkflowServer(
               text: formatAwaitSummary(result) + formatPendingPermissions(pendingPermissions),
               annotations: { audience: ["assistant"] },
             },
+            ...resultContentBlocks(scriptResources, parsedInput.runId, true),
             ...scriptResources.links(lineage),
           ],
           isError: false,
@@ -2984,14 +3157,16 @@ export function createWorkflowServer(
           });
         }
         const scriptUri = workflowScriptUri(run.runId);
+        const resultFields = resultResourceFields(scriptResources, run.runId);
         const structuredContent = {
-          ...toWorkflowToolResult(run, { scriptSource, scriptUri }),
+          ...toWorkflowToolResult(run, { scriptSource, scriptUri, ...resultFields }),
         };
         const isError = run.status === "failed" || run.status === "aborted";
         return {
           structuredContent: { ...structuredContent },
           content: [
             { type: "text", text: `${formatRunSummary(run)}${preflightWarningText}` },
+            ...resultContentBlocks(scriptResources, run.runId, true),
             ...scriptResources.links([{ runId: run.runId, uri: scriptUri, available: true }]),
           ],
           isError,

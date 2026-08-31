@@ -38,7 +38,7 @@ test("input shape: args is OPTIONAL and accepts an arbitrary JSON value", () => 
   assert.equal(Schema.parse({ script: "x", args: 7 }).args, 7);
 });
 
-test("input shape: one tool advertises the exact config, run, inspect, await, permission, and stop field superset", () => {
+test("input shape: one tool advertises the exact config, run, inspect, await, result, permission, and stop field superset", () => {
   assert.ok(!("startInBackground" in workflowToolInputShape), "startInBackground must not be a tool input");
   assert.deepEqual(
     Object.keys(workflowToolInputShape).sort(),
@@ -58,8 +58,10 @@ test("input shape: one tool advertises the exact config, run, inspect, await, pe
       "lastN",
       "logLines",
       "maxAgents",
+      "maxBytes",
       "modelFilter",
       "modelSpecs",
+      "offset",
       "permissionId",
       "probeTimeoutMs",
       "projectDir",
@@ -71,7 +73,7 @@ test("input shape: one tool advertises the exact config, run, inspect, await, pe
       "scriptPath",
       "waitMs",
     ],
-    "the exact config/run/inspect/await/permission/stop wire fields",
+    "the exact config/run/inspect/await/result/permission/stop wire fields",
   );
 });
 
@@ -198,6 +200,29 @@ test("await applies its default and accepts the exact wait bounds", () => {
   assert.equal(parseWorkflowToolInput(Schema.parse({ action: "await", runId: "a-b", waitMs: 25_000 })).waitMs, 25_000);
   for (const waitMs of [-1, 25_001, 1.5]) {
     assert.throws(() => Schema.parse({ action: "await", runId: "a-b", waitMs }));
+  }
+});
+
+test("result retrieval defaults to bounded UTF-8 chunks and rejects mixed fields", () => {
+  assert.deepEqual(
+    parseWorkflowToolInput(Schema.parse({ action: "result", runId: "a-b" })),
+    { action: "result", runId: "a-b", offset: 0, maxBytes: 16_384 },
+  );
+  assert.deepEqual(
+    parseWorkflowToolInput(Schema.parse({ action: "result", runId: "a-b", offset: 7, maxBytes: 4 })),
+    { action: "result", runId: "a-b", offset: 7, maxBytes: 4 },
+  );
+  for (const input of [
+    { action: "result" },
+    { action: "result", runId: "a-b", offset: -1 },
+    { action: "result", runId: "a-b", offset: 1.5 },
+    { action: "result", runId: "a-b", maxBytes: 3 },
+    { action: "result", runId: "a-b", maxBytes: 16_385 },
+    { action: "result", runId: "a-b", waitMs: 0 },
+    { action: "result", runId: "a-b", script: "x" },
+    { action: "result", runId: "a-b", lastN: 1 },
+  ]) {
+    assert.throws(() => parseWorkflowToolInput(Schema.parse(input)));
   }
 });
 
@@ -350,6 +375,9 @@ test("the discriminator rejects every missing or mixed run/inspect/await branch"
     { action: "run", script: "x", logLines: 0 },
     { action: "run", script: "x", harnesses: ["claude"] },
     { action: "inspect", runId: "a-b", modelFilter: "opus" },
+    { action: "inspect", runId: "a-b", offset: 0 },
+    { action: "await", runId: "a-b", maxBytes: 16 },
+    { script: "x", offset: 0 },
   ]) {
     const primitive = Schema.parse(input);
     assert.throws(

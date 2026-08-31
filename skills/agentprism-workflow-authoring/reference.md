@@ -203,7 +203,7 @@ The body is prepended to the agent's task as role guidance. An unknown `agentTyp
 
 ## How hosts run scripts (what authors can assume)
 
-The connected MCP `workflow` tool is the canonical way an agent runs an authored script; the per-action contracts are in the Running workflows guide section. The tool is self-contained: `config` discovers live backend options and `run` validates automatically before admission. The `workflow` tool is the server's whole *workflow* surface: config/run/resume/inspect/await/permissions-response/stop
+The connected MCP `workflow` tool is the canonical way an agent runs an authored script; the per-action contracts are in the Running workflows guide section. The tool is self-contained: `config` discovers live backend options and `run` validates automatically before admission. The `workflow` tool is the server's whole *workflow* surface: config/run/resume/inspect/await/result/permissions-response/stop
 are action branches, not separate tools, and this input does not resolve a saved workflow name.
 The server also registers model-facing `docs` for selective version-matched workflow/REPL reference topics and `repl` for interactive orchestration. This optional skill remains a standalone guide for non-MCP or skills-first hosts. A
 run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is
@@ -255,7 +255,7 @@ type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase & (
 // WorkflowExecuteToolInputBase also carries projectDir?: string — the absolute project
 // directory selecting the project-scoped run store and default execution cwd. REQUIRED for
 // config/run on the shared workflow daemon (one registration serves every project); optional on a
-// single-project (--in-process) server. inspect/await/permissions-response/stop never take it: a runId locates
+// single-project (--in-process) server. inspect/await/result/permissions-response/stop never take it: a runId locates
 // its project store automatically.
 
 interface WorkflowAwaitToolInput {
@@ -265,6 +265,27 @@ interface WorkflowAwaitToolInput {
   lastN?: number;       // default 20; integer 1..50
   labelGlob?: string;   // same whole-label glob as inspect
   logLines?: number;    // default 20; integer 0..50
+}
+
+interface WorkflowResultToolInput {
+  action: "result";
+  runId: string;
+  offset?: number;    // default 0; UTF-8 byte offset, use the prior endOffset
+  maxBytes?: number;  // default/max 16,384; minimum 4
+}
+
+interface WorkflowResultRetrieval {
+  action: "result";
+  runId: string;
+  status: "completed";
+  resultUri: string;
+  mimeType: "application/json";
+  encoding: "utf-8";
+  totalBytes: number;
+  offset: number;
+  endOffset: number;
+  hasMore: boolean;
+  chunk: string;
 }
 
 interface WorkflowPermissionResponseToolInput {
@@ -310,6 +331,7 @@ interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
   pendingPermissions?: WorkflowPendingPermission[];
   outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">; // exactly when terminal
   scriptUri: string;
+  resultUri?: string;
   lineage: Array<{ runId: string; uri: string; available: boolean }>;
 }
 
@@ -341,15 +363,17 @@ live `WorkflowRunStatus`; whole-run stop returns the terminal `WorkflowStopResul
 appear in foreground results plus terminal await `outcome`; neither appears on `WorkflowRunStatus`.
 
 At most four background runs may be active or starting per server instance. Foreground, inspect,
-await, and stop consume no slot; a durably stopped background run frees its slot immediately even
+await, result retrieval, and stop consume no slot; a durably stopped background run frees its slot immediately even
 while backend session wind-down remains. A timeout returns the freshest status and partial cumulative usage; replay
 hits cost/add zero. Terminal results have no MCP TTL and are reconstructed after restart while the
 project run record remains readable. The inherited status fields stay redacted/bounded at 24,576
 structured bytes and 8,192 text bytes. The full script lineage is never truncated; when lineage
 alone exceeds the status budget, `truncation.maxStructuredBytes` reports the larger actual envelope
-limit. Terminal `outcome` preserves the raw authored result/full logs and has no new total cap, but
-it is never copied into text. It includes `scriptUri` but not the unpersisted admission-only
-`scriptSource`.
+limit. Terminal `outcome` preserves the raw authored result/full logs and has no new total cap.
+Completed foreground/await results include `resultUri`; exact JSON up to 4,096 UTF-8 bytes is copied
+into model-visible text for content-first hosts. Larger results stay out of summary text and point
+to `workflow://runs/{runId}/result` plus bounded `action:"result"` paging. The outcome includes
+`scriptUri` but not the unpersisted admission-only `scriptSource`.
 
 The background start has no enduring request signal, progress channel, or live checkpoint channel.
 It returns immediately and emits no progress after returning, even if the initiating request
@@ -370,8 +394,13 @@ the script; their cold preflight may only reconcile a dead owner's stale `pendin
 to `paused` / `interrupted`.
 
 Every admitted script is an immutable persistence-backed MCP resource at
-`workflow://runs/{runId}/script`. Run results link the new script; inspect/await link the full
-resume lineage oldest-to-newest as structured `{ runId, uri, available }` entries. Listing and
+`workflow://runs/{runId}/script`. A completed JSON value is independently durable at
+`workflow://runs/{runId}/result`. Completed foreground/inspect/await responses include its
+`resultUri` and labelled link; run results link the new script, while inspect/await link the full
+script resume lineage oldest-to-newest as structured `{ runId, uri, available }` entries. Large
+result resources can be reconstructed exactly through 16,384-byte `action:"result"` chunks by
+following `endOffset` while `hasMore` is true; the bounded/redacted events resource is observability,
+not an exact-result API. Listing and
 completion include only the 50 newest runs, but a direct URI read works for any retained project
 run. A path is never persisted or implicitly re-read, and the MCP layer retains no scripts, args,
 or synthetic lineage metadata in process memory.
