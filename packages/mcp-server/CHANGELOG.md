@@ -1,5 +1,11 @@
 # @automatalabs/mcp-server
 
+## 0.38.1
+
+### Patch Changes
+
+- cc8306d: Expose completed workflow outputs through durable exact result resources, content-first text compatibility for small results, and bounded UTF-8 result paging for large outputs.
+
 ## 0.38.0
 
 ### Minor Changes
