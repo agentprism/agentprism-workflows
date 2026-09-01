@@ -1,5 +1,9 @@
 # Live workflow observability
 
+> **Current MCP action name:** historical `inspect`/`await` references below map to the single
+> `action:"status"` observation path. See
+> [`workflow-status-action.md`](workflow-status-action.md).
+
 ## Source
 
 The design owner made the following statements. They are reproduced verbatim from

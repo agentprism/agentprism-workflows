@@ -3,11 +3,10 @@ import type { WorkflowReplayEligibility, WorkflowRunStatus } from "@automatalabs
 import type {
   WorkflowBackgroundAccepted,
   WorkflowExecutionToolResult,
-  WorkflowInspectionToolResult,
   WorkflowResultRetrieval,
-  WorkflowRunAwaitResult,
   WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
+  WorkflowStatusToolResult,
   WorkflowStopPendingResult,
   WorkflowStopResult,
 } from "../src/workflow-tool-output.js";
@@ -67,23 +66,23 @@ const background: WorkflowBackgroundAccepted = {
   limits,
   replayEligibility,
 };
-const inspection: WorkflowInspectionToolResult = {
+const statusFields = {
   ...status,
   scriptUri: "workflow://runs/aa-bb/script",
   lineage,
 };
-const awaited: WorkflowRunAwaitResult = {
-  ...inspection,
+const observed: WorkflowStatusToolResult = {
+  ...statusFields,
   wait: { requestedMs: 0, elapsedMs: 0, returnedBecause: "immediate" },
 };
 const stopped: WorkflowStopResult = {
-  ...inspection,
+  ...statusFields,
   status: "aborted",
   stopped: true,
   alreadyTerminal: false,
 };
 const pendingStop: WorkflowStopPendingResult = {
-  ...inspection,
+  ...statusFields,
   status: "running",
   stopped: false,
   alreadyTerminal: false,
@@ -133,13 +132,14 @@ const backgroundWithoutUri: WorkflowBackgroundAccepted = {
   scriptSource: "inline",
   limits,
 };
-// @ts-expect-error inspections require the complete lineage
-const inspectionWithoutLineage: WorkflowInspectionToolResult = {
+// @ts-expect-error status results require the complete lineage
+const statusWithoutLineage: WorkflowStatusToolResult = {
   ...status,
   scriptUri: "workflow://runs/aa-bb/script",
+  wait: { requestedMs: 0, elapsedMs: 0, returnedBecause: "immediate" },
 };
-// @ts-expect-error await results require scriptUri
-const awaitWithoutUri: WorkflowRunAwaitResult = {
+// @ts-expect-error status results require scriptUri
+const statusWithoutUri: WorkflowStatusToolResult = {
   ...status,
   lineage,
   wait: { requestedMs: 0, elapsedMs: 0, returnedBecause: "immediate" },
@@ -162,16 +162,15 @@ void [
   resultRetrieval,
   resultRetrievalWithoutChunk,
   background,
-  inspection,
-  awaited,
+  observed,
   stopped,
   pendingStop,
   resourceFields,
   executionWithoutSource,
   executionWithoutLimits,
   backgroundWithoutUri,
-  inspectionWithoutLineage,
-  awaitWithoutUri,
+  statusWithoutLineage,
+  statusWithoutUri,
   stopWithoutTerminalAck,
   fieldsWithoutLineage,
 ];

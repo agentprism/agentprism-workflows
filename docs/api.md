@@ -10,7 +10,7 @@ Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 | `@automatalabs/workflow-engine` | The deterministic script engine + `WorkflowManager` (no agent construction — the runner is injected) | You bring your own `AgentRunner` and don't want ACP deps |
 | `@automatalabs/acp-agents` | The ACP runner: pooled Claude/Codex/OpenCode/pi ACP processes, model routing, structured output, events, interactive sessions | You want agent execution without the workflow engine |
 | `@automatalabs/shared-types` | The seam contracts: `AgentRunner`, `RunOptions`, `WorkflowError` (+ codes), workflow result/meta types | You implement a custom runner or need `instanceof WorkflowError` across packages |
-| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, bounded await, resume, inspect, live permission response, stop) and the `repl` tool (a persistent per-project JavaScript REPL for live subagent orchestration) | You drive workflows from Claude Code / an MCP client |
+| `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, bounded status, resume, live permission response, stop) and the `repl` tool (a persistent per-project JavaScript REPL for live subagent orchestration) | You drive workflows from Claude Code / an MCP client |
 | `@automatalabs/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` traces and metrics | Your host owns an OTel SDK and wants run/agent/tool observability |
 | `@automatalabs/pi-acp` | Standalone in-process pi coding-agent ACP server (bin `pi-acp`) with a side-effect-free library entry | You use the first-class `pi` backend or embed the ACP server directly |
 | `@automatalabs/codex-acp` | Fork of `@agentclientprotocol/codex-acp` adding turn-level `outputSchema` forwarding | Installed automatically by `acp-agents`; only pin it directly to override the version |
@@ -332,7 +332,7 @@ type WorkflowReplayEligibility = WorkflowReplayEligibilityBase &
 `WorkflowRunResult.resumeReport?` and persisted state carry this report for completed, paused, and
 failed resumed runs; ordinary and same-ID recovery runs omit it. `replayEligibility` is the bounded
 plan/progress surface for every new-run resume. The MCP background acknowledgement, foreground
-result, inspect status, and nonterminal/terminal await status carry it; terminal await `outcome`
+result and nonterminal/terminal status responses carry it; terminal status `outcome`
 carries the identical final value plus the complete `resumeReport`. Human text names the strategy,
 predicted and observed prefixes, counts, first non-replay and detail when known, source/current
 engine and input formats, and any non-gating operational changes. A zero predicted or observed
@@ -747,8 +747,8 @@ server restart, has no server-side envelope cap, and remains readable until run 
 or store loss. Running, paused, failed, aborted, unknown, deleted, and completed-without-value runs
 fail closed instead of manufacturing output.
 
-Completed foreground, inspect, and await responses expose `resultUri` and a separately labelled
-result `resource_link`; script links are explicitly labelled as scripts. Foreground and await also
+Completed foreground and status responses expose `resultUri` and a separately labelled
+result `resource_link`; script links are explicitly labelled as scripts. Foreground and status also
 copy exact result JSON up to 4,096 UTF-8 bytes into text for content-first hosts. For larger values,
 use the resource directly or page through `{ action:"result", runId, offset, maxBytes }`. The page is
 `{ action:"result", runId, status:"completed", resultUri, mimeType:"application/json",
@@ -1405,15 +1405,10 @@ interface WorkflowExecuteToolInput {
   background?: boolean; // default false
 }
 
-interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
-  action: "inspect";
+interface WorkflowStatusToolInput extends WorkflowRunInspectionOptions {
+  action: "status";
   runId: string;
-}
-
-interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
-  action: "await";
-  runId: string;
-  waitMs?: number; // default 20_000; integer 0..25_000
+  waitMs?: number; // default 0 (immediate); integer 0..25_000
 }
 
 interface WorkflowResultToolInput {
@@ -1467,10 +1462,13 @@ interface WorkflowExecutionToolResult<T = unknown> {
 
 `action:"config"` reuses the server's runner to open bounded no-prompt sessions and returns live model/mode/config catalogs without creating a manager run. Mode names, descriptions, and `_meta` are preserved verbatim in structured and human-readable output, alongside `defaultModeId` (`auto` / `agent` / `build` for the three mode-capable first-class backends). Every execution request is statically parsed, mock-executed, and probed before run admission; an invalid preflight returns `{ action:"run", status:"rejected", validation }` with no run ID, persistence record, background reservation, or live `AgentRunner.run()` call.
 
-Mixed/missing branches, invalid run IDs, invalid inspection bounds, and `waitMs` outside 0–25,000
+Mixed/missing branches, invalid run IDs, invalid status bounds, and `waitMs` outside 0–25,000
 are MCP Invalid Params (`-32602`). Omitted action/background preserves foreground execution byte for
 byte for executions that do not block on an ACP permission: it streams progress, honors request cancellation and live checkpoint elicitation, and returns
-`WorkflowExecutionToolResult<T>`. If a permission blocks first, foreground returns a running admission with `pendingPermissions` and the run stays live. `action:"inspect"` remains immediate for lifecycle state; when a permission is pending it also projects that request and may elicit one exact option from a capable client.
+`WorkflowExecutionToolResult<T>`. If a permission blocks first, foreground returns a running admission with `pendingPermissions` and the run stays live. `action:"status"` with omitted or zero `waitMs` observes lifecycle state immediately; when a permission is pending it also projects that request and may elicit one exact option from a capable client.
+The published schema advertises only `status`; runtime compatibility normalizes legacy `inspect` to
+an immediate status request and legacy `await` to status with its historical 20-second omitted
+default.
 
 After preflight succeeds, `background:true` reserves one of four process-local active-or-starting slots, performs lease acquisition and the durable initial save, then returns:
 
@@ -1483,7 +1481,7 @@ interface WorkflowBackgroundAccepted {
   pendingPermissions?: WorkflowPendingPermission[];
   interaction: {
     permissionRequests: "may-block";
-    collectWith: ("await" | "inspect")[];
+    collectWith: ["status"];
     respondWith: "permissions-response";
     elicitation: "available" | "unavailable";
   };
@@ -1494,14 +1492,14 @@ It does not await script/agent completion. The initiating request has no endurin
 channel, or live checkpoint `confirm`; checkpoints use authored headless behavior. Even when that
 start request supplied a progress token, it emits no background progress after returning.
 Cancelling the accepted call cannot abort the run. A fifth run fails with
-`Background workflow limit reached (4 active or starting runs). Await an existing run and retry.`
-Foreground, inspect, await, and result retrieval do not consume slots. A background `resumeFromRunId` creates a new run
+`Background workflow limit reached (4 active or starting runs). Check an existing run with status and retry.`
+Foreground, status, and result retrieval do not consume slots. A background `resumeFromRunId` creates a new run
 ID and copies the complete inherited journal plus any synthetic checkpoint answer into that new
 run's initial durable record, preserving multi-hop resume safety. Its acknowledgement includes the
 admission-time `replayEligibility` prediction before the script body is allowed to execute.
 
 Every newly admitted response reports its resolved `limits`. The same object appears on foreground
-results, background acknowledgements, inspect/await status, and terminal await `outcome`; legacy
+results, background acknowledgements, status, and terminal status `outcome`; legacy
 persisted records that predate limit storage may omit it. Failed call rows include their resolved
 `timeoutMs`, `idleTimeoutMs`, and `errorCode`, so an exhausted attempt is directly inspectable as `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`.
 
@@ -1525,14 +1523,14 @@ interface WorkflowPendingPermission {
   requestRedacted: boolean;
 }
 
-interface WorkflowAwaitMetadata {
+interface WorkflowStatusWaitMetadata {
   requestedMs: number;
   elapsedMs: number;
   returnedBecause: "terminal" | "timeout" | "immediate" | "action-required" | "permission-resolved";
 }
 
-interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
-  wait: WorkflowAwaitMetadata;
+interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
+  wait: WorkflowStatusWaitMetadata;
   tokenUsage?: TokenUsage;
   pendingPermissions?: WorkflowPendingPermission[];
   outcome?: WorkflowExecutionToolResult<T>; // present exactly at terminal status
@@ -1560,18 +1558,18 @@ interface WorkflowStopPendingResult extends WorkflowRunStatus {
 }
 ```
 
-Await returns immediately for terminal runs, is a non-blocking read at `waitMs:0`, and otherwise
+Status returns immediately for terminal runs, is a non-blocking read when `waitMs` is omitted or zero, and otherwise
 waits for terminal lifecycle state **or a live ACP permission** for at most the requested duration.
 A permission returns `action-required` before the bound. Elicitation-capable clients receive the
 backend's exact options; accepting maps to the selected option id, while decline/cancel maps to ACP
-cancelled. Without elicitation, inspect/await return the request for a later `permissions-response`
+cancelled. Without elicitation, status returns the request for a later `permissions-response`
 call. Selected ids are validated against the still-pending request and each permission settles once. For new-format runs it
-tails the generation-pinned event sidecar. When the **await request** carries a progress token, the
+tails the generation-pinned event sidecar. When the **status request** carries a progress token, the
 server emits the existing coarse notification shape after each phase, distinct agent start, and
 first terminal agent end for `(scope, callIndex)`: `progress` is the number of distinct ended calls,
 `total` is distinct started calls (omitted while zero), and `message` is the latest phase title
 (omitted until known). Snapshot agent rows/current phase seed those sets, and the tail begins after
-the snapshot watermark, so a late await neither scans the unbounded history for progress state nor
+the snapshot watermark, so a late status request neither scans the unbounded history for progress state nor
 double-counts the known prefix.
 
 The local settlement promise may still win the terminal race without disabling tail progress. A live
@@ -1579,29 +1577,29 @@ permission wait suspends `agentIdleTimeoutMs` but not total `agentTimeoutMs`; th
 its concurrency slot and ACP session. Permission inspection/response follows the lease owner over the
 signed daemon control plane. It is not a durable engine pause: owner loss invalidates the original
 ACP request and no successor reconstructs it cold. For
-legacy, incomplete, corrupt, mismatched, or otherwise unsafe event logs, await explicitly falls back
-to 250-ms `inspectRun()` terminal polling and emits no progress notifications even if that await has
-a token. Await cancellation closes its watcher/poller, ends only that request, and returns
-`Workflow await for runId "<runId>" was cancelled; the workflow was not cancelled.` with no
-structured content. Await is a successful read even for failed/aborted lifecycle status. Partial
+legacy, incomplete, corrupt, mismatched, or otherwise unsafe event logs, status explicitly falls back
+to 250-ms `inspectRun()` terminal polling and emits no progress notifications even if that status request has
+a token. Status cancellation closes its watcher/poller, ends only that request, and returns
+`Workflow status request for runId "<runId>" was cancelled; the workflow was not cancelled.` with no
+structured content. Status is a successful read even for failed/aborted lifecycle status. Partial
 `tokenUsage` is cumulative live work in this execution only; cached replay adds zero. At terminal,
 top-level and `outcome.tokenUsage` are identical.
 
 Terminal `outcome` is live-first and reconstructed from project-scoped persistence after restart,
 normalizing legacy missing `cost` to zero. Completed outcomes contain the exact authored result and
 raw full logs; paused outcomes carry existing non-secret `authContext`/`checkpointContext` and resume
-guidance. Completed foreground/await results add `resultUri`. Exact JSON up to 4,096 UTF-8 bytes is
+guidance. Completed foreground/status results add `resultUri`. Exact JSON up to 4,096 UTF-8 bytes is
 also copied into model-visible text for content-first hosts; larger values are not duplicated
 wholesale and instead point to the exact result resource plus bounded `action:"result"` paging.
 Retrieval has no TTL and remains available until SDK/manual deletion, corruption, or store loss. The
-inherited status portion retains its 24,576-byte/redaction bound and await text its 8,192-byte cap;
+inherited status portion retains its 24,576-byte/redaction bound and status text its 8,192-byte cap;
 raw terminal `outcome` intentionally has no new envelope cap.
 
 Runs execute in the shared per-user workflow daemon (the default stdio entry is a thin shim that proxies to it and auto-starts it), so a client disconnect, shim kill, or session eviction does not stop in-flight work. During version succession the current daemon is the front door while a predecessor may retain execution ownership under the run lease. Whole-run stop writes an idempotent durable intent and signed internal control forwards stop/cancel to that predecessor. A final stop response still requires a durable aborted snapshot plus its stopped event; a control wait that expires returns a successful nonterminal stop acknowledgement with `control.state:"pending"` and an operation ID. `forceOwner:true` on whole-run stop explicitly authorizes terminating a superseded owner daemon after identity revalidation and may interrupt sibling runs; it is forbidden with `callIndex`. Owner exit (signals, forced stop, crash, machine shutdown) — or, under `--in-process`, the single client-owned process exiting — can interrupt work; there is no cross-machine handoff. If an owner exits with a pending whole-stop intent, the next lease holder cold-stops it; otherwise cold preflights reconcile orphaned `pending`/`running` state to `paused` / `interrupted` for explicit `resumeFromRunId`. A live lease is never stolen because of a timeout.
 The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
 feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 
-Inspect returns `WorkflowRunStatus` plus live `pendingPermissions` and interaction guidance when applicable. Completed runs with an authored JSON value also expose `resultUri` and a labelled result resource link without adding that value to the bounded status projection. Permission diagnostics are credential-redacted and scalar-bounded, omit the private ACP session id, and preserve the complete ordered exact option-id list inside a separate 64 KiB envelope; an option set that cannot be represented safely is cancelled instead of partially exposed. Permission responses accept only cancellation or an exact selected optionId and forbid caller-supplied response `_meta`. Its JSON structured content is capped at 24,576 bytes
+Status returns `WorkflowRunStatus` plus wait metadata, live `pendingPermissions`, and interaction guidance when applicable. Completed runs with an authored JSON value also expose `resultUri` and a labelled result resource link without adding that value to the bounded status projection. Permission diagnostics are credential-redacted and scalar-bounded, omit the private ACP session id, and preserve the complete ordered exact option-id list inside a separate 64 KiB envelope; an option set that cannot be represented safely is cancelled instead of partially exposed. Permission responses accept only cancellation or an exact selected optionId and forbid caller-supplied response `_meta`. Its JSON structured content is capped at 24,576 bytes
 and its formatted text at 8,192 bytes. An existing failed or aborted run is still a successful read.
 An unknown/corrupt/unreadable run is `isError:true`, has no structured content, and returns exactly
 `No workflow run found for runId "<runId>" in this server's project-scoped run store.` Execution keeps current error semantics: failed/aborted are tool errors, paused is a successful resumable call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped at 12,288 bytes; rejected preflight scripts instead carry bounded structured validation diagnostics and have no run ID or tail.

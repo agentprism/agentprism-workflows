@@ -204,15 +204,17 @@ return await agent("work", { label: "worker", model: "codex" });`;
 
     const resolved = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 5_000 },
+      arguments: { action: "status", runId, waitMs: 5_000 },
     });
     assert.equal(resolved.isError, false);
     assert.equal(structured(resolved)?.permissionResponse?.outcome?.optionId, "allow_for_session");
+    assert.equal(structured(resolved)?.wait?.requestedMs, 5_000);
+    assert.equal(structured(resolved)?.wait?.returnedBecause, "permission-resolved");
     assert.equal(connected.elicitations.length, 1);
 
     const terminal = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 5_000 },
+      arguments: { action: "status", runId, waitMs: 5_000 },
     });
     assert.equal(structured(terminal)?.outcome?.result, "allow_for_session");
   } finally {
@@ -293,7 +295,7 @@ return await agent("wait", { label: "wait" });`;
   }
 });
 
-test("modern response-stream cancellation aborts await without cancelling the workflow", async () => {
+test("modern response-stream cancellation aborts status waiting without cancelling the workflow", async () => {
   const controlled = gatedRunner();
   const daemon = await startDaemon(controlled.runner);
   const projectDir = makeProjectDir("dual-era-cancellation");
@@ -313,7 +315,7 @@ return await agent("wait", { label: "wait" });`;
 
     const controller = new AbortController();
     const awaiting = connected.client.callTool(
-      { name: "workflow", arguments: { action: "await", runId, waitMs: 25_000 } },
+      { name: "workflow", arguments: { action: "status", runId, waitMs: 25_000 } },
       { signal: controller.signal },
     );
     setTimeout(() => controller.abort(), 25);
@@ -321,13 +323,13 @@ return await agent("wait", { label: "wait" });`;
 
     const inspection = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(inspection)?.status, "running");
     controlled.release();
     const completed = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 10_000 },
+      arguments: { action: "status", runId, waitMs: 10_000 },
     });
     assert.equal(structured(completed)?.status, "completed");
   } finally {

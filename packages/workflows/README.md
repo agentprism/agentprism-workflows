@@ -814,7 +814,7 @@ By default `mcp` runs a thin **stdio shim** that proxies to the shared local **w
 daemon** (Streamable HTTP on loopback, auto-started on first use), so workflow runs survive
 the MCP client killing the stdio process. Every `run` call names its project via the required
 `projectDir` tool argument, so one registration — even in global MCP settings — serves every
-project; `inspect`/`await`/`stop` locate a runId's project automatically. `--in-process`
+project; `status`/`stop` locate a runId's project automatically. `--in-process`
 restores the pre-daemon single-process stdio server (there `projectDir` is optional and
 defaults to that server's own cwd). Manage the daemon with `agentprism-workflows daemon
 <start|stop|status|url|run|logs>` — `daemon url` prints registration snippets for HTTP-capable

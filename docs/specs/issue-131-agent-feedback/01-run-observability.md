@@ -4,6 +4,11 @@
 
 **Feedback:** issue #131, section 1
 
+> **Current MCP migration:** this historical design introduced `action:"inspect"`. The implemented
+> model-facing contract now consolidates observation under `action:"status"`; see
+> [`workflow-status-action.md`](../workflow-status-action.md). The engine's backend-agnostic
+> `inspectRun()` primitive remains unchanged.
+
 ## 1. Problem
 
 The MCP `workflow` call returns a terminal summary, but an agent diagnosing a paused or failed run

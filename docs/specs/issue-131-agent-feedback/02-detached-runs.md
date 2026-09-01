@@ -4,6 +4,10 @@
 
 **Feedback:** issue #131, section 2
 
+> **Current MCP migration:** this historical design introduced separate `inspect` and `await`
+> actions. The implemented model-facing contract now consolidates both under `action:"status"`
+> with optional `waitMs`; see [`workflow-status-action.md`](../workflow-status-action.md).
+
 ## 1. Problem
 
 The MCP `workflow` tool currently keeps one `tools/call` open until the workflow reaches a terminal

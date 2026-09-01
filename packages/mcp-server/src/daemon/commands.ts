@@ -45,7 +45,7 @@ export function formatUrlSnippets(url: string): string {
     `  url = "${url}"`,
     "",
     "One registration serves every project: each workflow run names its project via the",
-    "required `projectDir` tool argument (inspect/await/stop locate a runId automatically).",
+    "required `projectDir` tool argument (status/stop locate a runId automatically).",
     "Stdio clients need no registration changes: the default stdio command proxies to this daemon automatically.",
     "Note: a direct HTTP registration pins this daemon's port; after a version upgrade the current",
     "daemon may listen elsewhere — re-run `daemon url`. The stdio command follows upgrades automatically.",

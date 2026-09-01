@@ -67,7 +67,7 @@ test("a nonexistent projectDir is rejected before any engine state is created", 
   }
 });
 
-test("background run started in one session is awaited from another — runId alone routes it", async () => {
+test("background run started in one session is observed from another — runId alone routes it", async () => {
   const { runner, release } = gatedRunner();
   const projectDir = makeProjectDir("shared-project");
   const daemon = await startDaemon(runner);
@@ -87,7 +87,7 @@ test("background run started in one session is awaited from another — runId al
     // Session B never named the project: await routes by locating the runId's store.
     const awaited = await b.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 15_000 },
+      arguments: { action: "status", runId, waitMs: 15_000 },
     });
     assert.equal(awaited.isError ?? false, false, textOf(awaited));
     assert.equal(structured(awaited)?.status, "completed");
@@ -153,7 +153,7 @@ test("a fresh daemon locates a prior daemon's run on disk via the project manife
     const session = await connectHttp(second.url);
     const inspected = await session.client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId },
+      arguments: { action: "status", runId },
     });
     assert.equal(inspected.isError ?? false, false, textOf(inspected));
     assert.equal(structured(inspected)?.status, "completed");
@@ -206,7 +206,7 @@ test("idle eviction closes a dead client's session; its background run survives 
     const b = await connectHttp(daemon.url);
     const awaited = await b.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 15_000 },
+      arguments: { action: "status", runId, waitMs: 15_000 },
     });
     assert.equal(structured(awaited)?.status, "completed", textOf(awaited));
     await b.dispose();
@@ -251,7 +251,7 @@ test("MAX_BACKGROUND_RUNS caps per project across sessions", async () => {
     for (const runId of runIds) {
       const awaited = await a.client.callTool({
         name: "workflow",
-        arguments: { action: "await", runId, waitMs: 15_000 },
+        arguments: { action: "status", runId, waitMs: 15_000 },
       });
       assert.equal(structured(awaited)?.status, "completed", textOf(awaited));
     }

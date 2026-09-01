@@ -27,12 +27,12 @@ reject once and approve once. Its first partial `{ "ok": false }` answer demonst
 fresh-base deep merge; the second supplies `{ "ok": true, "feedback": "" }` and
 finishes the existing gate.
 
-After running either script through MCP, retain the returned `runId`. Inspect the most recent
+After running either script through MCP, retain the returned `runId`. Check the most recent
 triage workers without re-running anything:
 
 ```json
 {
-  "action": "inspect",
+  "action": "status",
   "runId": "mabc1234-k9x2pq",
   "lastN": 10,
   "labelGlob": "verify:*",
@@ -44,7 +44,7 @@ For the nested quick-wins hunt, narrow the same run journal to its round labels:
 
 ```json
 {
-  "action": "inspect",
+  "action": "status",
   "runId": "mabc1234-k9x2pq",
   "lastN": 20,
   "labelGlob": "hunt:*",
@@ -53,7 +53,7 @@ For the nested quick-wins hunt, narrow the same run journal to its round labels:
 ```
 
 If a run paused or failed, read the execution response's immediate final-20 `logTail` first, then
-use inspection for attributed compact results. Host MCP actions stay outside workflow scripts; the
+use status for attributed compact results. Host MCP actions stay outside workflow scripts; the
 shipped `.workflow.js` files call only DSL globals.
 
 ## Complete background host-call transcript
@@ -77,7 +77,7 @@ The host retains that ID and waits in bounded 20-second calls. A first timeout r
 than failing the workflow:
 
 ```json
-{ "action": "await", "runId": "mabc1234-k9x2pq", "waitMs": 20000 }
+{ "action": "status", "runId": "mabc1234-k9x2pq", "waitMs": 20000 }
 ```
 
 ```json
@@ -94,10 +94,10 @@ than failing the workflow:
 }
 ```
 
-Call the same await again until `returnedBecause:"terminal"`; then `outcome.result` is the complete
+Call the same status request again until `returnedBecause:"terminal"`; then `outcome.result` is the complete
 authored result and `outcome.logs` the foreground-equivalent full logs.
 
-For a workflow that pauses at `checkpoint(..., { headless:"pause" })`, terminal await returns
+For a workflow that pauses at `checkpoint(..., { headless:"pause" })`, terminal status returns
 `outcome.checkpointContext.callIndex`. Resume through a second background run:
 
 ```json
@@ -114,6 +114,6 @@ For a workflow that pauses at `checkpoint(..., { headless:"pause" })`, terminal 
 { "runId": "mabc5678-z1n4rs", "status": "running" }
 ```
 
-The second ID is intentional: resume executes a new run. Retain it and await it in turn. Before its
+The second ID is intentional: resume executes a new run. Retain it and check its status in turn. Before its
 acknowledgement, the new record already contains the inherited call prefix and checkpoint answer, so
 another pause/crash can resume from `mabc5678-z1n4rs` without re-running that prefix.

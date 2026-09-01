@@ -203,7 +203,7 @@ The body is prepended to the agent's task as role guidance. An unknown `agentTyp
 
 ## How hosts run scripts (what authors can assume)
 
-The connected MCP `workflow` tool is the canonical way an agent runs an authored script; the per-action contracts are in the Running workflows guide section. The tool is self-contained: `config` discovers live backend options and `run` validates automatically before admission. The `workflow` tool is the server's whole *workflow* surface: config/run/resume/inspect/await/result/permissions-response/stop
+The connected MCP `workflow` tool is the canonical way an agent runs an authored script; the per-action contracts are in the Running workflows guide section. The tool is self-contained: `config` discovers live backend options and `run` validates automatically before admission. The `workflow` tool is the server's whole *workflow* surface: config/run/resume/status/result/permissions-response/stop
 are action branches, not separate tools, and this input does not resolve a saved workflow name.
 The server also registers model-facing `docs` for selective version-matched workflow/REPL reference topics and `repl` for interactive orchestration. This optional skill remains a standalone guide for non-MCP or skills-first hosts. A
 run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is
@@ -255,15 +255,15 @@ type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase & (
 // WorkflowExecuteToolInputBase also carries projectDir?: string — the absolute project
 // directory selecting the project-scoped run store and default execution cwd. REQUIRED for
 // config/run on the shared workflow daemon (one registration serves every project); optional on a
-// single-project (--in-process) server. inspect/await/result/permissions-response/stop never take it: a runId locates
+// single-project (--in-process) server. status/result/permissions-response/stop never take it: a runId locates
 // its project store automatically.
 
-interface WorkflowAwaitToolInput {
-  action: "await";
+interface WorkflowStatusToolInput {
+  action: "status";
   runId: string;
-  waitMs?: number;      // default 20_000; integer 0..25_000
+  waitMs?: number;      // default 0; integer 0..25_000
   lastN?: number;       // default 20; integer 1..50
-  labelGlob?: string;   // same whole-label glob as inspect
+  labelGlob?: string;   // whole-label glob
   logLines?: number;    // default 20; integer 0..50
 }
 
@@ -316,17 +316,17 @@ interface WorkflowBackgroundAccepted {
   limits: WorkflowRunLimits;
   replayEligibility?: WorkflowReplayEligibility;
   pendingPermissions?: WorkflowPendingPermission[];
-  interaction: { permissionRequests: "may-block"; collectWith: ("await" | "inspect")[]; respondWith: "permissions-response"; elicitation: "available" | "unavailable" };
+  interaction: { permissionRequests: "may-block"; collectWith: ["status"]; respondWith: "permissions-response"; elicitation: "available" | "unavailable" };
 }
 
-interface WorkflowAwaitMetadata {
+interface WorkflowStatusWaitMetadata {
   requestedMs: number;
   elapsedMs: number;
   returnedBecause: "terminal" | "timeout" | "immediate" | "action-required" | "permission-resolved";
 }
 
-interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus {
-  wait: WorkflowAwaitMetadata;
+interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
+  wait: WorkflowStatusWaitMetadata;
   tokenUsage?: TokenUsage;
   pendingPermissions?: WorkflowPendingPermission[];
   outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">; // exactly when terminal
@@ -360,24 +360,24 @@ live `WorkflowRunStatus`; whole-run stop returns the terminal `WorkflowStopResul
 `WorkflowRunResult.checkpointsTaken?: WorkflowCheckpointTaken[]` records resolved checkpoints as
 `{ callIndex, kind, decision, source }`, where source is `live`, `headless-default`,
 `journal-replay`, or `injected`. A paused checkpoint is not resolved. Both fields are persisted and
-appear in foreground results plus terminal await `outcome`; neither appears on `WorkflowRunStatus`.
+appear in foreground results plus terminal status `outcome`; neither appears on `WorkflowRunStatus`.
 
-At most four background runs may be active or starting per server instance. Foreground, inspect,
-await, result retrieval, and stop consume no slot; a durably stopped background run frees its slot immediately even
+At most four background runs may be active or starting per server instance. Foreground, status,
+result retrieval, and stop consume no slot; a durably stopped background run frees its slot immediately even
 while backend session wind-down remains. A timeout returns the freshest status and partial cumulative usage; replay
 hits cost/add zero. Terminal results have no MCP TTL and are reconstructed after restart while the
 project run record remains readable. The inherited status fields stay redacted/bounded at 24,576
 structured bytes and 8,192 text bytes. The full script lineage is never truncated; when lineage
 alone exceeds the status budget, `truncation.maxStructuredBytes` reports the larger actual envelope
 limit. Terminal `outcome` preserves the raw authored result/full logs and has no new total cap.
-Completed foreground/await results include `resultUri`; exact JSON up to 4,096 UTF-8 bytes is copied
+Completed foreground/status results include `resultUri`; exact JSON up to 4,096 UTF-8 bytes is copied
 into model-visible text for content-first hosts. Larger results stay out of summary text and point
 to `workflow://runs/{runId}/result` plus bounded `action:"result"` paging. The outcome includes
 `scriptUri` but not the unpersisted admission-only `scriptSource`.
 
 The background start has no enduring request signal, progress channel, or live checkpoint channel.
 It returns immediately and emits no progress after returning, even if the initiating request
-supplied a progress token. A later bounded `action:"await"` is a separate request; when that await
+supplied a progress token. A later bounded `action:"status"` is a separate request; when that status request
 carries a progress token, it can stream coarse phase and distinct started/ended-call progress while
 pending. The legacy/inconsistent-log polling fallback emits no progress notifications. A headless
 checkpoint default continues; abort fails with `WORKFLOW_ABORTED`; pause returns
@@ -389,14 +389,14 @@ to `paused` / `interrupted`.
 
 Every resumed background run durably seeds its inherited prefix (including a manager-owned
 checkpoint injection) beneath its new run ID before acknowledgement, so later resume hops remain
-self-contained. The MCP layer never rewrites that seed. Await and inspect never execute or resume
-the script; their cold preflight may only reconcile a dead owner's stale `pending`/`running` state
+self-contained. The MCP layer never rewrites that seed. Status never executes or resumes
+the script; its cold preflight may only reconcile a dead owner's stale `pending`/`running` state
 to `paused` / `interrupted`.
 
 Every admitted script is an immutable persistence-backed MCP resource at
 `workflow://runs/{runId}/script`. A completed JSON value is independently durable at
-`workflow://runs/{runId}/result`. Completed foreground/inspect/await responses include its
-`resultUri` and labelled link; run results link the new script, while inspect/await link the full
+`workflow://runs/{runId}/result`. Completed foreground/status responses include its
+`resultUri` and labelled link; run results link the new script, while status links the full
 script resume lineage oldest-to-newest as structured `{ runId, uri, available }` entries. Large
 result resources can be reconstructed exactly through 16,384-byte `action:"result"` chunks by
 following `endOffset` while `hasMore` is true; the bounded/redacted events resource is observability,
@@ -405,14 +405,15 @@ completion include only the 50 newest runs, but a direct URI read works for any 
 run. A path is never persisted or implicitly re-read, and the MCP layer retains no scripts, args,
 or synthetic lineage metadata in process memory.
 
-`action:"stop"` is location-independent: it stops a local live run, cold-stops a lease-free persisted run, or writes an idempotent intent and forwards signed control to a predecessor that holds the run lease. Final success appends `stopped`, releases the lease, and returns the final inspection projection with `stopped:true`. When cross-generation control does not settle inside the bound, the successful nonterminal result carries `control:{state:"pending",operationId,requestedAt,owner?}`; retry stop, inspect, or await. A repeated stop on a terminal run succeeds with `stopped:false,alreadyTerminal:true`. `forceOwner:true` explicitly authorizes terminating a superseded owner daemon and may interrupt sibling runs; it is forbidden with `callIndex`. Targeted call cancellation routes only to the live owner and is never reconstructed after owner loss. An in-flight stop may lack a quiescent terminal-environment proof, so the manager can conservatively run the following resume live; inspect `replayEligibility` and `resumeReport` rather than assuming a prefix replay.
+`action:"stop"` is location-independent: it stops a local live run, cold-stops a lease-free persisted run, or writes an idempotent intent and forwards signed control to a predecessor that holds the run lease. Final success appends `stopped`, releases the lease, and returns the final status projection with `stopped:true`. When cross-generation control does not settle inside the bound, the successful nonterminal result carries `control:{state:"pending",operationId,requestedAt,owner?}`; retry stop or status. A repeated stop on a terminal run succeeds with `stopped:false,alreadyTerminal:true`. `forceOwner:true` explicitly authorizes terminating a superseded owner daemon and may interrupt sibling runs; it is forbidden with `callIndex`. Targeted call cancellation routes only to the live owner and is never reconstructed after owner loss. An in-flight stop may lack a quiescent terminal-environment proof, so the manager can conservatively run the following resume live; read `replayEligibility` and `resumeReport` rather than assuming a prefix replay.
 
-Retain the run ID and inspect halted runs before guessing. The exact inspection input is:
+Retain the run ID and check halted runs before guessing. The exact status input is:
 
 ```ts
-interface WorkflowInspectToolInput {
-  action: "inspect";
+interface WorkflowStatusToolInput {
+  action: "status";
   runId: string;       // /^[a-z0-9]+-[a-z0-9]+$/, at most 128 characters
+  waitMs?: number;     // default 0; integer 0..25_000
   lastN?: number;      // default 20; integer 1..50
   labelGlob?: string;  // non-empty; at most 128 Unicode code points
   logLines?: number;   // default 20; integer 0..50

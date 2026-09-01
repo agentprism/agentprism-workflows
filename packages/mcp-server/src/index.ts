@@ -37,6 +37,7 @@ export type {
 export {
   clampWorkflowInput,
   parseWorkflowToolInput,
+  workflowToolInputSchema,
   workflowToolInputShape,
   WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT,
   WORKFLOW_RESULT_CHUNK_BYTES_MAX,
@@ -49,6 +50,7 @@ export type {
   WorkflowInspectToolInput,
   WorkflowPermissionResponseToolInput,
   WorkflowResultToolInput,
+  WorkflowStatusToolInput,
   WorkflowStopToolInput,
   WorkflowToolInput,
 } from "./workflow-tool-input.js";
@@ -72,6 +74,8 @@ export type {
   WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
   WorkflowScriptSource,
+  WorkflowStatusToolResult,
+  WorkflowStatusWaitMetadata,
   WorkflowStopPendingResult,
   WorkflowStopResult,
   WorkflowToolResult,

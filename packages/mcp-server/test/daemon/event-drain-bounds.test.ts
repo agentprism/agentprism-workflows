@@ -89,7 +89,7 @@ test(
       await waitUntil(() => daemon.activeRunCount() === 1, "the gated run should be running");
       const awaiting = session.client.callTool({
         name: "workflow",
-        arguments: { action: "await", runId: inflightRunId, waitMs: 15_000 },
+        arguments: { action: "status", runId: inflightRunId, waitMs: 15_000 },
       });
 
       // A real events subscription over the grown run (arms the daemon's watcher/notification path).

@@ -1,7 +1,7 @@
 import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 
 // Input schema and cross-field discriminator for the single MCP `workflow` tool.
-// Numeric execution knobs retain their existing clamp-at-runtime behavior. Inspection
+// Numeric execution knobs retain their existing clamp-at-runtime behavior. Status
 // bounds are rejected at the Zod boundary because they are wire-contract limits.
 import type { WorkflowRunInspectionOptions } from "@automatalabs/workflows";
 import { isAbsolute } from "node:path";
@@ -31,17 +31,17 @@ const checkpointRepliesSchema = z.record(
 
 export const workflowToolInputShape = {
   action: z
-    .enum(["run", "config", "inspect", "await", "result", "stop", "permissions-response"])
+    .enum(["run", "config", "status", "result", "stop", "permissions-response"])
     .optional()
     .describe(
-      "Operation. Omit or use run to validate then execute; config discovers live backend/model/mode/config options; inspect/await expose lifecycle and action requirements; result pages the exact completed JSON result; permissions-response resolves one pending ACP permission; stop aborts a run or one in-flight agent.",
+      "Operation. Omit or use run to validate then execute; config discovers live backend/model/mode/config options; status observes a run immediately or waits up to waitMs; result pages the exact completed JSON result; permissions-response resolves one pending ACP permission; stop aborts a run or one in-flight agent.",
     ),
   script: z
     .string()
     .min(1)
     .optional()
     .describe(
-      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/result/stop/permissions-response. First statement MUST be `export const meta = { name, description, phases? }`. When present, phases MUST be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings.",
+      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for config/status/result/stop/permissions-response. First statement MUST be `export const meta = { name, description, phases? }`. When present, phases MUST be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings.",
     ),
   scriptPath: z
     .string()
@@ -50,7 +50,7 @@ export const workflowToolInputShape = {
     .optional()
     .describe(
       "Absolute path, on the server's filesystem, to a workflow script file read once at admission. " +
-        "Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/result/stop/permissions-response. " +
+        "Exactly one of script or scriptPath is required for run; both are forbidden for config/status/result/stop/permissions-response. " +
         "Relative paths are rejected.",
     ),
   projectDir: z
@@ -62,7 +62,7 @@ export const workflowToolInputShape = {
       "Absolute project directory used as the cwd for config discovery and, for run, the project-scoped store " +
         "(where the runId, journal, and resume state live) plus default execution cwd. " +
         "Required for run and config on the shared workflow daemon; on a single-project (in-process) server it " +
-        "defaults to that server's own project. Forbidden for inspect/await/result/stop/permissions-response — a runId locates its project.",
+        "defaults to that server's own project. Forbidden for status/result/stop/permissions-response — a runId locates its project.",
     ),
   harnesses: z
     .array(z.string().regex(/^[a-z][a-z0-9._-]*$/i, "invalid backend name"))
@@ -149,12 +149,12 @@ export const workflowToolInputShape = {
     .max(128)
     .regex(/^[a-z0-9]+-[a-z0-9]+$/, "runId must be an engine-generated run ID")
     .optional()
-    .describe("Project-scoped workflow run ID. Required for inspect/await/result/stop/permissions-response; forbidden for config/run."),
+    .describe("Project-scoped workflow run ID. Required for status/result/stop/permissions-response; forbidden for config/run."),
   permissionId: z
     .string()
     .uuid()
     .optional()
-    .describe('With action="permissions-response", the opaque pending permission id returned by inspect/await.'),
+    .describe('With action="permissions-response", the opaque pending permission id returned by status.'),
   response: permissionResponseSchema
     .optional()
     .describe('With action="permissions-response", an exact ACP selected optionId or cancelled outcome.'),
@@ -188,7 +188,7 @@ export const workflowToolInputShape = {
     .min(0)
     .max(25_000)
     .optional()
-    .describe("Await duration in milliseconds. Default 20000; range 0..25000. Zero reads without blocking."),
+    .describe("With action=status, maximum MCP request wait in milliseconds. Omit or use zero for an immediate observation; range 0..25000. This never cancels workflow work."),
   offset: z
     .number()
     .int()
@@ -257,8 +257,8 @@ export interface WorkflowConfigToolInput {
   maxBytes?: never;
 }
 
-export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
-  action: "inspect";
+export interface WorkflowStatusToolInput extends WorkflowRunInspectionOptions {
+  action: "status";
   runId: string;
   callIndex?: never;
   forceOwner?: never;
@@ -266,7 +266,8 @@ export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
   scriptPath?: never;
   projectDir?: never;
   background?: never;
-  waitMs?: never;
+  /** Omit or use zero for an immediate observation; positive values wait at most this long. */
+  waitMs?: number;
   resumeFromRunId?: never;
   resumePolicy?: never;
   checkpointReplies?: never;
@@ -274,23 +275,18 @@ export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
   maxBytes?: never;
 }
 
-export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
+/** @deprecated Use WorkflowStatusToolInput with omitted waitMs. */
+export type WorkflowInspectToolInput = Omit<WorkflowStatusToolInput, "action" | "waitMs"> & {
+  action: "inspect";
+  waitMs?: never;
+};
+
+/** @deprecated Use WorkflowStatusToolInput with an explicit positive waitMs. */
+export type WorkflowAwaitToolInput = Omit<WorkflowStatusToolInput, "action"> & {
   action: "await";
-  runId: string;
-  callIndex?: never;
-  forceOwner?: never;
   /** Default 20_000; integer range 0..25_000. Zero is a non-blocking status read. */
   waitMs?: number;
-  script?: never;
-  scriptPath?: never;
-  projectDir?: never;
-  background?: never;
-  resumeFromRunId?: never;
-  resumePolicy?: never;
-  checkpointReplies?: never;
-  offset?: never;
-  maxBytes?: never;
-}
+};
 
 export interface WorkflowResultToolInput {
   action: "result";
@@ -360,14 +356,13 @@ export interface WorkflowStopToolInput extends WorkflowRunInspectionOptions {
 export type WorkflowToolInput =
   | WorkflowExecuteToolInput
   | WorkflowConfigToolInput
-  | WorkflowInspectToolInput
-  | WorkflowAwaitToolInput
+  | WorkflowStatusToolInput
   | WorkflowResultToolInput
   | WorkflowStopToolInput
   | WorkflowPermissionResponseToolInput;
 
 interface RawWorkflowToolInput {
-  action?: "run" | "config" | "inspect" | "await" | "result" | "stop" | "permissions-response";
+  action?: "run" | "config" | "status" | "inspect" | "await" | "result" | "stop" | "permissions-response";
   script?: string;
   scriptPath?: string;
   projectDir?: string;
@@ -432,6 +427,30 @@ function invalid(message: string): never {
   throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Invalid workflow tool input: ${message}`);
 }
 
+function normalizeLegacyObservationAction(raw: RawWorkflowToolInput): RawWorkflowToolInput {
+  if (raw.action === "inspect") {
+    return { ...raw, action: "status", waitMs: 0 };
+  }
+  if (raw.action === "await") {
+    return { ...raw, action: "status", waitMs: raw.waitMs ?? 20_000 };
+  }
+  return raw;
+}
+
+/**
+ * Runtime wire schema. Its published JSON Schema contains only canonical actions, while the
+ * preprocess keeps pre-status inspect/await clients working during migration.
+ */
+export const workflowToolInputSchema = z.preprocess(
+  (value) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+    const raw = value as RawWorkflowToolInput;
+    if (raw.action === "inspect" && raw.waitMs !== undefined) return value;
+    return normalizeLegacyObservationAction(raw);
+  },
+  z.object(workflowToolInputShape),
+);
+
 export interface ParseWorkflowToolInputOptions {
   /**
    * Enforce projectDir on run inputs. The shared workflow daemon serves every project from
@@ -443,9 +462,13 @@ export interface ParseWorkflowToolInputOptions {
 
 /** Apply the action discriminator after the MCP SDK has validated primitive fields. */
 export function parseWorkflowToolInput(
-  raw: RawWorkflowToolInput,
+  supplied: RawWorkflowToolInput,
   options: ParseWorkflowToolInputOptions = {},
 ): WorkflowToolInput {
+  if (supplied.action === "inspect" && supplied.waitMs !== undefined) {
+    invalid('legacy action="inspect" cannot include waitMs; use action="status"');
+  }
+  const raw = normalizeLegacyObservationAction(supplied);
   if (raw.action === "config") {
     if (
       raw.script !== undefined ||
@@ -536,29 +559,15 @@ export function parseWorkflowToolInput(
     };
   }
 
-  if (raw.action === "inspect") {
-    if (!raw.runId) invalid('action="inspect" requires runId');
-    if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || hasResultFields(raw) || raw.waitMs !== undefined || raw.callIndex !== undefined || raw.forceOwner !== undefined) {
-      invalid('action="inspect" cannot include execution fields');
-    }
-    return {
-      action: "inspect",
-      runId: raw.runId,
-      lastN: raw.lastN,
-      labelGlob: raw.labelGlob,
-      logLines: raw.logLines,
-    };
-  }
-
-  if (raw.action === "await") {
-    if (!raw.runId) invalid('action="await" requires runId');
+  if (raw.action === "status") {
+    if (!raw.runId) invalid('action="status" requires runId');
     if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || hasResultFields(raw) || raw.callIndex !== undefined || raw.forceOwner !== undefined) {
-      invalid('action="await" cannot include execution fields');
+      invalid('action="status" cannot include execution fields');
     }
     return {
-      action: "await",
+      action: "status",
       runId: raw.runId,
-      waitMs: raw.waitMs ?? 20_000,
+      waitMs: raw.waitMs ?? 0,
       lastN: raw.lastN,
       labelGlob: raw.labelGlob,
       logLines: raw.logLines,
@@ -596,7 +605,7 @@ export function parseWorkflowToolInput(
     hasConfigFields(raw) ||
     hasResultFields(raw)
   ) {
-    invalid("run inputs cannot include inspection fields");
+    invalid("run inputs cannot include status fields");
   }
   const hasScript = raw.script !== undefined;
   const hasScriptPath = raw.scriptPath !== undefined;
@@ -613,7 +622,7 @@ export function parseWorkflowToolInput(
     invalid("checkpointReplies requires resumeFromRunId");
   }
   const common = {
-    action: raw.action,
+    action: raw.action === "run" ? "run" as const : undefined,
     projectDir: raw.projectDir,
     args: raw.args,
     maxAgents: raw.maxAgents,
@@ -635,7 +644,7 @@ export function parseWorkflowToolInput(
     : { ...common, scriptPath: raw.scriptPath as string };
 }
 
-/** Clamp only execution resource knobs; inspection values are rejected rather than clamped. */
+/** Clamp only execution resource knobs; status values are rejected rather than clamped. */
 export function clampWorkflowInput(input: WorkflowExecuteToolInput): WorkflowExecuteToolInput {
   const clampInt = (value: number | undefined, minimum: number, maximum: number) =>
     value === undefined || !Number.isFinite(value)

@@ -249,7 +249,7 @@ function validResponse(response: WorkflowPermissionDecisionResponse): boolean {
 }
 
 /** Process-local broker for ACP requests that belong to live workflow agent calls. The request
- * remains parked inside AcpAgentRunner; inspect/await expose this bounded projection and a later
+ * remains parked inside AcpAgentRunner; status exposes this bounded projection and a later
  * MCP permission-response resolves the original promise. Nothing here reconstructs a request
  * after owner death. */
 export class WorkflowPermissionBroker {

@@ -53,7 +53,7 @@ test("a foreground call returns action-required without abandoning its live run"
     broker.respond(runId, pending.permissionId, { outcome: { outcome: "cancelled" } });
     const completed = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 2_000 },
+      arguments: { action: "status", runId, waitMs: 2_000 },
     }));
     assert.equal(completed.status, "completed");
     assert.equal((completed.outcome as Record<string, unknown>).result, "done");
@@ -63,7 +63,7 @@ test("a foreground call returns action-required without abandoning its live run"
   }
 });
 
-test("inspect exposes a live permission and permissions-response resumes the workflow", async () => {
+test("status exposes a live permission and permissions-response resumes the workflow", async () => {
   const broker = new WorkflowPermissionBroker();
   const runner = makeRunner(async (_prompt, options) => {
     const outcome = await broker.resolver(
@@ -102,7 +102,7 @@ test("inspect exposes a live permission and permissions-response resumes the wor
 
     const inspected = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId },
+      arguments: { action: "status", runId },
     }));
     const permissions = inspected.pendingPermissions as Array<Record<string, unknown>>;
     assert.equal(permissions.length, 1);
@@ -123,7 +123,7 @@ test("inspect exposes a live permission and permissions-response resumes the wor
 
     const awaited = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 2_000 },
+      arguments: { action: "status", runId, waitMs: 2_000 },
     }));
     assert.equal(awaited.status, "completed");
     assert.equal((awaited.outcome as Record<string, unknown>).result, "selected:cancel");
@@ -133,7 +133,7 @@ test("inspect exposes a live permission and permissions-response resumes the wor
   }
 });
 
-test("an elicitation-capable inspect presents the exact options and resumes the agent", async () => {
+test("elicitation-capable status presents the exact options and resumes the agent", async () => {
   const broker = new WorkflowPermissionBroker();
   const runner = makeRunner(async (_prompt, options) => {
     const outcome = await broker.resolver(
@@ -165,14 +165,14 @@ test("an elicitation-capable inspect presents the exact options and resumes the 
 
     const inspected = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId },
+      arguments: { action: "status", runId },
     }));
     assert.equal((inspected.permissionResponse as Record<string, unknown>).runId, runId);
     assert.deepEqual(inspected.pendingPermissions, []);
 
     const awaited = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 2_000 },
+      arguments: { action: "status", runId, waitMs: 2_000 },
     }));
     assert.equal((awaited.outcome as Record<string, unknown>).result, "allow_for_session");
   } finally {
@@ -231,7 +231,7 @@ test("the real ACP client, broker, and MCP tool preserve a same-kind Codex choic
 
     const inspected = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId },
+      arguments: { action: "status", runId },
     }));
     const [permission] = inspected.pendingPermissions as Array<{
       permissionId: string;
@@ -253,7 +253,7 @@ test("the real ACP client, broker, and MCP tool preserve a same-kind Codex choic
     });
     const terminal = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 3_000 },
+      arguments: { action: "status", runId, waitMs: 3_000 },
     }));
     assert.equal((terminal.outcome as Record<string, unknown>).result, "provider-finished");
     const records = (await readFile(logPath, "utf8"))
@@ -280,7 +280,7 @@ test("the real ACP client, broker, and MCP tool preserve a same-kind Codex choic
   }
 });
 
-test("await returns early with action-required instead of waiting for its full bound", async () => {
+test("status returns early with action-required instead of waiting for its full bound", async () => {
   const broker = new WorkflowPermissionBroker();
   const runner = makeRunner(async (_prompt, options) => {
     await broker.resolver(
@@ -303,7 +303,7 @@ test("await returns early with action-required instead of waiting for its full b
     const before = Date.now();
     const awaited = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 2_000 },
+      arguments: { action: "status", runId, waitMs: 2_000 },
     }));
     assert.equal((awaited.wait as Record<string, unknown>).returnedBecause, "action-required");
     assert.ok(Date.now() - before < 1_000);

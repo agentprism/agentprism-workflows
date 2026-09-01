@@ -131,7 +131,7 @@ const toolName = payload.tool_name ?? "";
 if (!toolName.endsWith(WORKFLOW_TOOL_SUFFIX)) process.exit(0); // defensive; matcher should scope
 const toolInput = payload.tool_input ?? {};
 const action = toolInput.action ?? "run";
-if (action !== "run") process.exit(0); // inspect/await/stop are read-side or lifecycle — not gated
+if (action !== "run") process.exit(0); // status/stop and other lifecycle actions are not gated
 
 const transcriptPath = payload.transcript_path;
 if (!transcriptPath || !existsSync(transcriptPath)) {

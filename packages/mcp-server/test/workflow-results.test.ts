@@ -48,7 +48,7 @@ async function waitUntil(predicate: () => boolean, message: string): Promise<voi
   assert.fail(message);
 }
 
-test("completed foreground, inspect, and await expose a distinct durable result resource to content-first clients", async () => {
+test("completed foreground and status expose a distinct durable result resource to content-first clients", async () => {
   const authored = { marker: "EXACT-WORKFLOW-RESULT", nested: { answer: 42 } };
   const serialized = JSON.stringify(authored);
   const script = [
@@ -72,14 +72,14 @@ test("completed foreground, inspect, and await expose a distinct durable result 
 
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(inspected)?.resultUri, resultUri);
     assert.deepEqual(links(inspected).map((link) => link.uri), [resultUri, scriptUri]);
 
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 0 },
+      arguments: { action: "status", runId, waitMs: 0 },
     });
     assert.equal(structured(awaited)?.resultUri, resultUri);
     assert.equal(
@@ -302,7 +302,7 @@ test("exact result retrieval survives restart and fails closed for every unavail
     const runId = String(structured(accepted)?.runId);
     const terminal = await paused.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 1_000 },
+      arguments: { action: "status", runId, waitMs: 1_000 },
     });
     assert.equal(structured(terminal)?.status, "paused");
     const unavailable = await paused.client.callTool({

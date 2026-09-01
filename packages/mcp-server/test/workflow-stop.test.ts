@@ -225,7 +225,7 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
 
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 25_000, lastN: 1, logLines: 0 },
+      arguments: { action: "status", runId, waitMs: 25_000, lastN: 1, logLines: 0 },
     });
     assert.equal(structured(awaited)?.status, "aborted");
     assert.equal((structured(awaited)?.wait as Record<string, unknown>).returnedBecause, "terminal");
@@ -258,7 +258,7 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
     assert.equal(resumeReport.live, 2);
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId: resumedRunId },
+      arguments: { action: "status", runId: resumedRunId },
     });
     assert.deepEqual(
       (structured(inspected)?.lineage as Array<Record<string, unknown>>).map((entry) => entry.runId),
@@ -337,7 +337,7 @@ test("stop with callIndex cancels one agent, keeps the run live, and treats labe
 
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId, lastN: 5, logLines: 5 },
+      arguments: { action: "status", runId, lastN: 5, logLines: 5 },
     });
     const cancelledCall = (structured(inspected)?.calls as Array<Record<string, unknown>>)
       .find((call) => call.index === 1);
@@ -351,7 +351,7 @@ test("stop with callIndex cancels one agent, keeps the run live, and treats labe
     controlled.calls[0].resolve("peer-ok");
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 25_000 },
+      arguments: { action: "status", runId, waitMs: 25_000 },
     });
     assert.equal(structured(awaited)?.status, "completed");
     const outcome = structured(awaited)?.outcome as Record<string, unknown>;
@@ -513,7 +513,7 @@ test("stop refuses a final acknowledgement when the terminal snapshot save fails
     fresh = await connectWithManager(freshRunner, freshManager);
     const inspected = await fresh.client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(inspected)?.status, "paused");
     const coldStop = await fresh.client.callTool({

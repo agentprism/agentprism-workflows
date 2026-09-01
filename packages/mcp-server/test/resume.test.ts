@@ -109,7 +109,7 @@ test("resumeFromRunId loads the persisted journal and REPLAYS it (runner is not 
   }
 });
 
-test("run, await, inspect, and foreground expose the same replay eligibility diagnostics", async () => {
+test("background admission, status, and foreground expose the same replay eligibility diagnostics", async () => {
   const { runner, calls } = countingRunner();
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
@@ -165,7 +165,7 @@ test("run, await, inspect, and foreground expose the same replay eligibility dia
     const resumedRunId = String(acceptedContent?.runId);
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId: resumedRunId, waitMs: 1_000 },
+      arguments: { action: "status", runId: resumedRunId, waitMs: 1_000 },
     });
     const awaitedContent = structured(awaited);
     const terminalEligibility = awaitedContent?.replayEligibility;
@@ -175,7 +175,7 @@ test("run, await, inspect, and foreground expose the same replay eligibility dia
 
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId: resumedRunId },
+      arguments: { action: "status", runId: resumedRunId },
     });
     assert.deepEqual(structured(inspected)?.replayEligibility, terminalEligibility);
     assert.match(textOf(inspected), /replayed prefix 2/);
@@ -216,7 +216,7 @@ test("a zero-prefix background acknowledgement warns with a named first miss", a
 
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId: String(structured(accepted)?.runId), waitMs: 1_000 },
+      arguments: { action: "status", runId: String(structured(accepted)?.runId), waitMs: 1_000 },
     });
     assert.equal(calls(), 2);
     assert.match(textOf(awaited), /WARNING: resume: identity-v1/);
@@ -390,11 +390,11 @@ return await agent('cached', { resume: { filesystem: 'read-only' } })`;
 
     const runningAwait = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId: targetRunId, waitMs: 0 },
+      arguments: { action: "status", runId: targetRunId, waitMs: 0 },
     });
     const runningInspect = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId: targetRunId },
+      arguments: { action: "status", runId: targetRunId },
     });
     assert.equal(structured(runningAwait)?.status, "running");
     assert.equal(structured(runningAwait)?.outcome, undefined);
@@ -411,7 +411,7 @@ return await agent('cached', { resume: { filesystem: 'read-only' } })`;
     releaseInserted("recorded:inserted");
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId: targetRunId, waitMs: 1_000 },
+      arguments: { action: "status", runId: targetRunId, waitMs: 1_000 },
     });
     assert.equal(structured(awaited)?.status, "completed");
     assert.equal(field(structured(awaited)?.outcome, "result"), "recorded:cached");

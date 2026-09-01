@@ -1,17 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
-import { z } from "zod";
 
 // Internals under test, imported via ../src (same-package unit test).
-import { clampWorkflowInput, parseWorkflowToolInput, workflowToolInputShape } from "../src/index.js";
+import {
+  clampWorkflowInput,
+  parseWorkflowToolInput,
+  workflowToolInputSchema,
+  workflowToolInputShape,
+} from "../src/index.js";
 
-// The MCP SDK validates a Zod RAW SHAPE before the handler runs; build the object schema
-// the SDK would build so we can assert exactly what the wire boundary accepts/rejects.
-const Schema = z.object(workflowToolInputShape);
+// The runtime schema performs compatibility normalization before canonical validation.
+const Schema = workflowToolInputSchema;
 
 test("input shape: primitive validation allows the union and the parser requires a complete branch", () => {
-  assert.deepEqual(Schema.parse({}), {}, "script is raw-schema optional so inspect can omit it");
+  assert.deepEqual(Schema.parse({}), {}, "script is raw-schema optional so status can omit it");
   assert.throws(() => parseWorkflowToolInput(Schema.parse({})), /Invalid workflow tool input/);
   assert.throws(() => Schema.parse({ script: "" }), "empty script must be rejected (min(1))");
   const ok = parseWorkflowToolInput(Schema.parse({ script: "export const meta = {};" }));
@@ -38,7 +41,7 @@ test("input shape: args is OPTIONAL and accepts an arbitrary JSON value", () => 
   assert.equal(Schema.parse({ script: "x", args: 7 }).args, 7);
 });
 
-test("input shape: one tool advertises the exact config, run, inspect, await, result, permission, and stop field superset", () => {
+test("input shape: one tool advertises the exact config, run, status, result, permission, and stop field superset", () => {
   assert.ok(!("startInBackground" in workflowToolInputShape), "startInBackground must not be a tool input");
   assert.deepEqual(
     Object.keys(workflowToolInputShape).sort(),
@@ -73,7 +76,7 @@ test("input shape: one tool advertises the exact config, run, inspect, await, re
       "scriptPath",
       "waitMs",
     ],
-    "the exact config/run/inspect/await/result/permission/stop wire fields",
+    "the exact config/run/status/result/permission/stop wire fields",
   );
 });
 
@@ -187,20 +190,46 @@ test("config accepts only bounded discovery fields and requires projectDir in da
   }
 });
 
-test("await applies its default and accepts the exact wait bounds", () => {
+test("status defaults to immediate observation and accepts the exact wait bounds", () => {
+  assert.deepEqual(parseWorkflowToolInput(Schema.parse({ action: "status", runId: "a-b" })), {
+    action: "status",
+    runId: "a-b",
+    waitMs: 0,
+    lastN: undefined,
+    labelGlob: undefined,
+    logLines: undefined,
+  });
+  assert.equal(parseWorkflowToolInput(Schema.parse({ action: "status", runId: "a-b", waitMs: 0 })).waitMs, 0);
+  assert.equal(parseWorkflowToolInput(Schema.parse({ action: "status", runId: "a-b", waitMs: 25_000 })).waitMs, 25_000);
+  for (const waitMs of [-1, 25_001, 1.5]) {
+    assert.throws(() => Schema.parse({ action: "status", runId: "a-b", waitMs }));
+  }
+});
+
+test("legacy inspect and await inputs normalize without remaining canonical actions", () => {
+  assert.throws(() => workflowToolInputShape.action.parse("inspect"));
+  assert.throws(() => workflowToolInputShape.action.parse("await"));
+  assert.deepEqual(parseWorkflowToolInput(Schema.parse({ action: "inspect", runId: "a-b" })), {
+    action: "status",
+    runId: "a-b",
+    waitMs: 0,
+    lastN: undefined,
+    labelGlob: undefined,
+    logLines: undefined,
+  });
   assert.deepEqual(parseWorkflowToolInput(Schema.parse({ action: "await", runId: "a-b" })), {
-    action: "await",
+    action: "status",
     runId: "a-b",
     waitMs: 20_000,
     lastN: undefined,
     labelGlob: undefined,
     logLines: undefined,
   });
-  assert.equal(parseWorkflowToolInput(Schema.parse({ action: "await", runId: "a-b", waitMs: 0 })).waitMs, 0);
-  assert.equal(parseWorkflowToolInput(Schema.parse({ action: "await", runId: "a-b", waitMs: 25_000 })).waitMs, 25_000);
-  for (const waitMs of [-1, 25_001, 1.5]) {
-    assert.throws(() => Schema.parse({ action: "await", runId: "a-b", waitMs }));
-  }
+  assert.equal(
+    parseWorkflowToolInput(Schema.parse({ action: "await", runId: "a-b", waitMs: 7 })).waitMs,
+    7,
+  );
+  assert.throws(() => Schema.parse({ action: "inspect", runId: "a-b", waitMs: 1 }));
 });
 
 test("result retrieval defaults to bounded UTF-8 chunks and rejects mixed fields", () => {
@@ -226,32 +255,33 @@ test("result retrieval defaults to bounded UTF-8 chunks and rejects mixed fields
   }
 });
 
-test("inspection accepts defaults and exact bounds, and rejects invalid IDs/globs/ranges", () => {
-  const bare = parseWorkflowToolInput(Schema.parse({ action: "inspect", runId: "mabc1234-k9x2pq" }));
+test("status accepts bounded filters and rejects invalid IDs, globs, and ranges", () => {
+  const bare = parseWorkflowToolInput(Schema.parse({ action: "status", runId: "mabc1234-k9x2pq" }));
   assert.deepEqual(bare, {
-    action: "inspect",
+    action: "status",
     runId: "mabc1234-k9x2pq",
+    waitMs: 0,
     lastN: undefined,
     labelGlob: undefined,
     logLines: undefined,
   });
   assert.doesNotThrow(() =>
     parseWorkflowToolInput(
-      Schema.parse({ action: "inspect", runId: "a-b", lastN: 1, logLines: 0, labelGlob: "review-?" }),
+      Schema.parse({ action: "status", runId: "a-b", lastN: 1, logLines: 0, labelGlob: "review-?" }),
     ),
   );
   assert.doesNotThrow(() =>
-    parseWorkflowToolInput(Schema.parse({ action: "inspect", runId: "a-b", lastN: 50, logLines: 50 })),
+    parseWorkflowToolInput(Schema.parse({ action: "status", runId: "a-b", lastN: 50, logLines: 50 })),
   );
   for (const input of [
-    { action: "inspect", runId: "../run" },
-    { action: "inspect", runId: "UPPER-case" },
-    { action: "inspect", runId: "a-b", lastN: 0 },
-    { action: "inspect", runId: "a-b", lastN: 51 },
-    { action: "inspect", runId: "a-b", logLines: -1 },
-    { action: "inspect", runId: "a-b", logLines: 51 },
-    { action: "inspect", runId: "a-b", labelGlob: "" },
-    { action: "inspect", runId: "a-b", labelGlob: "😀".repeat(129) },
+    { action: "status", runId: "../run" },
+    { action: "status", runId: "UPPER-case" },
+    { action: "status", runId: "a-b", lastN: 0 },
+    { action: "status", runId: "a-b", lastN: 51 },
+    { action: "status", runId: "a-b", logLines: -1 },
+    { action: "status", runId: "a-b", logLines: 51 },
+    { action: "status", runId: "a-b", labelGlob: "" },
+    { action: "status", runId: "a-b", labelGlob: "😀".repeat(129) },
   ]) {
     assert.throws(() => Schema.parse(input));
   }
@@ -295,7 +325,7 @@ test("stop requires runId, accepts an optional per-agent callIndex, and rejects 
     { action: "stop", runId: "a-b", args: {} },
     { action: "stop", runId: "a-b", background: true },
     { action: "stop", runId: "a-b", waitMs: 0 },
-    { action: "inspect", runId: "a-b", forceOwner: true },
+    { action: "status", runId: "a-b", forceOwner: true },
   ]) {
     assert.throws(() => parseWorkflowToolInput(Schema.parse(input)), /Invalid workflow tool input/);
   }
@@ -338,35 +368,24 @@ test("permissions-response accepts only an exact pending id and ACP response", (
   }), "provider effects must come only from the exact advertised optionId");
 });
 
-test("the discriminator rejects every missing or mixed run/inspect/await branch", () => {
+test("the discriminator rejects every missing or mixed run/status branch", () => {
   for (const input of [
     { action: "run" },
-    { action: "inspect" },
+    { action: "status" },
     { runId: "a-b" },
-    { action: "inspect", runId: "a-b", script: "x" },
-    { action: "inspect", runId: "a-b", scriptPath: "/tmp/x.js" },
-    { action: "inspect", runId: "a-b", args: {} },
-    { action: "inspect", runId: "a-b", concurrency: 2 },
-    { action: "inspect", runId: "a-b", resumeFromRunId: "c-d" },
-    { action: "inspect", runId: "a-b", resumePolicy: "auto" },
-    { action: "inspect", runId: "a-b", checkpointReplies: { 0: true } },
-    { action: "inspect", runId: "a-b", background: false },
-    { action: "inspect", runId: "a-b", waitMs: 0 },
-    { action: "inspect", runId: "a-b", callIndex: 0 },
-    { action: "await" },
-    { action: "await", runId: "a-b", script: "x" },
-    { action: "await", runId: "a-b", scriptPath: "/tmp/x.js" },
-    { action: "await", runId: "a-b", args: {} },
-    { action: "await", runId: "a-b", maxAgents: 1 },
-    { action: "await", runId: "a-b", concurrency: 1 },
-    { action: "await", runId: "a-b", agentRetries: 1 },
-    { action: "await", runId: "a-b", agentTimeoutMs: 1 },
-    { action: "await", runId: "a-b", agentIdleTimeoutMs: 1 },
-    { action: "await", runId: "a-b", resumeFromRunId: "c-d" },
-    { action: "await", runId: "a-b", resumePolicy: "auto" },
-    { action: "await", runId: "a-b", checkpointReplies: { 0: true } },
-    { action: "await", runId: "a-b", background: true },
-    { action: "await", runId: "a-b", callIndex: 0 },
+    { action: "status", runId: "a-b", script: "x" },
+    { action: "status", runId: "a-b", scriptPath: "/tmp/x.js" },
+    { action: "status", runId: "a-b", args: {} },
+    { action: "status", runId: "a-b", concurrency: 2 },
+    { action: "status", runId: "a-b", resumeFromRunId: "c-d" },
+    { action: "status", runId: "a-b", resumePolicy: "auto" },
+    { action: "status", runId: "a-b", checkpointReplies: { 0: true } },
+    { action: "status", runId: "a-b", background: false },
+    { action: "status", runId: "a-b", callIndex: 0 },
+    { action: "status", runId: "a-b", maxAgents: 1 },
+    { action: "status", runId: "a-b", agentRetries: 1 },
+    { action: "status", runId: "a-b", agentTimeoutMs: 1 },
+    { action: "status", runId: "a-b", agentIdleTimeoutMs: 1 },
     { script: "x", runId: "a-b" },
     { script: "x", callIndex: 0 },
     { script: "x", waitMs: 0 },
@@ -374,9 +393,9 @@ test("the discriminator rejects every missing or mixed run/inspect/await branch"
     { action: "run", script: "x", labelGlob: "*" },
     { action: "run", script: "x", logLines: 0 },
     { action: "run", script: "x", harnesses: ["claude"] },
-    { action: "inspect", runId: "a-b", modelFilter: "opus" },
-    { action: "inspect", runId: "a-b", offset: 0 },
-    { action: "await", runId: "a-b", maxBytes: 16 },
+    { action: "status", runId: "a-b", modelFilter: "opus" },
+    { action: "status", runId: "a-b", offset: 0 },
+    { action: "status", runId: "a-b", maxBytes: 16 },
     { script: "x", offset: 0 },
   ]) {
     const primitive = Schema.parse(input);

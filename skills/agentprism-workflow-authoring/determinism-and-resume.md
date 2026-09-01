@@ -59,6 +59,6 @@ Give repeated calls stable, descriptive labels and narrate decisions with `log()
 
 ### Kill, patch, resume
 
-Stop the live run with `{ action: "stop", runId }`. The returned `aborted` snapshot is the durable acknowledgement: resume is safe immediately, and a further await adds nothing. Edit the file. Start a new run with its absolute `scriptPath` and `resumeFromRunId`. Every completed call whose recorded identity and input fingerprint correspond replays, regardless of filesystem or environment drift. Read `replayEligibility` and the full `resumeReport` for the per-call decisions. A repeated stop of a terminal run is a successful no-op.
+Stop the live run with `{ action: "stop", runId }`. The returned `aborted` snapshot is the durable acknowledgement: resume is safe immediately, and a further status call adds nothing. Edit the file. Start a new run with its absolute `scriptPath` and `resumeFromRunId`. Every completed call whose recorded identity and input fingerprint correspond replays, regardless of filesystem or environment drift. Read `replayEligibility` and the full `resumeReport` for the per-call decisions. A repeated stop of a terminal run is a successful no-op.
 
 Registration, the per-action contracts, background collection, and the events resource are covered in **Running workflows** ([mcp-server-setup.md](mcp-server-setup.md)). Resume a durable checkpoint pause by re-sending the script with `resumeFromRunId` and `checkpointReplies` keyed by the source run's `checkpointContext.callIndex`.

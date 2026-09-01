@@ -72,7 +72,7 @@ const pendingPermissionSchema = z.object({
 
 const permissionInteractionSchema = z.object({
   permissionRequests: z.literal("may-block"),
-  collectWith: z.array(z.enum(["await", "inspect"])),
+  collectWith: z.array(z.literal("status")),
   respondWith: z.literal("permissions-response"),
   elicitation: z.enum(["available", "unavailable"]),
 });
@@ -626,7 +626,7 @@ export const workflowToolOutputShape = z
       valid = runCommonComplete && has("limits") && (value.status === "running"
         ? hasOnlyFields(value, ["scriptSource", "pendingPermissions", "interaction"])
         : terminal && hasOnlyFields(value, ["scriptSource", ...executionDetailFields]));
-    } else if (has("permissionResponse")) {
+    } else if (has("permissionResponse") && !has("wait")) {
       valid =
         runCommonComplete &&
         inspectionComplete &&
@@ -651,10 +651,10 @@ export const workflowToolOutputShape = z
       valid =
         runCommonComplete &&
         inspectionComplete &&
-        hasOnlyFields(value, [...inspectionFields, "wait", "tokenUsage", "outcome", "pendingPermissions", "interaction"]) &&
+        hasOnlyFields(value, [...inspectionFields, "wait", "tokenUsage", "outcome", "pendingPermissions", "interaction", "permissionResponse"]) &&
         (terminal ? has("outcome") : !has("outcome"));
     } else {
-      valid = runCommonComplete && inspectionComplete && hasOnlyFields(value, [...inspectionFields, "pendingPermissions", "interaction"]);
+      valid = runCommonComplete && inspectionComplete && hasOnlyFields(value, inspectionFields);
     }
     if (has("resultUri") && value.status !== "completed") valid = false;
     if (!valid) {
@@ -749,14 +749,9 @@ export const workflowToolOutputShape = z
         ...forbidsOutside(["scriptSource", "pendingPermissions", "interaction"]),
       },
       {
-        title: "Workflow inspection",
-        required: [...runOutputRequired, ...inspectionRequired],
-        ...forbidsOutside([...inspectionFields, "pendingPermissions", "interaction"]),
-      },
-      {
-        title: "Workflow await",
+        title: "Workflow status",
         required: [...runOutputRequired, ...inspectionRequired, "wait"],
-        ...forbidsOutside([...inspectionFields, "wait", "tokenUsage", "outcome", "pendingPermissions", "interaction"]),
+        ...forbidsOutside([...inspectionFields, "wait", "tokenUsage", "outcome", "pendingPermissions", "interaction", "permissionResponse"]),
         anyOf: [
           {
             required: ["outcome"],
@@ -767,6 +762,11 @@ export const workflowToolOutputShape = z
             ...forbidsRequired("outcome"),
           },
         ],
+      },
+      {
+        title: "Workflow targeted agent cancellation",
+        required: [...runOutputRequired, ...inspectionRequired],
+        ...forbidsOutside(inspectionFields),
       },
       {
         title: "Workflow permission response acknowledgement",
@@ -855,7 +855,7 @@ export interface WorkflowExecutionToolResult<T = unknown>
 
 export interface WorkflowPermissionInteraction {
   permissionRequests: "may-block";
-  collectWith: Array<"await" | "inspect">;
+  collectWith: ["status"];
   respondWith: "permissions-response";
   elicitation: "available" | "unavailable";
 }
@@ -869,19 +869,20 @@ export interface WorkflowBackgroundAccepted extends WorkflowExecutionScriptResou
   interaction?: WorkflowPermissionInteraction;
 }
 
-export interface WorkflowAwaitMetadata {
+export interface WorkflowStatusWaitMetadata {
   requestedMs: number;
   elapsedMs: number;
   returnedBecause: "terminal" | "timeout" | "immediate" | "action-required" | "permission-resolved";
 }
 
-export interface WorkflowInspectionToolResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
+export interface WorkflowRunObservation extends WorkflowRunStatus, WorkflowScriptResourceFields {
   pendingPermissions?: z.infer<typeof pendingPermissionSchema>[];
   interaction?: WorkflowPermissionInteraction;
+  permissionResponse?: z.infer<typeof permissionAcknowledgementSchema>;
 }
 
-export interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus, WorkflowScriptResourceFields {
-  wait: WorkflowAwaitMetadata;
+export interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunObservation {
+  wait: WorkflowStatusWaitMetadata;
   /** Cumulative usage observed for live calls in this execution; absent before any is known. */
   tokenUsage?: TokenUsage;
   pendingPermissions?: z.infer<typeof pendingPermissionSchema>[];
@@ -889,6 +890,15 @@ export interface WorkflowRunAwaitResult<T = unknown> extends WorkflowRunStatus, 
   /** Present exactly when status is paused/completed/failed/aborted. */
   outcome?: WorkflowExecutionOutcome<T>;
 }
+
+/** @deprecated Use WorkflowStatusWaitMetadata. */
+export type WorkflowAwaitMetadata = WorkflowStatusWaitMetadata;
+
+/** @deprecated Use WorkflowRunObservation for non-status observation payloads. */
+export type WorkflowInspectionToolResult = WorkflowRunObservation;
+
+/** @deprecated Use WorkflowStatusToolResult. */
+export type WorkflowRunAwaitResult<T = unknown> = WorkflowStatusToolResult<T>;
 
 export interface WorkflowResultRetrieval {
   action: "result";
@@ -946,8 +956,7 @@ export type WorkflowToolResult<T = unknown> =
   | WorkflowValidationRejected
   | WorkflowExecutionToolResult<T>
   | WorkflowBackgroundAccepted
-  | WorkflowInspectionToolResult
-  | WorkflowRunAwaitResult<T>
+  | WorkflowStatusToolResult<T>
   | WorkflowPermissionResponseResult
   | WorkflowStopResult
   | WorkflowStopPendingResult;

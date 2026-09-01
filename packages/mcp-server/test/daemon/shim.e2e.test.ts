@@ -298,7 +298,7 @@ test("subscriptions survive daemon death: the shim re-subscribes on session reco
     // Any call recovers the session (fresh daemon locates the run via the store manifest)
     // and the shim replays the tracked subscription onto the new session.
     const inspected = await session.client.callTool(
-      { name: "workflow", arguments: { action: "inspect", runId } },
+      { name: "workflow", arguments: { action: "status", runId } },
       { timeout: 60_000 },
     );
     assert.equal(inspected.isError ?? false, false, JSON.stringify(inspected.content));

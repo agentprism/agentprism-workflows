@@ -286,7 +286,7 @@ All versions below were re-verified from the installed workspace dependency grap
 ## 4. The MCP side — exposing the `workflow` tool
 
 The `workflow` tool grew from Pi's single-form input
-([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into an **action union** — `run` (the default when `action` is omitted), `inspect`, `await`, `result`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set (inspection fields on a run, or execution fields on an inspect/await/result/permissions-response/stop, are `InvalidParams`):
+([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into an **action union** — `run` (the default when `action` is omitted), `status`, `result`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set (status fields on a run, or execution fields on status/result/permissions-response/stop, are `InvalidParams`):
 
 - **Run** — supply **exactly one** of `script` or `scriptPath` (a raw JS string with no Markdown
   fences, or an absolute server-side path read once at admission; the first statement must be
@@ -297,12 +297,12 @@ The `workflow` tool grew from Pi's single-form input
   fields: `args`, `maxAgents` (default 1000), `concurrency` (clamped to 16), `agentRetries`
   (clamped to ≤3), `agentTimeoutMs` (total-wall, default none), `agentIdleTimeoutMs` (no backend activity, default disabled), the explicit-resume
   trio `resumeFromRunId` / `resumePolicy` / `checkpointReplies`, and `background`.
-- **Inspect / await / result / permissions-response / stop** — take a `runId` and never execution fields; `await` adds `waitMs` (default 20 000). `result` reads the authoritative completed value from persistence and returns at most 16,384 exact UTF-8 JSON bytes plus `endOffset`/`hasMore`; boundaries never split a code point and interior offsets fail closed. Inspect/await project live ACP permission requests and await returns early with `action-required`; `permissions-response` names the opaque request id and returns an exact advertised optionId or cancelled outcome. Whole-run stop is location-independent across daemon generations: the successor persists an idempotent intent, routes signed control to the lease owner, and may return a nonterminal pending-control acknowledgement before final settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and cancellation is never reconstructed after owner loss. Inspect, await, and stop accept the `lastN` / `labelGlob` / `logLines` projection bounds.
+- **Status / result / permissions-response / stop** — take a `runId` and never execution fields. `status` accepts the existing `lastN` / `labelGlob` / `logLines` projection bounds and `waitMs` (default 0): omitted/zero observes immediately and a positive value waits at most that long for terminal state or required permission. The request bound never cancels workflow work. `result` reads the authoritative completed value from persistence and returns at most 16,384 exact UTF-8 JSON bytes plus `endOffset`/`hasMore`; boundaries never split a code point and interior offsets fail closed. Status projects live ACP permission requests and returns early with `action-required`; `permissions-response` names the opaque request id and returns an exact advertised optionId or cancelled outcome. Whole-run stop is location-independent across daemon generations: the successor persists an idempotent intent, routes signed control to the lease owner, and may return a nonterminal pending-control acknowledgement before final settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and cancellation is never reconstructed after owner loss. Stop accepts the same projection bounds.
 - **Bounds clamp, don't reject:** accept `concurrency`/`agentRetries` as plain numbers in the tool
   schema — *not* Zod `.max()`, which rejects out-of-range input with `InvalidParams`. The engine
   already clamps them (`normalizeConcurrency` → `MAX_CONCURRENCY` 16, `normalizeAgentRetries` →
   `MAX_AGENT_RETRIES` 3), so defer to it and keep the "clamped" semantics above (matches Pi). The
-  inspection *bounds* (`lastN`/`logLines`/`waitMs`), by contrast, are wire-contract limits rejected
+  status *bounds* (`lastN`/`logLines`/`waitMs`), by contrast, are wire-contract limits rejected
   at the Zod boundary.
 
 **Two independent attempt clocks.** `agentTimeoutMs` / per-call `timeoutMs` cap total wall time;
@@ -315,9 +315,9 @@ final exhaustion resolves the call to `null`. Both are replay-neutral operationa
 
 **Exact result discovery is separate from observability.** Completed runs with a persisted JSON
 value expose `workflow://runs/{runId}/result`, distinct from the immutable `/script` resource and the
-bounded/redacted `/events` stream. Foreground, inspect, and await identify that URI and link with an
+bounded/redacted `/events` stream. Foreground and status identify that URI and link with an
 explicit result label; script links are labelled separately. Exact JSON up to 4,096 UTF-8 bytes is
-also copied into foreground/await text for content-first hosts. Larger results stay out of summary
+also copied into foreground/status text for content-first hosts. Larger results stay out of summary
 text and can be read as an unbounded resource or reconstructed from bounded `action:"result"` pages.
 All paths read the existing persisted snapshot, add no engine format, and fail closed for runs without
 a completed authored value. Events remain observability and are never promoted into a result
@@ -331,8 +331,8 @@ If an ACP permission blocks the turn first, foreground returns the still-running
 request rather than stranding the tool call; that run is then operated like a background run.
 But background support was **not** dropped. Runs execute in a shared per-user **workflow daemon**
 (the stdio entry is a thin shim that auto-starts it), so `background: true` acknowledges after
-durable admission with a `runId` and the run outlives the request — collected later with bounded
-`await` calls, and durable across client disconnects, shim kills, and session eviction. Version succession moves the family front door without moving live VM/ACP state: a predecessor keeps its run lease while the successor joins that lease to the predecessor's PID/instance record and forwards control over a user-key HMAC endpoint. A pre-control busy predecessor is temporarily retained for the first rolling upgrade. Owner exit, or the single client-owned process exiting under `--in-process`, can interrupt work; no timeout steals a live lease. Resume is **explicit**: a new run with `resumeFromRunId` continues from the persisted journal.
+durable admission with a `runId` and the run outlives the request — observed later with bounded
+`status` calls, and durable across client disconnects, shim kills, and session eviction. Version succession moves the family front door without moving live VM/ACP state: a predecessor keeps its run lease while the successor joins that lease to the predecessor's PID/instance record and forwards control over a user-key HMAC endpoint. A pre-control busy predecessor is temporarily retained for the first rolling upgrade. Owner exit, or the single client-owned process exiting under `--in-process`, can interrupt work; no timeout steals a live lease. Resume is **explicit**: a new run with `resumeFromRunId` continues from the persisted journal.
 
 The shipped server registers the `workflow` and `repl` tools — and no auth tool. Backend auth belongs to
 the agents' own CLI credential stores, and the server deliberately exposes no auth state for a

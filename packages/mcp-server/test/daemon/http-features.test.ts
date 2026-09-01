@@ -107,7 +107,7 @@ test("events subscription delivers resources/updated over the standalone GET str
 
     const awaited = await session.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 15_000 },
+      arguments: { action: "status", runId, waitMs: 15_000 },
     });
     assert.equal(structured(awaited)?.status, "completed", textOf(awaited));
     await session.dispose();
