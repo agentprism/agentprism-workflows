@@ -381,6 +381,7 @@ interface WorkflowExecutionToolResult {
   resumeReport?: WorkflowResumeReport;     // resumeFromRunId correspondence; otherwise absent
   scriptSource: "inline" | "path";
   scriptUri: string;
+  eventsUri: string; // durable bounded/redacted event stream
   resultUri?: string; // completed runs with a persisted JSON result
 }
 
@@ -401,6 +402,7 @@ interface WorkflowBackgroundAccepted {
   status: "running";
   scriptSource: "inline" | "path";
   scriptUri: string;
+  eventsUri: string;
   limits: WorkflowRunLimits;
   replayEligibility?: WorkflowReplayEligibility;
   pendingPermissions?: WorkflowPendingPermission[];
@@ -418,6 +420,7 @@ interface WorkflowResultRetrieval {
   runId: string;
   status: "completed";
   resultUri: string;
+  eventsUri?: string; // absent for legacy rows without a durable event stream
   mimeType: "application/json";
   encoding: "utf-8";
   totalBytes: number;
@@ -431,10 +434,28 @@ interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowStatusWaitMetadata;
   tokenUsage?: TokenUsage;
   pendingPermissions?: WorkflowPendingPermission[];
-  outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">; // exactly when terminal
+  outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource" | "eventsUri"> & { eventsUri?: string }; // terminal; legacy streams may omit URI
   scriptUri: string;
   resultUri?: string;
+  eventsUri?: string;
+  latestActivity?: WorkflowRunLatestActivity[];
   lineage: WorkflowScriptLineageEntry[];
+}
+
+interface WorkflowRunLatestActivity {
+  scope: string;
+  callIndex: number;
+  executionStartSeq: number;
+  label: string;
+  phase?: string;
+  timestamp: string;
+  cursor: number;
+  turnCount: number;
+  observedEvents: number;
+  latestText?: string;     // exactly one of latestText / lastToolName
+  lastToolName?: string;
+  tokensObserved?: number;
+  relevance: "current" | "terminal";
 }
 
 interface WorkflowScriptLineageEntry {
@@ -447,6 +468,8 @@ interface WorkflowPermissionResponseResult extends WorkflowRunStatus {
   pendingPermissions?: WorkflowPendingPermission[];
   permissionResponse: { permissionId: string; runId: string; callIndex: number; outcome: object; respondedAt: string };
   scriptUri: string;
+  eventsUri?: string;
+  latestActivity?: WorkflowRunLatestActivity[];
   lineage: WorkflowScriptLineageEntry[];
 }
 
@@ -454,6 +477,8 @@ interface WorkflowStopResult extends WorkflowRunStatus {
   stopped: boolean;
   alreadyTerminal: boolean;
   scriptUri: string;
+  eventsUri?: string;
+  latestActivity?: WorkflowRunLatestActivity[];
   lineage: WorkflowScriptLineageEntry[];
 }
 
@@ -494,7 +519,8 @@ an inline/path source in a later request or fresh server process.
 
 `status` lets a host distinguish a `completed` run from a `paused` one (resumable via `resumeFromRunId`) without parsing logs. The tool result is flagged `isError` when `status` is `failed` or `aborted`. A `result` field is only present when `status === "completed"`.
 
-A status response extends the shared `WorkflowRunStatus` with wait metadata, `scriptUri`, and `lineage`:
+A status response extends the shared `WorkflowRunStatus` with wait metadata, resource URIs,
+`latestActivity`, and `lineage`:
 
 ```ts
 interface WorkflowRunStatus {
@@ -528,7 +554,12 @@ and the complete ordered exact option-id set must fit within the 64 KiB permissi
 request is cancelled rather than exposed partially. Sensitive keys and credential-shaped strings are
 redacted before ordinary results are structurally compacted; every
 text scalar and preview is at most 512 UTF-8 bytes. The inherited structured status is at most
-24,576 bytes, retaining newest diagnostics by dropping oldest calls, logs, then phases. The full
+24,576 bytes. `latestActivity` is folded from the validated durable event stream into one latest
+sample per logical call. It reports its source cursor/timestamp, turn/event counts, observed tokens,
+exactly one bounded assistant preview or tool name, and `current`/`terminal` relevance. The same
+`lastN`/`labelGlob` selection applies to it; targeted cancellation, whole-run abort, and restart
+remain visible because the projection is rebuilt from durable records. Legacy or unsafe streams
+omit it. The cap retains newest diagnostics by dropping oldest calls, activity rows, logs, then phases. The full
 oldest-to-newest script lineage is mandatory: if that lineage alone makes the augmented envelope
 larger, requested diagnostics are retained and `truncation.maxStructuredBytes` rises to the actual
 envelope size instead of claiming the 24,576-byte status limit. The accompanying text is formatted
@@ -606,7 +637,7 @@ page the same exact UTF-8 JSON through the model-facing workflow tool:
 { "action": "result", "runId": "mabc1234-k9x2pq", "offset": 0, "maxBytes": 16384 }
 ```
 
-The response is `{ action:"result", runId, status:"completed", resultUri, mimeType:"application/json",
+The response is `{ action:"result", runId, status:"completed", resultUri, eventsUri?, mimeType:"application/json",
 encoding:"utf-8", totalBytes, offset, endOffset, hasMore, chunk }`. Concatenate `chunk` values in
 order and continue at each `endOffset`; boundaries never split a UTF-8 code point. An arbitrary
 caller offset inside a multi-byte code point is rejected instead of returning replacement text.
@@ -639,9 +670,12 @@ events document is bounded/redacted observability, not an exact result-reconstru
 content strings are credential-redacted and capped at 512 UTF-8 bytes. Query URIs are readable but not subscribable. Integrity failures are explicit rather than
 serving a silently incomplete transcript. See the [API contract](../../docs/api.md#mcp-live-events-resource).
 
-Run/background results contain a clearly labelled `resource_link` for the newly admitted script.
-Completed foreground and status results also carry `resultUri` and a clearly labelled exact
-result link. Status responses contain available script links for the full resume lineage, oldest to
+Run/background results contain clearly labelled `resource_link` blocks for the newly admitted
+script and its durable events stream, and structured `scriptUri`/`eventsUri` fields. Status,
+permission-response, stop, terminal outcome, and result-retrieval responses repeat `eventsUri` and
+the events link whenever that stream exists; legacy rows may omit them. Completed foreground and
+status results also carry `resultUri` and a clearly labelled exact result link. Status responses
+contain available script links for the full resume lineage, oldest to
 newest, and duplicate that history in structured `lineage`. A deleted revision remains listed as `available: false` without a
 fabricated link. Lineage is reconstructed at read time from the engine's durable resume-source
 pointer (`resumeSourceRunId`) and, for deleted ancestors, the engine's content-free lineage
@@ -660,7 +694,8 @@ client `resources` capability to gate these server-offered primitives.
   request cancellation, progress notifications, live checkpoint elicitation, terminal `isError`,
   and result shape.
 - **Detached admission.** `background:true` returns a running acknowledgement with `runId`,
-  `status`, `scriptSource`, `scriptUri`, resolved `limits`, optional resume `replayEligibility`, and the script resource link
+  `status`, `scriptSource`, `scriptUri`, `eventsUri`, resolved `limits`, optional resume
+  `replayEligibility`, and separately labelled script/events resource links
   after parsing, backend approval, one of four process-local slot reservations, lease acquisition,
   and successful persistence readback. It never awaits agent or script-body completion. A fifth
   active-or-starting request returns
@@ -972,6 +1007,7 @@ The REPL-specific exports are `replToolInputShape` / `replToolOutputShape` (the 
 `CreateWorkflowServerOptions`,
 `WorkflowExecuteToolInput`, `WorkflowStatusToolInput`, `WorkflowPermissionResponseToolInput`, `WorkflowStopToolInput`,
 `WorkflowExecutionToolResult`, `WorkflowBackgroundAccepted`, `WorkflowStatusWaitMetadata`,
+`WorkflowRunLatestActivity`,
 `WorkflowStatusToolResult`, `WorkflowPermissionResponseResult`, `WorkflowStopResult`,
 `WorkflowScriptLineageEntry`, `WorkflowToolResult`, `WorkflowPermissionBroker`, `WorkflowPendingPermission`, `MAX_BACKGROUND_RUNS`,
 `workflowToolOutputShape` / `toWorkflowToolResult`,

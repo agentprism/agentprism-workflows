@@ -22,7 +22,7 @@ cancels workflow work.
 
 `lastN`, `labelGlob`, and `logLines` keep their existing validation, filtering, redaction, and
 projection limits. Status retains owner-death reconciliation, cross-generation permission routing
-and elicitation, request progress-token behavior, script/result resource links, complete script
+and elicitation, request progress-token behavior, script/result/events resource links, complete script
 lineage, cumulative usage telemetry, terminal outcome reconstruction, and the distinction between
 a failed workflow lifecycle and a failed status read.
 
@@ -46,9 +46,11 @@ interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
   pendingPermissions?: WorkflowPendingPermission[];
   interaction?: WorkflowPermissionInteraction;
   permissionResponse?: WorkflowPermissionResponseAcknowledgement;
-  outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">;
+  outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource" | "eventsUri"> & { eventsUri?: string };
   scriptUri: string;
   resultUri?: string;
+  eventsUri?: string;
+  latestActivity?: WorkflowRunLatestActivity[];
   lineage: WorkflowScriptLineageEntry[];
 }
 ```
@@ -57,6 +59,14 @@ interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
 `returnedBecause: "action-required"`, or with `"permission-resolved"` when a compatible elicitation
 round resolves it. Targeted `stop` continues to return the same compact observation projection but
 is a stop result, not a second observation action.
+
+For every safe durable event stream, `eventsUri` names the detailed redacted source and a labelled
+events `resource_link` accompanies the response. `latestActivity` is reconstructed from that stream
+as one bounded sample per matching logical call: source timestamp/cursor, execution identity,
+turn/event counts, observed tokens, exactly one assistant preview or tool name, and
+`current`/`terminal` relevance. It survives targeted cancellation, whole-run abort, and restart;
+legacy or integrity-unsafe streams omit it. `lastN`/`labelGlob` filter activity along with call rows,
+and activity participates in the existing 24,576-byte structured status cap.
 
 ## Compatibility migration
 

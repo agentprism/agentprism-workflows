@@ -315,8 +315,11 @@ final exhaustion resolves the call to `null`. Both are replay-neutral operationa
 
 **Exact result discovery is separate from observability.** Completed runs with a persisted JSON
 value expose `workflow://runs/{runId}/result`, distinct from the immutable `/script` resource and the
-bounded/redacted `/events` stream. Foreground and status identify that URI and link with an
-explicit result label; script links are labelled separately. Exact JSON up to 4,096 UTF-8 bytes is
+bounded/redacted `/events` stream. Every admitted durable-log run and later status/terminal response
+identifies `/events` through `eventsUri` and a labelled resource link. Status additionally reduces
+durable progress to bounded per-call `latestActivity`; the linked event stream remains the detailed
+cursor/transcript authority. Foreground and status identify the exact-result URI and link with an
+explicit result label; script and events links are labelled separately. Exact JSON up to 4,096 UTF-8 bytes is
 also copied into foreground/status text for content-first hosts. Larger results stay out of summary
 text and can be read as an unbounded resource or reconstructed from bounded `action:"result"` pages.
 All paths read the existing persisted snapshot, add no engine format, and fail closed for runs without

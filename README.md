@@ -371,8 +371,10 @@ Then long-poll in ordinary bounded tool calls until `outcome` appears:
 ```
 
 A timeout returns the freshest bounded status and partial cumulative token usage; terminal status
-adds the same raw result/log projection a foreground call returns. Completed foreground/status
-responses expose `workflow://runs/{runId}/result` separately from the script resource. Exact JSON up
+adds the same raw result/log projection a foreground call returns. Every admitted run and subsequent
+status/terminal response for a durable event-log run exposes `eventsUri` plus a labelled events
+resource link. Completed foreground/status responses expose `workflow://runs/{runId}/result`
+separately from the script resource. Exact JSON up
 to 4,096 UTF-8 bytes is copied into foreground/status text for content-first hosts; larger results
 point to that resource and bounded `action:"result"` paging (`endOffset` + `hasMore`). The
 bounded/redacted events stream is observability, not an exact-result API. Status returns early with
@@ -406,8 +408,12 @@ new background run durably inherits the replay prefix under its new run ID befor
 
 #### Follow a background run live
 
-`status` returns bounded snapshots. To consume redacted progress and assistant/tool transcript
-upserts while agents are still working, subscribe to the run's durable MCP events resource. Subscribe
+`status` returns bounded snapshots, including one compact `latestActivity` sample per matching call
+when durable progress has been observed. The sample carries its source cursor/timestamp, turn and
+event counts, observed tokens, a bounded latest assistant preview or tool name, and current/terminal
+relevance; it is useful after cancellation, abort, and restart but is not a transcript. Use the
+returned `eventsUri` or labelled events link to consume redacted progress and assistant/tool
+transcript upserts while agents are still working. Subscribe
 before the first read so an append cannot race the handoff, then page from the last reduced cursor:
 
 ```ts
@@ -476,8 +482,10 @@ log, and call tail:
 { "action": "status", "runId": "mabc1234-k9x2pq", "lastN": 10, "labelGlob": "review-*", "logLines": 20 }
 ```
 
-Status returns lifecycle state, ordered phases, a redacted log tail, and attributed compact
-call previews. Its structured payload is capped at 24,576 UTF-8 bytes and its text at 8,192 bytes.
+Status returns lifecycle state, ordered phases, a redacted log tail, attributed compact call
+previews, and the durable latest-activity samples described above. `lastN` and `labelGlob` apply to
+both call rows and activity. Its structured payload, including `latestActivity`, is capped at 24,576
+UTF-8 bytes and its text at 8,192 bytes.
 Paused, failed, and aborted execution responses also include a redacted final-20 `logTail` immediately.
 
 The model-facing surface is `docs`, `workflow`, and `repl`. `docs` embeds one selected, version-matched text/markdown topic per call; `repl` is a persistent QuickJS-in-WASM JavaScript VM (one per project) for live, stateful orchestration. Prompt-capable hosts additionally get the compact user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which directs the assistant to relevant `docs` topics. Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.

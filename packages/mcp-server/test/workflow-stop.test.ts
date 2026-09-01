@@ -188,7 +188,10 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
       arguments: { scriptPath, background: true },
     });
     const runId = runIdOf(accepted);
-    assert.deepEqual(links(accepted).map((link) => link.uri), [`workflow://runs/${runId}/script`]);
+    assert.deepEqual(links(accepted).map((link) => link.uri), [
+      `workflow://runs/${runId}/script`,
+      `workflow://runs/${runId}/events`,
+    ]);
     await waitUntil(() => controlled.calls.length === 1, "the first agent should start");
     controlled.calls[0].resolve("first result");
     await waitUntil(() => controlled.calls.length === 2, "the second agent should start");
@@ -204,7 +207,10 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
     assert.equal(controlled.calls[1].options.signal?.aborted, true);
     assert.match(textOf(stopped), /snapshot is final for run fate/i);
     assert.match(textOf(stopped), /Agent-session cancellation may still be winding down/i);
-    assert.deepEqual(links(stopped).map((link) => link.uri), [`workflow://runs/${runId}/script`]);
+    assert.deepEqual(links(stopped).map((link) => link.uri), [
+      `workflow://runs/${runId}/script`,
+      `workflow://runs/${runId}/events`,
+    ]);
 
     const persistedFile = persistedRunFile(runId);
     assert.ok(persistedFile);

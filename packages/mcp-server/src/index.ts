@@ -71,6 +71,7 @@ export type {
   WorkflowPermissionResponseResult,
   WorkflowResultRetrieval,
   WorkflowRunAwaitResult,
+  WorkflowRunLatestActivity,
   WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
   WorkflowScriptSource,

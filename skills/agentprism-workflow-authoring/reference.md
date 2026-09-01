@@ -279,6 +279,7 @@ interface WorkflowResultRetrieval {
   runId: string;
   status: "completed";
   resultUri: string;
+  eventsUri?: string;
   mimeType: "application/json";
   encoding: "utf-8";
   totalBytes: number;
@@ -313,6 +314,7 @@ interface WorkflowBackgroundAccepted {
   status: "running";
   scriptSource: "inline" | "path";
   scriptUri: string;
+  eventsUri: string;
   limits: WorkflowRunLimits;
   replayEligibility?: WorkflowReplayEligibility;
   pendingPermissions?: WorkflowPendingPermission[];
@@ -329,10 +331,28 @@ interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowStatusWaitMetadata;
   tokenUsage?: TokenUsage;
   pendingPermissions?: WorkflowPendingPermission[];
-  outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource">; // exactly when terminal
+  outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource" | "eventsUri"> & { eventsUri?: string }; // terminal; legacy streams may omit URI
   scriptUri: string;
   resultUri?: string;
+  eventsUri?: string;
+  latestActivity?: WorkflowRunLatestActivity[];
   lineage: Array<{ runId: string; uri: string; available: boolean }>;
+}
+
+interface WorkflowRunLatestActivity {
+  scope: string;
+  callIndex: number;
+  executionStartSeq: number;
+  label: string;
+  phase?: string;
+  timestamp: string;
+  cursor: number;
+  turnCount: number;
+  observedEvents: number;
+  latestText?: string;
+  lastToolName?: string;
+  tokensObserved?: number;
+  relevance: "current" | "terminal";
 }
 
 interface WorkflowStopToolInput {
@@ -394,9 +414,12 @@ the script; its cold preflight may only reconcile a dead owner's stale `pending`
 to `paused` / `interrupted`.
 
 Every admitted script is an immutable persistence-backed MCP resource at
-`workflow://runs/{runId}/script`. A completed JSON value is independently durable at
+`workflow://runs/{runId}/script`. A durable event stream is discoverable through `eventsUri` and a
+labelled events link on admission and later status/terminal responses. Status derives one bounded,
+redacted `latestActivity` sample per matching call from that stream; the resource remains the
+detailed cursor/transcript authority. A completed JSON value is independently durable at
 `workflow://runs/{runId}/result`. Completed foreground/status responses include its
-`resultUri` and labelled link; run results link the new script, while status links the full
+`resultUri` and labelled link; run results link the new script and events, while status links the full
 script resume lineage oldest-to-newest as structured `{ runId, uri, available }` entries. Large
 result resources can be reconstructed exactly through 16,384-byte `action:"result"` chunks by
 following `endOffset` while `hasMore` is true; the bounded/redacted events resource is observability,

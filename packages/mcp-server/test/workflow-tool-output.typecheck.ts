@@ -42,6 +42,7 @@ const execution: WorkflowExecutionToolResult = {
   scriptSource: "inline",
   scriptUri: "workflow://runs/aa-bb/script",
   resultUri: "workflow://runs/aa-bb/result",
+  eventsUri: "workflow://runs/aa-bb/events",
   limits,
   replayEligibility,
 };
@@ -63,12 +64,14 @@ const background: WorkflowBackgroundAccepted = {
   status: "running",
   scriptSource: "path",
   scriptUri: "workflow://runs/aa-bb/script",
+  eventsUri: "workflow://runs/aa-bb/events",
   limits,
   replayEligibility,
 };
 const statusFields = {
   ...status,
   scriptUri: "workflow://runs/aa-bb/script",
+  eventsUri: "workflow://runs/aa-bb/events",
   lineage,
 };
 const observed: WorkflowStatusToolResult = {
@@ -117,6 +120,7 @@ const executionWithoutSource: WorkflowExecutionToolResult = {
   runId: "aa-bb",
   status: "completed",
   scriptUri: "workflow://runs/aa-bb/script",
+  eventsUri: "workflow://runs/aa-bb/events",
 };
 // @ts-expect-error execution results require resolved limits
 const executionWithoutLimits: WorkflowExecutionToolResult = {
@@ -124,12 +128,22 @@ const executionWithoutLimits: WorkflowExecutionToolResult = {
   status: "completed",
   scriptSource: "inline",
   scriptUri: "workflow://runs/aa-bb/script",
+  eventsUri: "workflow://runs/aa-bb/events",
 };
 // @ts-expect-error background acknowledgements require scriptUri
 const backgroundWithoutUri: WorkflowBackgroundAccepted = {
   runId: "aa-bb",
   status: "running",
   scriptSource: "inline",
+  eventsUri: "workflow://runs/aa-bb/events",
+  limits,
+};
+// @ts-expect-error current execution results require durable events discovery
+const executionWithoutEvents: WorkflowExecutionToolResult = {
+  runId: "aa-bb",
+  status: "completed",
+  scriptSource: "inline",
+  scriptUri: "workflow://runs/aa-bb/script",
   limits,
 };
 // @ts-expect-error status results require the complete lineage
@@ -168,6 +182,7 @@ void [
   resourceFields,
   executionWithoutSource,
   executionWithoutLimits,
+  executionWithoutEvents,
   backgroundWithoutUri,
   statusWithoutLineage,
   statusWithoutUri,

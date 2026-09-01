@@ -142,9 +142,11 @@ test("initialize advertises full resources capabilities and scriptPath snapshots
     assert.equal(result.isError, false);
     assert.equal(structured(result)?.scriptSource, "path");
     assert.equal(structured(result)?.scriptUri, uri);
+    assert.equal(structured(result)?.eventsUri, `workflow://runs/${runId}/events`);
     assert.deepEqual(resourceLinks(result).map((link) => link.uri), [
       `workflow://runs/${runId}/result`,
       uri,
+      `workflow://runs/${runId}/events`,
     ]);
 
     writeFileSync(scriptPath, `${NO_AGENT_SCRIPT}\n// later edit`, "utf8");
@@ -491,6 +493,7 @@ test("path and inline delivery share journal identity and changed path content r
       [
         `workflow://runs/${thirdRunId}/result`,
         ...[firstRunId, secondRunId, thirdRunId].map((runId) => `workflow://runs/${runId}/script`),
+        `workflow://runs/${thirdRunId}/events`,
       ],
     );
   } finally {
@@ -1101,6 +1104,7 @@ test("a 300-hop public resume lineage remains complete and reports a truthful st
       [
         `workflow://runs/${runIds.at(-1)}/result`,
         ...runIds.map((runId) => `workflow://runs/${runId}/script`),
+        `workflow://runs/${runIds.at(-1)}/events`,
       ],
     );
     assert.ok(Number(truncation.maxStructuredBytes) > 24_576);

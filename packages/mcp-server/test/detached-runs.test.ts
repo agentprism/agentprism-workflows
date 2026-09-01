@@ -103,6 +103,7 @@ test("background acceptance is immediate and status reports immediate, timeout, 
       status: "running",
       scriptSource: "inline",
       scriptUri: `workflow://runs/${acceptedRunId}/script`,
+      eventsUri: `workflow://runs/${acceptedRunId}/events`,
       limits: EXPECTED_LIMITS,
       pendingPermissions: [],
       interaction: {
@@ -475,8 +476,8 @@ test("status cancellation closes its event watcher without cancelling the workfl
     assert.equal(result.isError, true);
     assert.equal(
       watcherCloseCalls,
-      3,
-      "admission readback, resource projection, and status each obtain the shared persistence instance",
+      6,
+      "admission readback plus script, events-link, and latest-activity status projections use the shared persistence instance",
     );
     assert.equal(controlled.calls[0].options.signal?.aborted, false);
   } finally {

@@ -6,6 +6,12 @@
 > event-tail behavior now used by `action:"status"` when `waitMs` is positive. See
 > [`workflow-status-action.md`](workflow-status-action.md).
 
+> **Current MCP discovery:** every admitted durable-log run and later status/terminal response
+> returns the canonical `eventsUri` plus a labelled events `resource_link`. Status additionally
+> derives bounded per-call `latestActivity` from validated `agentProgress` records; it never copies
+> the detailed transcript into the tool envelope. Legacy or integrity-unsafe streams omit that
+> projection while ordinary status remains available.
+
 **References:** `packages/shared-types/src/workflow-result.ts`,
 `packages/workflow-engine/src/workflow.ts`,
 `packages/workflow-engine/src/workflow-manager.ts`,

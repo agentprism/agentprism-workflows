@@ -544,8 +544,9 @@ and gives the subscribing MCP client the transcript directly.
 
 The ordinary run JSON and live-only `agentHistory` manager event keep their current finalization
 semantics described in §2: `onHistory` can run before `agentEnd`, but only after ACP prompt
-processing and without causing a run save. `inspect` remains bounded and unchanged; a client that
-needs the in-flight transcript reads the events resource it already subscribed to. R3 is not
+processing and without causing a run save. Status remains bounded: it now derives only a compact
+per-call `latestActivity` sample from `agentProgress`; a client that needs the in-flight transcript
+reads the linked events resource. R3 is not
 inferred from sampled progress: transcript upserts have their own exact reducer contract.
 
 ### 6.2 Reducer and ordering
@@ -789,13 +790,23 @@ Unsubscribe, connection close, or run deletion closes all associated watchers an
 scheduler/recovery state. Run deletion also removes the subscription and sends list-changed; it
 does not send a final resource-updated notification for a resource that can no longer be read.
 
-### 7.3 Existing surfaces
+### 7.3 Tool discovery and compact status activity
 
-Script resource URI/read/subscription/lineage behavior remains unchanged. `await` continues to use
-the same event log and terminal detection, but its progress reporter adds the `agentProgress`
-content message from §6.3 and explicitly ignores `agentTranscript` records. Tool input/output
-schemas gain no field. Run/tool results and existing script resource links remain compatible;
-documentation adds the events URI rather than replacing script links.
+Script resource URI/read/subscription/lineage behavior remains unchanged. Canonical `status` uses
+the same event log and terminal detection, and its progress reporter adds the `agentProgress`
+content message from §6.3 while ignoring `agentTranscript` records. Every admitted durable-log run
+and later status/terminal response exposes the canonical `eventsUri` and a clearly labelled events
+`resource_link` alongside existing script/result links. Result retrieval repeats the URI/link when
+the stream exists. Legacy rows without valid event-generation metadata omit them.
+
+Status folds validated `agentProgress` records into at most one `latestActivity` row per logical
+`(scope, callIndex)`. The row carries `executionStartSeq`, safe label/phase, source timestamp/cursor,
+turn/event counts, optional observed tokens, exactly one bounded/redacted assistant preview or tool
+name, and `current`/`terminal` relevance. Root/call terminal events and persisted terminal state make
+the row terminal, so targeted cancellation, whole-run abort, and cold restart remain useful. The
+same `lastN` and `labelGlob` selection applies as for call rows. Legacy, incomplete, corrupt, or
+otherwise unsafe streams omit the projection. Activity is trimmed inside the established 24,576-byte
+structured status cap; the detailed transcript is never copied into a tool envelope.
 
 ## 8. Error and failure contract
 
@@ -864,7 +875,7 @@ One coordinated changeset set ships:
 | `@automatalabs/shared-types` | additive progress/transcript resource-facing event types | minor |
 | `@automatalabs/workflow-engine` | accumulator, projection, sampling, execution-cycle transcript ordering, critical resumed-status save, snapshot activity, JSONL validation | minor |
 | `@automatalabs/workflows` | shared `WorkflowAgentEventSource`, ACP projection, facade re-exports | minor |
-| `@automatalabs/mcp-server` | events resource, watcher/coalescer, content-bearing foreground/await progress | minor |
+| `@automatalabs/mcp-server` | events resource, watcher/coalescer, content-bearing status progress, URI/link discovery, bounded latest activity | minor |
 | `@automatalabs/acp-agents` | no runtime/type change; its existing firehose is consumed | none |
 
 The changesets explicitly call out: default-on progress/transcript for journaling runs; additive

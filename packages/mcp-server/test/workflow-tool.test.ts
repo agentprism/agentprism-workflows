@@ -103,11 +103,13 @@ function outputVariantFixtures() {
     status: "running" as const,
     scriptSource: "inline" as const,
     scriptUri: "workflow://runs/fixture-run/script",
+    eventsUri: "workflow://runs/fixture-run/events",
     limits: LIMITS,
   };
   const execution = {
     ...terminalOutcomeFixture,
     scriptSource: "inline" as const,
+    eventsUri: "workflow://runs/fixture-run/events",
   };
   const resultRetrieval = {
     action: "result" as const,
@@ -198,6 +200,7 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       "status",
       "result",
       "resultUri",
+      "eventsUri",
       "tokenUsage",
       "logs",
       "authContext",
@@ -223,6 +226,7 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       "pendingPermissions",
       "interaction",
       "permissionResponse",
+      "latestActivity",
       "mimeType",
       "encoding",
       "totalBytes",
@@ -240,8 +244,8 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       ["action", "runId", "status", "resultUri", "mimeType", "encoding", "totalBytes", "offset", "endOffset", "hasMore", "chunk"],
       ["action", "ok", "harnessOptions", "omittedHarnesses", "models"],
       ["action", "status", "validation"],
-      ["runId", "status", "scriptUri", "scriptSource", "limits"],
-      ["runId", "status", "scriptUri", "scriptSource", "limits"],
+      ["runId", "status", "scriptUri", "eventsUri", "scriptSource", "limits"],
+      ["runId", "status", "scriptUri", "eventsUri", "scriptSource", "limits"],
       ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage", "wait"],
       ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage"],
       [
@@ -730,9 +734,17 @@ test("runtime and advertised output schemas enforce exact result branches", asyn
       const { limits: _limits, ...withoutLimits } = fixtures.execution;
       return withoutLimits;
     })(),
+    "execution without events URI": (() => {
+      const { eventsUri: _eventsUri, ...withoutEventsUri } = fixtures.execution;
+      return withoutEventsUri;
+    })(),
     "background without limits": (() => {
       const { limits: _limits, ...withoutLimits } = fixtures.background;
       return withoutLimits;
+    })(),
+    "background without events URI": (() => {
+      const { eventsUri: _eventsUri, ...withoutEventsUri } = fixtures.background;
+      return withoutEventsUri;
     })(),
     "background with execution logs": { ...fixtures.background, logs: [] },
     "background with execution usage": {

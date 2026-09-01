@@ -748,7 +748,9 @@ or store loss. Running, paused, failed, aborted, unknown, deleted, and completed
 fail closed instead of manufacturing output.
 
 Completed foreground and status responses expose `resultUri` and a separately labelled
-result `resource_link`; script links are explicitly labelled as scripts. Foreground and status also
+result `resource_link`; script links are explicitly labelled as scripts. Every admitted durable-log
+run and every later status/terminal response exposes `eventsUri` and a separately labelled events
+`resource_link`. Foreground and status also
 copy exact result JSON up to 4,096 UTF-8 bytes into text for content-first hosts. For larger values,
 use the resource directly or page through `{ action:"result", runId, offset, maxBytes }`. The page is
 `{ action:"result", runId, status:"completed", resultUri, mimeType:"application/json",
@@ -762,7 +764,9 @@ result-reconstruction contract.
 #### MCP live events resource
 
 The MCP server exposes the same projected log at `workflow://runs/{runId}/events` with MIME type
-`application/json`. Subscribe to the canonical URI, treat `notifications/resources/updated` as an
+`application/json`. Admitted run responses return this canonical `eventsUri`; status, stop,
+permission-response, terminal outcome, and result retrieval repeat it whenever the durable stream
+exists. Subscribe to the canonical URI, treat `notifications/resources/updated` as an
 advisory hint, then read cursor pages until `hasMore` is false:
 
 ```ts
@@ -1432,6 +1436,7 @@ interface WorkflowResultRetrieval {
   runId: string;
   status: "completed";
   resultUri: string;
+  eventsUri?: string; // absent for legacy rows without a durable event stream
   mimeType: "application/json";
   encoding: "utf-8";
   totalBytes: number;
@@ -1456,6 +1461,7 @@ interface WorkflowExecutionToolResult<T = unknown> {
   resumeReport?: WorkflowResumeReport;   // resumeFromRunId executions only
   replayEligibility?: WorkflowReplayEligibility;
   scriptUri: string;
+  eventsUri: string;
   resultUri?: string;                     // completed runs with a persisted JSON value
 }
 ```
@@ -1476,6 +1482,9 @@ After preflight succeeds, `background:true` reserves one of four process-local a
 interface WorkflowBackgroundAccepted {
   runId: string;
   status: "running";
+  scriptSource: "inline" | "path";
+  scriptUri: string;
+  eventsUri: string;
   limits: WorkflowRunLimits;
   replayEligibility?: WorkflowReplayEligibility;
   pendingPermissions?: WorkflowPendingPermission[];
@@ -1533,9 +1542,27 @@ interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
   wait: WorkflowStatusWaitMetadata;
   tokenUsage?: TokenUsage;
   pendingPermissions?: WorkflowPendingPermission[];
-  outcome?: WorkflowExecutionToolResult<T>; // present exactly at terminal status
+  outcome?: Omit<WorkflowExecutionToolResult<T>, "eventsUri"> & { eventsUri?: string }; // terminal; legacy streams may omit URI
   scriptUri: string;
   resultUri?: string;
+  eventsUri?: string;
+  latestActivity?: WorkflowRunLatestActivity[];
+}
+
+interface WorkflowRunLatestActivity {
+  scope: string;
+  callIndex: number;
+  executionStartSeq: number;
+  label: string;
+  phase?: string;
+  timestamp: string;
+  cursor: number;
+  turnCount: number;
+  observedEvents: number;
+  latestText?: string;     // exactly one of latestText / lastToolName
+  lastToolName?: string;
+  tokensObserved?: number;
+  relevance: "current" | "terminal";
 }
 
 interface WorkflowStopPendingResult extends WorkflowRunStatus {
@@ -1585,10 +1612,20 @@ structured content. Status is a successful read even for failed/aborted lifecycl
 `tokenUsage` is cumulative live work in this execution only; cached replay adds zero. At terminal,
 top-level and `outcome.tokenUsage` are identical.
 
+For a valid durable event stream, status also folds `agentProgress` records into one compact
+`latestActivity` row per logical call. `lastN` and `labelGlob` select the same call labels as the
+ordinary status projection. Each row identifies its durable cursor/timestamp, execution, turn and
+event counts, observed tokens, exactly one credential-redacted 512-byte assistant preview or tool
+name, and whether it is currently relevant or terminal. Targeted cancellation, whole-run abort, and
+restart remain visible because the rows are reconstructed from the event stream. Legacy, incomplete,
+or otherwise unsafe streams omit the projection. Activity participates in the inherited 24,576-byte
+structured status cap; the detailed transcript remains available only through `eventsUri`.
+
 Terminal `outcome` is live-first and reconstructed from project-scoped persistence after restart,
 normalizing legacy missing `cost` to zero. Completed outcomes contain the exact authored result and
 raw full logs; paused outcomes carry existing non-secret `authContext`/`checkpointContext` and resume
-guidance. Completed foreground/status results add `resultUri`. Exact JSON up to 4,096 UTF-8 bytes is
+guidance. Admitted runs and status/terminal responses add `eventsUri` plus a labelled events link
+whenever a durable stream exists. Completed foreground/status results add `resultUri`. Exact JSON up to 4,096 UTF-8 bytes is
 also copied into model-visible text for content-first hosts; larger values are not duplicated
 wholesale and instead point to the exact result resource plus bounded `action:"result"` paging.
 Retrieval has no TTL and remains available until SDK/manual deletion, corruption, or store loss. The
@@ -1599,7 +1636,7 @@ Runs execute in the shared per-user workflow daemon (the default stdio entry is 
 The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
 feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 
-Status returns `WorkflowRunStatus` plus wait metadata, live `pendingPermissions`, and interaction guidance when applicable. Completed runs with an authored JSON value also expose `resultUri` and a labelled result resource link without adding that value to the bounded status projection. Permission diagnostics are credential-redacted and scalar-bounded, omit the private ACP session id, and preserve the complete ordered exact option-id list inside a separate 64 KiB envelope; an option set that cannot be represented safely is cancelled instead of partially exposed. Permission responses accept only cancellation or an exact selected optionId and forbid caller-supplied response `_meta`. Its JSON structured content is capped at 24,576 bytes
+Status returns `WorkflowRunStatus` plus wait metadata, durable `latestActivity`, live `pendingPermissions`, and interaction guidance when applicable. Durable-log runs expose `eventsUri` and a labelled events resource link; completed runs with an authored JSON value also expose `resultUri` and a labelled result resource link without adding either detailed event content or that value to the bounded status projection. Permission diagnostics are credential-redacted and scalar-bounded, omit the private ACP session id, and preserve the complete ordered exact option-id list inside a separate 64 KiB envelope; an option set that cannot be represented safely is cancelled instead of partially exposed. Permission responses accept only cancellation or an exact selected optionId and forbid caller-supplied response `_meta`. Its JSON structured content is capped at 24,576 bytes
 and its formatted text at 8,192 bytes. An existing failed or aborted run is still a successful read.
 An unknown/corrupt/unreadable run is `isError:true`, has no structured content, and returns exactly
 `No workflow run found for runId "<runId>" in this server's project-scoped run store.` Execution keeps current error semantics: failed/aborted are tool errors, paused is a successful resumable call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped at 12,288 bytes; rejected preflight scripts instead carry bounded structured validation diagnostics and have no run ID or tail.

@@ -285,9 +285,33 @@ const scriptLineageEntrySchema = z.object({
   available: z.boolean(),
 });
 
+const latestActivitySchema = z.object({
+  scope: z.string(),
+  callIndex: z.number().int().nonnegative(),
+  executionStartSeq: z.number().int().positive(),
+  label: z.string(),
+  phase: z.string().optional(),
+  timestamp: z.string(),
+  cursor: z.number().int().positive(),
+  turnCount: z.number().int().nonnegative(),
+  observedEvents: z.number().int().nonnegative(),
+  latestText: z.string().optional(),
+  lastToolName: z.string().optional(),
+  tokensObserved: z.number().int().nonnegative().optional(),
+  relevance: z.enum(["current", "terminal"]),
+}).superRefine((value, context) => {
+  if ((value.latestText === undefined) === (value.lastToolName === undefined)) {
+    context.addIssue({
+      code: "custom",
+      message: "latest activity must contain exactly one of latestText or lastToolName",
+    });
+  }
+});
+
 const inspectionScriptResourceShape = {
   scriptUri: z.string(),
   resultUri: z.string().optional(),
+  eventsUri: z.string().optional(),
   lineage: z.array(scriptLineageEntrySchema),
 } as const;
 
@@ -301,6 +325,7 @@ const runStatusShape = {
   errorCode: z.string().optional(),
   limits: workflowRunLimitsSchema.optional(),
   replayEligibility: replayEligibilitySchema.optional(),
+  latestActivity: z.array(latestActivitySchema).optional(),
   logTail: logTailSchema,
   calls: z.array(
     z.object({
@@ -361,6 +386,7 @@ const executionResultSchema = z
     ...executionDetailsShape,
     scriptUri: z.string(),
     resultUri: z.string().optional(),
+    eventsUri: z.string().optional(),
   })
   .strict()
   .superRefine((value, context) => {
@@ -466,7 +492,7 @@ const inspectionRequired = [
 
 const terminalStatuses = ["paused", "completed", "failed", "aborted"] as const;
 const nonterminalStatuses = ["pending", "running"] as const;
-const commonOutputFields = ["runId", "status", "scriptUri", "resultUri", "limits", "replayEligibility"] as const;
+const commonOutputFields = ["runId", "status", "scriptUri", "resultUri", "eventsUri", "limits", "replayEligibility"] as const;
 const runOutputRequired = ["runId", "status", "scriptUri"] as const;
 const executionDetailFields = [
   "result",
@@ -484,6 +510,7 @@ const inspectionFields = [
   "currentPhase",
   "reason",
   "errorCode",
+  "latestActivity",
 ] as const;
 const discoveryOutputFields = [
   "action",
@@ -528,6 +555,7 @@ const variantOutputFields = [
   "pendingPermissions",
   "interaction",
   "permissionResponse",
+  "latestActivity",
   ...resultRetrievalFields,
   ...discoveryOutputFields,
 ] as const;
@@ -572,12 +600,14 @@ export const workflowToolOutputShape = z
     scriptSource: scriptSourceSchema.optional(),
     scriptUri: z.string().optional(),
     resultUri: z.string().optional(),
+    eventsUri: z.string().optional(),
     lineage: inspectionScriptResourceShape.lineage.optional(),
     workflowName: runStatusShape.workflowName.optional(),
     phases: runStatusShape.phases.optional(),
     currentPhase: runStatusShape.currentPhase,
     reason: runStatusShape.reason,
     errorCode: runStatusShape.errorCode,
+    latestActivity: runStatusShape.latestActivity,
     calls: runStatusShape.calls.optional(),
     filter: runStatusShape.filter.optional(),
     truncation: runStatusShape.truncation.optional(),
@@ -609,7 +639,7 @@ export const workflowToolOutputShape = z
         has("runId") &&
         has("resultUri") &&
         resultRetrievalFields.every((field) => has(field)) &&
-        hasOnlyExactFields(value, ["action", "runId", "status", "resultUri", ...resultRetrievalFields]);
+        hasOnlyExactFields(value, ["action", "runId", "status", "resultUri", "eventsUri", ...resultRetrievalFields]);
     } else if (value.action === "config") {
       valid =
         has("ok") &&
@@ -623,7 +653,7 @@ export const workflowToolOutputShape = z
         has("validation") &&
         hasOnlyExactFields(value, ["action", "status", "validation"]);
     } else if (has("scriptSource")) {
-      valid = runCommonComplete && has("limits") && (value.status === "running"
+      valid = runCommonComplete && has("eventsUri") && has("limits") && (value.status === "running"
         ? hasOnlyFields(value, ["scriptSource", "pendingPermissions", "interaction"])
         : terminal && hasOnlyFields(value, ["scriptSource", ...executionDetailFields]));
     } else if (has("permissionResponse") && !has("wait")) {
@@ -705,6 +735,7 @@ export const workflowToolOutputShape = z
           "runId",
           "status",
           "scriptUri",
+          "eventsUri",
           "scriptSource",
           ...executionDetailFields,
           ...inspectionFields,
@@ -726,6 +757,7 @@ export const workflowToolOutputShape = z
           "models",
           "runId",
           "scriptUri",
+          "eventsUri",
           "scriptSource",
           ...executionDetailFields,
           ...inspectionFields,
@@ -738,13 +770,13 @@ export const workflowToolOutputShape = z
       },
       {
         title: "Workflow execution",
-        required: [...runOutputRequired, "scriptSource", "limits"],
+        required: [...runOutputRequired, "eventsUri", "scriptSource", "limits"],
         properties: { status: { enum: terminalStatuses } },
         ...forbidsOutside(["scriptSource", ...executionDetailFields]),
       },
       {
         title: "Workflow background admission",
-        required: [...runOutputRequired, "scriptSource", "limits"],
+        required: [...runOutputRequired, "eventsUri", "scriptSource", "limits"],
         properties: { status: { const: "running" } },
         ...forbidsOutside(["scriptSource", "pendingPermissions", "interaction"]),
       },
@@ -818,9 +850,29 @@ export interface WorkflowScriptLineageEntry {
   available: boolean;
 }
 
+/** One bounded, durable activity summary per logical agent call. */
+export interface WorkflowRunLatestActivity {
+  scope: string;
+  callIndex: number;
+  executionStartSeq: number;
+  label: string;
+  phase?: string;
+  timestamp: string;
+  /** Sequence/cursor of the source agentProgress record in the linked events stream. */
+  cursor: number;
+  turnCount: number;
+  observedEvents: number;
+  latestText?: string;
+  lastToolName?: string;
+  tokensObserved?: number;
+  /** Whether this execution is still current or has reached call/run terminal relevance. */
+  relevance: "current" | "terminal";
+}
+
 export interface WorkflowScriptResourceFields {
   scriptUri: string;
   resultUri?: string;
+  eventsUri?: string;
   lineage: WorkflowScriptLineageEntry[];
 }
 
@@ -828,6 +880,7 @@ export interface WorkflowExecutionScriptResourceFields {
   scriptSource: WorkflowScriptSource;
   scriptUri: string;
   resultUri?: string;
+  eventsUri: string;
 }
 
 export interface WorkflowExecutionOutcome<T = unknown> {
@@ -835,6 +888,7 @@ export interface WorkflowExecutionOutcome<T = unknown> {
   status: Exclude<WorkflowRunResult["status"], "pending" | "running">;
   scriptUri: string;
   resultUri?: string;
+  eventsUri?: string;
   limits?: WorkflowRunLimits;
   replayEligibility?: WorkflowReplayEligibility;
   result?: T;
@@ -848,10 +902,8 @@ export interface WorkflowExecutionOutcome<T = unknown> {
   resumeReport?: WorkflowRunResult["resumeReport"];
 }
 
-export interface WorkflowExecutionToolResult<T = unknown>
-  extends WorkflowExecutionOutcome<T>, WorkflowExecutionScriptResourceFields {
-  limits: WorkflowRunLimits;
-}
+export type WorkflowExecutionToolResult<T = unknown> = WorkflowExecutionOutcome<T> &
+  WorkflowExecutionScriptResourceFields & { limits: WorkflowRunLimits };
 
 export interface WorkflowPermissionInteraction {
   permissionRequests: "may-block";
@@ -876,6 +928,7 @@ export interface WorkflowStatusWaitMetadata {
 }
 
 export interface WorkflowRunObservation extends WorkflowRunStatus, WorkflowScriptResourceFields {
+  latestActivity?: WorkflowRunLatestActivity[];
   pendingPermissions?: z.infer<typeof pendingPermissionSchema>[];
   interaction?: WorkflowPermissionInteraction;
   permissionResponse?: z.infer<typeof permissionAcknowledgementSchema>;
@@ -905,6 +958,7 @@ export interface WorkflowResultRetrieval {
   runId: string;
   status: "completed";
   resultUri: string;
+  eventsUri?: string;
   mimeType: "application/json";
   encoding: "utf-8";
   totalBytes: number;
@@ -933,17 +987,20 @@ export interface WorkflowValidationRejected {
 }
 
 export interface WorkflowPermissionResponseResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
+  latestActivity?: WorkflowRunLatestActivity[];
   pendingPermissions?: z.infer<typeof pendingPermissionSchema>[];
   permissionResponse: z.infer<typeof permissionAcknowledgementSchema>;
 }
 
 export interface WorkflowStopResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
+  latestActivity?: WorkflowRunLatestActivity[];
   status: "completed" | "failed" | "aborted";
   stopped: boolean;
   alreadyTerminal: boolean;
 }
 
 export interface WorkflowStopPendingResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
+  latestActivity?: WorkflowRunLatestActivity[];
   status: "pending" | "running";
   stopped: false;
   alreadyTerminal: false;
@@ -963,7 +1020,8 @@ export type WorkflowToolResult<T = unknown> =
 
 export function toWorkflowExecutionOutcome<T>(
   run: WorkflowRunResult<T>,
-  resources: Pick<WorkflowExecutionScriptResourceFields, "scriptUri" | "resultUri">,
+  resources: Pick<WorkflowExecutionScriptResourceFields, "scriptUri" | "resultUri"> &
+    Partial<Pick<WorkflowExecutionScriptResourceFields, "eventsUri">>,
 ): WorkflowExecutionOutcome<T> {
   if (run.status === "pending" || run.status === "running") {
     throw new TypeError(`Workflow execution result must be terminal, received ${run.status}`);
@@ -983,6 +1041,7 @@ export function toWorkflowExecutionOutcome<T>(
     ...(run.checkpointsTaken === undefined ? {} : { checkpointsTaken: run.checkpointsTaken }),
     ...(run.resumeReport === undefined ? {} : { resumeReport: run.resumeReport }),
     scriptUri: resources.scriptUri,
+    ...(resources.eventsUri === undefined ? {} : { eventsUri: resources.eventsUri }),
     ...(run.status === "completed" && resources.resultUri !== undefined
       ? { resultUri: resources.resultUri }
       : {}),
@@ -1001,5 +1060,6 @@ export function toWorkflowToolResult<T>(
     ...outcome,
     limits: outcome.limits,
     scriptSource: resources.scriptSource,
+    eventsUri: resources.eventsUri,
   };
 }

@@ -12,11 +12,16 @@ import {
   RUN_EVENT_READ_LIMIT_MAX,
   RunEventLogError,
   WorkflowManager,
+  redactText,
+  truncateUtf8,
 } from "@automatalabs/workflows";
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
 import { singleStoreRouter, type RunStoreRouter } from "./project-registry.js";
 
-import type { WorkflowScriptLineageEntry } from "./workflow-tool-output.js";
+import type {
+  WorkflowRunLatestActivity,
+  WorkflowScriptLineageEntry,
+} from "./workflow-tool-output.js";
 
 export const SCRIPT_RESOURCE_MIME_TYPE = "text/javascript";
 export const RESULT_RESOURCE_MIME_TYPE = "application/json";
@@ -28,6 +33,7 @@ const SCRIPT_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/script$/;
 const RESULT_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/result$/;
 const EVENTS_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/events(?:\?([^#]*))?$/;
 const STREAM_ID_PATTERN = /^[0-9a-f]{32}$/;
+const MAX_ACTIVITY_SCALAR_BYTES = 512;
 
 function resourceNotFound(uri: string): never {
   throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Workflow resource not found: ${uri}`);
@@ -61,6 +67,19 @@ export interface SerializedWorkflowResult {
 
 function hasExactResult(state: PersistedRunState): boolean {
   return state.status === "completed" && state.result !== undefined;
+}
+
+function hasDurableEventStream(state: PersistedRunState): boolean {
+  return typeof state.eventStreamId === "string" && STREAM_ID_PATTERN.test(state.eventStreamId) &&
+    Number.isSafeInteger(state.eventSeq) && (state.eventSeq ?? -1) >= 0;
+}
+
+function latestActivityKey(scope: string, callIndex: number): string {
+  return JSON.stringify([scope, callIndex]);
+}
+
+function safeActivityText(value: string): string {
+  return truncateUtf8(redactText(value).value, MAX_ACTIVITY_SCALAR_BYTES);
 }
 
 export interface WorkflowRunEventsResourceDocument {
@@ -374,6 +393,12 @@ export class WorkflowScriptResources {
     return state && hasExactResult(state) ? workflowResultUri(runId) : undefined;
   }
 
+  /** Canonical events URI when the persisted row belongs to the durable event-log era. */
+  availableEventsUri(runId: string): string | undefined {
+    const state = this.loadState(runId);
+    return state && hasDurableEventStream(state) ? workflowRunEventsUri(runId) : undefined;
+  }
+
   resultLink(runId: string): ResourceLink | undefined {
     const state = this.loadState(runId);
     if (!state || !hasExactResult(state)) return undefined;
@@ -384,6 +409,98 @@ export class WorkflowScriptResources {
       description: `exact workflow result · completed ${state.completedAt ?? state.updatedAt}`,
       mimeType: RESULT_RESOURCE_MIME_TYPE,
     };
+  }
+
+  eventsLink(runId: string): ResourceLink | undefined {
+    const state = this.loadState(runId);
+    if (!state || !hasDurableEventStream(state)) return undefined;
+    return {
+      type: "resource_link",
+      uri: workflowRunEventsUri(runId),
+      name: `${state.workflowName} events (${state.runId})`,
+      description: `detailed workflow event stream · ${state.status} · started ${state.startedAt}`,
+      mimeType: EVENTS_RESOURCE_MIME_TYPE,
+    };
+  }
+
+  /**
+   * Fold the validated durable stream into one compact latest sample per logical call. The
+   * append-only events resource remains the detailed transcript and cursor authority.
+   */
+  latestActivity(runId: string): WorkflowRunLatestActivity[] | undefined {
+    const persistence = this.persistenceFor(runId);
+    const state = persistence?.load(runId);
+    if (!persistence || !state || !hasDurableEventStream(state)) return undefined;
+
+    const latest = new Map<string, WorkflowRunLatestActivity>();
+    const active = new Set<string>();
+    let after = 0;
+    let streamId = state.eventStreamId;
+    try {
+      while (true) {
+        const page = persistence.readEvents(runId, {
+          after,
+          limit: RUN_EVENT_READ_LIMIT_MAX,
+          streamId,
+        });
+        streamId = page.streamId;
+        for (const record of page.events) {
+          const event = record.event;
+          if (event.type === "agentStart") {
+            const key = latestActivityKey(event.scope, event.callIndex);
+            active.add(key);
+            const previous = latest.get(key);
+            if (previous) latest.set(key, { ...previous, relevance: "terminal" });
+            continue;
+          }
+          if (event.type === "agentProgress") {
+            const key = latestActivityKey(event.scope, event.callIndex);
+            latest.set(key, {
+              scope: safeActivityText(event.scope),
+              callIndex: event.callIndex,
+              executionStartSeq: event.executionStartSeq,
+              label: safeActivityText(event.label),
+              ...(event.phase === undefined ? {} : { phase: safeActivityText(event.phase) }),
+              timestamp: safeActivityText(record.timestamp),
+              cursor: record.seq,
+              turnCount: event.turnCount,
+              observedEvents: event.observedEvents,
+              ...(event.latestText === undefined
+                ? { lastToolName: safeActivityText(event.lastToolName!) }
+                : { latestText: safeActivityText(event.latestText) }),
+              ...(event.tokensObserved === undefined ? {} : { tokensObserved: event.tokensObserved }),
+              relevance: active.has(key) ? "current" : "terminal",
+            });
+            continue;
+          }
+          if (event.type === "agentEnd") {
+            const key = latestActivityKey(event.scope, event.callIndex);
+            active.delete(key);
+            const previous = latest.get(key);
+            if (previous) latest.set(key, { ...previous, relevance: "terminal" });
+            continue;
+          }
+          if (event.type === "complete" || event.type === "paused" || event.type === "error" || event.type === "stopped") {
+            active.clear();
+            for (const [key, previous] of latest) {
+              if (previous.relevance !== "terminal") latest.set(key, { ...previous, relevance: "terminal" });
+            }
+          }
+        }
+        after = page.cursor;
+        if (!page.hasMore) break;
+      }
+    } catch {
+      // Status remains available for legacy, incomplete, corrupt, or otherwise unsafe streams.
+      return undefined;
+    }
+
+    if (state.status !== "pending" && state.status !== "running") {
+      for (const [key, previous] of latest) {
+        if (previous.relevance !== "terminal") latest.set(key, { ...previous, relevance: "terminal" });
+      }
+    }
+    return [...latest.values()].sort((left, right) => left.cursor - right.cursor);
   }
 
   links(lineage: WorkflowScriptLineageEntry[]): ResourceLink[] {
@@ -474,7 +591,7 @@ export class WorkflowScriptResources {
       new ResourceTemplate("workflow://runs/{runId}/events", {
         list: () => ({
           resources: this.recentRuns()
-            .filter((state) => state.eventStreamId !== undefined && state.eventSeq !== undefined)
+            .filter(hasDurableEventStream)
             .map((state) => ({
               uri: workflowRunEventsUri(state.runId),
               name: `${state.workflowName} events (${state.runId})`,
@@ -484,7 +601,7 @@ export class WorkflowScriptResources {
         }),
         complete: {
           runId: (partial) => this.recentRuns()
-            .filter((state) => state.eventStreamId !== undefined && state.eventSeq !== undefined)
+            .filter(hasDurableEventStream)
             .map((state) => state.runId)
             .filter((runId) => runId.startsWith(partial)),
         },

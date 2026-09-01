@@ -101,6 +101,7 @@ import {
 import type {
   WorkflowExecutionOutcome,
   WorkflowResultRetrieval,
+  WorkflowRunLatestActivity,
   WorkflowStatusToolResult,
   WorkflowStopPendingResult,
   WorkflowStopResult,
@@ -1054,6 +1055,12 @@ function addInspectionResourceFields<Status extends WorkflowRunStatus, Fields ex
     },
     ...fields,
   };
+  const activityProjection = projected as Status & Fields & {
+    latestActivity?: WorkflowRunLatestActivity[];
+  };
+  if (activityProjection.latestActivity !== undefined) {
+    activityProjection.latestActivity = [...activityProjection.latestActivity];
+  }
   const phaseRetention = [...retention.phases];
   const logRetention = [...retention.logs];
   const refreshCounters = () => {
@@ -1080,6 +1087,7 @@ function addInspectionResourceFields<Status extends WorkflowRunStatus, Fields ex
     calls: [],
     logTail: { ...projected.logTail, lines: [] },
     phases: [],
+    ...(activityProjection.latestActivity === undefined ? {} : { latestActivity: [] }),
   };
 
   if (
@@ -1103,6 +1111,10 @@ function addInspectionResourceFields<Status extends WorkflowRunStatus, Fields ex
   while (projected.calls.length > 0 && tooLarge()) {
     projected.calls.shift();
     refreshCounters();
+    projected.truncation.byteCapApplied = true;
+  }
+  while ((activityProjection.latestActivity?.length ?? 0) > 0 && tooLarge()) {
+    activityProjection.latestActivity!.shift();
     projected.truncation.byteCapApplied = true;
   }
   while (projected.logTail.lines.length > 0 && tooLarge()) {
@@ -1190,12 +1202,18 @@ function requireAdmissionResource(
   let failure: string;
   try {
     const persisted = manager.getPersistence().load(runId);
-    if (persisted && persisted.script === admittedScript) {
+    if (
+      persisted &&
+      persisted.script === admittedScript &&
+      scriptResources.availableEventsUri(runId) !== undefined
+    ) {
       scriptResources.notifyRunAdmitted(runId);
       return;
     }
     failure = persisted
-      ? "the persisted script did not match the admitted snapshot"
+      ? persisted.script !== admittedScript
+        ? "the persisted script did not match the admitted snapshot"
+        : "the persisted run did not expose its durable events resource"
       : "the persisted run record was unreadable";
   } catch (error) {
     failure = `the persisted run record could not be read: ${error instanceof Error ? error.message : String(error)}`;
@@ -1276,6 +1294,7 @@ function currentTokenUsage(manager: WorkflowManager, runId: string): TokenUsage 
 function persistedOutcome(
   persisted: PersistedRunState,
   status: WorkflowRunStatus,
+  eventsUri: string | undefined,
 ): WorkflowExecutionOutcome {
   if (status.status === "pending" || status.status === "running") {
     throw new TypeError(`Terminal workflow outcome cannot have status ${status.status}`);
@@ -1297,6 +1316,7 @@ function persistedOutcome(
       ? {}
       : { replayEligibility: persisted.replayEligibility }),
     scriptUri: workflowScriptUri(persisted.runId),
+    ...(eventsUri === undefined ? {} : { eventsUri }),
     ...(status.status === "completed" && persisted.result !== undefined
       ? { resultUri: workflowResultUri(persisted.runId) }
       : {}),
@@ -1305,6 +1325,7 @@ function persistedOutcome(
 
 function terminalOutcome(
   manager: WorkflowManager,
+  resources: WorkflowScriptResources,
   runId: string,
   status: WorkflowRunStatus,
 ): WorkflowExecutionOutcome | undefined {
@@ -1313,13 +1334,15 @@ function terminalOutcome(
     ? workflowResultUri(runId)
     : undefined;
   const live = manager.getRun(runId)?.result;
+  const eventsUri = resources.availableEventsUri(runId);
   if (live) {
     return toWorkflowExecutionOutcome(live, {
       scriptUri: workflowScriptUri(runId),
       ...(resultUri === undefined ? {} : { resultUri }),
+      ...(eventsUri === undefined ? {} : { eventsUri }),
     });
   }
-  return persisted ? persistedOutcome(persisted, status) : undefined;
+  return persisted ? persistedOutcome(persisted, status, eventsUri) : undefined;
 }
 
 const INLINE_WORKFLOW_RESULT_MAX_BYTES = 4_096;
@@ -1328,9 +1351,72 @@ type WorkflowResultContentBlock =
   | { type: "text"; text: string; annotations?: { audience: ["assistant"] } }
   | ResourceLink;
 
-function resultResourceFields(resources: WorkflowScriptResources, runId: string): { resultUri?: string } {
+function resultResourceFields(
+  resources: WorkflowScriptResources,
+  runId: string,
+): { resultUri?: string; eventsUri?: string } {
   const resultUri = resources.availableResultUri(runId);
-  return resultUri === undefined ? {} : { resultUri };
+  const eventsUri = resources.availableEventsUri(runId);
+  return {
+    ...(resultUri === undefined ? {} : { resultUri }),
+    ...(eventsUri === undefined ? {} : { eventsUri }),
+  };
+}
+
+function matchesActivityLabelGlob(label: string, pattern: string): boolean {
+  const labelPoints = [...label];
+  const patternPoints = [...pattern];
+  const tokens: Array<{ kind: "star" } | { kind: "one" } | { kind: "literal"; value: string }> = [];
+  for (let index = 0; index < patternPoints.length; index++) {
+    const point = patternPoints[index]!;
+    if (point === "*") tokens.push({ kind: "star" });
+    else if (point === "?") tokens.push({ kind: "one" });
+    else if (point === "\\") {
+      const escaped = patternPoints[index + 1];
+      if (escaped === undefined) tokens.push({ kind: "literal", value: "\\" });
+      else {
+        tokens.push({ kind: "literal", value: escaped });
+        index++;
+      }
+    } else tokens.push({ kind: "literal", value: point });
+  }
+
+  let previous = new Array<boolean>(labelPoints.length + 1).fill(false);
+  previous[0] = true;
+  for (const token of tokens) {
+    const current = new Array<boolean>(labelPoints.length + 1).fill(false);
+    if (token.kind === "star") {
+      current[0] = previous[0]!;
+      for (let index = 1; index <= labelPoints.length; index++) {
+        current[index] = previous[index]! || current[index - 1]!;
+      }
+    } else {
+      for (let index = 1; index <= labelPoints.length; index++) {
+        current[index] = previous[index - 1]! &&
+          (token.kind === "one" || token.value === labelPoints[index - 1]);
+      }
+    }
+    previous = current;
+  }
+  return previous[labelPoints.length]!;
+}
+
+function latestActivityFields(
+  resources: WorkflowScriptResources,
+  runId: string,
+  status: WorkflowRunStatus,
+): { latestActivity?: WorkflowRunLatestActivity[] } {
+  const activity = resources.latestActivity(runId);
+  if (activity === undefined) return {};
+  const matched = status.filter.labelGlob === undefined
+    ? activity
+    : activity.filter((item) => matchesActivityLabelGlob(item.label, status.filter.labelGlob!));
+  return { latestActivity: matched.slice(-status.filter.lastN) };
+}
+
+function eventsContentBlocks(resources: WorkflowScriptResources, runId: string): ResourceLink[] {
+  const link = resources.eventsLink(runId);
+  return link === undefined ? [] : [link];
 }
 
 /**
@@ -1394,6 +1480,7 @@ function resultRetrievalPage(
   maxBytes: number,
 ): WorkflowResultRetrieval {
   const result = resources.serializedResult(runId);
+  const eventsUri = resources.availableEventsUri(runId);
   const buffer = Buffer.from(result.text, "utf8");
   if (offset > buffer.length) {
     throw new ProtocolError(
@@ -1416,6 +1503,7 @@ function resultRetrievalPage(
     runId,
     status: "completed",
     resultUri: result.uri,
+    ...(eventsUri === undefined ? {} : { eventsUri }),
     mimeType: RESULT_RESOURCE_MIME_TYPE,
     encoding: "utf-8",
     totalBytes: buffer.length,
@@ -2046,7 +2134,7 @@ export function createWorkflowServer(
         );
         const tokenUsage = currentTokenUsage(manager, requestState.runId);
         const outcome = isTerminalStatus(status.status)
-          ? terminalOutcome(manager, requestState.runId, status)
+          ? terminalOutcome(manager, scriptResources, requestState.runId, status)
           : undefined;
         const wait = {
           requestedMs: parsedInput.waitMs ?? 0,
@@ -2060,6 +2148,7 @@ export function createWorkflowServer(
             ...(tokenUsage === undefined ? {} : { tokenUsage }),
             scriptUri: workflowScriptUri(requestState.runId),
             ...resultResourceFields(scriptResources, requestState.runId),
+            ...latestActivityFields(scriptResources, requestState.runId, status),
             lineage,
             pendingPermissions: remaining,
             interaction: permissionInteraction(true),
@@ -2081,6 +2170,7 @@ export function createWorkflowServer(
             },
             ...resultContentBlocks(scriptResources, requestState.runId, true),
             ...scriptResources.links(lineage),
+            ...eventsContentBlocks(scriptResources, requestState.runId),
           ],
           isError: false,
         };
@@ -2196,6 +2286,7 @@ export function createWorkflowServer(
                 annotations: { audience: ["assistant"] },
               },
               ...(resultLink === undefined ? [] : [resultLink]),
+              ...eventsContentBlocks(scriptResources, parsedInput.runId),
             ],
             isError: false,
           };
@@ -2238,6 +2329,7 @@ export function createWorkflowServer(
           {
             scriptUri: workflowScriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId),
+            ...latestActivityFields(scriptResources, parsedInput.runId, status),
             lineage,
             pendingPermissions,
           },
@@ -2259,6 +2351,7 @@ export function createWorkflowServer(
             },
             ...resultContentBlocks(scriptResources, parsedInput.runId, false),
             ...scriptResources.links(lineage),
+            ...eventsContentBlocks(scriptResources, parsedInput.runId),
           ],
           isError: false,
         };
@@ -2331,6 +2424,8 @@ export function createWorkflowServer(
             status,
             {
               scriptUri: workflowScriptUri(parsedInput.runId),
+              ...resultResourceFields(scriptResources, parsedInput.runId),
+              ...latestActivityFields(scriptResources, parsedInput.runId, status),
               lineage,
             },
             inspectionRetentionMetadata(manager, parsedInput.runId, status),
@@ -2340,6 +2435,7 @@ export function createWorkflowServer(
             content: [
               { type: "text", text: formatAgentCancellationSummary(projected, cancellation) },
               ...scriptResources.links(lineage),
+              ...eventsContentBlocks(scriptResources, parsedInput.runId),
             ],
             isError: false,
           };
@@ -2380,6 +2476,8 @@ export function createWorkflowServer(
                   pendingStatus,
                   {
                     scriptUri: workflowScriptUri(parsedInput.runId),
+                    ...resultResourceFields(scriptResources, parsedInput.runId),
+                    ...latestActivityFields(scriptResources, parsedInput.runId, pendingStatus),
                     lineage,
                     stopped: false as const,
                     alreadyTerminal: false as const,
@@ -2401,7 +2499,11 @@ export function createWorkflowServer(
                   .filter((link) => link.uri === workflowScriptUri(parsedInput.runId));
                 return {
                   structuredContent: { ...result },
-                  content: [{ type: "text", text: formatPendingStopSummary(result) }, ...currentLink],
+                  content: [
+                    { type: "text", text: formatPendingStopSummary(result) },
+                    ...currentLink,
+                    ...eventsContentBlocks(scriptResources, parsedInput.runId),
+                  ],
                   isError: false,
                 };
               }
@@ -2468,6 +2570,7 @@ export function createWorkflowServer(
           {
             scriptUri: workflowScriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId),
+            ...latestActivityFields(scriptResources, parsedInput.runId, status),
             lineage,
             stopped,
             alreadyTerminal,
@@ -2484,6 +2587,7 @@ export function createWorkflowServer(
             { type: "text", text: formatStopSummary(result) },
             ...resultContentBlocks(scriptResources, parsedInput.runId, false),
             ...currentLink,
+            ...eventsContentBlocks(scriptResources, parsedInput.runId),
           ],
           isError: false,
         };
@@ -2648,7 +2752,7 @@ export function createWorkflowServer(
 
         const tokenUsage = currentTokenUsage(manager, parsedInput.runId);
         const baseOutcome = isTerminalStatus(status.status)
-          ? terminalOutcome(manager, parsedInput.runId, status)
+          ? terminalOutcome(manager, scriptResources, parsedInput.runId, status)
           : undefined;
         const outcome = baseOutcome;
         const lineage = scriptResources.lineage(parsedInput.runId);
@@ -2667,6 +2771,7 @@ export function createWorkflowServer(
             ...(permissionResponse === undefined ? {} : { permissionResponse }),
             scriptUri: workflowScriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId),
+            ...latestActivityFields(scriptResources, parsedInput.runId, status),
             lineage,
           },
           inspectionRetentionMetadata(manager, parsedInput.runId, status),
@@ -2686,6 +2791,7 @@ export function createWorkflowServer(
             },
             ...resultContentBlocks(scriptResources, parsedInput.runId, true),
             ...scriptResources.links(lineage),
+            ...eventsContentBlocks(scriptResources, parsedInput.runId),
           ],
           isError: false,
         };
@@ -2941,6 +3047,10 @@ export function createWorkflowServer(
           backgroundRuns.track(started.runId, started.promise);
           backgroundReservation = false;
           const scriptUri = workflowScriptUri(started.runId);
+          const eventsUri = scriptResources.availableEventsUri(started.runId);
+          if (eventsUri === undefined) {
+            throw new ProtocolError(ProtocolErrorCode.InternalError, "Workflow admission lost its durable events resource");
+          }
           const links = scriptResources.links([
             { runId: started.runId, uri: scriptUri, available: true },
           ]);
@@ -2950,6 +3060,7 @@ export function createWorkflowServer(
               status: "running" as const,
               scriptSource,
               scriptUri,
+              eventsUri,
               limits: admittedRun.limits,
               ...(admittedRun.replayEligibility === undefined
                 ? {}
@@ -2975,6 +3086,7 @@ export function createWorkflowServer(
                   `call status only when the model needs machine-readable state or wants to wait.`,
               },
               ...links,
+              ...eventsContentBlocks(scriptResources, started.runId),
             ],
             isError: false,
           };
@@ -3006,6 +3118,10 @@ export function createWorkflowServer(
           backgroundRuns.track(started.runId, started.promise);
           const pendingPermissions = permissionBroker.list(started.runId);
           const scriptUri = workflowScriptUri(started.runId);
+          const eventsUri = scriptResources.availableEventsUri(started.runId);
+          if (eventsUri === undefined) {
+            throw new ProtocolError(ProtocolErrorCode.InternalError, "Workflow admission lost its durable events resource");
+          }
           const canElicitPermission = Boolean(toolCatalog.clientCapabilities(ctx)?.elicitation);
           return {
             structuredContent: {
@@ -3013,6 +3129,7 @@ export function createWorkflowServer(
               status: "running" as const,
               scriptSource,
               scriptUri,
+              eventsUri,
               limits: admittedRun.limits,
               pendingPermissions,
               interaction: permissionInteraction(canElicitPermission),
@@ -3031,6 +3148,7 @@ export function createWorkflowServer(
                   `present the pending choice, and other clients can use action="permissions-response".`,
               },
               ...scriptResources.links([{ runId: started.runId, uri: scriptUri, available: true }]),
+              ...eventsContentBlocks(scriptResources, started.runId),
             ],
             isError: false,
           };
@@ -3067,8 +3185,12 @@ export function createWorkflowServer(
         }
         const scriptUri = workflowScriptUri(run.runId);
         const resultFields = resultResourceFields(scriptResources, run.runId);
+        const eventsUri = resultFields.eventsUri;
+        if (eventsUri === undefined) {
+          throw new ProtocolError(ProtocolErrorCode.InternalError, "Workflow result lost its durable events resource");
+        }
         const structuredContent = {
-          ...toWorkflowToolResult(run, { scriptSource, scriptUri, ...resultFields }),
+          ...toWorkflowToolResult(run, { scriptSource, scriptUri, ...resultFields, eventsUri }),
         };
         const isError = run.status === "failed" || run.status === "aborted";
         return {
@@ -3077,6 +3199,7 @@ export function createWorkflowServer(
             { type: "text", text: `${formatRunSummary(run)}${preflightWarningText}` },
             ...resultContentBlocks(scriptResources, run.runId, true),
             ...scriptResources.links([{ runId: run.runId, uri: scriptUri, available: true }]),
+            ...eventsContentBlocks(scriptResources, run.runId),
           ],
           isError,
         };
