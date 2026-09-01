@@ -163,16 +163,16 @@ const liveReport: WorkflowResumeReport = {
   calls: [],
 };
 const operationalChange: WorkflowReplayOperationalChange = {
-  option: "agentTimeoutMs",
-  source: 900_000,
-  current: null,
-  detail: "source recorded agentTimeoutMs=900000; this run: none",
+  option: "agentRetries",
+  source: 1,
+  current: 0,
+  detail: "source recorded agentRetries=1; this run: 0",
 };
 const idleOperationalChange: WorkflowReplayOperationalChange = {
-  option: "agentIdleTimeoutMs",
-  source: null,
-  current: 300_000,
-  detail: "source recorded agentIdleTimeoutMs=none; this run: 300000",
+  option: "concurrency",
+  source: 2,
+  current: 4,
+  detail: "source recorded concurrency=2; this run: 4",
 };
 const provenanceChange: WorkflowReplayProvenanceChange = {
   field: "runtime.node",
@@ -242,8 +242,8 @@ test("incremental resume shared type fixtures cover every public branch", () => 
   assert.equal(liveReport.disabledReason, "runtime-mismatch");
   assert.equal(replayEligibility.fallbackReason, "inputs-format-legacy");
   assert.equal(replayEligibility.predictedReplayablePrefix, 2);
-  assert.equal(replayEligibility.operationalChanges[0]?.option, "agentTimeoutMs");
-  assert.equal(replayEligibility.operationalChanges[1]?.option, "agentIdleTimeoutMs");
+  assert.equal(replayEligibility.operationalChanges[0]?.option, "agentRetries");
+  assert.equal(replayEligibility.operationalChanges[1]?.option, "concurrency");
 });
 
 test("legacy object literals omit every additive resume field", () => {

@@ -133,8 +133,6 @@ return await agent(String(args.value), { label: 'value' });`;
         maxAgents: 3,
         concurrency: 2,
         agentRetries: 1,
-        agentTimeoutMs: 900_000,
-        agentIdleTimeoutMs: 800_000,
       },
     });
     const sourceRunId = String(structured(source)?.runId);
@@ -155,8 +153,6 @@ return await agent(String(args.value), { label: 'value' });`;
     assert.equal(defaultLimits.maxAgents, 1_000);
     assert.equal(defaultLimits.concurrency, 8);
     assert.equal(defaultLimits.agentRetries, 0);
-    assert.equal(defaultLimits.agentTimeoutMs, null);
-    assert.equal(defaultLimits.agentIdleTimeoutMs, null);
     const defaultedFile = persistedRunFile(String(defaultedContent?.runId));
     assert.ok(defaultedFile);
     const defaultedState = JSON.parse(readFileSync(defaultedFile, "utf8")) as Record<string, unknown>;
@@ -186,8 +182,6 @@ return await agent(String(args.value), { label: 'value' });`;
         maxAgents: 9,
         concurrency: 7,
         agentRetries: 2,
-        agentTimeoutMs: 12_345,
-        agentIdleTimeoutMs: 6_789,
       },
     });
     const overriddenContent = structured(overridden);
@@ -198,8 +192,6 @@ return await agent(String(args.value), { label: 'value' });`;
     assert.equal(overriddenLimits.maxAgents, 9);
     assert.equal(overriddenLimits.concurrency, 7);
     assert.equal(overriddenLimits.agentRetries, 2);
-    assert.equal(overriddenLimits.agentTimeoutMs, 12_345);
-    assert.equal(overriddenLimits.agentIdleTimeoutMs, 6_789);
   } finally {
     await dispose();
   }
@@ -430,7 +422,6 @@ test("background admission, status, and foreground expose the same replay eligib
       name: "workflow",
       arguments: {
         script: TWO_AGENT_SCRIPT,
-        agentTimeoutMs: 900_000,
         agentRetries: 1,
         concurrency: 2,
       },
@@ -467,7 +458,6 @@ test("background admission, status, and foreground expose the same replay eligib
     assert.deepEqual(
       (acceptedEligibility.operationalChanges as Array<Record<string, unknown>>).map((change) => change.detail),
       [
-        "source recorded agentTimeoutMs=900000; this run: none",
         "source recorded agentRetries=1; this run: 0",
         "source recorded concurrency=2; this run: 7",
       ],
@@ -545,7 +535,7 @@ test("format-1 sources replay through the named positional bridge", async () => 
   try {
     const source = await client.callTool({
       name: "workflow",
-      arguments: { script: TWO_AGENT_SCRIPT, agentTimeoutMs: 900_000 },
+      arguments: { script: TWO_AGENT_SCRIPT, agentRetries: 1 },
     });
     const sourceRunId = String(structured(source)?.runId);
     const file = persistedRunFile(sourceRunId);
@@ -568,7 +558,7 @@ test("format-1 sources replay through the named positional bridge", async () => 
     assert.equal(field(eligibility, "currentInputsFormat"), 2);
     assert.equal(calls(), 2);
     assert.match(textOf(resumed), /inputs-format-legacy/);
-    assert.match(textOf(resumed), /source recorded agentTimeoutMs=900000; this run: none/);
+    assert.match(textOf(resumed), /source recorded agentRetries=1; this run: 0/);
 
     const missed = await client.callTool({
       name: "workflow",
@@ -581,11 +571,11 @@ test("format-1 sources replay through the named positional bridge", async () => 
     assert.equal(field(firstNonReplay, "reason"), "positional-miss");
     assert.equal(
       field(firstNonReplay, "detail"),
-      "source recorded agentTimeoutMs=900000; this run: none",
+      "source recorded agentRetries=1; this run: 0",
     );
     assert.match(
       textOf(missed),
-      /first non-replay: call 0 positional-miss — source recorded agentTimeoutMs=900000; this run: none/,
+      /first non-replay: call 0 positional-miss — source recorded agentRetries=1; this run: 0/,
     );
     assert.equal(calls(), 4);
   } finally {

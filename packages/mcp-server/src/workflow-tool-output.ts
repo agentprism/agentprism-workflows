@@ -31,8 +31,6 @@ const workflowRunLimitsSchema = z.object({
   maxAgents: z.number().int().positive(),
   concurrency: z.number().int().positive(),
   agentRetries: z.number().int().nonnegative(),
-  agentTimeoutMs: z.number().nonnegative().nullable(),
-  agentIdleTimeoutMs: z.number().nonnegative().nullable(),
 });
 
 const authContextSchema = z.object({
@@ -208,7 +206,7 @@ const resumeReportSchema = z.discriminatedUnion("strategy", [
 ]);
 
 const replayOperationalChangeSchema = z.object({
-  option: z.enum(["agentTimeoutMs", "agentIdleTimeoutMs", "agentRetries", "concurrency"]),
+  option: z.enum(["agentRetries", "concurrency"]),
   source: z.number().nullable(),
   current: z.number().nullable(),
   detail: z.string(),
@@ -333,8 +331,6 @@ const runStatusShape = {
       phase: z.string().optional(),
       model: z.string().optional(),
       backendId: z.string().optional(),
-      timeoutMs: z.number().nonnegative().nullable().optional(),
-      idleTimeoutMs: z.number().nonnegative().nullable().optional(),
       errorCode: z.string().optional(),
       status: z.enum(["queued", "running"]).optional(),
       resultPreview: z.string(),

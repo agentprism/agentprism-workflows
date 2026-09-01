@@ -86,13 +86,6 @@ export const workflowToolInputShape = {
     .describe(
       'With action="config", return model ids matching this case-insensitive substring or /regular expression/. Omit for bounded per-provider model summaries.',
     ),
-  probeTimeoutMs: z
-    .number()
-    .int()
-    .min(1)
-    .max(120_000)
-    .optional()
-    .describe('With action="config", per-backend no-prompt probe timeout. Default 60000; range 1..120000.'),
   args: z.unknown().optional().describe("Optional JSON value exposed to the script as the global `args`."),
   maxAgents: z
     .number()
@@ -112,20 +105,6 @@ export const workflowToolInputShape = {
     .min(0)
     .optional()
     .describe("Retry attempts for recoverable agent failures. CLAMPED to the runtime max (3) by the engine."),
-  agentTimeoutMs: z
-    .number()
-    .int()
-    .positive()
-    .nullable()
-    .optional()
-    .describe("Per-agent total-wall timeout in ms. Omit/null for no hard timeout (the engine owns the timeout)."),
-  agentIdleTimeoutMs: z
-    .number()
-    .int()
-    .positive()
-    .nullable()
-    .optional()
-    .describe("Per-agent no-backend-activity timeout in ms. Omit/null to disable the idle watchdog."),
   resumeFromRunId: z
     .string()
     .min(1)
@@ -213,8 +192,6 @@ interface WorkflowExecuteToolInputBase {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
@@ -252,8 +229,6 @@ export interface WorkflowResumeToolInput {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
   /** Default false. True acknowledges after admission and executes in this server process. */
@@ -281,7 +256,6 @@ export interface WorkflowConfigToolInput {
   harnesses?: string[];
   modelSpecs?: string[];
   modelFilter?: string;
-  probeTimeoutMs?: number;
   script?: never;
   scriptPath?: never;
   runId?: never;
@@ -405,13 +379,10 @@ interface RawWorkflowToolInput {
   harnesses?: string[];
   modelSpecs?: string[];
   modelFilter?: string;
-  probeTimeoutMs?: number;
   args?: unknown;
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<string, unknown>;
@@ -430,7 +401,7 @@ interface RawWorkflowToolInput {
 }
 
 function hasConfigFields(raw: RawWorkflowToolInput): boolean {
-  return raw.harnesses !== undefined || raw.modelSpecs !== undefined || raw.modelFilter !== undefined || raw.probeTimeoutMs !== undefined;
+  return raw.harnesses !== undefined || raw.modelSpecs !== undefined || raw.modelFilter !== undefined;
 }
 
 function hasPermissionFields(raw: RawWorkflowToolInput): boolean {
@@ -450,8 +421,6 @@ function hasExecutionFields(raw: RawWorkflowToolInput): boolean {
     raw.maxAgents !== undefined ||
     raw.concurrency !== undefined ||
     raw.agentRetries !== undefined ||
-    raw.agentTimeoutMs !== undefined ||
-    raw.agentIdleTimeoutMs !== undefined ||
     raw.resumeFromRunId !== undefined ||
     raw.resumePolicy !== undefined ||
     raw.checkpointReplies !== undefined ||
@@ -513,8 +482,6 @@ export function parseWorkflowToolInput(
       raw.maxAgents !== undefined ||
       raw.concurrency !== undefined ||
       raw.agentRetries !== undefined ||
-      raw.agentTimeoutMs !== undefined ||
-      raw.agentIdleTimeoutMs !== undefined ||
       raw.resumeFromRunId !== undefined ||
       raw.resumePolicy !== undefined ||
       raw.checkpointReplies !== undefined ||
@@ -529,7 +496,7 @@ export function parseWorkflowToolInput(
       raw.logLines !== undefined ||
       hasResultFields(raw)
     ) {
-      invalid('action="config" accepts only projectDir, harnesses, modelSpecs, modelFilter, and probeTimeoutMs');
+      invalid('action="config" accepts only projectDir, harnesses, modelSpecs, and modelFilter');
     }
     if (options.requireProjectDir === true && raw.projectDir === undefined) {
       invalid(
@@ -542,7 +509,6 @@ export function parseWorkflowToolInput(
       harnesses: raw.harnesses,
       modelSpecs: raw.modelSpecs,
       modelFilter: raw.modelFilter,
-      probeTimeoutMs: raw.probeTimeoutMs,
     };
   }
 
@@ -574,8 +540,6 @@ export function parseWorkflowToolInput(
       maxAgents: raw.maxAgents,
       concurrency: raw.concurrency,
       agentRetries: raw.agentRetries,
-      agentTimeoutMs: raw.agentTimeoutMs,
-      agentIdleTimeoutMs: raw.agentIdleTimeoutMs,
       resumePolicy: raw.resumePolicy,
       checkpointReplies: raw.checkpointReplies === undefined
         ? undefined
@@ -704,8 +668,6 @@ export function parseWorkflowToolInput(
     maxAgents: raw.maxAgents,
     concurrency: raw.concurrency,
     agentRetries: raw.agentRetries,
-    agentTimeoutMs: raw.agentTimeoutMs,
-    agentIdleTimeoutMs: raw.agentIdleTimeoutMs,
     resumeFromRunId: raw.resumeFromRunId,
     resumePolicy: raw.resumePolicy,
     checkpointReplies: raw.checkpointReplies === undefined

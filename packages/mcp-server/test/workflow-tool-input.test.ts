@@ -47,9 +47,7 @@ test("input shape: one tool advertises the exact config, run, resume, status, re
     Object.keys(workflowToolInputShape).sort(),
     [
       "action",
-      "agentIdleTimeoutMs",
       "agentRetries",
-      "agentTimeoutMs",
       "args",
       "background",
       "callIndex",
@@ -66,7 +64,6 @@ test("input shape: one tool advertises the exact config, run, resume, status, re
       "modelSpecs",
       "offset",
       "permissionId",
-      "probeTimeoutMs",
       "projectDir",
       "response",
       "resumeFromRunId",
@@ -78,14 +75,6 @@ test("input shape: one tool advertises the exact config, run, resume, status, re
     ],
     "the exact config/run/status/result/permission/stop wire fields",
   );
-});
-
-test("idle watchdog input is opt-in, nullable, positive, and run-only", () => {
-  assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x" })).agentIdleTimeoutMs, undefined);
-  assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", agentIdleTimeoutMs: null })).agentIdleTimeoutMs, null);
-  assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", agentIdleTimeoutMs: 300_000 })).agentIdleTimeoutMs, 300_000);
-  assert.throws(() => Schema.parse({ script: "x", agentIdleTimeoutMs: 0 }));
-  assert.throws(() => Schema.parse({ script: "x", agentIdleTimeoutMs: 1.5 }));
 });
 
 test("resume inputs advertise stored-content simplicity and manager-owned fail-to-live admission", () => {
@@ -144,8 +133,6 @@ test("resume policy and source validation reject invalid values and combinations
       maxAgents: undefined,
       concurrency: 99,
       agentRetries: undefined,
-      agentTimeoutMs: undefined,
-      agentIdleTimeoutMs: undefined,
       resumePolicy: "positional",
       checkpointReplies: { 0: true },
       background: true,
@@ -200,7 +187,6 @@ test("config accepts only bounded discovery fields and requires projectDir in da
         harnesses: ["claude", "team.agent"],
         modelFilter: "opus",
         modelSpecs: ["claude/opus"],
-        probeTimeoutMs: 5_000,
       }),
     ),
     {
@@ -209,7 +195,6 @@ test("config accepts only bounded discovery fields and requires projectDir in da
       harnesses: ["claude", "team.agent"],
       modelFilter: "opus",
       modelSpecs: ["claude/opus"],
-      probeTimeoutMs: 5_000,
     },
   );
   assert.throws(
@@ -225,7 +210,6 @@ test("config accepts only bounded discovery fields and requires projectDir in da
     { action: "config", harnesses: ["bad/name"] },
     { action: "config", modelFilter: "" },
     { action: "config", modelSpecs: [] },
-    { action: "config", probeTimeoutMs: 0 },
   ]) {
     assert.throws(() => parseWorkflowToolInput(Schema.parse(input)));
   }
@@ -425,8 +409,6 @@ test("the discriminator rejects every missing or mixed run/status branch", () =>
     { action: "status", runId: "a-b", callIndex: 0 },
     { action: "status", runId: "a-b", maxAgents: 1 },
     { action: "status", runId: "a-b", agentRetries: 1 },
-    { action: "status", runId: "a-b", agentTimeoutMs: 1 },
-    { action: "status", runId: "a-b", agentIdleTimeoutMs: 1 },
     { script: "x", runId: "a-b" },
     { script: "x", callIndex: 0 },
     { script: "x", waitMs: 0 },

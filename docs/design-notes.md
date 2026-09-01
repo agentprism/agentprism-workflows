@@ -295,7 +295,7 @@ The `workflow` tool grew from Pi's single-form input
   defaulting to the server's own project under `--in-process`. Agent-less deterministic scripts are
   valid; the validator warns when a script has neither `agent()` nor `checkpoint()`. Other run
   fields: `args`, `maxAgents` (default 1000), `concurrency` (clamped to 16), `agentRetries`
-  (clamped to ≤3), `agentTimeoutMs` (total-wall, default none), `agentIdleTimeoutMs` (no backend activity, default disabled), the explicit-resume
+  (clamped to ≤3), the explicit-resume
   trio `resumeFromRunId` / `resumePolicy` / `checkpointReplies`, and `background`.
 - **Resume** — supply a source `runId`; the server reads that run's immutable persisted script and
   stored strict-JSON args and always admits a fresh linked run. An explicit `args` value replaces
@@ -312,13 +312,10 @@ The `workflow` tool grew from Pi's single-form input
   status *bounds* (`lastN`/`logLines`/`waitMs`), by contrast, are wire-contract limits rejected
   at the Zod boundary.
 
-**Two independent attempt clocks.** `agentTimeoutMs` / per-call `timeoutMs` cap total wall time;
-`agentIdleTimeoutMs` / per-call `idleTimeoutMs` are opt-in wedge detection. The idle clock starts
-fresh for each retry and re-arms only on real backend activity (`session/update` for ACP runners),
-never on the engine's synthetic progress heartbeat. A live host-interaction wait suspends the idle
-clock and re-arms it after the response; total wall time continues. Either expiry cancels through the existing ACP
-turn wind-down and is recoverable (`AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`), so retries apply and
-final exhaustion resolves the call to `null`. Both are replay-neutral operational bounds.
+**Unbounded agent execution with explicit cancellation.** Model-facing agent work has no elapsed-time
+budget or idle watchdog. An attempt remains live until it completes, fails, or the host explicitly
+cancels its call or run. Protocol startup, cancellation-grace, cleanup, lease, and transport bounds
+remain fixed implementation safety controls; they are not configurable agent work budgets.
 
 **Exact result discovery is separate from observability.** Completed runs with a persisted JSON
 value expose `workflow://runs/{runId}/result`, distinct from the immutable `/script` resource and the

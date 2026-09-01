@@ -90,8 +90,6 @@ function recording(overrides: Partial<PersistedRunState> = {}): PersistedRunStat
       maxAgents: 10,
       concurrency: 2,
       agentRetries: 0,
-      agentTimeoutMs: null,
-      agentIdleTimeoutMs: null,
     },
     startedAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
@@ -563,7 +561,6 @@ return { first, target }`;
         maxAgents: 10,
         concurrency: 1,
         agentRetries: 0,
-        agentTimeoutMs: null,
         environmentKey: ENVIRONMENT_KEY,
       });
       assert.equal(baseline.status, "completed");
@@ -607,8 +604,8 @@ return { first, target }`;
     }
   });
 
-  it("classifies candidate fallback, target failure, zero-call nested workflow, and timeout cancellation", async () => {
-    const scenarios = ["fallback", "failure", "nested", "timeout"] as const;
+  it("classifies candidate fallback, target failure, and zero-call nested workflow", async () => {
+    const scenarios = ["fallback", "failure", "nested"] as const;
     for (const scenario of scenarios) {
       const root = mkdtempSync(join(tmpdir(), `isolation-${scenario}-`));
       const cwd = mkdtempSync(join(tmpdir(), `isolation-${scenario}-cwd-`));
@@ -632,10 +629,8 @@ return value`
           maxAgents: 10,
           concurrency: 1,
           agentRetries: 0,
-          agentTimeoutMs: scenario === "timeout" ? 10 : null,
           environmentKey: ENVIRONMENT_KEY,
         });
-        let timeoutSignalAborted = false;
         const result = await runIsolation({
           baselineRunId: `baseline-${scenario}`,
           cwd,
@@ -655,19 +650,6 @@ return value`
                   details: { exact: true },
                 });
               }
-              if (scenario === "timeout") {
-                await new Promise<void>((resolve) => {
-                  options?.signal?.addEventListener(
-                    "abort",
-                    () => {
-                      timeoutSignalAborted = true;
-                      resolve();
-                    },
-                    { once: true },
-                  );
-                });
-                return "late";
-              }
               options?.onModelResolved?.("candidate/concrete");
               return "candidate";
             },
@@ -675,7 +657,7 @@ return value`
         });
         assert.equal(
           result.status,
-          scenario === "failure" ? "target-failed" : scenario === "timeout" ? "target-failed" : "diverged",
+          scenario === "failure" ? "target-failed" : "diverged",
           scenario,
         );
         if (scenario === "fallback") assert.equal(result.report.divergence?.kind, "candidate-fallback");
@@ -684,7 +666,6 @@ return value`
           assert.equal(result.error?.code, WorkflowErrorCode.SCHEMA_NONCOMPLIANCE);
           assert.deepEqual(result.error?.details, { exact: true });
         }
-        if (scenario === "timeout") assert.equal(timeoutSignalAborted, true);
       } finally {
         rmSync(root, { recursive: true, force: true });
         rmSync(cwd, { recursive: true, force: true });
@@ -711,7 +692,6 @@ return 'caught'`;
         maxAgents: 10,
         concurrency: 1,
         agentRetries: 0,
-        agentTimeoutMs: null,
         environmentKey: ENVIRONMENT_KEY,
       });
       const controller = new AbortController();

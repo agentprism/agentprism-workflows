@@ -146,7 +146,7 @@ them); for those steps, propagation mode exists today.
 - **Input fingerprint** — `hashCallInputs` (§2.7): sha256 of the canonical strict-JSON
   of the call's resolved unhashed execution inputs — cwd, isolation, images,
   mcpServers, meta, promptMeta, keepSession, the resolved label, the effective
-  timeout/retry values, and the approved-backends digest (r6 B1). Recorded per call
+  retry value, and the approved-backends digest (r6 B1). Recorded per call
   (`WorkflowCallRecord.inputsHash`), threaded to the seam
   (`RunOptions.callInputsHash`), and REQUIRED to match for target binding — the
   fail-closed guard against a live target executing with unhashed context the baseline
@@ -373,7 +373,7 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
 
   /** The input fingerprint for THIS call (§2.7): sha256 of the canonical strict-JSON
    *  of the call's resolved unhashed execution inputs (cwd/isolation/images/mcpServers/
-   *  meta/promptMeta/keepSession/label/effective timeout+retries/approved-backends
+   *  meta/promptMeta/keepSession/label/effective retries/approved-backends
    *  digest — r6 B1). Identical across retry attempts. ABSENT when any component fails
    *  strict-JSON canonicalization — never fabricated. ADDITIVE, not a hash input. */
   callInputsHash?: string;
@@ -620,8 +620,6 @@ that executes live:
   mcpServers: agentOptions.mcpServers ?? null, meta: agentOptions.meta ?? null,
   promptMeta: agentOptions.promptMeta ?? null,
   label: <the resolved label — requestedLabel || defaultAgentLabel(...), workflow.ts:519>,
-  timeoutMs: <the effective value: agentOptions.timeoutMs !== undefined ?
-  agentOptions.timeoutMs : agentTimeoutMs, :550, null when none>,
   retries: normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0)
   <the normalized capped value, :551/:1397-1400>,
   backends: <the run's approved-backends digest, below> }` (r6 B1). Every component is
@@ -629,8 +627,8 @@ that executes live:
   pre-resolution, so the fingerprint is stable across runs (the resolved worktree cwd
   embeds `runId`/`callIndex` via `createWorktree(baseCwd,
   `\`${runId}-${callIndex}-${label}\``)`, `workflow.ts:568-573`, and would never
-  match); the effective timeout/retry components fold in run-level settings, which §4.3
-  reproduces from the recording, so they too are replay-stable.
+  match); the effective retry component folds in run-level settings, which §4.3
+  reproduces from the recording, so it too is replay-stable.
   `resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation`.
 - **Approved-backends digest.** Once per run: `backends = options.scriptBackends ?
   sha256(canonicalStrictJson(<the registry as a name→config record>)) : null` — a
@@ -900,9 +898,8 @@ Pre-allocation gate failures (§1) are structurally invisible to this accounting
 
 **Effective execution inputs and abort accounting (r5 B2/B4).** The engine returns
 `WorkflowRunResult.effectiveLimits?: { maxAgents: number; concurrency: number;
-agentRetries: number; agentTimeoutMs: number | null }` —
-the RESOLVED values in force: `maxAgents` (`workflow.ts:346`), `agentTimeoutMs`
-(`:347`), `concurrency` (`:384-385` — the default derives from the HOST's
+agentRetries: number }` —
+the RESOLVED values in force: `maxAgents` (`workflow.ts:346`), `concurrency` (`:384-385` — the default derives from the HOST's
 `hardwareConcurrency`, so it must be recorded, not re-derived), the run-level
 `agentRetries` as NORMALIZED and capped by `normalizeAgentRetries` (consulted per
 call at `:551`, capped at `:1397-1400` — the value in force, never the raw option;
@@ -1036,9 +1033,9 @@ consumers under structural contravariance):
   onAgentHistory: { …existing…, callIndex: number, scope: string }
 ```
 
-**Why sealed telemetry rides the event (r5 B7 — the directive-2 hook).** The
-engine's timeout races OUTSIDE the wrapper (`workflow.ts:621-675`, `:1405-1427`), so
-a wrapper CANNOT know a callback it forwards belongs to a timed-out loser; only the
+**Why sealed telemetry rides the event (r5 B7 — the directive-2 hook).** Runner
+callbacks can arrive after explicit abort or attempt settlement, so a wrapper cannot
+know that a callback it forwards belongs to a settled attempt; only the
 engine's attempt-sealed slots (§3.5) hold the truth, surfaced on the one
 exactly-once settlement signal (§2.6) — the isolation report consumes ONLY that
 (§4.6 rule T). The wrapper intercepts NO observation callbacks (§4.5).
@@ -1130,10 +1127,9 @@ nested-child events patching parent rows).
   callsAllocated?: number;
   /** NEW — the run's resolved execution inputs (§3.2), from
    *  WorkflowRunResult.effectiveLimits on completion: every run-level setting that is
-   *  control-flow-visible (gates, retries-to-null conversion, timeouts) or
+   *  control-flow-visible (gates and retries-to-null conversion) or
    *  host-derived (concurrency). §4.3 defaults the replay to these. */
-  limits?: { maxAgents: number; concurrency: number; agentRetries: number;
-             agentTimeoutMs: number | null };
+  limits?: { maxAgents: number; concurrency: number; agentRetries: number };
   /** NEW — set when the run's abort signal was ever observed aborted (engine-returned
    *  abortSignaled, OR managed.controller.signal.aborted at terminal save). */
   abortSignaled?: true;
@@ -1257,18 +1253,13 @@ Normative rules replacing the single reset-per-attempt closures
   once, in `finally` — already conformant.)
 - **The settlement seal.** An attempt settles when the engine's await of the seam
   returns or throws (`withTimeout` resolution `:621` or the catch at `:699`). At
-  settlement the attempt's slots seal; a callback arriving afterwards (a timed-out
-  loser's eventual report) is DROPPED — it never mutates a slot, an artifact, an
+  settlement the attempt's slots seal; a callback arriving afterwards is DROPPED —
+  it never mutates a slot, an artifact, an
   event, or the run aggregate.
-- **Per-attempt abort (r6 B13).** Every attempt gets a FRESH `AbortController`; the
-  runner's `RunOptions.signal` is `AbortSignal.any([runSignal, attempt.signal])`.
-  When `withTimeout`'s timer wins, the engine ABORTS the attempt controller — the
-  loser is actively cancelled through the seam (the ACP runner maps signal abort to
-  `session/cancel`, `acp-agents/src/acp-client.ts:1876-1883,2086-2089`), not merely
-  floated. Settlement is unchanged: the attempt is already classified as the timeout
-  outcome, its slots sealed, the loser's eventual rejection/reports dropped by the
-  seal. Residual: a signal-ignoring third-party runner (§4.12 item 4). Disclosed
-  (§8 item 10).
+- **Explicit abort (r6 B13).** The runner's `RunOptions.signal` carries whole-run or
+  targeted-call cancellation. The ACP runner maps signal abort to `session/cancel`;
+  attempt slots seal at settlement and drop any later reports from an uncooperative
+  runner. Residual: a signal-ignoring third-party runner (§4.12 item 4).
 - **Per-call usage** = the field-wise sum of each attempt's sealed winning `onUsage`
   report (attempts with no report contribute nothing; no reports at all →
   `undefined`). **Per-call model/backend/provenance telemetry** = the terminal
@@ -1405,16 +1396,15 @@ export interface RunIsolationOptions {
   /** APPROVED script-declared backends (ExecOptions.scriptBackends semantics). */
   scriptBackends?: Record<string, WorkflowBackendConfig>;
   // Execution-setting overrides (ExecOptions semantics). DEFAULTS (normative):
-  // the RECORDING's persisted limits — concurrency ?? limits.concurrency,
-  // agentTimeoutMs ?? limits.agentTimeoutMs, agentRetries ?? limits.agentRetries —
+  // the RECORDING's persisted limits — concurrency ?? limits.concurrency and
+  // agentRetries ?? limits.agentRetries —
   // so the replay runs under the baseline's effective settings unless the caller
   // deliberately deviates (recorded concurrency reproduces the scheduling ENVELOPE,
   // not latencies — §4.12 item 1). In practice they govern only live-target behavior:
-  // served calls resolve at the seam and never hit timeout/retry machinery.
+  // served calls resolve at the seam and never hit retry machinery.
   // maxAgents is not accepted: §4.3 forces the recording's persisted limit and
   // agent-limit gate-freedom is separately proven (§4.9 check 6).
   concurrency?: number;
-  agentTimeoutMs?: number | null;
   agentRetries?: number;
   signal?: AbortSignal;
   /** Model-resolution reproduction inputs. Defaults (normative):
@@ -1566,8 +1556,7 @@ export interface ReplayRunner extends AgentRunner {
    baselineRunId }, cwd: recording.effectiveCwd ?? recording.cwd ?? executionCwd,
    journaling, scriptBackends, onProgress, signal: <combined>,
    concurrency: concurrency ?? recording.limits.concurrency,
-   agentTimeoutMs: agentTimeoutMs !== undefined ? agentTimeoutMs :
-   recording.limits.agentTimeoutMs, agentRetries: agentRetries ??
+   agentRetries: agentRetries ??
    recording.limits.agentRetries, maxAgents: recording.limits.maxAgents,
    onNestedWorkflow: <latch fatal REPLAY_DIVERGENCE "nested-workflow-call" + fire the
    internal abort — spend stops the moment an unsupported child is INVOKED, even a
@@ -2098,8 +2087,8 @@ on both API paths. `RECORDING_UNUSABLE` reasons are FROZEN kebab-case literals
    `mainModel`/`agentsDir` strings when present; `runtime.node` a string and
    `runtime.pathFormat` an integer when present; `callsAllocated` a non-negative
    integer when present; `limits` when present: `maxAgents`/`concurrency` positive
-   integers, `agentRetries` a non-negative integer, `agentTimeoutMs` null-or-number;
-   historical budget properties are ignored; `args` anything JSON. `agents[]`: per row, `label`
+   integers and `agentRetries` a non-negative integer; historical budget and timeout
+   properties are ignored; `args` anything JSON. `agents[]`: per row, `label`
    string, `status` in the §3.4 enum, `callIndex`/`scope`/`model`/`usage` type-checked
    when present. `journal[]`: may be EMPTY; per entry `index` non-negative integer,
    indexes unique, `hash` non-empty string, `kind`/`scope` in-enum/non-empty when
@@ -2310,7 +2299,7 @@ Precisely (resolving r5 advisory 5's ambiguity):
   engine-owned manifest append FIRST — r6 B7); §3.5 attempt-scoped slots
   (snapshot-at-receipt + usage validation, r6 advisory 2) + settlement seal for
   `onUsage`/`onSessionOpen`/`onModelResolved`/`onModelFallback`/`onResultProvenance`/
-  `onHistory`; per-attempt AbortController + timeout abort (§3.5, r6 B13);
+  `onHistory`; explicit abort handling (§3.5, r6 B13);
   `settlementOrdinal` capture (§3.2, §3.5); §3.0 strict-JSON
   validation + deep-freeze at every capture boundary (agent results, checkpoint
   replies, headless defaults); `onCallRecord` emission at every §3.2 exit;
@@ -2442,8 +2431,8 @@ never enter the persisted file.
 **`workflow-engine/test/input-fingerprint.test.ts` (new).** Canonicalization: sorted
 keys, arrays ordered; identical across runs for worktree-isolated calls
 (pre-resolution values); each of images/cwd/mcpServers/meta/promptMeta/keepSession/
-isolation — and **[r6 B1]** label (incl. the default-label path), effective
-timeoutMs, normalized retries, and the approved-backends digest (same name,
+isolation — and **[r6 B1]** label (incl. the default-label path), normalized retries,
+and the approved-backends digest (same name,
 different config) — changes the fingerprint; a non-qualifying component (function in
 `meta`) → fingerprint absent, never partial. **[r6 B5]** every fingerprint fixture
 object is created INSIDE the vm realm (actual script-authored literals), never a

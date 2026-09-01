@@ -317,7 +317,6 @@ export interface WorkflowExecuteToolInput {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
   resumeFromRunId?: string;
   checkpointReplies?: Record<number, unknown>;
   runId?: never;

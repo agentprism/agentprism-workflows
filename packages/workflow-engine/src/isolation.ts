@@ -178,8 +178,6 @@ export interface RunIsolationOptions {
   persistenceRoot?: string;
   scriptBackends?: Record<string, WorkflowBackendConfig>;
   concurrency?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
   agentRetries?: number;
   signal?: AbortSignal;
   agentsDir?: string;
@@ -509,19 +507,6 @@ function validateStructure(recording: PersistedRunState): void {
     if (!isPositiveInteger(recording.limits.maxAgents)) corrupt(recording, "limits.maxAgents");
     if (!isPositiveInteger(recording.limits.concurrency)) corrupt(recording, "limits.concurrency");
     if (!isNonNegativeInteger(recording.limits.agentRetries)) corrupt(recording, "limits.agentRetries");
-    if (
-      recording.limits.agentTimeoutMs !== null &&
-      (typeof recording.limits.agentTimeoutMs !== "number" || !Number.isFinite(recording.limits.agentTimeoutMs))
-    ) {
-      corrupt(recording, "limits.agentTimeoutMs");
-    }
-    if (
-      recording.limits.agentIdleTimeoutMs !== undefined &&
-      recording.limits.agentIdleTimeoutMs !== null &&
-      (typeof recording.limits.agentIdleTimeoutMs !== "number" || !Number.isFinite(recording.limits.agentIdleTimeoutMs))
-    ) {
-      corrupt(recording, "limits.agentIdleTimeoutMs");
-    }
   }
 
   if (recording.agents !== undefined && !Array.isArray(recording.agents)) corrupt(recording, "agents");
@@ -1564,14 +1549,6 @@ export async function runIsolation<T = unknown>(
         onProgress: options.onProgress,
         signal: combinedSignal,
         concurrency: options.concurrency ?? recording.limits?.concurrency,
-        agentTimeoutMs:
-          options.agentTimeoutMs !== undefined
-            ? options.agentTimeoutMs
-            : recording.limits?.agentTimeoutMs,
-        agentIdleTimeoutMs:
-          options.agentIdleTimeoutMs !== undefined
-            ? options.agentIdleTimeoutMs
-            : recording.limits?.agentIdleTimeoutMs ?? null,
         agentRetries: options.agentRetries ?? recording.limits?.agentRetries,
         maxAgents: recording.limits?.maxAgents,
         onNestedWorkflow: (_ordinal, childRunId) => {

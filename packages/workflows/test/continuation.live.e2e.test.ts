@@ -86,11 +86,11 @@ function workflow(model: string): string {
   return `export const meta = { name: "continuation-live", description: "minimal live continuation" }
 const prefix = await agent(
   "Reply with exactly PREFIX_OK and nothing else.",
-  { label: "prefix", model: ${JSON.stringify(model)}, retries: 0, timeoutMs: null },
+  { label: "prefix", model: ${JSON.stringify(model)}, retries: 0 },
 )
 const tail = await agent(
   "Reply with exactly TAIL_OK and nothing else. If asked to continue, reply with exactly TAIL_RESUMED_OK.",
-  { label: "tail", model: ${JSON.stringify(model)}, keepSession: true, retries: 0, timeoutMs: null },
+  { label: "tail", model: ${JSON.stringify(model)}, keepSession: true, retries: 0 },
 )
 return { prefix, tail }`;
 }
@@ -134,7 +134,6 @@ async function runColdContinuation(method: ReattachMethod): Promise<void> {
     const paused = await sourceManager.runSync(workflow(model), undefined, {
       concurrency: 1,
       agentRetries: 0,
-      agentTimeoutMs: null,
     });
     assert.equal(paused.status, "paused");
 

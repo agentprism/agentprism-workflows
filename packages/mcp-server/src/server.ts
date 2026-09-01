@@ -1962,7 +1962,7 @@ export function createWorkflowServer(
         "pipeline(items, ...stages) for streaming stages; checkpoint(prompt, options?) for a human gate; phase(title) and log(message) " +
         "for progress; and return the final JSON-serializable value. Top-level await is supported. Imports, require, network APIs, " +
         "Date.now(), and Math.random() are unavailable. Always label agent calls; schema is a plain JSON Schema object for structured results. " +
-        "The only agent option keys are label, phase, model, tier, mode, configOptions, schema, cwd, timeoutMs, idleTimeoutMs, retries, isolation:\"worktree\", resume, agentType, mcpServers, images, meta, promptMeta, and keepSession; unknown keys reject before admission. " +
+        "The only agent option keys are label, phase, model, tier, mode, configOptions, schema, cwd, retries, isolation:\"worktree\", resume, agentType, mcpServers, images, meta, promptMeta, and keepSession; unknown keys reject before admission. " +
         "Every parallel entry must be a thunk: parallel([() => agent(...), () => agent(...)]). For deeper syntax, read docs topic workflow/quickstart and then one related workflow/* topic. " +
         "Minimal script: `export const meta = { name: \"review\", description: \"Review a target\", phases: [{ title: \"Review\" }] }; phase(\"Review\"); const report = await agent(\"Review \" + args.target, { label: \"review\" }); return { report };`. " +
         "Omit model for the server default (explicit AGENTPRISM_DEFAULT_BACKEND, else a zero-token auto-selected project pin), or use a backend name alone to preserve that backend's configured default. " +
@@ -2049,7 +2049,6 @@ export function createWorkflowServer(
           harnesses: parsedInput.harnesses,
           modelSpecs: parsedInput.modelSpecs,
           cwd,
-          timeoutMs: parsedInput.probeTimeoutMs,
           probeRunner,
         });
         let projected;
@@ -2877,8 +2876,6 @@ export function createWorkflowServer(
           maxAgents: resumeInput.maxAgents,
           concurrency: resumeInput.concurrency,
           agentRetries: resumeInput.agentRetries,
-          agentTimeoutMs: resumeInput.agentTimeoutMs,
-          agentIdleTimeoutMs: resumeInput.agentIdleTimeoutMs,
           resumeFromRunId: resumeInput.runId,
           resumePolicy: resumeInput.resumePolicy,
           checkpointReplies: resumeInput.checkpointReplies,
@@ -3027,7 +3024,6 @@ export function createWorkflowServer(
           cwd: context.projectDir,
           maxAgents: input.maxAgents,
           timeoutMs: 30_000,
-          probeTimeoutMs: 60_000,
           defaultModel,
           probeRunner,
           loadSavedWorkflow: (name) => context.manager.resolveSavedWorkflow(name),
@@ -3079,8 +3075,6 @@ export function createWorkflowServer(
           maxAgents: input.maxAgents,
           concurrency: input.concurrency,
           agentRetries: input.agentRetries,
-          agentTimeoutMs: input.agentTimeoutMs,
-          agentIdleTimeoutMs: input.agentIdleTimeoutMs,
           resumeFromRunId: input.resumeFromRunId,
           resumePolicy: input.resumePolicy,
           checkpointReplies: input.checkpointReplies,

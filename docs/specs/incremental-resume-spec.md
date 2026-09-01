@@ -117,7 +117,7 @@ The implementation preserves these named invariants:
    change.
 8. **Quiescent terminal identity.** A new-format source records a terminal environment only when
    every allocated agent/checkpoint/nested invocation, every worktree cleanup, and every underlying
-   runner promise (including a timeout loser) has actually settled. A terminal script result alone
+   runner promise (including a signal-ignoring cancellation loser) has actually settled. A terminal script result alone
    never certifies filesystem quiescence.
 
 The current `firstMiss` field remains, but is consulted only by the positional strategy. The
@@ -313,11 +313,11 @@ shared runtime and reports its absolute value through the manager-only
    continuation can make the root run terminal.
 2. Increment a second unit immediately before each underlying `AgentRunner.run()` invocation and
    attach non-throwing decrement handlers to the **raw runner promise** before passing that original
-   promise unchanged into `withTimeout`. A timeout race, retry classification, attempt-slot seal, or
-   per-attempt abort does not decrement that unit; only fulfillment/rejection of the raw promise
+   promise unchanged into the targeted-cancellation race. Cancellation, retry classification, or an
+   attempt-slot seal does not decrement that unit; only fulfillment/rejection of the raw promise
    does. If a structurally valid runner nevertheless throws synchronously instead of returning a
    promise, the invocation catch decrements the unit before classifying that throw. Thus a
-   signal-ignoring timeout loser keeps the source non-quiescent.
+   signal-ignoring cancellation loser keeps the source non-quiescent.
 3. Separately, after each root-scope agent/checkpoint index allocation, call the manager-only
    `onResumeCallAllocated(callIndex + 1)` hook from §2.6. It must report `1, 2, ...` monotonically;
    nested engines clear this hook because child indexes/scopes are not in the root manifest. This
@@ -1405,10 +1405,10 @@ source falls back and a current live call closes the cache before delegation.
 #### Script settles while an effect may still be running
 
 Recording: one parallel branch fails or the script floats a call while another agent/checkpoint/
-nested invocation is still pending; alternatively, a runner ignores per-attempt abort after losing
-a timeout race. The manager reaches a terminal status before that work can no longer mutate state.
+nested invocation is still pending; alternatively, a runner ignores explicit cancellation after
+the engine settles the targeted call. The manager reaches a terminal status before that work can no longer mutate state.
 
-- The root resume-activity counter remains non-zero for the allocated primitive. A timeout loser
+- The root resume-activity counter remains non-zero for the allocated primitive. A cancellation loser
   also retains its raw-runner unit even after retry classification and logical-call settlement.
 - The manager therefore omits `resume.terminalEnvironment`; it never fingerprints a tree while
   engine-known work can still change it.

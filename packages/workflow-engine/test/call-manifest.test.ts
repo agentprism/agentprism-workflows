@@ -238,7 +238,6 @@ return [a, b]`,
           maxAgents: 7,
           concurrency: 3,
           agentRetries: 99,
-          agentTimeoutMs: 123,
           persistLogs: false,
         },
       );
@@ -246,8 +245,6 @@ return [a, b]`,
         maxAgents: 7,
         concurrency: 3,
         agentRetries: 3,
-        agentTimeoutMs: 123,
-        agentIdleTimeoutMs: null,
       });
       const estimated = Math.ceil(JSON.stringify("four").length / 4) +
         Math.ceil(JSON.stringify("long prompt").length / 4);

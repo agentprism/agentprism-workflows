@@ -280,14 +280,11 @@ describe("live-boundary continuation", () => {
     }
   });
 
-  it("keeps an interrupted occurrence eligible when timeout or retry bounds change", async () => {
+  it("keeps an interrupted occurrence eligible when retry bounds change", async () => {
     const fixture = tempCwd();
     try {
       const source = await recordInterrupted(fixture.cwd);
-      for (const item of [
-        { name: "timeout", script: workflow("timeoutMs: 100") },
-        { name: "retries", script: workflow("retries: 1") },
-      ]) {
+      for (const item of [{ name: "retries", script: workflow("retries: 1") }]) {
         const result = await runWorkflow(item.script, {
           cwd: fixture.cwd,
           persistLogs: false,
@@ -303,7 +300,7 @@ describe("live-boundary continuation", () => {
 
   it("compares format-1 continuation candidates with the legacy fingerprint", async () => {
     const fixture = tempCwd();
-    const sourceScript = workflow("retries: 1, timeoutMs: null");
+    const sourceScript = workflow("retries: 1");
     try {
       const source = await recordInterrupted(fixture.cwd, sourceScript);
       const legacyCandidate: ContinuationCandidate = {
@@ -321,7 +318,7 @@ describe("live-boundary continuation", () => {
 
       const fallbacks: WorkflowRunFallback[] = [];
       const changed = await runWorkflow(
-        workflow("retries: 1, timeoutMs: null, meta: { changed: true }"),
+        workflow("retries: 1, meta: { changed: true }"),
         {
           cwd: fixture.cwd,
           persistLogs: false,
@@ -464,49 +461,6 @@ describe("live-boundary continuation", () => {
       assert.deepEqual(directives.map(Boolean), [true, false]);
       assert.deepEqual(fallbacks.map((fallback) => fallback.continuation), [
         { outcome: "reattached", method: "resume" },
-      ]);
-      assert.equal(journal[0]?.call?.kind === "agent" ? journal[0].call.continuation : undefined, undefined);
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  it("runs a timed-out continuation only once and retries fresh without duplicating its notice", async () => {
-    const fixture = tempCwd();
-    try {
-      const timedScript = workflow("retries: 1, timeoutMs: 10");
-      const source = await recordInterrupted(fixture.cwd, timedScript);
-      const directives: boolean[] = [];
-      const fallbacks: WorkflowRunFallback[] = [];
-      const journal: JournalEntry[] = [];
-      let attempt = 0;
-      const result = await runWorkflow(timedScript, {
-        cwd: fixture.cwd,
-        persistLogs: false,
-        preparedContinuation: prepared(source.candidate),
-        agent: {
-          async run(_prompt, options) {
-            attempt += 1;
-            directives.push(options.continueFromSession !== undefined);
-            if (attempt === 1) {
-              options.onResultProvenance?.({
-                source: "live",
-                continuation: { reattached: true, method: "load" },
-              });
-              await new Promise<never>((_resolve, reject) => {
-                options.signal?.addEventListener("abort", () => reject(new Error("timed out")), { once: true });
-              });
-            }
-            return "fresh after timeout";
-          },
-        },
-        onFallback: (fallback) => fallbacks.push(fallback),
-        onAgentJournal: (entry) => journal.push(entry),
-      });
-      assert.equal(result.result, "fresh after timeout");
-      assert.deepEqual(directives, [true, false]);
-      assert.deepEqual(fallbacks.map((fallback) => fallback.continuation), [
-        { outcome: "reattached", method: "load" },
       ]);
       assert.equal(journal[0]?.call?.kind === "agent" ? journal[0].call.continuation : undefined, undefined);
     } finally {

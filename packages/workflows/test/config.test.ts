@@ -222,39 +222,6 @@ test("a failing probe reports probed:false with the reason and flips the exit co
   }
 });
 
-test("a hung probe times out, aborts its request, and does not block the others", async () => {
-  let disposed = 0;
-  let aborted = false;
-  const restore = setValidateProbeFactoryForTests(() => ({
-    probeConfigOptions(spec, options) {
-      if (spec === "opencode") {
-        options?.signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
-        return new Promise(() => {});
-      }
-      return Promise.resolve({ backendId: spec ?? "claude", options: [] });
-    },
-    async dispose() {
-      disposed++;
-    },
-  }));
-  try {
-    const report = await probeHarnessConfig({ harnesses: ["opencode", "claude"], timeoutMs: 50 });
-    assert.equal(report.exitCode, 1);
-    assert.equal(report.harnessOptions[0].probed, false);
-    assert.match(report.harnessOptions[0].error ?? "", /probe timed out after 50ms/);
-    assert.equal(report.harnessOptions[1].probed, true);
-    assert.equal(disposed, 1);
-    assert.equal(aborted, true);
-  } finally {
-    restore();
-  }
-});
-
-test("invalid timeoutMs throws before any probe", async () => {
-  await assert.rejects(probeHarnessConfig({ timeoutMs: 0 }), TypeError);
-  await assert.rejects(probeHarnessConfig({ timeoutMs: Number.NaN }), TypeError);
-});
-
 test("formatHarnessConfigReport renders validate's table format plus a probe summary", () => {
   const human = formatHarnessConfigReport({
     ok: false,
@@ -440,7 +407,7 @@ test("CLI: an env-registered custom backend is probeable by name and joins the d
 });
 
 test("CLI: a harness that dies at spawn reports probed:false and exits 1", () => {
-  const result = runCli(["claude", "--json", "--timeout-ms", "15000"], {
+  const result = runCli(["claude", "--json"], {
     AGENTPRISM_CLAUDE_ACP_ARGS: undefined,
     AGENTPRISM_CLAUDE_ACP_CMD: "/nonexistent/acp-agent-binary",
   });

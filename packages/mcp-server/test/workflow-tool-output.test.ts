@@ -32,16 +32,16 @@ const replayEligibility = {
   }],
   operationalChanges: [
     {
-      option: "agentTimeoutMs",
-      source: 900_000,
-      current: null,
-      detail: "source recorded agentTimeoutMs=900000; this run: none",
+      option: "agentRetries",
+      source: 1,
+      current: 0,
+      detail: "source recorded agentRetries=1; this run: 0",
     },
     {
-      option: "agentIdleTimeoutMs",
-      source: null,
-      current: 300_000,
-      detail: "source recorded agentIdleTimeoutMs=none; this run: 300000",
+      option: "concurrency",
+      source: 2,
+      current: 4,
+      detail: "source recorded concurrency=2; this run: 4",
     },
   ],
 } as const satisfies WorkflowReplayEligibility;
@@ -60,8 +60,6 @@ const baseRun: WorkflowRunResult<null> = {
     maxAgents: 50,
     concurrency: 3,
     agentRetries: 2,
-    agentTimeoutMs: 45_000,
-    agentIdleTimeoutMs: 300_000,
   },
 };
 

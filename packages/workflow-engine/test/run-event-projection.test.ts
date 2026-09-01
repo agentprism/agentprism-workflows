@@ -169,7 +169,7 @@ test("projectRunEventForPersistence redacts every retained string surface withou
   }
 });
 
-test("agentStart path passes through verbatim and an oversized path is dropped, never truncated", () => {
+test("agentStart path passes through verbatim, retired timeout fields are omitted, and oversized paths are dropped", () => {
   const base = {
     type: "agentStart" as const,
     runId: "run-projection",
@@ -184,8 +184,8 @@ test("agentStart path passes through verbatim and an oversized path is dropped, 
   assert.equal(kept.event.type, "agentStart");
   if (kept.event.type === "agentStart") {
     assert.equal(kept.event.path, "3:14<7:9");
-    assert.equal(kept.event.timeoutMs, 900_000);
-    assert.equal(kept.event.idleTimeoutMs, 300_000);
+    assert.equal("timeoutMs" in kept.event, false);
+    assert.equal("idleTimeoutMs" in kept.event, false);
   }
 
   const oversized = projectRunEventForPersistence({

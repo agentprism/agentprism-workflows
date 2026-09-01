@@ -113,8 +113,7 @@ ascending call-index order.
 
 The `WorkflowRunStatus` projection includes the run's resolved limits and, for a new-run resume,
 its bounded `replayEligibility` admission/progress summary. Agent call rows include their
-resolved per-attempt `timeoutMs` / `idleTimeoutMs` and terminal `errorCode`, which keeps failures such as
-`AGENT_TIMEOUT`, `AGENT_IDLE_TIMEOUT`, and `AGENT_CANCELLED` visible even though they have no result journal row. The
+terminal `errorCode`, which keeps failures such as `AGENT_CANCELLED` visible even though they have no result journal row. The
 projection is allowlisted:
 it never exposes script, args, prompts,
 histories, journal hashes, session IDs, cwd, checkpoint text/defaults, auth context, or raw results.
@@ -143,7 +142,7 @@ Inside a workflow body these are available as globals (no imports):
 - `agent(prompt, opts?)` — run one subagent. `opts` includes `label`, `phase`, `schema`
   (typebox → validated object), `model`, `mode`, `tier`, `agentType`,
   `isolation: "worktree"`, legacy replay-neutral `resume: { filesystem: "read-only" }`, `cwd`, `mcpServers`, `images`, `meta`, `promptMeta`,
-  `keepSession`, `timeoutMs`, `idleTimeoutMs`, `retries`. The single call into your `AgentRunner`.
+  `keepSession`, `retries`. The single call into your `AgentRunner`.
 - `parallel([() => agent(...), ...])` — run thunks concurrently (bounded by the run's
   concurrency limiter).
 - `pipeline(items, stage1, stage2, ...)` — map each item through ordered stages.
@@ -188,8 +187,8 @@ catalogs, and checkpoint source-index rules are in the
 [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
 
 The call identity hashes authored behavior; the separate input fingerprint covers label, per-call
-cwd/isolation/session/tool inputs, metadata, and approved backends. Host `agentTimeoutMs`,
-`agentIdleTimeoutMs`, `agentRetries`, and `concurrency`, plus per-call `timeoutMs`, `idleTimeoutMs`, and `retries`, are operational and enter
+cwd/isolation/session/tool inputs, metadata, and approved backends. Host `agentRetries` and
+`concurrency`, plus per-call `retries`, are operational and enter
 neither hash. Captured start/terminal environment values, current environment, Node, and V8 are
 provenance only and never gate matching. Reporting compares the recorded terminal environment (or
 start environment when no terminal capture exists) with the current environment. A current-format crash snapshot reconciled to
@@ -227,18 +226,11 @@ const [audit, experiment] = await parallel([
 The worktree and its edits are discarded; return the diff as data. Both calls replay from matching
 journal rows without a filesystem-safety declaration.
 
-`maxAgents`, `concurrency`, `agentTimeoutMs`, `agentIdleTimeoutMs`, and `agentRetries` bound the run.
-`phase(title)` groups subsequent calls under a named phase. `agentTimeoutMs` is a total wall-clock
-ceiling for each attempt; `agentIdleTimeoutMs` is a separate opt-in no-backend-activity ceiling. The
-per-call `timeoutMs` / `idleTimeoutMs` counterparts can tighten but cannot raise or disable a finite
-host ceiling. ACP `session/update` traffic re-arms the idle clock; synthetic progress heartbeats do
-not. A runner-reported live permission wait suspends the idle clock and re-arms it after the response,
-while total wall time continues. Size it above the longest expected backend-silent local tool call. Every retry gets fresh
-clocks. Exhaustion is recoverable `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`, so the call settles to
-`null` and frees its concurrency slot. The ACP runner cancels the session and closes/recycles a
-child that does not honor cancellation. Defaults are exported as `MAX_AGENTS_PER_RUN`,
-`MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`, `DEFAULT_AGENT_TIMEOUT_MS`, and
-`DEFAULT_AGENT_IDLE_TIMEOUT_MS`.
+`maxAgents`, `concurrency`, and `agentRetries` bound the run. `phase(title)` groups subsequent calls
+under a named phase. Agent attempts have no elapsed-time or idle budget and remain live until they
+complete, fail, or the host explicitly cancels the call or run. Fixed protocol startup,
+cancellation-grace, cleanup, lease, and transport bounds remain internal safety controls. Exported
+caps are `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, and `MAX_AGENT_RETRIES`.
 
 New resume executions resolve limits from their own `ExecOptions`; they do not inherit the source
 run's values. Pass operational bounds again when constructing a resume; changing them does not
@@ -372,8 +364,7 @@ From `@automatalabs/workflow-engine` (see `src/index.ts`):
 - **Errors** — `WorkflowError`, `WorkflowErrorCode`, `isWorkflowError`, `wrapError`,
   `isProviderUsageLimit`, `isAuthRequired`, `isAbortError`, `isTimeoutError`,
   `ProviderUsageLimitContext`, `AuthErrorContext`, and `CheckpointContext`.
-- **Config caps** — `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`,
-  `DEFAULT_AGENT_TIMEOUT_MS`, `DEFAULT_AGENT_IDLE_TIMEOUT_MS`, `AGENTS_DIR`.
+- **Config caps** — `MAX_AGENTS_PER_RUN`, `MAX_CONCURRENCY`, `MAX_AGENT_RETRIES`, `AGENTS_DIR`.
 - **Model routing / tiers** — `parseModelRoutingFromMeta`, `resolveModelForPhase`,
   `buildDefaultTierConfig`, `loadModelTierConfig`, `saveModelTierConfig`,
   `resolveTierModel`, `sortedTierNames`, `getModelTierConfigPath`.

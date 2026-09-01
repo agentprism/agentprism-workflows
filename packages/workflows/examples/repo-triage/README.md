@@ -44,7 +44,7 @@ would put a `checkpoint()` before the irreversible step — see the SDK README.)
 | SDK / DSL surface | where |
 |---|---|
 | `openWorkflowDir` + `runDynamicWorkflow` (list saved workflows, run one by **name**) | `src/main.ts` |
-| `exec` knobs: `agentTimeoutMs`, `agentRetries`, `onProgress` | `src/main.ts` |
+| `exec` knobs: `agentRetries`, `onProgress` | `src/main.ts` |
 | Per-call **backend routing** (`model`) with registered prefixes and live-catalog-verified ids sent verbatim | the vendor pool in both scripts |
 | **Read-only session modes** copied from each selected model's published catalog snapshot | the vendor pool in both scripts |
 | `pipeline()` (barrier-less multi-stage flow) + `parallel()` (verification panel) | `repo-triage.workflow.js` |

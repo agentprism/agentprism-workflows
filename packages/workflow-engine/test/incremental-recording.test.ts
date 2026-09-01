@@ -469,7 +469,7 @@ return "done"`),
     assert.deepEqual(nestedActivities, [1, 0]);
   });
 
-  it("decrements a synchronously throwing runner unit and retains a timeout loser", async () => {
+  it("decrements a synchronously throwing runner unit", async () => {
     const syncActivities: number[] = [];
     await runWorkflow(script(`try { await agent("sync") } catch {}\nreturn "caught"`), {
       agent: { run() { throw new Error("sync"); } } as AgentRunner,
@@ -477,19 +477,6 @@ return "done"`),
       onResumeActivity: (active) => syncActivities.push(active),
     });
     assert.deepEqual(syncActivities, [1, 2, 1, 0]);
-
-    const loser = deferred<string>();
-    const timeoutActivities: number[] = [];
-    const timed = await runWorkflow(script(`return await agent("timeout", { timeoutMs: 1 })`), {
-      agent: { async run() { return await loser.promise; } },
-      persistLogs: false,
-      onResumeActivity: (active) => timeoutActivities.push(active),
-    });
-    assert.equal(timed.result, null);
-    assert.deepEqual(timeoutActivities, [1, 2, 1]);
-    loser.resolve("late");
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(timeoutActivities, [1, 2, 1, 0]);
   });
 });
 
@@ -647,23 +634,9 @@ describe("managed identity-v1 persistence", () => {
     }
   });
 
-  it("omits a timeout-losing raw promise, records dense failures, and fails closed on invalid activity", async () => {
+  it("records dense failures and fails closed on invalid activity", async () => {
     const dirs = tempDirs();
-    const loser = deferred<string>();
     try {
-      const manager = new WorkflowManager({
-        cwd: dirs.cwd,
-        persistenceRoot: dirs.root,
-        environmentKey: "static-key",
-        agent: { async run() { return await loser.promise; } },
-      });
-      const timed = await manager.runSync(script(`return await agent("timeout", { timeoutMs: 1 })`, "timeout-loser"));
-      assert.equal(timed.status, "completed");
-      assert.equal(manager.getPersistence().load(timed.runId)?.resume?.terminalEnvironment, undefined);
-      loser.resolve("late");
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(manager.getPersistence().load(timed.runId)?.resume?.terminalEnvironment, undefined);
-
       const failedManager = new WorkflowManager({
         cwd: dirs.cwd,
         persistenceRoot: dirs.root,

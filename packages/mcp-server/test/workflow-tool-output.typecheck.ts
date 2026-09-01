@@ -23,8 +23,6 @@ const limits = {
   maxAgents: 1_000,
   concurrency: 6,
   agentRetries: 0,
-  agentTimeoutMs: null,
-  agentIdleTimeoutMs: null,
 };
 const replayEligibility: WorkflowReplayEligibility = {
   strategy: "identity-v1",
@@ -110,8 +108,6 @@ const removedBudgetLimit: WorkflowRunLimits = {
   maxAgents: 1,
   concurrency: 1,
   agentRetries: 0,
-  agentTimeoutMs: null,
-  agentIdleTimeoutMs: null,
   // @ts-expect-error token budgets are not part of current run limits
   tokenBudget: null,
 };

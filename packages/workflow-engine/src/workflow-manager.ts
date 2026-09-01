@@ -287,10 +287,6 @@ export interface ExecOptions {
   resumeCalls?: WorkflowCallRecord[];
   /** Cap on total agents for this run. */
   maxAgents?: number;
-  /** Host total-wall-clock ceiling per attempt. null/omitted means the host imposes no ceiling. */
-  agentTimeoutMs?: number | null;
-  /** Host no-backend-activity ceiling per attempt. null/omitted disables the idle watchdog. */
-  agentIdleTimeoutMs?: number | null;
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
   /** Alias for externalSignal — the engine-owned cancellation the MCP shell threads in. */
@@ -340,10 +336,6 @@ export interface WorkflowManagerOptions {
   mainModel?: string;
   /** The session id to tag runs with (see setSessionId). */
   sessionId?: string;
-  /** Default host ceiling when a run omits agentTimeoutMs. null means no host ceiling. */
-  defaultAgentTimeoutMs?: number | null;
-  /** Default host idle ceiling when a run omits agentIdleTimeoutMs. null disables the watchdog. */
-  defaultAgentIdleTimeoutMs?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
   /** Override the directory scanned for `agentType` definitions (defaults to AGENTS_DIR). */
@@ -578,8 +570,6 @@ export class WorkflowManager extends EventEmitter {
   private mainModel?: string;
   /** The current session id; runs are stamped with it and listRuns() filters by it. */
   private sessionId?: string;
-  private defaultAgentTimeoutMs: number | null;
-  private defaultAgentIdleTimeoutMs: number | null;
   private defaultAgentRetries: number;
   private agentsDir?: string;
   private persistenceRoot: string;
@@ -595,8 +585,6 @@ export class WorkflowManager extends EventEmitter {
     this.agent = options.agent;
     this.mainModel = options.mainModel;
     this.sessionId = options.sessionId;
-    this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
-    this.defaultAgentIdleTimeoutMs = options.defaultAgentIdleTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.agentsDir = options.agentsDir;
     this.persistenceRoot = workflowHomeDir({ persistenceRoot: options.persistenceRoot });
@@ -875,15 +863,11 @@ export class WorkflowManager extends EventEmitter {
     managed: ManagedRun,
   ): WorkflowReplayOperationalChange[] {
     if (!source.limits || !managed.limits) return [];
-    const options = ["agentTimeoutMs", "agentIdleTimeoutMs", "agentRetries", "concurrency"] as const;
+    const options = ["agentRetries", "concurrency"] as const;
     const changes: WorkflowReplayOperationalChange[] = [];
     for (const option of options) {
-      const sourceValue = option === "agentIdleTimeoutMs"
-        ? source.limits.agentIdleTimeoutMs ?? null
-        : source.limits[option];
-      const currentValue = option === "agentIdleTimeoutMs"
-        ? managed.limits.agentIdleTimeoutMs ?? null
-        : managed.limits[option];
+      const sourceValue = source.limits[option];
+      const currentValue = managed.limits[option];
       if (sourceValue === currentValue) continue;
       changes.push({
         option,
@@ -1489,12 +1473,6 @@ export class WorkflowManager extends EventEmitter {
         maxAgents: exec.maxAgents,
         concurrency: exec.concurrency ?? this.concurrency,
         agentRetries: exec.agentRetries ?? this.defaultAgentRetries,
-        agentTimeoutMs: exec.agentTimeoutMs !== undefined
-          ? exec.agentTimeoutMs
-          : this.defaultAgentTimeoutMs,
-        agentIdleTimeoutMs: exec.agentIdleTimeoutMs !== undefined
-          ? exec.agentIdleTimeoutMs
-          : this.defaultAgentIdleTimeoutMs,
       }),
       mainModel: this.mainModel,
       defaultModel: exec.defaultModel,
@@ -1729,8 +1707,6 @@ export class WorkflowManager extends EventEmitter {
   ): Promise<WorkflowRunResult> {
     const {
       maxAgents,
-      agentTimeoutMs,
-      agentIdleTimeoutMs,
       externalSignal,
       signal,
       onProgress,
@@ -1744,10 +1720,6 @@ export class WorkflowManager extends EventEmitter {
     const resumeJournal = resumeExecution?.resumeJournal ?? exec.resumeJournal;
     const preparedResume = resumeExecution?.preparedResume;
     const preparedContinuation = managed.preparedContinuation;
-    const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
-    const resolvedAgentIdleTimeoutMs = agentIdleTimeoutMs !== undefined
-      ? agentIdleTimeoutMs
-      : this.defaultAgentIdleTimeoutMs;
     const resolvedConcurrency = concurrency ?? this.concurrency;
     const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
     // Sync the derived counters (agentCount/runningCount/doneCount/errorCount) from the
@@ -1796,8 +1768,6 @@ export class WorkflowManager extends EventEmitter {
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
         maxAgents,
-        agentTimeoutMs: resolvedAgentTimeoutMs,
-        agentIdleTimeoutMs: resolvedAgentIdleTimeoutMs,
         confirm,
         pauseOnCheckpoint,
         onNestedWorkflow: (ordinal, childRunId) => {
@@ -1885,8 +1855,6 @@ export class WorkflowManager extends EventEmitter {
             prompt: event.prompt,
             status: "running",
             model: event.model,
-            timeoutMs: event.timeoutMs,
-            idleTimeoutMs: event.idleTimeoutMs,
             callIndex: event.callIndex,
             scope: event.scope,
           });
@@ -2827,12 +2795,6 @@ export class WorkflowManager extends EventEmitter {
         maxAgents: exec.maxAgents,
         concurrency: exec.concurrency ?? this.concurrency,
         agentRetries: exec.agentRetries ?? this.defaultAgentRetries,
-        agentTimeoutMs: exec.agentTimeoutMs !== undefined
-          ? exec.agentTimeoutMs
-          : this.defaultAgentTimeoutMs,
-        agentIdleTimeoutMs: exec.agentIdleTimeoutMs !== undefined
-          ? exec.agentIdleTimeoutMs
-          : this.defaultAgentIdleTimeoutMs,
       }),
       mainModel: persisted.mainModel ?? this.mainModel,
       defaultModel: exec.defaultModel ?? persisted.defaultModel,

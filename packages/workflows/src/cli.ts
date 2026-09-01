@@ -113,8 +113,6 @@ Options:
   --cwd <dir>         session cwd for the probes (default: the current directory —
                       harnesses may resolve project-level config, and hence their
                       catalog, from it)
-  --timeout-ms <n>    per-harness probe bound in milliseconds (default 60000); a
-                      timed-out harness reports probed:false
   --models[=<filter>] list a harness's model catalog: bare = provider/group breakdown;
                       =<provider|substring|/regex/> = the matching leaf ids. There is no
                       unfiltered full-leaf dump on any surface
@@ -192,9 +190,6 @@ async function mainConfig(rest: string[]): Promise<void> {
         break;
       case "--cwd":
         options.cwd = resolve(rest[++i] ?? fail("--cwd expects a directory"));
-        break;
-      case "--timeout-ms":
-        options.timeoutMs = parseIntFlag("--timeout-ms", rest[++i]);
         break;
       default:
         if (arg.startsWith("--models=")) {

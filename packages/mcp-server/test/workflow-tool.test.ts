@@ -26,11 +26,7 @@ const LIMITS = {
   maxAgents: 1_000,
   concurrency: 6,
   agentRetries: 0,
-  agentTimeoutMs: null,
-  agentIdleTimeoutMs: null,
 } as const;
-const ADMISSION_LOG =
-  "agent timeout admission: total-wall ceiling none; idle ceiling disabled; each retry re-arms both clocks";
 
 function inspectionFixture(status: "running" | "completed" | "failed" | "aborted" = "running") {
   return {
@@ -169,7 +165,7 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     assert.match(tool.description ?? "", /Every parallel entry must be a thunk/);
     assert.match(tool.description ?? "", /phases must be an array of objects shaped `\{ title: string, detail\?: string, model\?: string \}`, never an array of strings/);
     assert.match(tool.description ?? "", /Minimal script:.*phases: \[\{ title: \"Review\" \}\].*phase\(\"Review\"\)/);
-    assert.match(tool.description ?? "", /configOptions, schema, cwd, timeoutMs, idleTimeoutMs, retries/);
+    assert.match(tool.description ?? "", /configOptions, schema, cwd, retries/);
     assert.doesNotMatch(tool.description ?? "", /npx|CLI|shell out/i);
 
     assert.deepEqual(tool.inputSchema.required, undefined, "the raw shape leaves branch requirements to the discriminator");
@@ -183,7 +179,9 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     assert.ok(inputProps.includes("checkpointReplies"), "durable checkpoint reply channel is advertised");
     assert.ok(inputProps.includes("concurrency") && inputProps.includes("agentRetries"));
     assert.ok(inputProps.includes("forceOwner"), "explicit predecessor-force authorization is advertised");
-    assert.ok(inputProps.includes("harnesses") && inputProps.includes("modelSpecs") && inputProps.includes("modelFilter") && inputProps.includes("probeTimeoutMs"));
+    assert.ok(inputProps.includes("harnesses") && inputProps.includes("modelSpecs") && inputProps.includes("modelFilter"));
+    assert.ok(!inputProps.includes("probeTimeoutMs"));
+    assert.ok(!inputProps.includes("agentTimeoutMs") && !inputProps.includes("agentIdleTimeoutMs"));
     assert.deepEqual(
       field(field(tool.inputSchema, "properties"), "action") &&
         field(field(field(tool.inputSchema, "properties"), "action"), "enum"),
@@ -1093,7 +1091,7 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     assert.equal(pausedTail[0], "line-6");
     assert.equal(pausedTail.at(-1), "line-25");
     assert.equal(pausedTail.some((line) => line.includes(token)), false);
-    assert.match(textOf(paused), /recent run log \(last 20 of 26\):/);
+    assert.match(textOf(paused), /recent run log \(last 20 of 25\):/);
     assert.match(textOf(paused), /\n  line-6\n/);
     assert.doesNotMatch(textOf(paused), /\n  line-[1-5]\n/);
     assert.doesNotMatch(textOf(paused), /ghp_/);
@@ -1108,7 +1106,7 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     assert.equal(failed.isError, true);
     const failedTail = field(structured(failed)?.logTail, "lines") as string[];
     assert.equal(failedTail[0], "line-7");
-    assert.match(textOf(failed), /recent run log \(last 20 of 27\):/);
+    assert.match(textOf(failed), /recent run log \(last 20 of 26\):/);
 
     const empty = await client.callTool({
       name: "workflow",
@@ -1117,9 +1115,8 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
       },
     });
     const emptyLines = field(structured(empty)?.logTail, "lines") as string[];
-    assert.equal(emptyLines[0], ADMISSION_LOG);
-    assert.equal(emptyLines.length, 2);
-    assert.match(textOf(empty), /recent run log \(last 2 of 2\):/);
+    assert.equal(emptyLines.length, 1);
+    assert.match(textOf(empty), /recent run log \(last 1 of 1\):/);
   } finally {
     await dispose();
   }

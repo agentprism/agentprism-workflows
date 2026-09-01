@@ -14,8 +14,6 @@ interface WorkflowResumeToolInput {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
   background?: boolean;

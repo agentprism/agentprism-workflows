@@ -361,7 +361,7 @@ test(
         },
       ],
       callsAllocated: 1,
-      limits: { maxAgents: 10, concurrency: 2, agentRetries: 1, agentTimeoutMs: null, agentIdleTimeoutMs: null },
+      limits: { maxAgents: 10, concurrency: 2, agentRetries: 1 },
       abortSignaled: true,
       mainModel: "provider/model",
       agentsDir: "/agents",

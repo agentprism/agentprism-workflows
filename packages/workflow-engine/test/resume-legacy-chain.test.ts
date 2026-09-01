@@ -70,7 +70,6 @@ test("a markerless 0.23 chained journal accepts persisted ancestors but excludes
     const replayed = await manager.runSync(source.script, source.args, {
       runId: "legacy-chain-target",
       resumeFromRunId: source.runId,
-      agentTimeoutMs: null,
     });
     assert.equal(listCalls, 1, "positional preparation scans persisted run IDs exactly once");
     assert.equal(replayed.status, "completed");
@@ -86,10 +85,7 @@ test("a markerless 0.23 chained journal accepts persisted ancestors but excludes
     assert.equal(replayed.replayEligibility?.engineVersionComparison, "source-unknown");
     assert.equal(replayed.replayEligibility?.sourceInputsFormat, 1);
     assert.equal(replayed.replayEligibility?.currentInputsFormat, 2);
-    assert.equal(
-      replayed.replayEligibility?.operationalChanges.find((change) => change.option === "agentTimeoutMs")?.detail,
-      "source recorded agentTimeoutMs=900000; this run: none",
-    );
+    assert.deepEqual(replayed.replayEligibility?.operationalChanges, []);
     const persisted = persistence.load("legacy-chain-target");
     assert.equal(persisted?.runtime?.inputsFormat, 2);
     assert.ok(persisted?.runtime?.engineVersion);
@@ -108,7 +104,6 @@ test("a markerless 0.23 chained journal accepts persisted ancestors but excludes
     const missingAncestor = await manager.runSync(source.script, source.args, {
       runId: "legacy-chain-missing-ancestor",
       resumeFromRunId: source.runId,
-      agentTimeoutMs: null,
     });
     assert.equal(listCalls, 1, "each positional admission performs one persisted-run scan");
     assert.equal(liveCalls, 3, "an absent ancestor remains conservatively ineligible");

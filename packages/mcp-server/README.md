@@ -194,14 +194,11 @@ default; new callers should not emit those aliases.
 | `harnesses` | backend-name array (1–16) | config only | every registered backend | Limit no-prompt discovery to these backends. |
 | `modelSpecs` | model-spec array (1–16) | config only | — | Select these exact routed models before reading their model-specific mode and config-option catalogs. |
 | `modelFilter` | string (1–128) | config only | provider/group summaries | Case-insensitive substring or `/regular expression/` used to return bounded matching model ids. |
-| `probeTimeoutMs` | integer 1–120,000 | config only | `60,000` | Per-backend no-prompt discovery timeout. |
 | `background` | boolean | run/resume | `false` | Acknowledge the new run after admission and execute in this server process. |
 | `args` | any JSON value | no | — | Optional value exposed to the script as the global `args`. Resume defaults to the source's stored strict-JSON args; an explicit value replaces them. |
 | `maxAgents` | integer > 0 | no | `1000` | Max agents allowed in this run (engine cap `MAX_AGENTS_PER_RUN`). Values below 1 are clamped up to 1. |
 | `concurrency` | integer > 0 | no | engine default | Max concurrent agents. **Clamped to 16** (the runtime max) by the engine — never rejected. |
 | `agentRetries` | integer ≥ 0 | no | engine default | Retry attempts for recoverable agent failures. **Clamped to 3** (the runtime max). |
-| `agentTimeoutMs` | integer > 0 \| null | no | none | Total wall-clock ceiling in ms for each attempt. A per-call `timeoutMs` may tighten but cannot escape a finite ceiling. Omit/pass `null` for no host ceiling. |
-| `agentIdleTimeoutMs` | integer > 0 \| null | no | disabled | No-backend-activity ceiling in ms for each attempt. A per-call `idleTimeoutMs` may tighten but cannot escape a finite ceiling. |
 | `resumeFromRunId` | string | run only | — | Advanced edited replay: start a new run from this source while using the explicitly supplied `script`/`scriptPath` and current `args`. Simple `action:"resume"` uses the source's persisted content. The manager admits compatible format/metadata/manifest/cwd state and replays only eligible calls; current-environment and Node/V8 drift are diagnostic. |
 | `resumePolicy` | `"auto" \| "positional"` | resume/run-with-source | `"auto"` | Positional requests index/prefix matching but cannot bypass new-format format/metadata/manifest/input checks. |
 | `checkpointReplies` | object | resume/run-with-source | — | Map the **source** `checkpointContext.callIndex` to the durable decision. This works under the default policy and does not require `resumePolicy: "positional"`. The JSON decision is returned verbatim (`kind: "confirm"` normally uses a boolean). Wire keys must be canonical non-negative safe integers. |
@@ -215,16 +212,10 @@ default; new callers should not emit those aliases.
 | `labelGlob` | string | status/stop only | all calls | Non-empty, at most 128 Unicode code points. Case-sensitive whole-label `*`/`?` glob with backslash escaping; trailing backslash is literal. Only known agent labels match. |
 | `logLines` | integer 0–50 | status/stop only | `20` | Latest run-log lines. |
 
-`agentTimeoutMs` is not an idle timer: it covers the complete attempt, including backend startup,
-configuration, tool work, and streamed output. `agentIdleTimeoutMs` is the separate opt-in wedge
-watchdog. Real ACP `session/update` traffic re-arms it; synthetic progress heartbeats do not. A live
-permission resolver wait suspends only the idle watchdog; total wall time continues. Size
-it above the longest expected backend-silent local tool operation (typically 5–10 minutes). Each
-retry receives fresh clocks. Exhaustion settles the call to `null` with recoverable `AGENT_TIMEOUT`
-or `AGENT_IDLE_TIMEOUT`, frees its concurrency slot, and cancels the ACP session; a turn that
-ignores cancel is closed where supported and its pooled child is recycled after sibling sessions
-drain. Resume requests resolve their own limits, so pass the intended timeout/idle-timeout/retry/
-concurrency values again.
+Agent attempts have no elapsed-time or idle budget. They remain live until completion, failure, or
+explicit call/run cancellation. Fixed protocol startup, cancellation-grace, cleanup, lease, and
+transport bounds remain internal safety controls, not workflow inputs. Resume requests resolve
+their own retry and concurrency limits.
 
 Discover a backend's live catalog before pinning model, mode, or `configOptions`:
 
@@ -300,9 +291,7 @@ Background start and bounded collection:
   "limits": {
     "maxAgents": 1000,
     "concurrency": 4,
-    "agentRetries": 0,
-    "agentTimeoutMs": null,
-    "agentIdleTimeoutMs": null
+    "agentRetries": 0
   }
 }
 ```
@@ -541,12 +530,10 @@ interface WorkflowRunStatus {
 ```
 
 Each call has its deterministic index, known agent/checkpoint attribution, a compact JSON
-`resultPreview`, and redaction/truncation flags. Agent rows also expose resolved `timeoutMs`,
-`idleTimeoutMs`, and a terminal `errorCode`; timed-out and host-cancelled calls therefore remain
-visible as `AGENT_TIMEOUT`, `AGENT_IDLE_TIMEOUT`, and `AGENT_CANCELLED`. `limits` contains
-`maxAgents`, `concurrency`, `agentRetries`, `agentTimeoutMs`, and `agentIdleTimeoutMs` as resolved
-for this run (legacy persisted rows may omit it). Historical budget fields are accepted only while
-reading old persisted runs and are omitted from current status output. Ordinary call-status projection never returns script,
+`resultPreview`, and redaction/truncation flags. Agent rows also expose a terminal `errorCode`, so
+host-cancelled calls remain visible as `AGENT_CANCELLED`. `limits` contains
+`maxAgents`, `concurrency`, and `agentRetries` as resolved for
+this run (legacy persisted rows may omit it). Ordinary call-status projection never returns script,
 args, prompts, histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results;
 a live `pendingPermissions` entry carries a safe ACP projection so the caller can make the decision.
 The private ACP session id is omitted; diagnostic values are credential-redacted and scalar-bounded,
@@ -579,8 +566,7 @@ permission is pending. Status attaches the request's exact ordered option ids wi
 redacted presentation metadata. Elicitation-capable clients present one choice; other clients answer
 with `permissions-response`. The response accepts only the selected exact optionId or cancellation—
 caller-supplied response `_meta` is forbidden—and routes to the daemon generation holding the run lease. The workflow remains running
-and keeps its ACP session/concurrency slot; the idle watchdog is suspended while total wall time
-continues. This state is execution-affine, not a durable pause, and cannot be reconstructed after
+and keeps its ACP session/concurrency slot. This state is execution-affine, not a durable pause, and cannot be reconstructed after
 owner loss.
 
 Status retains the 24,576-byte bound,

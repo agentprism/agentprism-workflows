@@ -150,7 +150,6 @@ export interface WorkflowExecuteToolInput {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
   resumeFromRunId?: string;
   checkpointReplies?: Record<number, unknown>;
   /** Default false. True acknowledges after admission and executes in this server process. */
@@ -316,7 +315,7 @@ three ways:
   semantics.
 
 Every other execution option is identical to foreground, including `maxAgents`, per-run agent
-`concurrency`, retries, timeout, approved script backends, and checkpoint reply
+`concurrency`, retries, approved script backends, and checkpoint reply
 injection used during resume.
 
 When `background: true` and `resumeFromRunId` are supplied together, the MCP adapter continues its

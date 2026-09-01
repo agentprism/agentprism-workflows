@@ -70,8 +70,6 @@ export interface ValidateWorkflowOptions {
   maxAgents?: number;
   /** Dry-run wall-clock limit. Default 30_000 ms. */
   timeoutMs?: number;
-  /** Per routed backend/model config-probe limit. Default 60_000 ms. */
-  probeTimeoutMs?: number;
   /**
    * Host-pinned model/backend for calls with no authored model, agentType model, tier,
    * or phase/meta route. The dry run resolves and reports it like live execution.
@@ -872,7 +870,6 @@ async function probeHarnessConfigOptions(
   declared: Record<string, CustomBackendConfig> | undefined,
   warnings: string[],
   probeRunner: ValidateProbeRunner | undefined,
-  probeTimeoutMs: number,
 ): Promise<ProbeStageResult> {
   const targets = configProbeTargets(calls, registry, hostRegistry, declared);
   const harnessOptions: ValidateHarnessOptions[] = [];
@@ -919,7 +916,7 @@ async function probeHarnessConfigOptions(
             backends: declared,
             signal,
           }),
-          probeTimeoutMs,
+          60_000,
         );
         catalogs.set(key, result.options);
         modes.set(key, result.modes ?? null);
@@ -1522,11 +1519,6 @@ export async function validateWorkflowScript(
 ): Promise<ValidateWorkflowReport> {
   const mockAnswerState = options.mockAnswers === undefined ? undefined : normalizeMockAnswers(options.mockAnswers);
   const warnings: string[] = [];
-  const probeTimeoutMs = options.probeTimeoutMs ?? 60_000;
-  if (!Number.isFinite(probeTimeoutMs) || probeTimeoutMs <= 0) {
-    throw new TypeError("validateWorkflowScript: probeTimeoutMs must be a positive number");
-  }
-
   let meta: WorkflowMeta;
   try {
     meta = parseWorkflowScript(script).meta;
@@ -1757,7 +1749,6 @@ export async function validateWorkflowScript(
           declaredBackends,
           warnings,
           options.probeRunner,
-          probeTimeoutMs,
         );
     const optionErrors = options.probeConfig === false
       ? []

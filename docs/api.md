@@ -39,7 +39,7 @@ Options (`RunDynamicWorkflowOptions`): `runner?` (custom `AgentRunner`; defaults
 
 `openWorkflowDir(dir | dirs, { cwd? })` binds a read-only view over folders of versioned workflow scripts. Construction does **no I/O** (nothing created, scanned, or cached); every method reads the filesystem at call time so the view always reflects the current working tree, and missing dirs contribute nothing. The filename stem is the name (`review-pr.workflow.js` / `review-pr.js` ⇒ `review-pr`; across dirs first hit wins, within a dir `.workflow.js` beats `.js`; also `.mjs` variants). Surface: `dirs` (absolute, precedence order), `list()` (`[{ name, file, meta?, error? }]`, meta parsed per call, sorted), `read(name)` (script text; throws with searched dirs + closest matches), and `resolve(name)` — `(name) => string | undefined`, deliberately the exact `loadSavedWorkflow` contract, with strict name-shape validation (one flat path segment) so inline nested scripts fall through and path traversal is impossible. Exported by both `@automatalabs/workflow-engine` and the facade.
 
-**Script validation (token-free):** `validateWorkflowScript(script, opts?)` runs a static parse (meta literal, syntax, and direct nondeterministic call expressions) plus a dry run over an in-process mock `AgentRunner`, then opens one no-prompt session for every distinct routed backend/model pair. `workflowMayUseDefaultModel(script)` is the conservative static companion used by composition roots: it detects direct model-less calls/default-model helpers/nested workflows even behind a branch the fabricated result did not take; dynamic uncertainty fails toward `true`. An authored model is selected verbatim before the echoed, model-specific modes and config options are read; a call without a model reads its harness/session default. The probe spends no tokens. `dryRun.harnessOptions` reports each routed catalog with optional `model` attribution on every run, even when the script authors no `mode` or `configOptions`; the human formatter prints the same tables. Successfully probed mode ids are validated exactly: only `modes.availableModes` values pass, while `modes:null` rejects any authored mode and tells the author to omit it. Config option ids and values are checked for unknown ids, invalid select values, non-boolean boolean values, and the reserved `"model"` id. A select option may add `_meta["@automatalabs/agentprism"].recognizedValues`: supported values pass unchanged, recognized unsupported values pass with an ordered clamp warning, and unrecognized values fail. Pi derives this domain from its SDK and advertises a per-model `thinkingLevel` subset. Ordered built-ins without that metadata (Claude and Codex) derive it client-side by enumerating the advertised model picker through the existing per-model probe cache and merging consistent per-model orders. Claude's absent `effort` option means unsupported, while `default` is recognized but excluded from ordered ceiling comparisons. `ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT` is 32; a larger picker or inconsistent orders warn and fall back to exact advertised-value validation. OpenCode and custom/unknown backends are exact-set and reject unadvertised thought-level values without clamping. A routed probe spawn/auth/model-selection/session failure adds one warning, sets that pair to `probed:false`, and skips its checks without invalidating the report. A successful probe proves session/config discovery, not universal first-prompt authentication: ACP has no generic zero-token auth-status method and some agents defer credential failure until `session/prompt`. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` warns because a truly unattended run would abort. Script-declared backends are treated as approved (with a warning). Invalid scripts resolve to a report; read `report.ok` / `report.exitCode` (`0` valid, `1` parse failure, `2` dry-run or agent-configuration failure). `ValidateWorkflowOptions` is `{ args?, workflows?, dryRun?, cwd?, maxAgents?, timeoutMs?, probeTimeoutMs?, defaultModel?, probeConfig?, probeRunner?, loadSavedWorkflow?, mockAnswers? }`; `defaultModel` is the host-pinned fallback applied to otherwise model-less calls, while `probeConfig:false` runs the mock routing pass without any no-prompt config probes/checks. `probeRunner` reuses a host-owned live runner without disposing it and `loadSavedWorkflow` keeps nested-name resolution identical to live admission; `workflows` accepts a `WorkflowDir` or dir path(s), the mock reports `MOCK_TOKENS_PER_AGENT` = 1000 per call, and timeout defaults to 30 000 ms.
+**Script validation (token-free):** `validateWorkflowScript(script, opts?)` runs a static parse (meta literal, syntax, and direct nondeterministic call expressions) plus a dry run over an in-process mock `AgentRunner`, then opens one no-prompt session for every distinct routed backend/model pair. `workflowMayUseDefaultModel(script)` is the conservative static companion used by composition roots: it detects direct model-less calls/default-model helpers/nested workflows even behind a branch the fabricated result did not take; dynamic uncertainty fails toward `true`. An authored model is selected verbatim before the echoed, model-specific modes and config options are read; a call without a model reads its harness/session default. The probe spends no tokens. `dryRun.harnessOptions` reports each routed catalog with optional `model` attribution on every run, even when the script authors no `mode` or `configOptions`; the human formatter prints the same tables. Successfully probed mode ids are validated exactly: only `modes.availableModes` values pass, while `modes:null` rejects any authored mode and tells the author to omit it. Config option ids and values are checked for unknown ids, invalid select values, non-boolean boolean values, and the reserved `"model"` id. A select option may add `_meta["@automatalabs/agentprism"].recognizedValues`: supported values pass unchanged, recognized unsupported values pass with an ordered clamp warning, and unrecognized values fail. Pi derives this domain from its SDK and advertises a per-model `thinkingLevel` subset. Ordered built-ins without that metadata (Claude and Codex) derive it client-side by enumerating the advertised model picker through the existing per-model probe cache and merging consistent per-model orders. Claude's absent `effort` option means unsupported, while `default` is recognized but excluded from ordered ceiling comparisons. `ORDERED_THOUGHT_LEVEL_ENUMERATION_MODEL_LIMIT` is 32; a larger picker or inconsistent orders warn and fall back to exact advertised-value validation. OpenCode and custom/unknown backends are exact-set and reject unadvertised thought-level values without clamping. A routed probe spawn/auth/model-selection/session failure adds one warning, sets that pair to `probed:false`, and skips its checks without invalidating the report. A successful probe proves session/config discovery, not universal first-prompt authentication: ACP has no generic zero-token auth-status method and some agents defer credential failure until `session/prompt`. A mock live confirm answers checkpoints with `default ?? true`, so `headless: "pause"` dry-runs cleanly; `headless: "abort"` warns because a truly unattended run would abort. Script-declared backends are treated as approved (with a warning). Invalid scripts resolve to a report; read `report.ok` / `report.exitCode` (`0` valid, `1` parse failure, `2` dry-run or agent-configuration failure). `ValidateWorkflowOptions` is `{ args?, workflows?, dryRun?, cwd?, maxAgents?, timeoutMs?, defaultModel?, probeConfig?, probeRunner?, loadSavedWorkflow?, mockAnswers? }`; `defaultModel` is the host-pinned fallback applied to otherwise model-less calls, while `probeConfig:false` runs the mock routing pass without any no-prompt config probes/checks. `probeRunner` reuses a host-owned live runner without disposing it and `loadSavedWorkflow` keeps nested-name resolution identical to live admission; `workflows` accepts a `WorkflowDir` or dir path(s), the mock reports `MOCK_TOKENS_PER_AGENT` = 1000 per call, and timeout defaults to 30 000 ms.
 
 `MockAnswers` is a read-only record from label glob to JSON answer or `{ $sequence: readonly MockAnswerJson[] }`. Matching uses the final resolved label, is case-sensitive and whole-label, and supports `*`, `?`, and backslash escaping. Normalization captures property order once and the last matching rule wins. Raw canonical array-index keys `"0"` through `"4294967294"` are reserved because ECMAScript reorders them; spell an exact numeric-label rule with an escape, such as JSON key `"\\10"` for label `10`. `"01"` and `"4294967295"` are not reserved. A raw array is one answer, while `$sequence` is finite and consumes only when its rule wins.
 
@@ -47,9 +47,9 @@ For schema calls the validator creates a fresh fabricated base per invocation an
 
 Inputs are limited to 256 KiB raw CLI UTF-8 and canonical programmatic JSON, 256 rules, 256 UTF-16 code units per glob, 256 sequence items, and answer depth 32; only ordinary JSON data is accepted. Supplying invalid programmatic `mockAnswers` throws `TypeError` before parsing. Mock-enabled validation serializes agent service at concurrency one for deterministic FIFO sequence use, so it is not a load simulator. Attribution, warnings, and validation errors never echo answers, but workflow code receives the fixture normally and may expose it in `log()` or the returned result; fixtures must not contain credentials or production data.
 
-The CLI adds mutually exclusive `--mock-answers <json>` and `--mock-answers-file <path>` to the existing `npx @automatalabs/workflows validate <file-or-name> [--args <json> | --args-file <path>] [--workflows-dir <dir>]… [--parse-only] [--cwd <dir>] [--max-agents <n>] [--timeout-ms <n>] [--json]` surface (`3` = usage error). With `--workflows-dir` the positional may be a workflow name and nested `workflow("<name>")` calls resolve. The package exports `MockAnswerJson`, `MockAnswerSequence`, `MockAnswerRule`, `MockAnswers`, `ValidatedMockAnswerUse`, `ValidatedMockAnswerRule`, `UnusedMockAnswer`, and `ValidatedMockAnswers`, along with the existing validation types and `fabricateFromSchema()` / `formatValidateReport()` helpers.
+The CLI adds mutually exclusive `--mock-answers <json>` and `--mock-answers-file <path>` to the existing `npx @automatalabs/workflows validate <file-or-name> [--args <json> | --args-file <path>] [--workflows-dir <dir>]… [--parse-only] [--cwd <dir>] [--max-agents <n>] [--json]` surface (`3` = usage error). With `--workflows-dir` the positional may be a workflow name and nested `workflow("<name>")` calls resolve. The package exports `MockAnswerJson`, `MockAnswerSequence`, `MockAnswerRule`, `MockAnswers`, `ValidatedMockAnswerUse`, `ValidatedMockAnswerRule`, `UnusedMockAnswer`, and `ValidatedMockAnswers`, along with the existing validation types and `fabricateFromSchema()` / `formatValidateReport()` helpers.
 
-**Harness config discovery (token-free):** `probeHarnessConfig({ harnesses?, modelSpecs?, backends?, cwd?, timeoutMs?, probeRunner? })` runs validate's no-prompt config probe standalone — no script — and resolves to a `HarnessConfigReport` (`{ ok, exitCode, harnessOptions }`, per-harness entries in the same `ValidateHarnessOptions` shape with `modes?: SessionModeState | null` and `options?: SessionConfigOption[]`). A successful built-in probe always reports modes explicitly after normalizing ACP's mode config-option fallback; `null` means unsupported, so callers must omit `mode` rather than infer a default. Default targets are the built-in harnesses plus every registered custom backend; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner`. A per-harness spawn/auth/session failure or timeout (default 60 000 ms) reports `probed:false` without throwing; only a malformed registry or invalid options throw. `probed:true` means the no-prompt session/config path succeeded, not that every adapter proved first-prompt authentication. `formatHarnessConfigReport(report)` renders the CLI's human table. CLI: `npx @automatalabs/workflows config [harness ...] [--cwd <dir>] [--timeout-ms <n>] [--json]` — exit `0` all probed, `1` at least one probe failed, `3` usage error.
+**Harness config discovery (token-free):** `probeHarnessConfig({ harnesses?, modelSpecs?, backends?, cwd?, probeRunner? })` runs validate's no-prompt config probe standalone — no script — and resolves to a `HarnessConfigReport` (`{ ok, exitCode, harnessOptions }`, per-harness entries in the same `ValidateHarnessOptions` shape with `modes?: SessionModeState | null` and `options?: SessionConfigOption[]`). A successful built-in probe always reports modes explicitly after normalizing ACP's mode config-option fallback; `null` means unsupported, so callers must omit `mode` rather than infer a default. Default targets are the built-in harnesses plus every registered custom backend; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner`. A per-harness spawn/auth/session failure or timeout (default 60 000 ms) reports `probed:false` without throwing; only a malformed registry or invalid options throw. `probed:true` means the no-prompt session/config path succeeded, not that every adapter proved first-prompt authentication. `formatHarnessConfigReport(report)` renders the CLI's human table. CLI: `npx @automatalabs/workflows config [harness ...] [--cwd <dir>] [--json]` — exit `0` all probed, `1` at least one probe failed, `3` usage error.
 
 **Host-embedded (manager):** long-lived, evented, resumable.
 
@@ -80,8 +80,6 @@ manager.stop(runId);                    // whole-run terminal abort
 | `journaling` | `true` | Default journaling policy. `false` = the host owns transcripts: no run-state/log files, `resume()` rejects, and construction/lazy stale-run reconciliation is skipped entirely. |
 | `persistenceRoot` | `AGENTPRISM_PERSISTENCE_ROOT` env, else `~/.agentprism/workflows` | Absolute root for run state/logs. Relative paths throw. |
 | `persistence` | filesystem persistence | Custom `RunPersistence` implementation. Omit it for the default `createRunPersistence(cwd, ..., { persistenceRoot })` path. |
-| `defaultAgentTimeoutMs` | `null` (none) | Host total-wall-clock ceiling for each agent attempt. |
-| `defaultAgentIdleTimeoutMs` | `null` (disabled) | Host no-backend-activity ceiling for each agent attempt. |
 | `defaultAgentRetries` | 0 | Retries after *recoverable* agent failures. |
 | `mainModel` | — | Session model spec (registered harness prefix + verbatim id, or backend-only name) used to auto-tier explore-style agents. |
 | `sessionId` | — | Tag for new runs; `listRuns()` filters by it (`listAllRuns()` doesn't). Update via `setSessionId()`. |
@@ -108,8 +106,6 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `journaling` | Per-run journaling override. |
 | `environmentKey` | Host-supplied non-git environment label used for replay provenance diagnostics. It never gates journal replay; git workspaces report measured HEAD + dirty digest instead. |
 | `maxAgents` | Cap on total agent calls for the run. |
-| `agentTimeoutMs` | Host total-wall-clock ceiling for each agent attempt (`null` = no host ceiling). |
-| `agentIdleTimeoutMs` | Host no-backend-activity ceiling for each attempt (`null` = watchdog disabled). |
 | `concurrency`, `agentRetries` | Per-run overrides of the manager defaults. |
 | `defaultModel` | Host-pinned backend/model for calls with no authored model, agent-definition model, tier, or phase/meta route. It is persisted, passed as the resolved model, and enters call identity. Primarily used by the MCP composition root's automatic default selection. |
 | `confirm` | `(promptText, options) => Promise<reply>` — live human channel for `checkpoint()`. When present it wins over every headless mode, including `"pause"`. |
@@ -120,19 +116,10 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `scriptBackends` | APPROVED script-declared custom backends (`meta.backends`). Omitting leaves them inert — approval belongs to the composition root. |
 | `resumeJournal` | Low-level legacy positional channel. Mutually exclusive with `resumeFromRunId`/`resumePolicy`; manual use permanently marks the result legacy. Prefer manager-owned `resumeFromRunId`. |
 
-A finite `agentTimeoutMs` is an unbypassable host total-wall ceiling. An `agent({ timeoutMs })`
-value may shorten it; per-call `null` or omission means uncapped only when the host supplied no
-ceiling. It covers the complete attempt and is **not** an idle timer. The separate opt-in
-`agentIdleTimeoutMs` / per-call `idleTimeoutMs` pair uses the same ceiling rules and fires only when
-the runner reports no real backend activity for that duration. The ACP runner reports every
-`session/update`; synthetic 15-second progress heartbeats never reset the watchdog. Size an idle
-bound above the longest expected backend-silent local tool operation (typically 5–10 minutes).
-
-Every retry starts fresh total-wall and idle clocks. Exhaustion settles the call to `null` with
-recoverable `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT` and frees its concurrency slot. The runner
-cancels the ACP turn; after a five-second grace, an uncooperative turn is closed where supported and
-its pooled child is quarantined and recycled after sibling sessions drain. A new resume execution
-does not inherit operational limits from its source; pass the desired timeout, idle-timeout, retry,
+Agent attempts have no model-facing wall-clock or idle timeout. They remain live until they complete,
+fail, or the host explicitly cancels the call or run. Fixed protocol startup, cancellation-grace,
+cleanup, lease, and transport bounds remain internal safety controls rather than agent work budgets.
+A new resume execution does not inherit operational limits from its source; pass the desired retry,
 concurrency, and agent-count values again.
 
 ### `CheckpointOptions` — in-script human gates
@@ -285,7 +272,7 @@ type WorkflowResumeReport = WorkflowResumeReportBase &
   );
 
 interface WorkflowReplayOperationalChange {
-  option: "agentTimeoutMs" | "agentIdleTimeoutMs" | "agentRetries" | "concurrency";
+  option: "agentRetries" | "concurrency";
   source: number | null;
   current: number | null;
   detail: string;
@@ -362,8 +349,8 @@ correspondence rule.
 An agent call's identity hash covers prompt, resolved model, authored mode/config options/tier,
 phase, agent type and resolved definition, and schema. Its separate input fingerprint covers the
 resolved label, per-call cwd, resolved isolation, `keepSession`, images, MCP servers, metadata,
-prompt metadata, and the approved script-backend digest. Host `agentTimeoutMs`, `agentIdleTimeoutMs`, `agentRetries`, and
-`concurrency`, plus per-call `timeoutMs`, `idleTimeoutMs`, and `retries`, are operational bounds and enter neither
+prompt metadata, and the approved script-backend digest. Host `agentRetries` and
+`concurrency`, plus per-call `retries`, are operational bounds and enter neither
 hash. They may change on a new-run resume or an interrupted-turn continuation without rejecting an
 otherwise matching call.
 
@@ -514,8 +501,6 @@ interface WorkflowRunCallStatus {
   phase?: string;
   model?: string;
   backendId?: string;
-  timeoutMs?: number | null;
-  idleTimeoutMs?: number | null;
   errorCode?: WorkflowErrorCode;
   /** Present only while the call is in flight on a live run; settled calls omit it. */
   status?: "queued" | "running";
@@ -544,8 +529,6 @@ interface WorkflowRunLimits {
   maxAgents: number;
   concurrency: number;
   agentRetries: number;
-  agentTimeoutMs: number | null;
-  agentIdleTimeoutMs: number | null;
 }
 ```
 
@@ -1109,7 +1092,7 @@ const runner = createAcpRunner({
 
 One agent call per invocation; returns the assistant text, or the **validated object** when `schema` is set (native/tool-captured structured output + validate-and-re-prompt). Key `RunOptions`:
 
-`label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `configOptions`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), `keepSession` (skip the release-time best-effort `session/close` so the agent-persisted session stays re-openable), resume-only `continueFromSession` (advisory exact-session reattach), callbacks `onUsage`, `onHistory`, `onActivity` (one real backend progress event), `onInteractionStateChange` (live permission wait/resume), `onResultProvenance`, `onModelResolved`, `onModelFallback`, `onSessionOpen`.
+`label`, `schema` (JSON Schema / TypeBox), `signal`, `model` / `tier`, `mode`, `configOptions`, `cwd` (per-session working directory — worktree isolation preserved on a pooled process), `instructions`, `toolNames` / `disallowedToolNames` (the `ToolPolicy` allow/deny lists), `mcpServers`, `images`, `meta` / `promptMeta` (ACP `_meta` passthroughs), `backends` (approved script-declared), `runId` (correlation stamp), `keepSession` (skip the release-time best-effort `session/close` so the agent-persisted session stays re-openable), resume-only `continueFromSession` (advisory exact-session reattach), callbacks `onUsage`, `onHistory`, `onResultProvenance`, `onModelResolved`, `onModelFallback`, `onSessionOpen`.
 
 **Session hand-off.** `run()`'s return value is always the bare result, so the ACP session identity travels out-of-band: `onSessionOpen` fires exactly once for whichever acquisition wins — fresh `session/new`, successful `session/resume`/`session/load`, or the fresh fallback after a reopen failure — and always before that acquisition's prompt. Its `AgentSessionRef` is `{ sessionId, backendId, poolKey?, initializeMeta?, cwd, reopen: { load, resume, list, fork } }`; `poolKey` pins the effective custom-backend spawn identity. `initializeMeta`, when the initialize response supplies non-null `_meta`, is one complete recursively frozen JSON snapshot owned by the session and shared with its event contexts; absent/null metadata omits the key. Pair a successful call with `keepSession: true` when the host intends to reopen it. Usage/auth pause errors keep the session open automatically for managed continuation. With `continueFromSession`, the runner prefers currently advertised resume, falls back to load, and reports reattached/skipped provenance. Every non-cancellation failure through the reopen RPC cleans up and opens a fresh session with the original prompt; after reopen succeeds, the turn is committed and receives a fixed continuation instruction. The ref contains no secrets added by the client and is JSON-round-trippable; agents remain responsible for what they place in `_meta`.
 
@@ -1356,8 +1339,6 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `SCRIPT_VALIDATION_ERROR` | no | Script failed parse/validation (bad meta, nondeterministic API, protocol mismatch). |
 | `SCRIPT_ERROR` | no | The script **crashed at runtime**: uncaught throw or unhandled promise rejection in the script body. Run fails. |
 | `WORKFLOW_ABORTED` | — | Actual cancellation (pause/stop/signal). Never used for crashes. |
-| `AGENT_TIMEOUT` | yes | Total wall-clock attempt cap exhausted. Each retry gets a fresh clock; after exhaustion the call settles to `null`, and an ACP turn that ignores cancel is closed/recycled after its grace period. |
-| `AGENT_IDLE_TIMEOUT` | yes | Opt-in no-backend-activity cap exhausted. Real backend events re-arm it; retries and cancellation match `AGENT_TIMEOUT`. |
 | `AGENT_CANCELLED` | yes | The host selected one in-flight agent. It settles to `null`, skips retries, leaves the run and siblings live, and creates a failed call record but no replayable journal result. |
 | `AGENT_EMPTY_OUTPUT` | yes | No assistant text on a schema-less call. |
 | `SCHEMA_NONCOMPLIANCE` | no | Structured output never validated after the repair ladder. |
@@ -1387,7 +1368,6 @@ interface WorkflowConfigToolInput {
   harnesses?: string[];
   modelSpecs?: string[]; // exact routed models; selected before reading model-specific options
   modelFilter?: string;
-  probeTimeoutMs?: number;
 }
 
 interface WorkflowExecuteToolInput {
@@ -1400,8 +1380,6 @@ interface WorkflowExecuteToolInput {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
   resumeFromRunId?: string;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
@@ -1415,8 +1393,6 @@ interface WorkflowResumeToolInput {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
   resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
   background?: boolean;
@@ -1523,8 +1499,8 @@ admission-time `replayEligibility` prediction before the script body is allowed 
 
 Every newly admitted response reports its resolved `limits`. The same object appears on foreground
 results, background acknowledgements, status, and terminal status `outcome`; legacy
-persisted records that predate limit storage may omit it. Failed call rows include their resolved
-`timeoutMs`, `idleTimeoutMs`, and `errorCode`, so an exhausted attempt is directly inspectable as `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`.
+persisted records that predate limit storage may omit it. Failed call rows include their terminal
+`errorCode`.
 
 ```ts
 interface WorkflowPermissionRequestProjection {
@@ -1614,8 +1590,8 @@ the snapshot watermark, so a late status request neither scans the unbounded his
 double-counts the known prefix.
 
 The local settlement promise may still win the terminal race without disabling tail progress. A live
-permission wait suspends `agentIdleTimeoutMs` but not total `agentTimeoutMs`; the agent call retains
-its concurrency slot and ACP session. Permission inspection/response follows the lease owner over the
+permission wait retains the agent call's concurrency slot and ACP session. Permission
+inspection/response follows the lease owner over the
 signed daemon control plane. It is not a durable engine pause: owner loss invalidates the original
 ACP request and no successor reconstructs it cold. For
 legacy, incomplete, corrupt, mismatched, or otherwise unsafe event logs, status explicitly falls back
@@ -1703,7 +1679,7 @@ The full engine contract (guest library, host-call surface, FORMAT.md preview ru
 
 Scripts run in a deterministic `vm` realm (`Date.now`/`Math.random`/argless `new Date()` throw — the journal/resume identity depends on it; the realm is a determinism boundary, **not** a security boundary). Realm globals:
 
-`agent(prompt, { label?, schema?, model?, mode?, configOptions?, tier?, phase?, isolation?, resume?, cwd?, timeoutMs?, idleTimeoutMs?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` (unknown option keys reject before call allocation or runner invocation) · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title)` · `log(msg)` · `args` · `cwd`.
+`agent(prompt, { label?, schema?, model?, mode?, configOptions?, tier?, phase?, isolation?, resume?, cwd?, retries?, mcpServers?, images?, agentType?, meta?, promptMeta?, keepSession? })` (unknown option keys reject before call allocation or runner invocation) · `parallel(thunks)` (barrier; failed thunks → `null`) · `pipeline(items, ...stages)` (no inter-stage barrier) · `workflow(nameOrScript, args?)` (one level of nesting) · `checkpoint(prompt, opts?)` (journaled human gate; live/default/abort/durable-pause modes) · `gate(thunk, validator, opts?)` · `retry(thunk, opts?)` · `verify(item, opts?)` · `judgePanel(...)` · `loopUntilDry(opts)` · `completenessCheck(args, results)` · `phase(title)` · `log(msg)` · `args` · `cwd`.
 
 `gate()` validators may return `{ ok: boolean, feedback?: string, ... }`, a bare boolean, or
 `null`. A fulfilled gate returns exactly `{ ok, value, verdict, attempts }`: `value` is the final

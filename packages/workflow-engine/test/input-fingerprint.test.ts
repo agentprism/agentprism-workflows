@@ -120,13 +120,6 @@ return await agent('same-prompt')`,
   it("excludes run-level and per-call operational knobs from the fingerprint", async () => {
     const baseline = await fingerprintFor("{ label: 'fixed' }");
     const variants = await Promise.all([
-      fingerprintFor("{ label: 'fixed' }", { agentTimeoutMs: 100 }),
-      fingerprintFor("{ label: 'fixed' }", { agentTimeoutMs: 200 }),
-      fingerprintFor("{ label: 'fixed', timeoutMs: null }", { agentTimeoutMs: 100 }),
-      fingerprintFor("{ label: 'fixed', timeoutMs: 50 }", { agentTimeoutMs: 100 }),
-      fingerprintFor("{ label: 'fixed' }", { agentIdleTimeoutMs: 100 }),
-      fingerprintFor("{ label: 'fixed', idleTimeoutMs: null }", { agentIdleTimeoutMs: 100 }),
-      fingerprintFor("{ label: 'fixed', idleTimeoutMs: 50 }", { agentIdleTimeoutMs: 100 }),
       fingerprintFor("{ label: 'fixed' }", { agentRetries: 1 }),
       fingerprintFor("{ label: 'fixed', retries: 2 }", { agentRetries: 0 }),
       fingerprintFor("{ label: 'fixed' }", { concurrency: 1 }),

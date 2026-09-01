@@ -93,8 +93,7 @@ const run = await runDynamicWorkflow(workflowName, {
     rounds: num("hunt-rounds", 3), // quick-wins' round cap, when run standalone
   },
   exec: {
-    agentTimeoutMs: 600_000, // no single agent may run longer than 10 minutes
-    agentRetries: 1, // default retry for recoverable failures (timeouts, empty output)
+    agentRetries: 1, // default retry for recoverable failures such as empty output
     onProgress: (s: WorkflowSnapshot) => {
       const running = s.agents.filter((a) => a.status === "running").map((a) => a.label).join(", ");
       const line = `[${s.currentPhase ?? "…"}] ${s.doneCount}/${s.agentCount} agents done${running ? ` — running: ${running}` : ""}`;

@@ -54,7 +54,13 @@ const EVENT_TYPES = new Set([
   "stopped",
   "resumed",
 ]);
-const WORKFLOW_ERROR_CODES = new Set(Object.values(WorkflowErrorCode));
+// Retired execution-budget errors remain readable in historical event logs, but no new
+// execution can emit them and current public error enums omit them.
+const WORKFLOW_ERROR_CODES = new Set<string>([
+  ...Object.values(WorkflowErrorCode),
+  "AGENT_TIMEOUT",
+  "AGENT_IDLE_TIMEOUT",
+]);
 const CONTINUATION_SKIP_REASONS = new Set([
   "hash-mismatch",
   "inputs-mismatch",
