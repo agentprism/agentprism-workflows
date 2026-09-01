@@ -14,7 +14,7 @@ A workflow script is plain JavaScript, passed around as a **string**, not a modu
 <!-- guide-index:begin -->
 Read the section your task needs — each is a separate document in this skill directory:
 
-1. **[Running workflows](mcp-server-setup.md)** — register `@automatalabs/mcp-server`; the `workflow` tool's run/status/stop actions; background runs; execution logs through the events resource.
+1. **[Running workflows](mcp-server-setup.md)** — register `@automatalabs/mcp-server`; the `workflow` tool's run/resume/status/stop actions; background runs; execution logs through the events resource.
 2. **[Backends and structured output](models-and-output.md)** — per-call model routing, `configOptions`, and schema-validated outputs on every backend.
 3. **[Composition and failure](composition-and-failure.md)** — the `meta` header, `parallel` and `pipeline`, null semantics, and phases.
 4. **[Quality helpers and checkpoints](gates-and-lenses.md)** — `gate`, `retry`, `verify`, `judgePanel`, `loopUntilDry`, `completenessCheck`, and the human `checkpoint()` gate.

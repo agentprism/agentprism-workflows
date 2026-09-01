@@ -41,7 +41,7 @@ test("input shape: args is OPTIONAL and accepts an arbitrary JSON value", () => 
   assert.equal(Schema.parse({ script: "x", args: 7 }).args, 7);
 });
 
-test("input shape: one tool advertises the exact config, run, status, result, permission, and stop field superset", () => {
+test("input shape: one tool advertises the exact config, run, resume, status, result, permission, and stop field superset", () => {
   assert.ok(!("startInBackground" in workflowToolInputShape), "startInBackground must not be a tool input");
   assert.deepEqual(
     Object.keys(workflowToolInputShape).sort(),
@@ -88,11 +88,13 @@ test("idle watchdog input is opt-in, nullable, positive, and run-only", () => {
   assert.throws(() => Schema.parse({ script: "x", agentIdleTimeoutMs: 1.5 }));
 });
 
-test("resume inputs advertise manager-owned fail-to-live admission", () => {
-  assert.match(workflowToolInputShape.resumeFromRunId.description ?? "", /Re-send the script via script or scriptPath/);
+test("resume inputs advertise stored-content simplicity and manager-owned fail-to-live admission", () => {
+  assert.match(workflowToolInputShape.action.description ?? "", /resume starts a new run from a source run's stored script and args/);
+  assert.match(workflowToolInputShape.resumeFromRunId.description ?? "", /With action=run/);
+  assert.match(workflowToolInputShape.resumeFromRunId.description ?? "", /Use action=resume with runId for stored-script replay/);
   assert.match(workflowToolInputShape.resumeFromRunId.description ?? "", /manager validates replay eligibility/);
   assert.match(workflowToolInputShape.resumeFromRunId.description ?? "", /runs live wherever reuse is uncertain/);
-  assert.match(workflowToolInputShape.resumePolicy.description ?? "", /requires resumeFromRunId/);
+  assert.match(workflowToolInputShape.resumePolicy.description ?? "", /valid with action=resume or a run carrying resumeFromRunId/);
 });
 
 test("resume policy and source validation reject invalid values and combinations", () => {
@@ -122,15 +124,42 @@ test("resume policy and source validation reject invalid values and combinations
       (error: unknown) => error instanceof ProtocolError && error.code === ProtocolErrorCode.InvalidParams,
     );
   }
+
+  assert.deepEqual(
+    parseWorkflowToolInput(
+      Schema.parse({
+        action: "resume",
+        runId: "source-1",
+        args: { changed: true },
+        resumePolicy: "positional",
+        checkpointReplies: { "0": true },
+        concurrency: 99,
+        background: true,
+      }),
+    ),
+    {
+      action: "resume",
+      runId: "source-1",
+      args: { changed: true },
+      maxAgents: undefined,
+      concurrency: 99,
+      agentRetries: undefined,
+      agentTimeoutMs: undefined,
+      agentIdleTimeoutMs: undefined,
+      resumePolicy: "positional",
+      checkpointReplies: { 0: true },
+      background: true,
+    },
+  );
 });
 
-test("background defaults false and accepts explicit false or true on run only", () => {
+test("background defaults false and accepts explicit false or true on execution actions", () => {
   assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x" })).background, false);
   assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", background: false })).background, false);
   assert.equal(parseWorkflowToolInput(Schema.parse({ script: "x", background: true })).background, true);
 });
 
-test("script and scriptPath are an absolute-path XOR for every run and resume", () => {
+test("script and scriptPath are an absolute-path XOR for explicit run and forbidden for simple resume", () => {
   assert.equal(parseWorkflowToolInput(Schema.parse({ scriptPath: "/tmp/workflow.js" })).scriptPath, "/tmp/workflow.js");
   assert.equal(
     parseWorkflowToolInput(Schema.parse({ action: "run", scriptPath: "/tmp/workflow.js", resumeFromRunId: "a-b" })).scriptPath,
@@ -147,6 +176,18 @@ test("script and scriptPath are an absolute-path XOR for every run and resume", 
       () => parseWorkflowToolInput(Schema.parse(input)),
       /exactly one of script or scriptPath is required/,
     );
+  }
+  assert.doesNotThrow(() => parseWorkflowToolInput(Schema.parse({ action: "resume", runId: "a-b" })));
+  for (const input of [
+    { action: "resume" },
+    { action: "resume", runId: "a-b", script: "x" },
+    { action: "resume", runId: "a-b", scriptPath: "/tmp/workflow.js" },
+    { action: "resume", runId: "a-b", projectDir: "/tmp" },
+    { action: "resume", runId: "a-b", resumeFromRunId: "c-d" },
+    { action: "resume", runId: "a-b", waitMs: 0 },
+    { action: "resume", runId: "a-b", lastN: 1 },
+  ]) {
+    assert.throws(() => parseWorkflowToolInput(Schema.parse(input)));
   }
 });
 

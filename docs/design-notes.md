@@ -286,7 +286,7 @@ All versions below were re-verified from the installed workspace dependency grap
 ## 4. The MCP side — exposing the `workflow` tool
 
 The `workflow` tool grew from Pi's single-form input
-([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into an **action union** — `run` (the default when `action` is omitted), `status`, `result`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set (status fields on a run, or execution fields on status/result/permissions-response/stop, are `InvalidParams`):
+([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into an **action union** — `config`, `run` (the default when `action` is omitted), `resume`, `status`, `result`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set (status fields on a run, or execution fields on observation/control actions, are `InvalidParams`):
 
 - **Run** — supply **exactly one** of `script` or `scriptPath` (a raw JS string with no Markdown
   fences, or an absolute server-side path read once at admission; the first statement must be
@@ -297,6 +297,13 @@ The `workflow` tool grew from Pi's single-form input
   fields: `args`, `maxAgents` (default 1000), `concurrency` (clamped to 16), `agentRetries`
   (clamped to ≤3), `agentTimeoutMs` (total-wall, default none), `agentIdleTimeoutMs` (no backend activity, default disabled), the explicit-resume
   trio `resumeFromRunId` / `resumePolicy` / `checkpointReplies`, and `background`.
+- **Resume** — supply a source `runId`; the server reads that run's immutable persisted script and
+  stored strict-JSON args and always admits a fresh linked run. An explicit `args` value replaces
+  the stored value. It accepts the new run's operational overrides, replay policy, checkpoint
+  replies, and background mode, but no script or project path. It never inherits old operational
+  limits. Completed, failed, aborted, and resumable paused sources are valid when their persisted
+  data is readable; missing/unreadable content and unreplayable stored args fail before admission.
+  Edited replay remains the Run form with explicit `script`/`scriptPath` plus `resumeFromRunId`.
 - **Status / result / permissions-response / stop** — take a `runId` and never execution fields. `status` accepts the existing `lastN` / `labelGlob` / `logLines` projection bounds and `waitMs` (default 0): omitted/zero observes immediately and a positive value waits at most that long for terminal state or required permission. The request bound never cancels workflow work. `result` reads the authoritative completed value from persistence and returns at most 16,384 exact UTF-8 JSON bytes plus `endOffset`/`hasMore`; boundaries never split a code point and interior offsets fail closed. Status projects live ACP permission requests and returns early with `action-required`; `permissions-response` names the opaque request id and returns an exact advertised optionId or cancelled outcome. Whole-run stop is location-independent across daemon generations: the successor persists an idempotent intent, routes signed control to the lease owner, and may return a nonterminal pending-control acknowledgement before final settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and cancellation is never reconstructed after owner loss. Stop accepts the same projection bounds.
 - **Bounds clamp, don't reject:** accept `concurrency`/`agentRetries` as plain numbers in the tool
   schema — *not* Zod `.max()`, which rejects out-of-range input with `InvalidParams`. The engine
@@ -335,7 +342,7 @@ request rather than stranding the tool call; that run is then operated like a ba
 But background support was **not** dropped. Runs execute in a shared per-user **workflow daemon**
 (the stdio entry is a thin shim that auto-starts it), so `background: true` acknowledges after
 durable admission with a `runId` and the run outlives the request — observed later with bounded
-`status` calls, and durable across client disconnects, shim kills, and session eviction. Version succession moves the family front door without moving live VM/ACP state: a predecessor keeps its run lease while the successor joins that lease to the predecessor's PID/instance record and forwards control over a user-key HMAC endpoint. A pre-control busy predecessor is temporarily retained for the first rolling upgrade. Owner exit, or the single client-owned process exiting under `--in-process`, can interrupt work; no timeout steals a live lease. Resume is **explicit**: a new run with `resumeFromRunId` continues from the persisted journal.
+`status` calls, and durable across client disconnects, shim kills, and session eviction. Version succession moves the family front door without moving live VM/ACP state: a predecessor keeps its run lease while the successor joins that lease to the predecessor's PID/instance record and forwards control over a user-key HMAC endpoint. A pre-control busy predecessor is temporarily retained for the first rolling upgrade. Owner exit, or the single client-owned process exiting under `--in-process`, can interrupt work; no timeout steals a live lease. Resume is **explicit**: `action:"resume"` creates a new run from a source's stored script/args, while Run with explicit content plus `resumeFromRunId` is the edited replay path.
 
 The shipped server registers the `workflow` and `repl` tools — and no auth tool. Backend auth belongs to
 the agents' own CLI credential stores, and the server deliberately exposes no auth state for a
@@ -350,12 +357,12 @@ Pi's credential-filtered model catalog), then falls back to the first session-re
 pins that backend-only spec into engine validation, call identity, persistence, and resume. A later
 `AUTH_REQUIRED` pauses on that backend; there is no mid-run provider fallback. `AUTH_REQUIRED`
 pauses a run with the non-secret `authContext`; the recovery sequence is an out-of-band CLI login,
-then re-call `workflow` with `resumeFromRunId`. Programmatic credential injection stays in the
+then re-call `workflow` with `action:"resume"` and the source `runId`. Programmatic credential injection stays in the
 SDK's auth-capable runner APIs for embedding hosts.
 
-Resume is **not lost**, it becomes **explicit**: expose a `resumeFromRunId` tool parameter; the
-host calls `workflow` again to continue from the persisted journal (the engine already supports
-this via `resumeJournal` in `runWorkflow`). If the source paused inside a root agent turn on
+Resume is **not lost**, it has two explicit new-run forms: the simple `resume` action hydrates the
+persisted source script/args, while `run` plus `resumeFromRunId` uses caller-supplied content. Both
+continue from the persisted journal. If the source paused inside a root agent turn on
 usage/auth, the manager separately projects its persisted call/session join into a continuation
 candidate. The resumed live occurrence reopens and continues that session when every identity,
 input, cwd, backend, and capability gate holds; otherwise it opens a fresh session. This channel is
@@ -379,7 +386,7 @@ labels, kind, or response metadata.
 Human-in-the-loop checkpoints: `checkpoint()` relied on Pi's `ui.confirm`. Over MCP, elicitation-capable
 clients provide the live channel. Without elicitation, the authored headless mode applies:
 `"default"` takes `default ?? true`, `"abort"` aborts, and opt-in `"pause"` persists a
-`checkpoint_required` pause. The host resumes that pause with `resumeFromRunId` plus a decision in
+`checkpoint_required` pause. The host resumes that pause with `action:"resume"`, its `runId`, and a decision in
 `checkpointReplies`; its `checkpointContext` supplies the call index and hash used to journal it.
 
 ---

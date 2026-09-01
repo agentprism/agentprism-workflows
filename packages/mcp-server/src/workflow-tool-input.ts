@@ -31,17 +31,17 @@ const checkpointRepliesSchema = z.record(
 
 export const workflowToolInputShape = {
   action: z
-    .enum(["run", "config", "status", "result", "stop", "permissions-response"])
+    .enum(["run", "resume", "config", "status", "result", "stop", "permissions-response"])
     .optional()
     .describe(
-      "Operation. Omit or use run to validate then execute; config discovers live backend/model/mode/config options; status observes a run immediately or waits up to waitMs; result pages the exact completed JSON result; permissions-response resolves one pending ACP permission; stop aborts a run or one in-flight agent.",
+      "Operation. Omit or use run to validate then execute explicit content; resume starts a new run from a source run's stored script and args; config discovers live backend/model/mode/config options; status observes a run immediately or waits up to waitMs; result pages the exact completed JSON result; permissions-response resolves one pending ACP permission; stop aborts a run or one in-flight agent.",
     ),
   script: z
     .string()
     .min(1)
     .optional()
     .describe(
-      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for config/status/result/stop/permissions-response. First statement MUST be `export const meta = { name, description, phases? }`. When present, phases MUST be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings.",
+      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for resume/config/status/result/stop/permissions-response. First statement MUST be `export const meta = { name, description, phases? }`. When present, phases MUST be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings.",
     ),
   scriptPath: z
     .string()
@@ -50,7 +50,7 @@ export const workflowToolInputShape = {
     .optional()
     .describe(
       "Absolute path, on the server's filesystem, to a workflow script file read once at admission. " +
-        "Exactly one of script or scriptPath is required for run; both are forbidden for config/status/result/stop/permissions-response. " +
+        "Exactly one of script or scriptPath is required for run; both are forbidden for resume/config/status/result/stop/permissions-response. " +
         "Relative paths are rejected.",
     ),
   projectDir: z
@@ -62,7 +62,7 @@ export const workflowToolInputShape = {
       "Absolute project directory used as the cwd for config discovery and, for run, the project-scoped store " +
         "(where the runId, journal, and resume state live) plus default execution cwd. " +
         "Required for run and config on the shared workflow daemon; on a single-project (in-process) server it " +
-        "defaults to that server's own project. Forbidden for status/result/stop/permissions-response — a runId locates its project.",
+        "defaults to that server's own project. Forbidden for resume/status/result/stop/permissions-response — a runId locates its project.",
     ),
   harnesses: z
     .array(z.string().regex(/^[a-z][a-z0-9._-]*$/i, "invalid backend name"))
@@ -131,15 +131,15 @@ export const workflowToolInputShape = {
     .min(1)
     .optional()
     .describe(
-      "Start a new run from this persisted source run. Re-send the script via script or scriptPath and the desired args; the manager validates replay eligibility and runs live wherever reuse is uncertain. The source ID must exist in this project namespace.",
+      "With action=run, start a new run from this persisted source while using the explicitly supplied script or scriptPath and args. Use action=resume with runId for stored-script replay. The manager validates replay eligibility and runs live wherever reuse is uncertain.",
     ),
   resumePolicy: z
     .enum(["auto", "positional"])
     .optional()
-    .describe('Resume matching policy. Default "auto"; requires resumeFromRunId.'),
+    .describe('Resume matching policy. Default "auto"; valid with action=resume or a run carrying resumeFromRunId.'),
   checkpointReplies: checkpointRepliesSchema
     .optional()
-    .describe("With resumeFromRunId, durable-checkpoint decisions keyed by checkpointContext.callIndex."),
+    .describe("For a resume action or run with resumeFromRunId, durable-checkpoint decisions keyed by checkpointContext.callIndex."),
   background: z
     .boolean()
     .optional()
@@ -149,7 +149,7 @@ export const workflowToolInputShape = {
     .max(128)
     .regex(/^[a-z0-9]+-[a-z0-9]+$/, "runId must be an engine-generated run ID")
     .optional()
-    .describe("Project-scoped workflow run ID. Required for status/result/stop/permissions-response; forbidden for config/run."),
+    .describe("Project-scoped workflow run ID. Required for resume/status/result/stop/permissions-response; forbidden for config/run."),
   permissionId: z
     .string()
     .uuid()
@@ -238,6 +238,41 @@ export type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase &
     | { script: string; scriptPath?: never }
     | { script?: never; scriptPath: string }
   );
+
+/**
+ * Simple stored-content replay. This is still a new-run resume: runId names the source,
+ * while the manager creates and durably links a fresh target run.
+ */
+export interface WorkflowResumeToolInput {
+  action: "resume";
+  /** Persisted source run whose immutable script and (by default) strict-JSON args are reused. */
+  runId: string;
+  /** Explicit replacement for the source run's stored args. */
+  args?: unknown;
+  maxAgents?: number;
+  concurrency?: number;
+  agentRetries?: number;
+  agentTimeoutMs?: number | null;
+  agentIdleTimeoutMs?: number | null;
+  resumePolicy?: "auto" | "positional";
+  checkpointReplies?: Record<number, unknown>;
+  /** Default false. True acknowledges after admission and executes in this server process. */
+  background?: boolean;
+  script?: never;
+  scriptPath?: never;
+  projectDir?: never;
+  resumeFromRunId?: never;
+  permissionId?: never;
+  response?: never;
+  callIndex?: never;
+  forceOwner?: never;
+  waitMs?: never;
+  lastN?: never;
+  labelGlob?: never;
+  logLines?: never;
+  offset?: never;
+  maxBytes?: never;
+}
 
 export interface WorkflowConfigToolInput {
   action: "config";
@@ -355,6 +390,7 @@ export interface WorkflowStopToolInput extends WorkflowRunInspectionOptions {
 
 export type WorkflowToolInput =
   | WorkflowExecuteToolInput
+  | WorkflowResumeToolInput
   | WorkflowConfigToolInput
   | WorkflowStatusToolInput
   | WorkflowResultToolInput
@@ -362,7 +398,7 @@ export type WorkflowToolInput =
   | WorkflowPermissionResponseToolInput;
 
 interface RawWorkflowToolInput {
-  action?: "run" | "config" | "status" | "inspect" | "await" | "result" | "stop" | "permissions-response";
+  action?: "run" | "resume" | "config" | "status" | "inspect" | "await" | "result" | "stop" | "permissions-response";
   script?: string;
   scriptPath?: string;
   projectDir?: string;
@@ -510,6 +546,46 @@ export function parseWorkflowToolInput(
     };
   }
 
+  if (raw.action === "resume") {
+    if (!raw.runId) invalid('action="resume" requires runId');
+    if (
+      raw.script !== undefined ||
+      raw.scriptPath !== undefined ||
+      raw.projectDir !== undefined ||
+      raw.resumeFromRunId !== undefined ||
+      hasConfigFields(raw) ||
+      hasPermissionFields(raw) ||
+      raw.callIndex !== undefined ||
+      raw.forceOwner !== undefined ||
+      raw.waitMs !== undefined ||
+      raw.lastN !== undefined ||
+      raw.labelGlob !== undefined ||
+      raw.logLines !== undefined ||
+      hasResultFields(raw)
+    ) {
+      invalid(
+        'action="resume" accepts only runId, args, operational execution overrides, resumePolicy, checkpointReplies, and background',
+      );
+    }
+    return {
+      action: "resume",
+      runId: raw.runId,
+      args: raw.args,
+      maxAgents: raw.maxAgents,
+      concurrency: raw.concurrency,
+      agentRetries: raw.agentRetries,
+      agentTimeoutMs: raw.agentTimeoutMs,
+      agentIdleTimeoutMs: raw.agentIdleTimeoutMs,
+      resumePolicy: raw.resumePolicy,
+      checkpointReplies: raw.checkpointReplies === undefined
+        ? undefined
+        : Object.fromEntries(
+            Object.entries(raw.checkpointReplies).map(([callIndex, reply]) => [Number(callIndex), reply]),
+          ),
+      background: raw.background ?? false,
+    };
+  }
+
   if (raw.action === "result") {
     if (!raw.runId) invalid('action="result" requires runId');
     if (
@@ -645,7 +721,7 @@ export function parseWorkflowToolInput(
 }
 
 /** Clamp only execution resource knobs; status values are rejected rather than clamped. */
-export function clampWorkflowInput(input: WorkflowExecuteToolInput): WorkflowExecuteToolInput {
+export function clampWorkflowInput<T extends WorkflowExecuteToolInput | WorkflowResumeToolInput>(input: T): T {
   const clampInt = (value: number | undefined, minimum: number, maximum: number) =>
     value === undefined || !Number.isFinite(value)
       ? undefined
@@ -658,5 +734,5 @@ export function clampWorkflowInput(input: WorkflowExecuteToolInput): WorkflowExe
       input.maxAgents === undefined || !Number.isFinite(input.maxAgents)
         ? undefined
         : Math.max(1, Math.floor(input.maxAgents)),
-  };
+  } as T;
 }

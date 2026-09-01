@@ -246,22 +246,19 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
       name: "workflow",
       arguments: { scriptPath, resumeFromRunId: runId, resumePolicy: "positional" },
     });
-    await waitUntil(() => controlled.calls.length === 3, "the stopped source should fail live safely");
-    assert.equal(controlled.calls[2].prompt, "first");
-    controlled.calls[2].resolve("first rerun");
-    await waitUntil(() => controlled.calls.length === 4, "the patched call should run after the live prefix");
-    assert.equal(controlled.calls[3].prompt, "second patched");
-    controlled.calls[3].resolve("patched result");
+    await waitUntil(() => controlled.calls.length === 3, "the patched call should run after the replayed prefix");
+    assert.equal(controlled.calls[2].prompt, "second patched");
+    controlled.calls[2].resolve("patched result");
     const resumed = await resumedPromise;
     const resumedRunId = runIdOf(resumed);
     assert.equal(structured(resumed)?.status, "completed", JSON.stringify(structured(resumed)));
     assert.equal(
       JSON.stringify(structured(resumed)?.result),
-      JSON.stringify({ first: "first rerun", second: "patched result" }),
+      JSON.stringify({ first: "first result", second: "patched result" }),
     );
     const resumeReport = structured(resumed)?.resumeReport as Record<string, unknown>;
-    assert.equal(resumeReport.replayed, 0);
-    assert.equal(resumeReport.live, 2);
+    assert.equal(resumeReport.replayed, 1);
+    assert.equal(resumeReport.live, 1);
     const inspected = await client.callTool({
       name: "workflow",
       arguments: { action: "status", runId: resumedRunId },

@@ -30,9 +30,9 @@ import type {
 //   - runSync RESOLVES to a TERMINAL WorkflowRunResult (status completed|paused|failed|
 //     aborted, carrying reason/resetHint) and does NOT throw on pause/fail/abort — so the
 //     shell does no status composition and needs no lifecycle try/catch.
-//   - resumeFromRunId, resumePolicy, and checkpointReplies pass straight to the manager,
-//     which owns source admission, durable seed construction, and checkpoint injection.
-//     The shell neither hydrates journals nor owns/forges a runId.
+//   - simple resume hydrates only the source's persisted script/args, then resumeFromRunId,
+//     resumePolicy, and checkpointReplies pass to the manager, which owns journal admission,
+//     durable seed construction, checkpoint injection, and the fresh target runId.
 // Mid-run progress streams via notifications/progress; ctx.mcpReq.signal threads cancellation into
 // the engine; checkpoint() is driven by the engine's `confirm` hook only when the client
 // advertises elicitation. Otherwise the checkpoint's authored headless mode applies.
@@ -76,6 +76,10 @@ import {
   parseWorkflowToolInput,
   workflowToolInputSchema,
   WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT,
+} from "./workflow-tool-input.js";
+import type {
+  WorkflowExecuteToolInput,
+  WorkflowResumeToolInput,
 } from "./workflow-tool-input.js";
 import {
   DEFAULT_BACKEND_ENV,
@@ -171,7 +175,8 @@ export const SERVER_INSTRUCTIONS = [
   "• workflow — DETERMINISTIC BATCH orchestration. Supply a JavaScript workflow script (inline or " +
     "by absolute scriptPath) that fans out agent() subagents and optional checkpoint() gates; it " +
     "runs to completion in the foreground, or background:true returns a durable runId for bounded " +
-    "action:\"status\"/\"permissions-response\"/\"stop\" calls, with journaling, replay, and resumeFromRunId. " +
+    "action:\"status\"/\"permissions-response\"/\"stop\" calls, with journaling and replay. " +
+    "action:\"resume\" reuses a source run's stored script and args; explicit script plus resumeFromRunId remains the edited-replay path. " +
     "Status surfaces exact live ACP permission options when an agent needs external action. Reach " +
     "for it when the orchestration is known up front and you want it repeatable and resumable. " +
     "action:\"config\" discovers the live backend/model option catalog without starting a run, and " +
@@ -943,19 +948,19 @@ function formatTerminalSummary(run: WorkflowRunResult): string {
       lines.push(
         `Agents authenticate from their own credential sources: configure that backend on this ` +
           `machine (e.g. \`claude /login\`, \`codex login\`, \`opencode auth login\`, or a pi provider key / \`~/.pi/agent/auth.json\`), ` +
-          `then re-call the workflow tool with resumeFromRunId="${run.runId}".`,
+          `then call the workflow tool with action="resume" and runId="${run.runId}".`,
       );
     } else if (run.reason === "checkpoint_required" && run.checkpointContext) {
       const checkpoint = run.checkpointContext;
       lines.push(`This run awaits a ${checkpoint.kind} decision for: ${checkpoint.prompt}`);
       if (checkpoint.choices?.length) lines.push(`choices: ${checkpoint.choices.join(", ")}`);
       lines.push(
-        `Re-call the workflow tool with resumeFromRunId="${run.runId}" and ` +
+        `Call the workflow tool with action="resume", runId="${run.runId}", and ` +
           `checkpointReplies={ "${checkpoint.callIndex}": <decision> }.`,
       );
     } else {
       lines.push(
-        `This run is resumable — call the workflow tool again with resumeFromRunId="${run.runId}" to continue from its journal.`,
+        `This run is resumable — call the workflow tool with action="resume" and runId="${run.runId}" to continue from its journal.`,
       );
     }
   }
@@ -1145,7 +1150,7 @@ function formatStopSummary(result: WorkflowStopResult): string {
     lines.splice(
       2,
       0,
-      "Stop is durably complete: this snapshot is final for run fate, resumeFromRunId is safe immediately, and a follow-up status call adds nothing.",
+      "Stop is durably complete: this snapshot is final for run fate, a new resume action is safe immediately, and a follow-up status call adds nothing.",
       "Agent-session cancellation may still be winding down; check the per-agent states only if backend cleanup appears hung.",
     );
   }
@@ -1702,19 +1707,21 @@ function formatStatusSummary(result: WorkflowStatusToolResult): string {
       }
       lines.push(
         `Agents authenticate from their own credential sources: configure that backend on this ` +
-          `machine (e.g. \`claude /login\`, \`codex login\`, \`opencode auth login\`, or a pi provider key / \`~/.pi/agent/auth.json\`), then start a new ` +
-          `workflow run with resumeFromRunId="${result.runId}".`,
+          `machine (e.g. \`claude /login\`, \`codex login\`, \`opencode auth login\`, or a pi provider key / \`~/.pi/agent/auth.json\`), then call the ` +
+          `workflow tool with action="resume" and runId="${result.runId}".`,
       );
     } else if (result.reason === "checkpoint_required" && result.outcome.checkpointContext) {
       const checkpoint = result.outcome.checkpointContext;
       lines.push(`This run awaits a ${checkpoint.kind} decision for: ${checkpoint.prompt}`);
       if (checkpoint.choices?.length) lines.push(`choices: ${checkpoint.choices.join(", ")}`);
       lines.push(
-        `Start a new workflow run with resumeFromRunId="${result.runId}" and ` +
+        `Call the workflow tool with action="resume", runId="${result.runId}", and ` +
           `checkpointReplies={ "${checkpoint.callIndex}": <decision> }.`,
       );
     } else {
-      lines.push(`Start a new workflow run with resumeFromRunId="${result.runId}" to continue from its journal.`);
+      lines.push(
+        `Call the workflow tool with action="resume" and runId="${result.runId}" to continue from its journal.`,
+      );
     }
   }
   lines.push(...diagnostics);
@@ -1868,7 +1875,7 @@ export function createWorkflowServer(
   // Composition root: the ACP-backed AgentRunner is injected into the engine here. Each
   // project's manager owns run lifecycle, status stamping, and the persisted journal used by
   // resume; the registry routes calls to the right project (run: the projectDir argument;
-  // status/stop: locating the runId's store).
+  // resume/status/stop: locating the runId's store).
   const requireProjectDir = options.requireProjectDir === true;
   const projects = options.projects ?? new WorkflowProjectRegistry(runner);
   const defaultContext: ProjectContext | undefined = requireProjectDir
@@ -1895,6 +1902,7 @@ export function createWorkflowServer(
   const resolveContext = (input: ReturnType<typeof parseWorkflowToolInput>): ProjectContext | undefined => {
     if (
       input.action === "status" ||
+      input.action === "resume" ||
       input.action === "stop" ||
       input.action === "permissions-response"
     ) {
@@ -1933,7 +1941,7 @@ export function createWorkflowServer(
 
   const workflowToolOutputSchema = workflowToolOutputShape;
   const workflowToolConfig = {
-    title: "Discover, validate, run, observe status, answer permissions, stop, or narrow-cancel a workflow",
+    title: "Discover, validate, run, resume, observe status, answer permissions, stop, or narrow-cancel a workflow",
     description:
         "Author and operate JavaScript agent workflows through one project-scoped tool. " +
         "A script's first statement must be `export const meta = { name, description, phases? }`. When present, phases must be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings. " +
@@ -1957,11 +1965,10 @@ export function createWorkflowServer(
         (requireProjectDir
           ? "config and run REQUIRE projectDir (absolute): it is the discovery cwd and selects the project-scoped run store/default execution cwd. "
           : "run optionally takes projectDir (absolute) to select the project-scoped run store; default is this server's own project. ") +
-        "status/result/stop/permissions-response locate the project store from runId and never accept projectDir. " +
+        "resume/status/result/stop/permissions-response locate the project store from runId and never accept projectDir. " +
         "Foreground is the default and streams progress; background:true returns " +
         "a durable runId for bounded action:\"status\" calls. run and status honor _meta.progressToken " +
-        "with notifications/progress while they block. Pass resumeFromRunId to execute a new " +
-        "run from a prior journal prefix. " +
+        "with notifications/progress while they block. Use action:\"resume\" with runId to create a new run from that source's stored immutable script and strict-JSON args; an explicit args value overrides the stored args, and operational limits come only from the new request. Use action:\"run\" with explicit script or scriptPath plus resumeFromRunId for edited-script replay. " +
         "In hosts that render MCP Apps, every call of this tool shows a live self-updating run-monitor " +
         "panel and the panel reports phase starts, pauses, and terminal outcomes on its own — do NOT poll " +
         'action:"status" only when you need machine-readable state or want to wait for a milestone. ' +
@@ -2178,7 +2185,7 @@ export function createWorkflowServer(
 
       if (requestState?.flow === "checkpoint") {
         if (
-          (parsedInput.action !== undefined && parsedInput.action !== "run") ||
+          (parsedInput.action !== undefined && parsedInput.action !== "run" && parsedInput.action !== "resume") ||
           parsedInput.background ||
           parsedInput.resumeFromRunId !== undefined ||
           parsedInput.checkpointReplies !== undefined
@@ -2242,11 +2249,17 @@ export function createWorkflowServer(
           });
         }
 
-        parsedInput = {
-          ...parsedInput,
-          resumeFromRunId: requestState.runId,
-          checkpointReplies: { [requestState.callIndex]: decision },
-        };
+        parsedInput = parsedInput.action === "resume"
+          ? {
+              ...parsedInput,
+              runId: requestState.runId,
+              checkpointReplies: { [requestState.callIndex]: decision },
+            }
+          : {
+              ...parsedInput,
+              resumeFromRunId: requestState.runId,
+              checkpointReplies: { [requestState.callIndex]: decision },
+            };
       }
 
       if ((parsedInput.action === undefined || parsedInput.action === "run") && parsedInput.resumeFromRunId !== undefined) {
@@ -2797,8 +2810,73 @@ export function createWorkflowServer(
         };
       }
 
-      const input = clampWorkflowInput(parsedInput);
-      const scriptSource = input.script === undefined ? "path" as const : "inline" as const;
+      let executionInput: WorkflowExecuteToolInput;
+      let scriptSource: "inline" | "path" | "stored";
+      if (parsedInput.action === "resume") {
+        const resumeInput: WorkflowResumeToolInput = parsedInput;
+        let source: PersistedRunState | null;
+        try {
+          source = manager.getPersistence().load(parsedInput.runId);
+        } catch {
+          return {
+            content: [{
+              type: "text",
+              text: `Cannot resume workflow run "${parsedInput.runId}": its persisted source content is unreadable.`,
+            }],
+            isError: true,
+          };
+        }
+        if (source === null) {
+          return {
+            content: [{
+              type: "text",
+              text: `Cannot resume workflow run "${parsedInput.runId}": the source run is missing or its persisted content is unreadable.`,
+            }],
+            isError: true,
+          };
+        }
+        if (
+          source.runId !== parsedInput.runId ||
+          typeof source.script !== "string" ||
+          source.script.length === 0
+        ) {
+          return {
+            content: [{
+              type: "text",
+              text: `Cannot resume workflow run "${parsedInput.runId}": its persisted source script is missing or unreadable.`,
+            }],
+            isError: true,
+          };
+        }
+        if (resumeInput.args === undefined && source.argsUnreplayable === true) {
+          return {
+            content: [{
+              type: "text",
+              text: `Cannot resume workflow run "${parsedInput.runId}": its stored args are not replayable strict JSON.`,
+            }],
+            isError: true,
+          };
+        }
+        executionInput = {
+          action: "run",
+          script: source.script,
+          args: resumeInput.args === undefined ? source.args : resumeInput.args,
+          maxAgents: resumeInput.maxAgents,
+          concurrency: resumeInput.concurrency,
+          agentRetries: resumeInput.agentRetries,
+          agentTimeoutMs: resumeInput.agentTimeoutMs,
+          agentIdleTimeoutMs: resumeInput.agentIdleTimeoutMs,
+          resumeFromRunId: resumeInput.runId,
+          resumePolicy: resumeInput.resumePolicy,
+          checkpointReplies: resumeInput.checkpointReplies,
+          background: resumeInput.background,
+        };
+        scriptSource = "stored";
+      } else {
+        executionInput = parsedInput;
+        scriptSource = executionInput.script === undefined ? "path" : "inline";
+      }
+      const input = clampWorkflowInput(executionInput);
       const admittedScript = input.script ?? readScriptAtAdmission(input.scriptPath);
       if (requestState !== undefined && requestState.scriptHash !== workflowScriptHash(admittedScript)) {
         throw new ProtocolError(

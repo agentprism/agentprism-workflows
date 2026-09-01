@@ -14,15 +14,13 @@ The guide section **Determinism and resume** carries the full semantics: what ea
 - `resumePolicy: "positional"` requests index/prefix correspondence but cannot bypass new-format format, metadata, manifest, cwd, or input checks. Marker-less journals and permanently marked manual/same-run legacy resumes retain historical hash-only positional behavior. Sources below input format 2 use `inputs-format-legacy`. Ancestor-scoped rows carried by a ≤0.23 resume hop replay only while that ancestor is still persisted; engine-minted nested scopes and deleted ancestor scopes stay live.
 - There is no `require`, `import`, Node API, or network API in the realm. `Date.now()`, `Math.random()`, and no-arg `new Date()` / `Date()` fail static validation; aliased or computed forms are blocked at runtime; `new Date(value)` works.
 
-Every new-run resume exposes `replayEligibility` on admission, polling, inspection, and the terminal result. It reports strategy, predicted/observed replayable prefix and counts, first non-replay/reason/detail, engine/input-format diagnostics, non-gating runtime/environment `provenanceChanges`, and non-gating operational changes; `resumeReport` retains the complete terminal per-call correspondence.
+Every new-run resume exposes `replayEligibility` on background acknowledgement, status, and the terminal result. It reports strategy, predicted/observed replayable prefix and counts, first non-replay/reason/detail, engine/input-format diagnostics, non-gating runtime/environment `provenanceChanges`, and non-gating operational changes; `resumeReport` retains the complete terminal per-call correspondence.
 
 An all-live outcome is expected when correspondence cannot be established, not when the world changed. Missing resume metadata, incompatible format literals, or an invalid manifest/seed can disable reuse. A new-format source containing any result row without a captured call path/input fact—possible with a call stack deeper than the raw-frame cap or a non-strict-JSON `meta` value—is source-wide `"manifest-invalid"`; excluding the row could make an ambiguous sibling look unique. Format-1 bytes are never reinterpreted; they enter the positional bridge and replayed rows are recorded under format 2.
 
 An args-controlled cap is the useful case: a cap that changes how many calls are reachable, but
-does not appear in an earlier call's prompt, lets those calls replay on resume. The worked example lives in `workflow/determinism-and-resume`. This changed-args pattern is specific to new-run entry
-points that accept current args with `resumeFromRunId`. The MCP `workflow` tool does, as does
-`WorkflowManager.runSync(script, newArgs, { resumeFromRunId })`. MCP resume always requires
-explicit content; a bare `resumeFromRunId` is invalid. `WorkflowManager.resume(runId)` is a
+does not appear in an earlier call's prompt, lets those calls replay on resume. The worked example lives in `workflow/determinism-and-resume`. MCP `{ action:"resume", runId, args? }` creates a new run from the source's immutable stored script and stored-or-explicit strict-JSON args. It works from completed, failed, aborted, and resumable paused sources, never inherits their operational limits, and rejects missing/unreadable source content or unreplayable stored args. MCP Run with explicit content and `resumeFromRunId`, plus
+`WorkflowManager.runSync(script, newArgs, { resumeFromRunId })`, are the edited-content forms. `WorkflowManager.resume(runId)` is a
 different same-ID recovery API: it reloads the persisted original script/args and permanently uses
 legacy positional replay semantics, while the independent default-on channel may still continue an
 eligible usage/auth-interrupted live call.

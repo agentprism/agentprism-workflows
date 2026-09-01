@@ -23,6 +23,12 @@ function assertAlphaBeta(result: unknown): void {
   assert.equal(field(result, "b"), "r:beta:2", "agent[1] result carries the run-1 invocation counter");
 }
 
+function overwritePersistedRun(file: string, state: Record<string, unknown>): void {
+  const json = JSON.stringify(state);
+  writeFileSync(file, json, "utf8");
+  writeFileSync(`${file}.bak`, json, "utf8");
+}
+
 const RESUME_LOOP_CAP_SCRIPT = `export const meta = { name: 'resume-loop-cap', description: 'Run expensive review rounds up to an args-controlled cap', phases: [{ title: 'Review' }] };
 const input = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
 const numericCap = Number(input.maxRounds);
@@ -106,6 +112,313 @@ test("resumeFromRunId loads the persisted journal and REPLAYS it (runner is not 
     );
   } finally {
     await dispose();
+  }
+});
+
+test("action resume creates linked runs from stored script/args and applies only new operational overrides", async () => {
+  let calls = 0;
+  const runner = makeRunner((prompt) => {
+    calls += 1;
+    return `reply:${prompt}:${calls}`;
+  });
+  const script = `export const meta = { name: 'stored-resume', description: 'stored resume' };
+return await agent(String(args.value), { label: 'value' });`;
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const source = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script,
+        args: { value: "original" },
+        maxAgents: 3,
+        concurrency: 2,
+        agentRetries: 1,
+        agentTimeoutMs: 900_000,
+        agentIdleTimeoutMs: 800_000,
+      },
+    });
+    const sourceRunId = String(structured(source)?.runId);
+    assert.equal(calls, 1);
+
+    const defaulted = await client.callTool({
+      name: "workflow",
+      arguments: { action: "resume", runId: sourceRunId },
+    });
+    const defaultedContent = structured(defaulted);
+    assert.equal(defaulted.isError, false);
+    assert.equal(defaultedContent?.status, "completed");
+    assert.equal(defaultedContent?.scriptSource, "stored");
+    assert.equal(defaultedContent?.result, "reply:original:1");
+    assert.equal(calls, 1, "stored args preserve the completed call as a zero-provider-use replay");
+    assert.notEqual(defaultedContent?.runId, sourceRunId);
+    const defaultLimits = defaultedContent?.limits as Record<string, unknown>;
+    assert.equal(defaultLimits.maxAgents, 1_000);
+    assert.equal(defaultLimits.concurrency, 8);
+    assert.equal(defaultLimits.agentRetries, 0);
+    assert.equal(defaultLimits.agentTimeoutMs, null);
+    assert.equal(defaultLimits.agentIdleTimeoutMs, null);
+    const defaultedFile = persistedRunFile(String(defaultedContent?.runId));
+    assert.ok(defaultedFile);
+    const defaultedState = JSON.parse(readFileSync(defaultedFile, "utf8")) as Record<string, unknown>;
+    assert.equal(defaultedState.resumeSourceRunId, sourceRunId);
+
+    const background = await client.callTool({
+      name: "workflow",
+      arguments: { action: "resume", runId: sourceRunId, background: true },
+    });
+    const backgroundContent = structured(background);
+    assert.equal(backgroundContent?.status, "running");
+    assert.equal(backgroundContent?.scriptSource, "stored");
+    assert.notEqual(backgroundContent?.runId, sourceRunId);
+    const backgroundStatus = await client.callTool({
+      name: "workflow",
+      arguments: { action: "status", runId: String(backgroundContent?.runId), waitMs: 1_000 },
+    });
+    assert.equal(structured(backgroundStatus)?.status, "completed");
+    assert.equal(calls, 1, "background stored-content replay also avoids provider use");
+
+    const overridden = await client.callTool({
+      name: "workflow",
+      arguments: {
+        action: "resume",
+        runId: sourceRunId,
+        args: { value: "edited" },
+        maxAgents: 9,
+        concurrency: 7,
+        agentRetries: 2,
+        agentTimeoutMs: 12_345,
+        agentIdleTimeoutMs: 6_789,
+      },
+    });
+    const overriddenContent = structured(overridden);
+    assert.equal(overriddenContent?.status, "completed");
+    assert.equal(overriddenContent?.scriptSource, "stored");
+    assert.equal(overriddenContent?.result, "reply:edited:2");
+    const overriddenLimits = overriddenContent?.limits as Record<string, unknown>;
+    assert.equal(overriddenLimits.maxAgents, 9);
+    assert.equal(overriddenLimits.concurrency, 7);
+    assert.equal(overriddenLimits.agentRetries, 2);
+    assert.equal(overriddenLimits.agentTimeoutMs, 12_345);
+    assert.equal(overriddenLimits.agentIdleTimeoutMs, 6_789);
+  } finally {
+    await dispose();
+  }
+});
+
+test("action resume reuses completed calls from failed and aborted terminal sources", async () => {
+  let calls = 0;
+  let abortSecond = true;
+  let markSecondStarted!: () => void;
+  const secondStarted = new Promise<void>((resolve) => {
+    markSecondStarted = resolve;
+  });
+  const runner = makeRunner((prompt, options) => {
+    calls += 1;
+    if (prompt === "failed-live") throw new Error("expected agent failure");
+    if (prompt === "abort-second" && abortSecond) {
+      markSecondStarted();
+      return new Promise<string>((_resolve, reject) => {
+        const rejectCancelled = () => reject(new Error("cancelled by test"));
+        options.signal?.addEventListener("abort", rejectCancelled, { once: true });
+        if (options.signal?.aborted) rejectCancelled();
+      });
+    }
+    return `terminal:${prompt}:${calls}`;
+  });
+  const failedScript = `export const meta = { name: 'failed-source', description: 'failed source' };
+await agent('failed-prefix', { label: 'failed-prefix' });
+const failed = await agent('failed-live', { label: 'failed-live' });
+if (failed === null) throw new Error('expected terminal failure');
+return failed;`;
+  const abortedScript = `export const meta = { name: 'aborted-source', description: 'aborted source' };
+const first = await agent('abort-prefix', { label: 'abort-prefix' });
+const second = await agent('abort-second', { label: 'abort-second' });
+return { first, second };`;
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const failed = await client.callTool({ name: "workflow", arguments: { script: failedScript } });
+    assert.equal(structured(failed)?.status, "failed");
+    assert.equal(calls, 2);
+    const failedResume = await client.callTool({
+      name: "workflow",
+      arguments: { action: "resume", runId: String(structured(failed)?.runId) },
+    });
+    assert.equal(structured(failedResume)?.status, "failed");
+    assert.equal(calls, 3, "the failed source's completed prefix replays while only its failed call runs live");
+
+    const admitted = await client.callTool({
+      name: "workflow",
+      arguments: { script: abortedScript, background: true },
+    });
+    const abortedRunId = String(structured(admitted)?.runId);
+    await secondStarted;
+    const stopped = await client.callTool({
+      name: "workflow",
+      arguments: { action: "stop", runId: abortedRunId },
+    });
+    assert.equal(structured(stopped)?.status, "aborted");
+    assert.equal(calls, 5, "the source reached one completed and one interrupted call");
+
+    abortSecond = false;
+    const resumed = await client.callTool({
+      name: "workflow",
+      arguments: { action: "resume", runId: abortedRunId },
+    });
+    const resumedContent = structured(resumed);
+    assert.equal(resumedContent?.status, "completed");
+    assert.equal(
+      field(resumedContent?.resumeReport, "replayed"),
+      1,
+      JSON.stringify(resumedContent?.resumeReport),
+    );
+    assert.equal(field(resumedContent?.resumeReport, "live"), 1);
+    assert.equal(calls, 6, "the aborted source's completed prefix replays and only its interrupted call runs live");
+  } finally {
+    await dispose();
+  }
+});
+
+test("action resume answers a persisted checkpoint using the source script and args", async () => {
+  const { runner, calls } = countingRunner();
+  const script = `export const meta = { name: 'checkpoint-source', description: 'checkpoint source' };
+const before = await agent(String(args.before), { label: 'before' });
+const approved = await checkpoint('Continue?', { headless: 'pause', default: false });
+const after = approved ? await agent('after', { label: 'after' }) : null;
+return { before, approved, after };`;
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const paused = await client.callTool({
+      name: "workflow",
+      arguments: { script, args: { before: "before" } },
+    });
+    const pausedContent = structured(paused);
+    assert.equal(pausedContent?.status, "paused");
+    assert.equal(calls(), 1);
+    const checkpoint = pausedContent?.checkpointContext as Record<string, unknown>;
+    const callIndex = Number(checkpoint.callIndex);
+
+    const resumed = await client.callTool({
+      name: "workflow",
+      arguments: {
+        action: "resume",
+        runId: String(pausedContent?.runId),
+        checkpointReplies: { [String(callIndex)]: true },
+      },
+    });
+    const resumedContent = structured(resumed);
+    assert.equal(resumedContent?.status, "completed");
+    assert.equal(resumedContent?.scriptSource, "stored");
+    assert.equal(field(resumedContent?.result, "before"), "r:before:1");
+    assert.equal(field(resumedContent?.result, "approved"), true);
+    assert.equal(field(resumedContent?.result, "after"), "r:after:2");
+    assert.equal(calls(), 2, "the completed prefix replays before the injected checkpoint reply");
+  } finally {
+    await dispose();
+  }
+});
+
+test("action resume rejects missing, unreadable, and unreplayable stored source data before admission", async () => {
+  const { runner, calls } = countingRunner();
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const missing = await client.callTool({
+      name: "workflow",
+      arguments: { action: "resume", runId: "nosuch-run" },
+    });
+    assert.equal(missing.isError, true);
+    assert.equal(structured(missing), undefined);
+    assert.match(textOf(missing), /source run is missing or its persisted content is unreadable/);
+
+    const corruptSource = await client.callTool({
+      name: "workflow",
+      arguments: { script: TWO_AGENT_SCRIPT },
+    });
+    const corruptFile = persistedRunFile(String(structured(corruptSource)?.runId));
+    assert.ok(corruptFile);
+    writeFileSync(corruptFile, "{", "utf8");
+    writeFileSync(`${corruptFile}.bak`, "{", "utf8");
+    const corrupt = await client.callTool({
+      name: "workflow",
+      arguments: { action: "resume", runId: String(structured(corruptSource)?.runId) },
+    });
+    assert.equal(corrupt.isError, true);
+    assert.match(textOf(corrupt), /source run is missing or its persisted content is unreadable/);
+
+    const scriptSource = await client.callTool({
+      name: "workflow",
+      arguments: { script: TWO_AGENT_SCRIPT },
+    });
+    const scriptFile = persistedRunFile(String(structured(scriptSource)?.runId));
+    assert.ok(scriptFile);
+    const missingScriptState = JSON.parse(readFileSync(scriptFile, "utf8")) as Record<string, unknown>;
+    delete missingScriptState.script;
+    overwritePersistedRun(scriptFile, missingScriptState);
+    const missingScript = await client.callTool({
+      name: "workflow",
+      arguments: { action: "resume", runId: String(structured(scriptSource)?.runId) },
+    });
+    assert.equal(missingScript.isError, true);
+    assert.match(textOf(missingScript), /persisted source script is missing or unreadable/);
+
+    const argsSource = await client.callTool({
+      name: "workflow",
+      arguments: { script: TWO_AGENT_SCRIPT, args: { valid: true } },
+    });
+    const argsFile = persistedRunFile(String(structured(argsSource)?.runId));
+    assert.ok(argsFile);
+    const badArgsState = JSON.parse(readFileSync(argsFile, "utf8")) as Record<string, unknown>;
+    badArgsState.argsUnreplayable = true;
+    overwritePersistedRun(argsFile, badArgsState);
+    const badArgs = await client.callTool({
+      name: "workflow",
+      arguments: { action: "resume", runId: String(structured(argsSource)?.runId) },
+    });
+    assert.equal(badArgs.isError, true);
+    assert.match(textOf(badArgs), /stored args are not replayable strict JSON/);
+
+    const replacedArgs = await client.callTool({
+      name: "workflow",
+      arguments: {
+        action: "resume",
+        runId: String(structured(argsSource)?.runId),
+        args: { replacement: true },
+      },
+    });
+    assert.equal(replacedArgs.isError, false, "an explicit strict-JSON value replaces unreadable stored args");
+    assert.notEqual(structured(replacedArgs)?.runId, structured(argsSource)?.runId);
+    assert.equal(calls(), 6, "rejections create no target and the explicit replacement replays without provider use");
+  } finally {
+    await dispose();
+  }
+});
+
+test("action resume reloads stored content after an MCP server restart", async () => {
+  const { runner, calls } = countingRunner();
+  const firstConnection = await connect(runner, { listTools: true });
+  let sourceRunId: string;
+  try {
+    const source = await firstConnection.client.callTool({
+      name: "workflow",
+      arguments: { script: TWO_AGENT_SCRIPT, args: { persisted: true } },
+    });
+    sourceRunId = String(structured(source)?.runId);
+    assert.equal(calls(), 2);
+  } finally {
+    await firstConnection.dispose();
+  }
+
+  const secondConnection = await connect(runner, { listTools: true });
+  try {
+    const resumed = await secondConnection.client.callTool({
+      name: "workflow",
+      arguments: { action: "resume", runId: sourceRunId! },
+    });
+    assert.equal(resumed.isError, false);
+    assert.equal(structured(resumed)?.status, "completed");
+    assert.equal(structured(resumed)?.scriptSource, "stored");
+    assert.equal(calls(), 2, "cold stored-content replay spends no current provider calls");
+  } finally {
+    await secondConnection.dispose();
   }
 });
 

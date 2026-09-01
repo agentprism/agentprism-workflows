@@ -4,9 +4,10 @@ import type { CallToolResult } from "@modelcontextprotocol/client";
 
 // Rendered by MCP Apps hosts for `workflow` tool calls (the tool carries
 // _meta.ui.resourceUri). The panel derives the runId from whichever arrives first:
-//   - tool ARGUMENTS for action inspect/await/stop (runId is an input), or
-//   - the tool RESULT's structuredContent.runId for execute calls (background admission
-//     returns it immediately; foreground returns it with the terminal result).
+//   - tool ARGUMENTS for status/result/permissions-response/stop (runId is the observed run), or
+//   - the tool RESULT's structuredContent.runId for run/resume calls (background admission
+//     returns it immediately; foreground returns it with the terminal result). Resume input names
+//     the source run, so it must never win over the newly-created result runId.
 // Once a runId is known the panel keeps itself live with the MCP Apps Interactive Updates
 // pattern: it polls the app-only `workflow-events` tool (~2s while live, adaptive backoff when
 // idle or faulted) and folds structured event pages into the render model. Server-side capability
@@ -40,6 +41,10 @@ import type { EventsDoc } from "./workflow-events-poll.js";
 import "./style.css";
 
 function runIdFromArgs(args: Record<string, unknown> | null): string | undefined {
+  const action = args?.["action"];
+  if (action === undefined || action === "run" || action === "resume" || action === "config") {
+    return undefined;
+  }
   const runId = args?.["runId"];
   return typeof runId === "string" && runId.length > 0 ? runId : undefined;
 }

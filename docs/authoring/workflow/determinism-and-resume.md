@@ -55,7 +55,7 @@ if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rou
 return { rounds };
 ```
 
-Run it with `args: { "maxRounds": 6 }`. Then send the same content (via `script`, or the absolute `scriptPath` you edit) with `args: { "maxRounds": 8 }` and the first result's `runId` as `resumeFromRunId`. Rounds 1–6 replay for zero current provider tokens; only rounds 7–8 run live, because the cap controls call count but is not interpolated into the round prompt. If every round prompt included `maxRounds`, all eight identities would change and all would run live. Resume always states its content; a bare `resumeFromRunId` never silently reuses the old script.
+Run it with `args: { "maxRounds": 6 }`. Then call `{ action:"resume", runId:firstRunId, args:{ maxRounds:8 } }`. The source's immutable stored script is reused. Rounds 1–6 replay for zero current provider tokens; only rounds 7–8 run live, because the cap controls call count but is not interpolated into the round prompt. If every round prompt included `maxRounds`, all eight identities would change and all would run live. Omit `args` to reuse the source's stored strict-JSON value. Use explicit `script` or `scriptPath` plus `resumeFromRunId` only when replaying edited content.
 
 Give repeated calls stable, descriptive labels and narrate decisions with `log()` — inspection by `labelGlob` then turns a pause or failure into a diagnosis instead of a guess.
 
@@ -63,4 +63,4 @@ Give repeated calls stable, descriptive labels and narrate decisions with `log()
 
 Stop the live run with `{ action: "stop", runId }`. The returned `aborted` snapshot is the durable acknowledgement: resume is safe immediately, and another status call adds nothing. Edit the file. Start a new run with its absolute `scriptPath` and `resumeFromRunId`. Every completed call whose recorded identity and input fingerprint correspond replays, regardless of filesystem or environment drift. Read `replayEligibility` and the full `resumeReport` for the per-call decisions. A repeated stop of a terminal run is a successful no-op.
 
-Registration, the per-action contracts, background collection, and the events resource are covered in **Running workflows** ([mcp-server-setup.md](mcp-server-setup.md)). Resume a durable checkpoint pause by re-sending the script with `resumeFromRunId` and `checkpointReplies` keyed by the source run's `checkpointContext.callIndex`.
+Registration, the per-action contracts, background collection, and the events resource are covered in **Running workflows** ([mcp-server-setup.md](mcp-server-setup.md)). Resume a durable checkpoint pause with `{ action:"resume", runId, checkpointReplies }`, keyed by the source run's `checkpointContext.callIndex`.

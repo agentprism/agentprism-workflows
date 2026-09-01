@@ -479,8 +479,6 @@ return { first, second };`;
   it("pins the remaining structural, status, metadata, and runtime-format outcomes", () => {
     const cases: Array<[string, PersistedRunState, Partial<Omit<ResumeAdmissionInput, "source">>, string]> = [
       ["unsupported", sourceState(undefined, { resume: { format: "future" } as never }), {}, "unsupported-format"],
-      ["aborted", sourceState(undefined, { status: "aborted" }), {}, "abort-residue"],
-      ["abort signal", sourceState(undefined, { abortSignaled: true }), {}, "abort-residue"],
       ["running", sourceState(undefined, { status: "running" }), {}, "source-not-terminal"],
       ["isolation", sourceState(undefined, { executionMode: { kind: "isolation", baselineRunId: "base" } }), {}, "isolation-recording"],
       ["cwd metadata", sourceState(undefined, { effectiveCwd: undefined }), {}, "resume-metadata-missing"],
@@ -498,6 +496,17 @@ return { first, second };`;
       assert.equal(decision.strategy, "live", name);
       assert.equal(decision.strategy === "live" && decision.disabledReason, reason, name);
     }
+
+    assert.equal(
+      admission(sourceState(undefined, { status: "aborted" })).strategy,
+      "identity-v1",
+      "a terminal aborted source keeps its completed correspondence candidates",
+    );
+    assert.equal(
+      admission(sourceState(undefined, { abortSignaled: true })).strategy,
+      "identity-v1",
+      "an abort marker is diagnostic once the source has terminal persisted call facts",
+    );
 
     const missingTerminal = admission(sourceState(undefined, {
       resume: { format: "identity-v1" },
@@ -591,7 +600,7 @@ return { first, second };`;
     });
     assert.equal(admission(unknownAborted).strategy === "live" && admission(unknownAborted).disabledReason, "unsupported-format");
     const abortedRunning = sourceState(undefined, { status: "running", abortSignaled: true });
-    assert.equal(admission(abortedRunning).strategy === "live" && admission(abortedRunning).disabledReason, "abort-residue");
+    assert.equal(admission(abortedRunning).strategy === "live" && admission(abortedRunning).disabledReason, "source-not-terminal");
     const runningIsolation = sourceState(undefined, {
       status: "running",
       executionMode: { kind: "isolation", baselineRunId: "base" },

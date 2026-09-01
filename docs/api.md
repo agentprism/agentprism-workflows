@@ -376,8 +376,8 @@ duplicate content, consumed candidates, or empty schema-less output run live. Th
 matcher never pairs by occurrence ordinal/source order and never uses isolation's path-only
 fallback. Stable explicit labels matter because runner-visible label changes alter `inputsHash`.
 
-Before any new-format journal is considered, admission requires a terminal non-aborted,
-non-isolation source; exact `effectiveCwd`; exact call-path and checkpoint-input formats; a
+Before any new-format journal is considered, admission requires a terminal (completed, failed,
+paused, or aborted), non-isolation source; exact `effectiveCwd`; exact call-path and checkpoint-input formats; a
 compatible agent-input format; and complete journal/call/allocation metadata with a valid
 manifest and seed. These are journal-integrity and execution-correspondence checks. Git HEAD/dirty
 digest, `environmentKey`, captured start/terminal environment values, Node/V8, and producing engine
@@ -478,7 +478,9 @@ facade. Their literal unions live in `@automatalabs/shared-types`:
 The catalogs are wire-compatible with existing journals and consumers. World/safety-era literals
 such as `crash-residue`, `unsafe-recording`, `nested-workflows`,
 `source-environment-drift`, `safety-changed`, and `unsafe-suffix` remain parseable but are not
-world-state gates in the current automatic contract.
+world-state gates in the current automatic contract. `abort-residue` likewise remains a readable
+historical diagnostic; current new-run replay does not disable a source merely because its terminal
+status or persisted marker is aborted.
 
 Every branch follows fail-to-live: the report explains why a call ran or why resume was disabled;
 no reason authorizes a possibly stale value.
@@ -1409,6 +1411,20 @@ interface WorkflowExecuteToolInput {
   background?: boolean; // default false
 }
 
+interface WorkflowResumeToolInput {
+  action: "resume";
+  runId: string; // persisted source; the result receives a fresh linked runId
+  args?: unknown; // explicit replacement; omission reuses stored strict-JSON args
+  maxAgents?: number;
+  concurrency?: number;
+  agentRetries?: number;
+  agentTimeoutMs?: number | null;
+  agentIdleTimeoutMs?: number | null;
+  resumePolicy?: "auto" | "positional";
+  checkpointReplies?: Record<number, unknown>;
+  background?: boolean;
+}
+
 interface WorkflowStatusToolInput extends WorkflowRunInspectionOptions {
   action: "status";
   runId: string;
@@ -1460,13 +1476,14 @@ interface WorkflowExecutionToolResult<T = unknown> {
   checkpointsTaken?: WorkflowCheckpointTaken[];
   resumeReport?: WorkflowResumeReport;   // resumeFromRunId executions only
   replayEligibility?: WorkflowReplayEligibility;
+  scriptSource: "inline" | "path" | "stored";
   scriptUri: string;
   eventsUri: string;
   resultUri?: string;                     // completed runs with a persisted JSON value
 }
 ```
 
-`action:"config"` reuses the server's runner to open bounded no-prompt sessions and returns live model/mode/config catalogs without creating a manager run. Mode names, descriptions, and `_meta` are preserved verbatim in structured and human-readable output, alongside `defaultModeId` (`auto` / `agent` / `build` for the three mode-capable first-class backends). Every execution request is statically parsed, mock-executed, and probed before run admission; an invalid preflight returns `{ action:"run", status:"rejected", validation }` with no run ID, persistence record, background reservation, or live `AgentRunner.run()` call.
+`action:"config"` reuses the server's runner to open bounded no-prompt sessions and returns live model/mode/config catalogs without creating a manager run. Mode names, descriptions, and `_meta` are preserved verbatim in structured and human-readable output, alongside `defaultModeId` (`auto` / `agent` / `build` for the three mode-capable first-class backends). `action:"resume"` first locates the source project from `runId`, rejects missing/unreadable persisted content or unreplayable stored args directly, then submits the immutable stored script and stored-or-explicit args through the same new-run validation/admission path with `resumeFromRunId` set internally. It works from supported paused and terminal sources, never mutates the source, never inherits its operational limits, and returns a fresh linked run ID; `scriptSource:"stored"` identifies this admission. Ordinary `action:"run"` with explicit script content plus `resumeFromRunId` remains the edited replay path. Every execution request is statically parsed, mock-executed, and probed before run admission; an invalid preflight returns `{ action:"run", status:"rejected", validation }` with no run ID, persistence record, background reservation, or live `AgentRunner.run()` call.
 
 Mixed/missing branches, invalid run IDs, invalid status bounds, and `waitMs` outside 0–25,000
 are MCP Invalid Params (`-32602`). Omitted action/background preserves foreground execution byte for
@@ -1482,7 +1499,7 @@ After preflight succeeds, `background:true` reserves one of four process-local a
 interface WorkflowBackgroundAccepted {
   runId: string;
   status: "running";
-  scriptSource: "inline" | "path";
+  scriptSource: "inline" | "path" | "stored";
   scriptUri: string;
   eventsUri: string;
   limits: WorkflowRunLimits;
@@ -1502,7 +1519,7 @@ channel, or live checkpoint `confirm`; checkpoints use authored headless behavio
 start request supplied a progress token, it emits no background progress after returning.
 Cancelling the accepted call cannot abort the run. A fifth run fails with
 `Background workflow limit reached (4 active or starting runs). Check an existing run with status and retry.`
-Foreground, status, and result retrieval do not consume slots. A background `resumeFromRunId` creates a new run
+Foreground, status, and result retrieval do not consume slots. A background simple resume or run carrying `resumeFromRunId` creates a new run
 ID and copies the complete inherited journal plus any synthetic checkpoint answer into that new
 run's initial durable record, preserving multi-hop resume safety. Its acknowledgement includes the
 admission-time `replayEligibility` prediction before the script body is allowed to execute.
@@ -1639,11 +1656,11 @@ feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_
 Status returns `WorkflowRunStatus` plus wait metadata, durable `latestActivity`, live `pendingPermissions`, and interaction guidance when applicable. Durable-log runs expose `eventsUri` and a labelled events resource link; completed runs with an authored JSON value also expose `resultUri` and a labelled result resource link without adding either detailed event content or that value to the bounded status projection. Permission diagnostics are credential-redacted and scalar-bounded, omit the private ACP session id, and preserve the complete ordered exact option-id list inside a separate 64 KiB envelope; an option set that cannot be represented safely is cancelled instead of partially exposed. Permission responses accept only cancellation or an exact selected optionId and forbid caller-supplied response `_meta`. Its JSON structured content is capped at 24,576 bytes
 and its formatted text at 8,192 bytes. An existing failed or aborted run is still a successful read.
 An unknown/corrupt/unreadable run is `isError:true`, has no structured content, and returns exactly
-`No workflow run found for runId "<runId>" in this server's project-scoped run store.` Execution keeps current error semantics: failed/aborted are tool errors, paused is a successful resumable call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped at 12,288 bytes; rejected preflight scripts instead carry bounded structured validation diagnostics and have no run ID or tail.
+`No workflow run found for runId "<runId>" in this server's project-scoped run store.` Simple resume also fails directly when its source content is unreadable or its stored args cannot be replayed as strict JSON. Execution keeps current error semantics: failed/aborted are tool errors, paused is a successful resumable call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped at 12,288 bytes; rejected preflight scripts instead carry bounded structured validation diagnostics and have no run ID or tail.
 
 **The `author-workflow` prompt.** Prompt-capable hosts additionally get one compact user-controlled MCP prompt, `author-workflow` (optional `task` argument). It frames the task and directs the assistant to `docs` topic `workflow/quickstart` plus only the related topics needed; it does not inject the optional skill or the complete reference. Prompts never enter the model's tool-selection loop.
 
-**Auth is the agents' own concern.** Claude, Codex, and OpenCode use their CLI credential stores; pi uses provider environment keys or `~/.pi/agent/auth.json`. Configured credentials need no MCP-side step, and the server exposes no auth state for a host to inspect or manage. A run that genuinely hits ACP `AUTH_REQUIRED` pauses with `reason:"auth_required"` and a summary built from the structured, non-secret `authContext` (backend id + advertised method `{ id, type, name }[]`) — never parsed from the error message — directing out-of-band credential configuration followed by `workflow` with `resumeFromRunId`. Programmatic credential injection and provider routing (`completeAuth`, `listProviders` / `setProvider` / `disableProvider`) are [SDK runner APIs](#auth--providers) for embedding hosts.
+**Auth is the agents' own concern.** Claude, Codex, and OpenCode use their CLI credential stores; pi uses provider environment keys or `~/.pi/agent/auth.json`. Configured credentials need no MCP-side step, and the server exposes no auth state for a host to inspect or manage. A run that genuinely hits ACP `AUTH_REQUIRED` pauses with `reason:"auth_required"` and a summary built from the structured, non-secret `authContext` (backend id + advertised method `{ id, type, name }[]`) — never parsed from the error message — directing out-of-band credential configuration followed by `workflow` `action:"resume"` with that source `runId`. Programmatic credential injection and provider routing (`completeAuth`, `listProviders` / `setProvider` / `disableProvider`) are [SDK runner APIs](#auth--providers) for embedding hosts.
 
 ### The `repl` tool
 

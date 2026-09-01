@@ -49,6 +49,7 @@ export type {
   WorkflowExecuteToolInput,
   WorkflowInspectToolInput,
   WorkflowPermissionResponseToolInput,
+  WorkflowResumeToolInput,
   WorkflowResultToolInput,
   WorkflowStatusToolInput,
   WorkflowStopToolInput,
@@ -152,7 +153,7 @@ export type {
  * Bootstrap the MCP `workflow` server over stdio. Composition root: build the ACP-backed
  * AgentRunner, inject it into the workflow-engine via the server shell, and serve on
  * stdin/stdout. Backend auth stays with the agents' own CLI credential stores; a run that
- * hits AUTH_REQUIRED pauses and resumes (resumeFromRunId) after an out-of-band CLI login.
+ * hits AUTH_REQUIRED pauses and resumes through a fresh linked run after an out-of-band CLI login.
  * The stdio transport is the RELAY transport (phase-F review round 3): its stdin reader
  * lives on a worker thread that fires the server's out-of-band eval-break relay for
  * `repl` interrupt calls, so the documented no-id interrupt works for a synchronously

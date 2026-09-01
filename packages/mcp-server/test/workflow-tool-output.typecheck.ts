@@ -62,7 +62,7 @@ const resultRetrieval: WorkflowResultRetrieval = {
 const background: WorkflowBackgroundAccepted = {
   runId: "aa-bb",
   status: "running",
-  scriptSource: "path",
+  scriptSource: "stored",
   scriptUri: "workflow://runs/aa-bb/script",
   eventsUri: "workflow://runs/aa-bb/events",
   limits,

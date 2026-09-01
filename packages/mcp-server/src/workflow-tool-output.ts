@@ -277,7 +277,7 @@ const replayEligibilitySchema = z.discriminatedUnion("strategy", [
   }),
 ]);
 
-const scriptSourceSchema = z.enum(["inline", "path"]);
+const scriptSourceSchema = z.enum(["inline", "path", "stored"]);
 
 const scriptLineageEntrySchema = z.object({
   runId: z.string(),

@@ -285,8 +285,9 @@ in through `capabilities.extensions["io.modelcontextprotocol/ui"]` with
 metadata and app-only surface. Supporting hosts (Claude, Claude Desktop, VS Code Copilot,
 Goose, …) show a live run-monitor panel
 for `workflow` calls: a phase/agent graph with per-node log drill-in, live token/cost totals,
-and a Stop control. The panel derives the runId from the call's arguments (status/stop)
-or from the execute result (immediately for `background: true` admissions), then keeps itself
+and a Stop control. The panel derives the observed runId from the call's arguments
+(status/result/permissions-response/stop) or the newly-created runId from a run/resume result
+(immediately for `background: true` admissions), then keeps itself
 current by polling the app-only `workflow-events` tool (`visibility: ["app"]`, outside the
 model's tool loop) — no model tokens are spent while it is visible. The panel also mirrors
 run status into the host's model context (`ui/update-model-context`, last push wins) at
@@ -319,25 +320,25 @@ reference host's generic core client must advertise.
 
 | Param | Type | Notes |
 |---|---|---|
-| `action` | `"config" \| "run" \| "status" \| "result" \| "permissions-response" \| "stop"` | `"config"` performs zero-token live backend discovery. Omit or use `"run"` for validation plus execution. `"status"` is the one run-observation action. `"result"` pages a completed exact JSON result. `permissions-response` resolves one live ACP request using an exact advertised option. |
-| `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for status/result/permissions-response/stop. |
-| `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for status/result/permissions-response/stop. |
-| `projectDir` | absolute path string | Config/run: project-sensitive discovery cwd and the run's project store/default cwd. Required for both on the shared daemon; defaults to the server's project under `--in-process`. |
+| `action` | `"config" \| "run" \| "resume" \| "status" \| "result" \| "permissions-response" \| "stop"` | `"config"` performs zero-token live backend discovery. Omit or use `"run"` for validation plus explicit-content execution. `"resume"` creates a new run from a source run's stored script and args. `"status"` is the one run-observation action. `"result"` pages a completed exact JSON result. `permissions-response` resolves one live ACP request using an exact advertised option. |
+| `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for resume/status/result/permissions-response/stop. |
+| `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for resume/status/result/permissions-response/stop. |
+| `projectDir` | absolute path string | Config/run: project-sensitive discovery cwd and the run's project store/default cwd. Required for both on the shared daemon; defaults to the server's project under `--in-process`. Resume locates the project from its source `runId`. |
 | `harnesses` | string[] | Config only: optional backend names to probe; omission discovers every registered backend. |
 | `modelSpecs` | string[] | Config only: select exact routed models before reading their model-specific options. |
 | `modelFilter` | string | Config only: bounded model-id substring or `/regex/` filter. |
 | `probeTimeoutMs` | integer | Config only: per-backend timeout, default 60,000 ms. |
-| `background` | boolean | Run only; default `false`. `true` acknowledges after durable admission and executes in the daemon (returns `{ runId, status: "running" }`). |
-| `args` | any | Exposed to the script as the global `args`. |
+| `background` | boolean | Run/resume; default `false`. `true` acknowledges after durable admission and executes in the daemon (returns the new `{ runId, status: "running" }`). |
+| `args` | any | Exposed to the script as the global `args`. Resume defaults to the source's stored strict-JSON args; an explicit value replaces them. |
 | `maxAgents` | number | Default 1000. |
 | `concurrency` | number | **Clamped** to 16 (not rejected). |
 | `agentRetries` | number | **Clamped** to 3. |
 | `agentTimeoutMs` | number \| null | Per-attempt total-wall timeout; omit/null for none. |
 | `agentIdleTimeoutMs` | number \| null | Per-attempt no-backend-activity timeout; omit/null to disable. |
-| `resumeFromRunId` | string | Resume a prior run from its persisted journal (resume is **explicit**). |
-| `resumePolicy` | `"auto" \| "positional"` | Default `"auto"`; positional requests index/prefix matching but cannot bypass new-format format, metadata, manifest, input, or safety checks. Requires `resumeFromRunId`. |
-| `checkpointReplies` | object | With `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to its decision. Keys must be canonical non-negative integer strings on the JSON wire. |
-| `runId` | string | Required for status/result/permissions-response/stop; the project-scoped run capability returned by execution. |
+| `resumeFromRunId` | string | Run only: advanced edited replay using the explicitly supplied `script`/`scriptPath` and current `args`. Simple stored-content replay uses `action:"resume"` plus `runId`. |
+| `resumePolicy` | `"auto" \| "positional"` | Resume/run-with-`resumeFromRunId`; default `"auto"`. Positional requests index/prefix matching but cannot bypass new-format format, metadata, manifest, or input checks. |
+| `checkpointReplies` | object | With resume or `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to its decision. Keys must be canonical non-negative integer strings on the JSON wire. |
+| `runId` | string | Required for resume/status/result/permissions-response/stop. For resume it names the immutable source; the response carries a new run ID. |
 | `permissionId` | UUID string | Permissions-response only: opaque pending request id returned by status. |
 | `response` | ACP permission response | Permissions-response only: `{ outcome:{ outcome:"selected", optionId } }` using an exact advertised option, or `{ outcome:{ outcome:"cancelled" } }`. |
 | `callIndex` | integer | Stop only: cancel exactly that one in-flight agent call (its slot settles to `null` with `AGENT_CANCELLED`) without aborting the run. Forbidden for every other action. |
@@ -403,8 +404,11 @@ to the predecessor holding the run lease; whole-stop intent is durable and can r
 `control.state:"pending"` before final settlement. Owner daemon exit (signals, forced owner stop,
 crash, machine loss) — or, under `--in-process`, the client-owned process exiting — can interrupt
 in-flight work, while the durable journal prefix remains resumable. Background runs send no request progress and use authored headless
-checkpoint behavior. Resume after a pause/crash by starting a new run with `resumeFromRunId`; each
-new background run durably inherits the replay prefix under its new run ID before acknowledgement.
+checkpoint behavior. Resume a paused, failed, completed, or aborted source with
+`{ "action":"resume", "runId":"…" }`; the server reuses its immutable persisted script and stored
+strict-JSON args, creates a new linked run, and durably records any replay prefix before a background
+acknowledgement. Supply `args` to replace the stored value. Operational limits come only from the new
+request. Use explicit `script` or `scriptPath` plus `resumeFromRunId` when replaying edited content.
 
 #### Follow a background run live
 
@@ -473,7 +477,7 @@ if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rou
 return { rounds };
 ```
 
-Call `workflow` once with that script and `args: { "maxRounds": 6 }`. Copy the returned `runId`, then call `workflow` again with the same script, `args: { "maxRounds": 8 }`, and that ID as `resumeFromRunId`. Rounds 1–6 rebuild the same identities and replay with zero current provider tokens; only rounds 7 and 8 run live. Keep the cap out of the round prompt: interpolating `maxRounds` into every prompt would change all eight identities and make all eight calls live.
+Call `workflow` once with that script and `args: { "maxRounds": 6 }`. Copy the returned `runId`, then call `{ "action":"resume", "runId":"…", "args":{ "maxRounds":8 } }`. The stored immutable script is reused, rounds 1–6 rebuild the same identities and replay with zero current provider tokens, and only rounds 7 and 8 run live. Keep the cap out of the round prompt: interpolating `maxRounds` into every prompt would change all eight identities and make all eight calls live.
 
 Retain every returned `runId`. Before guessing why a run paused or failed, read its safe status,
 log, and call tail:
@@ -488,7 +492,7 @@ both call rows and activity. Its structured payload, including `latestActivity`,
 UTF-8 bytes and its text at 8,192 bytes.
 Paused, failed, and aborted execution responses also include a redacted final-20 `logTail` immediately.
 
-The model-facing surface is `docs`, `workflow`, and `repl`. `docs` embeds one selected, version-matched text/markdown topic per call; `repl` is a persistent QuickJS-in-WASM JavaScript VM (one per project) for live, stateful orchestration. Prompt-capable hosts additionally get the compact user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which directs the assistant to relevant `docs` topics. Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `workflow` again with the paused `resumeFromRunId`. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
+The model-facing surface is `docs`, `workflow`, and `repl`. `docs` embeds one selected, version-matched text/markdown topic per call; `repl` is a persistent QuickJS-in-WASM JavaScript VM (one per project) for live, stateful orchestration. Prompt-capable hosts additionally get the compact user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which directs the assistant to relevant `docs` topics. Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `{ "action":"resume", "runId":"…" }` for the paused source. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
 
 ---
 

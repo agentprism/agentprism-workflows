@@ -166,7 +166,8 @@ throw, so a re-run reproduces the journaled values. Pass any timestamps/randomne
 ## Resume & run limits
 
 Every `agent()` / `checkpoint()` result is journaled by a deterministic call index. For
-edited-script/current-args resume, name a terminal persisted source on a **new** manager run:
+edited-script/current-args resume, name a completed, failed, paused, or aborted persisted source on
+a **new** manager run:
 
 ```ts
 const first = await manager.runSync(script, { topic: "otters" });

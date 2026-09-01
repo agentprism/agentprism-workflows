@@ -33,7 +33,7 @@ import {
 import { cloneFrozenStrictJson, cloneStrictJsonValue, deepFreeze } from "./strict-json.js";
 
 const SHA256 = /^[0-9a-f]{64}$/;
-const TERMINAL_STATUSES = new Set(["completed", "paused", "failed"]);
+const TERMINAL_STATUSES = new Set(["completed", "paused", "failed", "aborted"]);
 const RESUME_MATCHES = new Set(["path-hash", "unique-hash", "index-hash"]);
 const RESUME_SAFETY = new Set(["declared-read-only", "isolated-worktree"]);
 
@@ -793,9 +793,6 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
       undefined,
       checkpointReplyIndex,
     );
-  }
-  if (source.status === "aborted" || source.abortSignaled === true) {
-    return liveDecision(sourceRunId, requestedPolicy, "abort-residue", undefined, checkpointReplyIndex);
   }
   if (!TERMINAL_STATUSES.has(String(source.status))) {
     return liveDecision(

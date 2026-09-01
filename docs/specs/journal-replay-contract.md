@@ -1,6 +1,6 @@
 # Journal replay contract
 
-**Status:** current · **Date:** 2026-07-21 · **Motivation:** issue #271
+**Status:** current · **Date:** 2026-09-01 · **Motivation:** issues #271 and #427
 
 This contract supersedes the filesystem-safety and purity rules in
 [`incremental-resume-spec.md`](incremental-resume-spec.md). The engine replays recorded workflow
@@ -27,8 +27,8 @@ tier, phase, agent definition, and schema. The separate execution-input fingerpr
 per-call cwd, isolation, session/tool attachments, metadata, and approved script backends. Exact
 path/hash matching wins; otherwise one unique hash+input match may move after script edits.
 
-Source admission remains fail-to-live for journal integrity: terminal/non-aborted status, exact
-effective cwd, supported fingerprint formats, complete call/journal/allocation metadata, a dense
+Source admission remains fail-to-live for journal integrity: terminal status (completed, failed,
+paused, or aborted), exact effective cwd, supported fingerprint formats, complete call/journal/allocation metadata, a dense
 manifest, and a valid retained seed. These checks answer “can this recorded call be identified and
 trusted as a journal row?” They do not answer “does the current world resemble the recorded world?”
 
@@ -37,6 +37,11 @@ start/terminal environment values are diagnostics only. For provenance reporting
 terminal environment (or start environment when no terminal capture exists) is compared with the
 current environment. Differences may appear in `replayEligibility.provenanceChanges`; none can
 disable replay or turn a matching call live.
+
+Terminal abort state and the persisted `abortSignaled` marker are diagnostic history, not replay
+gates. Completed rows from an aborted source remain eligible; interrupted/non-result rows still run
+live. The historical `abort-residue` reason remains in the exported/readable catalog for wire and
+journal compatibility but is not emitted by current new-run source admission.
 
 ## World neutrality
 

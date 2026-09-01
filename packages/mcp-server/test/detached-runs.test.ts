@@ -813,7 +813,8 @@ test("background checkpoints stay headless despite elicitation capability and au
     assert.deepEqual(field(structured(awaited)?.outcome, "authContext"), authContext);
     assert.doesNotMatch(JSON.stringify(field(structured(awaited)?.outcome, "authContext")), /credential|secret/i);
     assert.match(textOf(awaited), /codex login/);
-    assert.match(textOf(awaited), /resumeFromRunId/);
+    assert.match(textOf(awaited), /action="resume"/);
+    assert.match(textOf(awaited), new RegExp(`runId="${runIdOf(accepted)}"`));
   } finally {
     await auth.dispose();
   }

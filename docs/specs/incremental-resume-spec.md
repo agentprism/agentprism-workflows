@@ -1,7 +1,7 @@
 # Content-addressed Incremental Resume
 
-> **Superseded in part (2026-07-21):** The filesystem-purity, safety-marker, terminal-environment,
-> cache-closing, headless-checkpoint, and crash-residue gates in this historical specification are
+> **Superseded in part (updated 2026-09-01):** The filesystem-purity, safety-marker, terminal-environment,
+> cache-closing, headless-checkpoint, crash-residue, and aborted-source gates in this historical specification are
 > no longer the product contract. See the current
 > [journal replay contract](journal-replay-contract.md). Identity/fingerprint and journal-integrity
 > sections remain useful implementation history.

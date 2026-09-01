@@ -188,7 +188,7 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     assert.deepEqual(
       field(field(tool.inputSchema, "properties"), "action") &&
         field(field(field(tool.inputSchema, "properties"), "action"), "enum"),
-      ["run", "config", "status", "result", "stop", "permissions-response"],
+      ["run", "resume", "config", "status", "result", "stop", "permissions-response"],
       "the published action enum contains only canonical actions",
     );
 
@@ -1098,7 +1098,7 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     assert.match(textOf(paused), /\n  line-6\n/);
     assert.doesNotMatch(textOf(paused), /\n  line-[1-5]\n/);
     assert.doesNotMatch(textOf(paused), /ghp_/);
-    assert.match(textOf(paused), /resumeFromRunId/);
+    assert.match(textOf(paused), /action="resume"/);
 
     const failed = await client.callTool({
       name: "workflow",
@@ -1205,7 +1205,10 @@ test("paused run -> shell does NOT throw: isError:false, status 'paused', resetH
     const text = textOf(res);
     assert.match(text, /paused/, "summary reports the paused status");
     assert.ok(text.includes("Resets in ~3h"), "the provider resetHint passes through verbatim");
-    assert.ok(text.includes(String(sc.runId)) && text.includes("resumeFromRunId"), "summary tells the host how to resume");
+    assert.ok(
+      text.includes(String(sc.runId)) && text.includes('action="resume"'),
+      "summary tells the host how to resume",
+    );
   } finally {
     await dispose();
   }
