@@ -1601,11 +1601,6 @@ bijection on the next hop.
   calls return the counter to zero and report dense root allocation counts even when the script
   throws; invalid/negative/non-monotonic transitions fail closed; a late decrement never retrofits
   the terminal file.
-- **Budget:** non-contiguous hits add source logical debit once; live calls add actual debit;
-  token/provider usage remains zero for hits; phase/run gates see logical spent; missing debit
-  disables v1; positional current spend stays zero while a forced-positional -> identity multi-hop
-  preserves the original debit; legacy positional has no fabricated debit. Isolation trajectory
-  tests remain unchanged.
 - **Checkpoints:** proven host decision replays with shifted indexes and preserves its provenance
   across multiple hops; injected reply keyed by source index reaches a shifted current checkpoint;
   a quiescent checkpoint pause with a unique validated reply remains identity-v1 and flattens its

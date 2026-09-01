@@ -1311,7 +1311,7 @@ export class WorkflowManager extends EventEmitter {
       predictedPositionalReplayablePrefix(admission.eligibility, sourceJournal, managed.calls),
     );
     if (admission.checkpointSeed) managed.resumeSeed = admission.checkpointSeed;
-    // Marked format-1 rows can republish matching debit/diagnostic provenance under format 2;
+    // Marked format-1 rows can republish matching diagnostic provenance under format 2;
     // markerless legacy rows have no trustworthy source-call facts to promote.
     const retainSourceCallFacts =
       admission.eligibility !== "legacy" ||

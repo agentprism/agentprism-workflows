@@ -65,7 +65,7 @@ export interface PersistedAgentState {
   timeoutMs?: number | null;
   /** Resolved no-backend-activity deadline for each attempt; null means disabled. */
   idleTimeoutMs?: number | null;
-  /** This logical call's aggregate token debit (provider total or estimate). */
+  /** This logical call's aggregate observed token total (provider total or estimate). */
   tokens?: number;
   callIndex?: number;
   scope?: string;

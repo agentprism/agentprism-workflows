@@ -316,7 +316,7 @@ three ways:
   semantics.
 
 Every other execution option is identical to foreground, including `maxAgents`, per-run agent
-`concurrency`, retries, timeout, token budget, approved script backends, and checkpoint reply
+`concurrency`, retries, timeout, approved script backends, and checkpoint reply
 injection used during resume.
 
 When `background: true` and `resumeFromRunId` are supplied together, the MCP adapter continues its

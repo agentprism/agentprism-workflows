@@ -128,7 +128,7 @@ export type PreparedResume =
        *  compatibility and initializes firstMiss to 0. */
       eligibility: "legacy" | "safe-prefix" | "all-live";
       /** Root source manifest by source index when available; empty for pre-manifest legacy
-       *  sources. Used to validate inputs and carry debit/diagnostic provenance. */
+       *  sources. Used to validate inputs and carry diagnostic provenance. */
       sourceCalls: ReadonlyMap<number, WorkflowCallRecord>;
       /** Present only for a new-format shifted checkpoint injection. Its candidates
        *  array is empty; commitSeed has the same critical semantics as above. */
