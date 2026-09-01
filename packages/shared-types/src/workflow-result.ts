@@ -281,9 +281,6 @@ export interface WorkflowCallReplayProvenance {
   sourceRunId: string;
   recordedIndex: number;
   match: WorkflowResumeMatch;
-  /** Preserved source cost. Applied to script-visible spent only by identity-v1;
-   *  absent for checkpoints and legacy rows without a source manifest. */
-  logicalBudgetDebit?: number;
   /** Agents only: legacy source-world classification retained as diagnostic
    *  provenance. It never determines whether a call is replayable. */
   sourceResumeSafety?: WorkflowResumeSafety;
@@ -302,7 +299,6 @@ export type WorkflowResumeCallDecision =
       recordedIndex: number;
       match: WorkflowResumeMatch;
       reason?: never;
-      logicalBudgetDebit?: number;
       checkpointInjected?: true;
     }
   | {
@@ -316,7 +312,6 @@ export type WorkflowResumeCallDecision =
       sourceRunId?: never;
       recordedIndex?: never;
       match?: never;
-      logicalBudgetDebit?: never;
       checkpointInjected?: never;
     }
   | {
@@ -327,7 +322,6 @@ export type WorkflowResumeCallDecision =
       sourceRunId?: never;
       recordedIndex?: never;
       match?: never;
-      logicalBudgetDebit?: never;
       checkpointInjected?: never;
     };
 
@@ -500,9 +494,6 @@ export interface WorkflowCallRecord {
   isolation?: "worktree";
   /** The post-resolution execution directory handed to the runner. */
   resolvedCwd?: string;
-  /** What this logical call added to the run's script-visible spent value. Zero on
-   *  journal-replayed rows; absent on checkpoint rows. */
-  budgetDebit?: number;
   /** Legacy source-world classification retained for diagnostics and old journal
    *  compatibility. Replay eligibility is based on recorded call correspondence,
    *  not this marker. */
@@ -575,7 +566,6 @@ export interface WorkflowRunStatusTruncation {
 /** Host-resolved execution bounds in force for one run. */
 export interface WorkflowRunLimits {
   maxAgents: number;
-  tokenBudget: number | null;
   concurrency: number;
   agentRetries: number;
   /** Total-wall-clock ceiling for each attempt; null means the host imposes none. */

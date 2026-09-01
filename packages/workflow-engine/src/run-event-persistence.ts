@@ -550,7 +550,6 @@ function isCallRecord(value: unknown, projected: boolean): boolean {
     !hasOptional(value, "worktree", isBoolean) ||
     !hasOptional(value, "isolation", (candidate) => candidate === "worktree") ||
     !hasOptional(value, "resolvedCwd", text) ||
-    !hasOptional(value, "budgetDebit", isNonNegativeSafeInteger) ||
     !hasOptional(value, "settlementOrdinal", isPositiveSafeInteger) ||
     !hasOptional(value, "provenance", (candidate) => isProvenance(candidate, projected)) ||
     !hasOptional(value, "scope", text)
@@ -774,6 +773,16 @@ function recordShapeIsValid(value: unknown, requestedRunId: string): value is Ru
   );
 }
 
+function stripLegacyBudgetFields(record: RunEventLogRecord): RunEventLogRecord {
+  if (record.event.type !== "callRecord") return record;
+  const { budgetDebit: _budgetDebit, ...currentCall } = record.event.record as
+    typeof record.event.record & { budgetDebit?: unknown };
+  return {
+    ...record,
+    event: { ...record.event, record: currentCall },
+  };
+}
+
 function isEnoent(error: unknown): boolean {
   return isObject(error) && error.code === "ENOENT";
 }
@@ -966,7 +975,7 @@ function parseLogFrom(
     if (semanticError !== undefined) {
       throw eventError(`Event record ${expectedSeq} ${semanticError}`, "CORRUPT_LOG", runId, path, value.seq);
     }
-    records.push(value);
+    records.push(stripLegacyBudgetFields(value));
     offset = lf + 1;
     completeBytes = offset;
     expectedSeq += 1;

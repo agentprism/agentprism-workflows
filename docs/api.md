@@ -249,7 +249,6 @@ type WorkflowResumeCallDecision =
       sourceRunId: string;
       recordedIndex: number;
       match: WorkflowResumeMatch;
-      logicalBudgetDebit?: number;
       checkpointInjected?: true;
     }
   | {
@@ -417,10 +416,10 @@ the other side of a nested workflow can still replay. This remains true when a w
 a live host checkpoint callback runs. The engine never uses ambient/world effects as an implicit
 dependency graph.
 
-Identity replays preserve the source accounting debit on the record, but current `tokenUsage`,
-provider cost, and the current physical `WorkflowCallRecord.budgetDebit` remain zero; the debit
-field remains for record-shape stability. Replayed agent sessions open no new
-session: their record keeps source session/backend/cwd/reopen fields and rebinds only the current
+Identity replays are free: current `tokenUsage` and provider cost remain zero. Historical
+`tokenBudget`, `budgetDebit`, and `logicalBudgetDebit` properties are ignored when old persisted
+runs are read and are never copied into new call records, resume provenance, or reports. Replayed
+agent sessions open no new session: their record keeps source session/backend/cwd/reopen fields and rebinds only the current
 call index, label, and phase. Completed checkpoint decisions use the same identity rules plus an
 equal fingerprint of `default`, `headless`, and `timeoutMs`, regardless of host/headless origin.
 New-run `checkpointReplies` keys name source indexes. A reply may follow a uniquely moved checkpoint
@@ -543,7 +542,6 @@ interface WorkflowRunStatus {
 
 interface WorkflowRunLimits {
   maxAgents: number;
-  tokenBudget: number | null; // persisted compatibility field; new runs report null
   concurrency: number;
   agentRetries: number;
   agentTimeoutMs: number | null;
@@ -1029,7 +1027,6 @@ one of the following frozen values. First failure wins.
 | `runtime-mismatch` | Run under exactly the recorded Node/V8 and path/input formats, or re-record. |
 | `no-limits` | Re-record so effective execution limits are persisted. |
 | `agent-limit-boundary` | Re-record with `maxAgents` strictly greater than allocated calls. |
-| `no-budget-trajectory` | Re-record so every call has a settlement ordinal and every agent a budget debit. |
 | `no-execution-cwd` | Supply `executionCwd` for a legacy recording, or create a new recording. |
 | `no-environment-identity` | Re-record in Git or supply the same explicit `environmentKey` outside Git. |
 | `environment-mismatch` | Restore the recorded Git HEAD/dirty state or matching non-Git key, then retry. |

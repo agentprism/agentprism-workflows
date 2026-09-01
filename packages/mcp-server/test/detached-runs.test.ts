@@ -72,7 +72,6 @@ const TWO_AGENT_BACKGROUND = [
 
 const EXPECTED_LIMITS = {
   maxAgents: 1_000,
-  tokenBudget: null,
   concurrency: 3,
   agentRetries: 1,
   agentTimeoutMs: 50_000,
@@ -249,7 +248,6 @@ test("MCP status exposes the resolved timeout and AGENT_TIMEOUT call failure", a
   const { client, dispose } = await connect(runner, { listTools: true });
   const expectedLimits = {
     maxAgents: 1_000,
-    tokenBudget: null,
     concurrency: 2,
     agentRetries: 0,
     agentTimeoutMs: 25,
@@ -310,7 +308,6 @@ test("MCP idle watchdog cancels a silent attempt and exposes AGENT_IDLE_TIMEOUT"
   const { client, dispose } = await connect(runner, { listTools: true });
   const expectedLimits = {
     maxAgents: 1_000,
-    tokenBudget: null,
     concurrency: 8,
     agentRetries: 0,
     agentTimeoutMs: null,

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { AgentRunner, JournalEntry, RunOptions } from "@automatalabs/shared-types";
+import type { AgentRunner, JournalEntry, RunOptions, WorkflowRunLimits } from "@automatalabs/shared-types";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import {
   MAX_STRUCTURED_STATUS_BYTES,
@@ -94,9 +94,10 @@ test("inspection normalizes pre-watchdog limits to an explicitly disabled idle b
     concurrency: 2,
     agentRetries: 1,
     agentTimeoutMs: null,
-  };
+  } as WorkflowRunLimits & { tokenBudget: null };
   const status = projectWorkflowRunStatus(source);
   assert.equal(status.limits?.agentIdleTimeoutMs, null);
+  assert.equal(Object.hasOwn(status.limits ?? {}, "tokenBudget"), false);
 });
 
 test("inspection is live-first, cold-readable, ordered, missing-safe, and read-only", async () => {

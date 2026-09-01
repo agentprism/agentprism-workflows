@@ -88,8 +88,6 @@ export interface PersistedResumeCandidate {
   /** Frozen source values; entry.index/call.index remain the source index. */
   entry: JournalEntry;
   call: WorkflowCallRecord;
-  /** Logical debit preserved across resume hops. Agent candidates only. */
-  logicalBudgetDebit?: number;
 }
 
 /** A settled non-result occurrence retained in the identity matcher. It can never

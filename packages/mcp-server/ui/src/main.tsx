@@ -56,14 +56,6 @@ function runIdFromResult(result: CallToolResult | null): string | undefined {
     : undefined;
 }
 
-function budgetFromResult(result: CallToolResult | null): number | null | undefined {
-  const structured = result?.structuredContent as
-    | { limits?: { tokenBudget?: unknown } }
-    | undefined;
-  const budget = structured?.limits?.tokenBudget;
-  return typeof budget === "number" || budget === null ? budget : undefined;
-}
-
 interface MonitorState {
   model: RunModel | null;
   connectionLost: boolean;
@@ -328,7 +320,6 @@ function MonitorBody({
   connectionLost,
   disconnected,
   fatal,
-  budget,
 }: {
   app: App;
   model: RunModel;
@@ -336,7 +327,6 @@ function MonitorBody({
   connectionLost: boolean;
   disconnected: boolean;
   fatal: string | undefined;
-  budget: number | null | undefined;
 }) {
   const [view, setView] = useState<{ kind: "graph" } | { kind: "detail"; target: NodeSelection }>({
     kind: "graph",
@@ -400,7 +390,7 @@ function MonitorBody({
         {usage !== undefined && (
           <span className="totals">
             <strong>{fmtTokens(usage.total)}</strong>
-            {budget !== undefined && budget !== null ? ` / ${fmtTokens(budget)} tok` : " tok"}
+            {" tok"}
             {"  "}
             {fmtCost(usage.cost)}
           </span>
@@ -438,7 +428,6 @@ function RunMonitor() {
   const runId = runIdFromArgs(toolArgs) ?? runIdFromResult(toolResult);
   const { model, connectionLost, disconnected, fatal } = useRunModel(app, runId, tornDown);
   const skeleton = useSkeleton(app, runId);
-  const budget = budgetFromResult(toolResult);
 
   if (error) return <div className="log-empty">Failed to connect to host: {error.message}</div>;
   if (!app) return <div className="log-empty">Connecting…</div>;
@@ -456,7 +445,6 @@ function RunMonitor() {
       connectionLost={connectionLost}
       disconnected={disconnected}
       fatal={fatal}
-      budget={budget}
     />
   );
 }

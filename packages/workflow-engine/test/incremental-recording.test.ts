@@ -55,7 +55,6 @@ function resultRow(overrides: Partial<WorkflowCallRecord> = {}): WorkflowCallRec
     hash: "a".repeat(64),
     outcome: "result",
     origin: "runner",
-    budgetDebit: 1,
     scope: "source",
     ...overrides,
   };
@@ -239,7 +238,7 @@ return { safe, unsafe, empty }`),
     );
     assert.equal(
       validateResumeSafetyMarker(
-        resultRow({ kind: "checkpoint", origin: "confirm", resumeSafety: "declared-read-only", budgetDebit: undefined }),
+        resultRow({ kind: "checkpoint", origin: "confirm", resumeSafety: "declared-read-only" }),
         false,
       ),
       false,

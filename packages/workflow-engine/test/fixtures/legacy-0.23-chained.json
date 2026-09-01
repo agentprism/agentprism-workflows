@@ -94,7 +94,13 @@
       },
       "budgetDebit": 0,
       "settlementOrdinal": 1,
-      "scope": "mrpnqf9e-azqmcv"
+      "scope": "mrpnqf9e-azqmcv",
+      "replay": {
+        "sourceRunId": "mrpnqf8o-9hmztt",
+        "recordedIndex": 0,
+        "match": "index-hash",
+        "logicalBudgetDebit": 2
+      }
     },
     {
       "index": 1,
@@ -115,7 +121,13 @@
       },
       "budgetDebit": 0,
       "settlementOrdinal": 2,
-      "scope": "mrpnqf9e-azqmcv"
+      "scope": "mrpnqf9e-azqmcv",
+      "replay": {
+        "sourceRunId": "mrpnqf8o-9hmztt",
+        "recordedIndex": 1,
+        "match": "index-hash",
+        "logicalBudgetDebit": 2
+      }
     },
     {
       "index": 2,
@@ -136,7 +148,13 @@
       },
       "budgetDebit": 0,
       "settlementOrdinal": 3,
-      "scope": "mrpnqf9e-azqmcv"
+      "scope": "mrpnqf9e-azqmcv",
+      "replay": {
+        "sourceRunId": "mrpnqf8o-9hmztt",
+        "recordedIndex": 2,
+        "match": "index-hash",
+        "logicalBudgetDebit": 2
+      }
     }
   ],
   "callsAllocated": 3,

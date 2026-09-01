@@ -536,13 +536,10 @@ export interface WorkflowRunLimitOptions {
   agentIdleTimeoutMs?: number | null;
 }
 
-/** Resolve the run limits once so admission, persistence, and execution report the same values.
- *  `tokenBudget` stays in the persisted record, ALWAYS null — the budget is deleted (§7); the
- *  field survives only so old persisted runs and isolation recordings keep their shape. */
+/** Resolve the run limits once so admission, persistence, and execution report the same values. */
 export function resolveWorkflowRunLimits(options: WorkflowRunLimitOptions): WorkflowRunLimits {
   return {
     maxAgents: options.maxAgents ?? MAX_AGENTS_PER_RUN,
-    tokenBudget: null,
     concurrency: normalizeConcurrency(
       options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
     ),
@@ -1202,7 +1199,6 @@ export async function runWorkflow<T = unknown>(
         origin: "engine",
         error: errorRecord,
         aborted: true,
-        budgetDebit: 0,
         ...(legacyResumeSafety === "declared-read-only"
           ? { resumeSafety: legacyResumeSafety }
           : {}),
@@ -1232,7 +1228,7 @@ export async function runWorkflow<T = unknown>(
       let worktree = precreatedWorktree;
       let runCwd = preparedRunCwd;
       let attemptsRan = 0;
-      let budgetDebit = 0;
+      let observedTokens = 0;
       const sealedUsage: AgentUsage[] = [];
       const modelFallbacks: string[] = [];
       const continuationCandidate = preparedContinuation?.candidatesByIndex.get(callIndex);
@@ -1257,7 +1253,7 @@ export async function runWorkflow<T = unknown>(
           shared.tokenUsage.cacheWrite += usage.cacheWrite;
         }
         shared.tokenUsage.total += tokens;
-        budgetDebit += tokens;
+        observedTokens += tokens;
         options.onTokenUsage?.({ ...shared.tokenUsage }, callbackContext);
         return tokens;
       };
@@ -1337,7 +1333,6 @@ export async function runWorkflow<T = unknown>(
           ...(modelFallbacks.length ? { modelFallback: true as const } : {}),
           ...(worktree?.isolated ? { worktree: true } : {}),
           ...(runCwd !== undefined && origin === "runner" ? { resolvedCwd: runCwd } : {}),
-          budgetDebit,
           ...(resumeDeclared && resolvedIsolation === undefined
             ? { resumeSafety: "declared-read-only" as const }
             : resumeDeclared &&
@@ -1352,7 +1347,7 @@ export async function runWorkflow<T = unknown>(
           label,
           phase: assignedPhase,
           result: null,
-          tokens: budgetDebit,
+          tokens: observedTokens,
           worktree: runCwd,
           model: slot?.modelResolved ?? displayModel,
           error: workflowError.message,
@@ -1616,7 +1611,6 @@ export async function runWorkflow<T = unknown>(
               ...(modelFallbacks.length ? { modelFallback: true as const } : {}),
               ...(worktree?.isolated ? { worktree: true } : {}),
               resolvedCwd: runCwd,
-              budgetDebit,
               ...(resumeDeclared && resolvedIsolation === undefined
                 ? { resumeSafety: "declared-read-only" as const }
                 : resumeDeclared &&
@@ -1655,7 +1649,7 @@ export async function runWorkflow<T = unknown>(
               label,
               phase: assignedPhase,
               result: resultSnapshot,
-              tokens: budgetDebit,
+              tokens: observedTokens,
               worktree: runCwd,
               model: slot.modelResolved ?? displayModel,
               session,
@@ -1732,7 +1726,6 @@ export async function runWorkflow<T = unknown>(
       sourceRunId: string;
       recordedIndex: number;
       match: "path-hash" | "unique-hash" | "index-hash";
-      logicalBudgetDebit?: number;
       sourceResumeSafety?: WorkflowResumeSafety;
       rebindSession: boolean;
       manifestProvenance: boolean;
@@ -1759,7 +1752,6 @@ export async function runWorkflow<T = unknown>(
         outcome: "result",
         origin: "journal-replay",
         ...(cachedUsage ? { usage: cachedUsage } : {}),
-        budgetDebit: 0,
         ...(input.sourceResumeSafety ? { resumeSafety: input.sourceResumeSafety } : {}),
         ...(input.manifestProvenance
           ? {
@@ -1767,9 +1759,6 @@ export async function runWorkflow<T = unknown>(
                 sourceRunId: input.sourceRunId,
                 recordedIndex: input.recordedIndex,
                 match: input.match,
-                ...(input.logicalBudgetDebit !== undefined
-                  ? { logicalBudgetDebit: input.logicalBudgetDebit }
-                  : {}),
                 ...(input.sourceResumeSafety
                   ? { sourceResumeSafety: input.sourceResumeSafety }
                   : {}),
@@ -1846,7 +1835,6 @@ export async function runWorkflow<T = unknown>(
               sourceRunId: source.candidate.sourceRunId,
               recordedIndex: source.candidate.recordedIndex,
               match: match.match,
-              logicalBudgetDebit: source.candidate.logicalBudgetDebit as number,
             });
             gate.release();
             return replayPreparedAgent({
@@ -1855,7 +1843,6 @@ export async function runWorkflow<T = unknown>(
               sourceRunId: source.candidate.sourceRunId,
               recordedIndex: source.candidate.recordedIndex,
               match: match.match,
-              logicalBudgetDebit: source.candidate.logicalBudgetDebit,
               sourceResumeSafety: source.candidate.call.resumeSafety,
               rebindSession: true,
               manifestProvenance: true,
@@ -1900,9 +1887,6 @@ export async function runWorkflow<T = unknown>(
               sourceRunId: preparedResume.sourceRunId,
               recordedIndex: callIndex,
               match: match.match,
-              ...(match.logicalBudgetDebit === undefined
-                ? {}
-                : { logicalBudgetDebit: match.logicalBudgetDebit }),
             });
             gate.release();
             return replayPreparedAgent({
@@ -1911,7 +1895,6 @@ export async function runWorkflow<T = unknown>(
               sourceRunId: preparedResume.sourceRunId,
               recordedIndex: callIndex,
               match: match.match,
-              logicalBudgetDebit: match.logicalBudgetDebit,
               sourceResumeSafety,
               rebindSession: false,
               manifestProvenance: sourceCall !== undefined,
@@ -1979,7 +1962,7 @@ export async function runWorkflow<T = unknown>(
         if (!settled) {
           const errorRecord = projectRecordedError(error);
           const workflowError = wrapError(error, { agentLabel: label });
-          settle({ outcome: "error", origin: "engine", error: errorRecord, budgetDebit: 0 });
+          settle({ outcome: "error", origin: "engine", error: errorRecord });
           if (agentStartEmitted) {
             emitAgentEnd({
               label,
@@ -2013,7 +1996,6 @@ export async function runWorkflow<T = unknown>(
             outcome: "result",
             origin: "journal-replay",
             ...(cachedUsage ? { usage: cachedUsage } : {}),
-            budgetDebit: 0,
           });
           emitAgentEnd({
             label,
@@ -2028,7 +2010,7 @@ export async function runWorkflow<T = unknown>(
         } catch (error) {
           const errorRecord = projectRecordedError(error);
           const workflowError = wrapError(error, { agentLabel: label });
-          settle({ outcome: "error", origin: "engine", error: errorRecord, budgetDebit: 0 });
+          settle({ outcome: "error", origin: "engine", error: errorRecord });
           emitAgentEnd({
             label,
             phase: assignedPhase,

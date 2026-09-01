@@ -521,7 +521,6 @@ interface WorkflowRunStatus {
 
 interface WorkflowRunLimits {
   maxAgents: number;
-  tokenBudget: null; // persisted-shape compatibility field; new runs always report null
   concurrency: number;
   agentRetries: number;
   agentTimeoutMs: number | null;

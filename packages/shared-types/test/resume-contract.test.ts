@@ -94,7 +94,6 @@ const replayProvenance: WorkflowCallReplayProvenance = {
   sourceRunId: "source-run",
   recordedIndex: 4,
   match: "unique-hash",
-  logicalBudgetDebit: 12,
   sourceResumeSafety: "declared-read-only",
 };
 const checkpointReplayProvenance: WorkflowCallReplayProvenance = {
@@ -111,7 +110,6 @@ const replayedDecision: WorkflowResumeCallDecision = {
   sourceRunId: "source-run",
   recordedIndex: 4,
   match: "unique-hash",
-  logicalBudgetDebit: 12,
 };
 const liveDecision: WorkflowResumeCallDecision = {
   index: 1,
@@ -223,7 +221,6 @@ const resumeCall: WorkflowCallRecord = {
   ...legacyCall,
   inputsHash: "checkpoint-or-agent-inputs",
   origin: "journal-replay",
-  budgetDebit: 0,
   resumeSafety: "declared-read-only",
   replay: replayProvenance,
 };

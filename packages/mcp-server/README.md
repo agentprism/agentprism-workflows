@@ -299,7 +299,6 @@ Background start and bounded collection:
   "status": "running",
   "limits": {
     "maxAgents": 1000,
-    "tokenBudget": null,
     "concurrency": 4,
     "agentRetries": 0,
     "agentTimeoutMs": null,
@@ -545,9 +544,9 @@ Each call has its deterministic index, known agent/checkpoint attribution, a com
 `resultPreview`, and redaction/truncation flags. Agent rows also expose resolved `timeoutMs`,
 `idleTimeoutMs`, and a terminal `errorCode`; timed-out and host-cancelled calls therefore remain
 visible as `AGENT_TIMEOUT`, `AGENT_IDLE_TIMEOUT`, and `AGENT_CANCELLED`. `limits` contains
-`maxAgents`, `tokenBudget` (a persisted-shape compatibility field that is always `null` for new
-runs), `concurrency`, `agentRetries`, `agentTimeoutMs`, and `agentIdleTimeoutMs` as resolved for
-this run (legacy persisted rows may omit it). Ordinary call-status projection never returns script,
+`maxAgents`, `concurrency`, `agentRetries`, `agentTimeoutMs`, and `agentIdleTimeoutMs` as resolved
+for this run (legacy persisted rows may omit it). Historical budget fields are accepted only while
+reading old persisted runs and are omitted from current status output. Ordinary call-status projection never returns script,
 args, prompts, histories, hashes, session IDs, cwd, checkpoint/auth details, or raw journal results;
 a live `pendingPermissions` entry carries a safe ACP projection so the caller can make the decision.
 The private ACP session id is omitted; diagnostic values are credential-redacted and scalar-bounded,

@@ -67,7 +67,6 @@ return { success, exhausted, confirmed }`,
         usage: success.usage,
         modelResolved: success.modelResolved,
         backendId: success.backendId,
-        budgetDebit: success.budgetDebit,
         scope: success.scope,
       },
       {
@@ -77,7 +76,6 @@ return { success, exhausted, confirmed }`,
         usage: usage(7),
         modelResolved: "provider/concrete",
         backendId: "backend",
-        budgetDebit: 7,
         scope: "manifest-run",
       },
     );
@@ -124,7 +122,7 @@ return { a, c }`,
     });
     assert.deepEqual(replay.calls?.map((row) => row.origin), ["journal-replay", "journal-replay"]);
     assert.deepEqual(replay.calls?.[0].usage, usage(9));
-    assert.equal(replay.calls?.[0].budgetDebit, 0);
+    assert.equal(Object.hasOwn(replay.calls?.[0] ?? {}, "budgetDebit"), false);
   });
 
   it("puts the same recorded-error projection on the manifest row and terminal event", async () => {
@@ -217,7 +215,7 @@ return { a, c }`,
     assert.equal(engineRows[0].aborted, true);
   });
 
-  it("returns the effective limits (tokenBudget pinned null — the budget is deleted) and exact provider/estimate budget debits", async () => {
+  it("returns current effective limits and observational provider/estimate token usage without budget fields", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "manifest-cwd-"));
     try {
       let call = 0;
@@ -246,14 +244,16 @@ return [a, b]`,
       );
       assert.deepEqual(result.effectiveLimits, {
         maxAgents: 7,
-        tokenBudget: null,
         concurrency: 3,
         agentRetries: 3,
         agentTimeoutMs: 123,
         agentIdleTimeoutMs: null,
       });
-      assert.equal(result.calls?.[0].budgetDebit, 11);
-      assert.equal(result.calls?.[1].budgetDebit, Math.ceil(JSON.stringify("four").length / 4) + Math.ceil(JSON.stringify("long prompt").length / 4));
+      const estimated = Math.ceil(JSON.stringify("four").length / 4) +
+        Math.ceil(JSON.stringify("long prompt").length / 4);
+      assert.equal(result.tokenUsage?.total, 11 + estimated);
+      assert.equal(result.calls?.some((row) => Object.hasOwn(row, "budgetDebit")), false);
+      assert.equal(Object.hasOwn(result.effectiveLimits ?? {}, "tokenBudget"), false);
       assert.equal(result.calls?.every((row) => row.resolvedCwd === cwd), true);
     } finally {
       rmSync(cwd, { recursive: true, force: true });

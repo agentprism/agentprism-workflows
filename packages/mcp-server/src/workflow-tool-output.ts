@@ -29,7 +29,6 @@ const tokenUsageSchema = z.object({
 
 const workflowRunLimitsSchema = z.object({
   maxAgents: z.number().int().positive(),
-  tokenBudget: z.number().nonnegative().nullable(),
   concurrency: z.number().int().positive(),
   agentRetries: z.number().int().nonnegative(),
   agentTimeoutMs: z.number().nonnegative().nullable(),
@@ -163,7 +162,6 @@ const resumeCallDecisionSchema = z.discriminatedUnion("action", [
     sourceRunId: z.string(),
     recordedIndex: z.number().int().nonnegative(),
     match: z.enum(["path-hash", "unique-hash", "index-hash"]),
-    logicalBudgetDebit: z.number().optional(),
     checkpointInjected: z.literal(true).optional(),
   }),
   z.object({

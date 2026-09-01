@@ -53,8 +53,8 @@ bytes:
 - `PersistedRunState` records the script, args, effective cwd, runtime/path/input format, and the
   run-creation environment identity;
 - isolation's `ReplayRunner` already indexes rows by
-  `kind + "\u0000" + path + "\u0000" + hash`, rejects ambiguity, carries budget trajectory, and
-  reports typed correspondence decisions.
+  `kind + "\u0000" + path + "\u0000" + hash`, rejects ambiguity, preserves deterministic
+  settlement order, and reports typed correspondence decisions.
 
 Naive hash matching is nevertheless unsound for ordinary coding agents. File flow is invisible to
 the prompt hash. If a changed upstream agent runs live and writes different files, an unchanged
@@ -508,21 +508,17 @@ For a new-format source, validate in this order:
    journal entry; the relation is a bijection. Stale/unpaired/unknown-kind entries or result rows
    make the new-format source malformed and are not served positionally. Non-result call rows need
    no journal pair.
-7. Every agent result row has a non-empty NUL-free path and lowercase SHA-256 `inputsHash`. Its effective
-   logical debit is selected by origin: an origin-`"runner"` row requires finite non-negative
-   `budgetDebit`; an origin-`"journal-replay"` row requires `replay` provenance with a finite
-   non-negative `logicalBudgetDebit` and physical `budgetDebit === 0`; every other origin is invalid
-   for an agent result. This
-   origin-specific rule prevents a replay row's physical `budgetDebit: 0` from laundering away its
-   source cost. Every checkpoint result row has a non-empty NUL-free path, a lowercase SHA-256
-   `inputsHash` produced by `hashCheckpointInputs()` (§2.7), omits `budgetDebit`, and has an origin
+7. Every agent result row has a non-empty NUL-free path and lowercase SHA-256 `inputsHash`. Its
+   origin is `"runner"` or `"journal-replay"`; every other origin is invalid for an agent result.
+   Every checkpoint result row has a non-empty NUL-free path, a lowercase SHA-256
+   `inputsHash` produced by `hashCheckpointInputs()` (§2.7), and has an origin
    of `"confirm"`, `"headless"`, or `"journal-replay"`. Every present safety marker
    is a known literal consistent
    with the row's outcome/origin/worktree fields. `replay` is present exactly on non-legacy
    origin-`"journal-replay"` result rows and absent on every other origin/outcome. A present
    `replay` object must have a non-empty `sourceRunId`, non-negative safe
-   `recordedIndex`, known `match`, and only correctly-typed optional fields; logical debit and
-   `sourceResumeSafety` are agent-only, checkpoint flags are checkpoint-only, and
+   `recordedIndex`, known `match`, and only correctly-typed optional fields;
+   `sourceResumeSafety` is agent-only, checkpoint flags are checkpoint-only, and
    `checkpointInjected` implies `checkpointHostDecision`. An agent replay requires both agent
    fields and equality between `sourceResumeSafety` and `resumeSafety`; a checkpoint replay
    requires `checkpointHostDecision: true`. Frozen journal results retain the existing strict-JSON
@@ -538,8 +534,7 @@ For a new-format source, validate in this order:
    non-empty `sourceRunId`, matching non-negative safe `recordedIndex`/entry/call indexes, equal
    explicit kind/hash, `outcome: "result"`, entry/call scopes both exactly equal to
    `candidate.sourceRunId`, strict-JSON result/session/usage, and required path/input facts. An agent
-   candidate has an admissible safety marker and a finite non-negative `logicalBudgetDebit` exactly
-   equal to rule 7's origin-selected debit; a checkpoint candidate omits that field and satisfies
+   candidate has an admissible safety marker; a checkpoint candidate satisfies
    rule 7's host-decision origin/provenance proof, including its checkpoint `inputsHash`. Every
    injection has a non-empty source ID, non-negative safe `recordedIndex`, non-empty NUL-free path,
    lowercase SHA-256 hash, a lowercase SHA-256 `inputsHash`, and a strict-JSON decision. A call
@@ -656,8 +651,6 @@ export interface PersistedResumeCandidate {
   /** Frozen source values; entry.index/call.index remain the source index. */
   entry: JournalEntry;
   call: WorkflowCallRecord;
-  /** Logical debit preserved across resume hops. Agent candidates only. */
-  logicalBudgetDebit?: number;
 }
 
 export interface PersistedResumeCallBlocker {
@@ -742,12 +735,9 @@ export interface WorkflowRunOptions {
 }
 ```
 
-For an agent candidate, `logicalBudgetDebit` is copied from `call.budgetDebit` when
-`call.origin === "runner"` and from the required `call.replay.logicalBudgetDebit` when
-`call.origin === "journal-replay"`; it must be finite and non-negative. There is no nullish
-fallback from replay provenance to physical `budgetDebit`. This normalization prevents an
-identity-replayed source row (`call.budgetDebit === 0`) from losing the original logical debit on
-the next hop.
+Historical `tokenBudget`, `budgetDebit`, and `logicalBudgetDebit` properties are accepted as
+ignored compatibility input when persisted runs are read. Candidate normalization strips them,
+so a new seed never carries obsolete budget metadata across resume hops.
 
 The seed contains the source agent result pairs admitted by §2.5 plus only the proven-host subset
 of checkpoint result pairs, validated non-result call blockers, the prepared pending injection if
@@ -976,17 +966,13 @@ mode is carried by `PreparedResume.eligibility`:
    entry lowers `firstMiss` to the current index; every later agent/checkpoint runs live.
 6. A parent `workflow()` invocation synchronously lowers `firstMiss` to the current `callSeq` before
    entering its unseeded child, so no later parent call replays after live nested work.
-7. Replayed calls cost zero current tokens and add zero to script-visible `budget.spent()`, exactly
-   as today.
+7. Replayed calls cost zero current provider tokens.
 
 An ordinary positional journal hit reports `match: "index-hash"` and
 `recordedIndex: currentIndex`; a shifted/same-index injection reports its identity match from
-§2.7. The ordinary hit's freshly
-emitted journal/manifest entry carries the source run ID and, when the validated source call is
-available, its normalized logical debit. Positional mode does not apply that debit to current
-`shared.spent`; carrying it is lineage metadata so a later identity hop cannot launder cost through
-a forced/unsafe positional hop. Legacy sources without call manifests carry no debit and remain
-`legacyResume`.
+§2.7. The ordinary hit's freshly emitted journal/manifest entry carries the source run ID when the
+validated source call is available. Historical debit metadata is ignored and not copied. Legacy
+sources without call manifests remain `legacyResume`.
 
 Non-legacy new-format positional fallback additionally passed the admission gate, so the current
 workspace matches the source terminal workspace. `"safe-prefix"` also proved source start equals
@@ -1064,38 +1050,15 @@ and must be expressed as a sequenced dependency. This limitation does not permit
 replay after a lower-index unsafe decision: the chain and whole-cache closure still forbid that
 serve.
 
-### 2.10 Budget accounting
+### 2.10 Usage telemetry
 
-Identity replay uses a **logical resume debit** so non-contiguous hits preserve budget-driven
-control flow without claiming current spend:
-
-- immediately before a selected replay settles, add the candidate's normalized
-  `logicalBudgetDebit` once to `shared.spent`;
-- a live call adds its actual current debit through the existing `recordTokens` path;
-- `budget.total`, `budget.spent()`, `budget.remaining()`, phase gates, and the pre-allocation hard
-  gate all read this logical sum;
-- `tokenUsage`, per-agent `tokens`, and provider usage remain current-execution cost: a replay adds
-  zero;
-- current `WorkflowCallRecord.budgetDebit` keeps its isolation-defined meaning and is `0` for a
-  journal replay. The source logical amount is preserved in replay provenance; identity mode adds
-  it to current logical spend, while positional mode carries but does not apply it.
-
-A cached settlement crosses one microtask boundary before applying its debit and resolving its
-promise. This preserves the existing synchronous allocation prefix of `parallel()`: all sibling
-thunks allocate their deterministic indexes before any replay debit can trip the hard budget gate.
-A sequential `await agent(...)` still observes the debit before its continuation, and
-`await parallel(...)` observes the sum of every settled live and replayed sibling. The engine does
-not reproduce source provider latency or reorder current promises by source settlement ordinal.
-
-This is not isolation's full `budgetReplay.trajectory`. Isolation suppresses live accrual and
-replays every source settlement ordinal to hold a comparison trajectory fixed. Mainline resume has
-a new mixture of live and cached calls, so it applies a cached debit when that cached call settles
-and applies live debit normally. Parallel settlement timing remains ordinary Promise timing; the
-contract does not delay a cached result to reproduce provider latency.
-
-A missing/non-finite source debit selected by the origin-specific rule in §2.5 makes a new-format
-source inadmissible rather than silently treating a replay row's `budgetDebit: 0` as logical cost.
-Legacy positional accounting is unchanged.
+Token usage is observational and never participates in replay admission or script control flow.
+A replayed call performs no provider work, so it contributes zero to current `tokenUsage` and
+provider cost. Live calls continue to report provider usage through the existing per-agent and
+run-level telemetry. Settlement ordinals retain deterministic ordering diagnostics, but neither
+mainline replay nor isolation requires a debit or budget trajectory. Cached results are still
+resolved through the existing microtask boundary; the engine does not reproduce source provider
+latency or reorder current promises by source settlement ordinal.
 
 ### 2.11 Sessions and journal rebinding
 
@@ -1249,9 +1212,6 @@ export interface WorkflowCallReplayProvenance {
   sourceRunId: string;
   recordedIndex: number;
   match: WorkflowResumeMatch;
-  /** Preserved source cost. Applied to script-visible spent only by identity-v1;
-   *  absent for checkpoints and legacy rows without a source manifest. */
-  logicalBudgetDebit?: number;
   /** Agents only: source row's admitted safety class. Required on every non-legacy
    *  journal replay and equal to the current row's resumeSafety. */
   sourceResumeSafety?: WorkflowResumeSafety;
@@ -1270,7 +1230,6 @@ export type WorkflowResumeCallDecision =
       recordedIndex: number;
       match: WorkflowResumeMatch;
       reason?: never;
-      logicalBudgetDebit?: number;
       checkpointInjected?: true;
     }
   | {
@@ -1281,7 +1240,6 @@ export type WorkflowResumeCallDecision =
       sourceRunId?: never;
       recordedIndex?: never;
       match?: never;
-      logicalBudgetDebit?: never;
       checkpointInjected?: never;
     }
   | {
@@ -1292,7 +1250,6 @@ export type WorkflowResumeCallDecision =
       sourceRunId?: never;
       recordedIndex?: never;
       match?: never;
-      logicalBudgetDebit?: never;
       checkpointInjected?: never;
     };
 
@@ -1334,9 +1291,7 @@ source run ID or manifest correspondence; reports are guaranteed for manager-own
 `resumeFromRunId` only.
 `origin: "journal-replay"` remains the authoritative manifest origin for replayed calls;
 `replay.recordedIndex` explains non-positional correspondence. Live miss reasons live only in the
-report so the runner-origin manifest shape does not acquire speculative source indexes. A replay
-decision's `logicalBudgetDebit` mirrors provenance: identity-v1 applied it to logical spend;
-positional-v1 only preserved it for a later hop.
+report so the runner-origin manifest shape does not acquire speculative source indexes.
 Every identity/manager-prepared positional replay of a proven host checkpoint writes
 `replay.checkpointHostDecision: true`; an injected reply also writes `checkpointInjected: true`.
 Both fields are forbidden on agent rows, and `checkpointInjected` implies
@@ -1500,7 +1455,7 @@ Refactoring shared pure utilities is allowed but behavior is split deliberately:
 | Recording | frozen journal + manifest cross-check | paused/failed reached prefix allowed; allocated rows are complete/dense | complete, completed, dense manifest required |
 | Inputs hash | common field/validation; agent bytes unchanged | equality required for every agent or checkpoint hit | agent target equality only; served calls do not execute and isolation ignores checkpoint input hashes |
 | Filesystem | common environment equality helper | safety classes + terminal admission + live barrier | run-creation environment comparability |
-| Budget | recorded `budgetDebit` | cached logical debit + live actual debit | full settlement-ordinal trajectory |
+| Usage | provider token/cost telemetry | replay is free; live usage is observational | served calls are free; live target usage is observational |
 | Nested workflow | scope/root helpers | source falls back positional/all-live; a new invocation closes the identity replay cache or lowers positional `firstMiss`; child is unseeded | recording and live invocation rejected |
 | Report | shared clone/freeze conventions | `WorkflowResumeReport` | existing `ReplayReport` unchanged |
 
@@ -1687,7 +1642,7 @@ bijection on the next hop.
   provenance, and ordering are exact; report present for paused/failed runs and absent for ordinary
   runs; no sensitive fields.
 - **Isolation non-regression:** the complete existing `isolation.test.ts`, preflight matrix, reason
-  arrays, budget trajectory, nested exclusion, ambiguous-identity rejection, and report fixtures
+  arrays, settlement ordering, nested exclusion, ambiguous-identity rejection, and report fixtures
   pass unmodified. Add a focused shared-index test proving isolation still uses exact/path-only
   rules rather than the mainline hash-only fallback.
 

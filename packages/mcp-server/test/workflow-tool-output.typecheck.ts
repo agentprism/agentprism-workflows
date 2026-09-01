@@ -1,4 +1,10 @@
-import type { WorkflowReplayEligibility, WorkflowRunStatus } from "@automatalabs/workflows";
+import type {
+  WorkflowCallRecord,
+  WorkflowReplayEligibility,
+  WorkflowResumeCallDecision,
+  WorkflowRunLimits,
+  WorkflowRunStatus,
+} from "@automatalabs/workflows";
 
 import type {
   WorkflowBackgroundAccepted,
@@ -15,7 +21,6 @@ declare const status: WorkflowRunStatus;
 const lineage: WorkflowScriptLineageEntry[] = [];
 const limits = {
   maxAgents: 1_000,
-  tokenBudget: null,
   concurrency: 6,
   agentRetries: 0,
   agentTimeoutMs: null,
@@ -101,6 +106,34 @@ const resourceFields: WorkflowScriptResourceFields = {
   resultUri: "workflow://runs/aa-bb/result",
   lineage,
 };
+const removedBudgetLimit: WorkflowRunLimits = {
+  maxAgents: 1,
+  concurrency: 1,
+  agentRetries: 0,
+  agentTimeoutMs: null,
+  agentIdleTimeoutMs: null,
+  // @ts-expect-error token budgets are not part of current run limits
+  tokenBudget: null,
+};
+const removedCallDebit: WorkflowCallRecord = {
+  index: 0,
+  kind: "agent",
+  hash: "hash",
+  outcome: "result",
+  origin: "runner",
+  // @ts-expect-error debit metadata is not part of current call records
+  budgetDebit: 0,
+};
+const removedLogicalDebit: WorkflowResumeCallDecision = {
+  index: 0,
+  kind: "agent",
+  action: "replayed",
+  sourceRunId: "source",
+  recordedIndex: 0,
+  match: "index-hash",
+  // @ts-expect-error replay reports do not expose logical debit metadata
+  logicalBudgetDebit: 0,
+};
 
 // @ts-expect-error result retrieval requires the exact chunk
 const resultRetrievalWithoutChunk: WorkflowResultRetrieval = {
@@ -180,6 +213,9 @@ void [
   stopped,
   pendingStop,
   resourceFields,
+  removedBudgetLimit,
+  removedCallDebit,
+  removedLogicalDebit,
   executionWithoutSource,
   executionWithoutLimits,
   executionWithoutEvents,

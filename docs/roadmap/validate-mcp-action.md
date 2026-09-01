@@ -12,7 +12,7 @@ neither of which fits hosts that only speak MCP.
 ## Direction
 
 Add `action: "validate"` to the `workflow` tool: accept a script plus the validator's
-existing knobs (`args`, `mockAnswers`, `tokenBudget`, `maxAgents`), run
+existing knobs (`args`, `mockAnswers`, `maxAgents`), run
 `validateWorkflowScript` in the server process, and return the report — including the probed
 per-harness advertised options, which is how an MCP-only host learns what models, modes, and
 config options its installed harnesses actually accept.

@@ -116,7 +116,7 @@ function identityPrepared(
 }
 
 describe("PreparedResume identity engine integration", () => {
-  it("replays moved calls, re-journals current indexes, rebinds sessions, and applies logical budget debit", async () => {
+  it("replays moved calls, re-journals current indexes, rebinds sessions, and keeps usage observational", async () => {
     const sourceRunner: AgentRunner = {
       async run(prompt: string, options: RunOptions) {
         options.onUsage?.(usage(5));
@@ -188,11 +188,13 @@ return { values }`), {
       [1, "resume-target"],
       [2, "resume-target"],
     ]);
-    assert.deepEqual(result.calls?.map((call) => [call.index, call.origin, call.budgetDebit]), [
-      [0, "runner", 7],
-      [1, "journal-replay", 0],
-      [2, "journal-replay", 0],
+    assert.deepEqual(result.calls?.map((call) => [call.index, call.origin]), [
+      [0, "runner"],
+      [1, "journal-replay"],
+      [2, "journal-replay"],
     ]);
+    assert.equal(result.calls?.some((call) => Object.hasOwn(call, "budgetDebit")), false);
+    assert.equal(result.resumeReport?.calls.some((call) => Object.hasOwn(call, "logicalBudgetDebit")), false);
     assert.deepEqual(result.agentSessions?.map((session) => [session.callIndex, session.label, session.phase]), [
       [1, "alpha", "read"],
       [2, "beta", "read"],

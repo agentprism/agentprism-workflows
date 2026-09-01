@@ -199,7 +199,6 @@ test("WorkflowManager.startInBackground persists and inspects timeout limits and
     assert.equal(result.result, null);
     assert.deepEqual(result.effectiveLimits, {
       maxAgents: 1000,
-      tokenBudget: null,
       concurrency: 2,
       agentRetries: 0,
       agentTimeoutMs: 30,

@@ -1296,6 +1296,17 @@ function currentTokenUsage(manager: WorkflowManager, runId: string): TokenUsage 
   return normalizeTokenUsage(manager.getPersistence().load(runId)?.tokenUsage);
 }
 
+function currentResumeReport(report: WorkflowResumeReport): WorkflowResumeReport {
+  return {
+    ...report,
+    calls: report.calls.map((decision) => {
+      const { logicalBudgetDebit: _logicalBudgetDebit, ...currentDecision } = decision as
+        typeof decision & { logicalBudgetDebit?: unknown };
+      return currentDecision;
+    }),
+  } as WorkflowResumeReport;
+}
+
 function persistedOutcome(
   persisted: PersistedRunState,
   status: WorkflowRunStatus,
@@ -1316,7 +1327,9 @@ function persistedOutcome(
     checkpointContext: persisted.checkpointContext,
     ...(persisted.fallbacks === undefined ? {} : { fallbacks: persisted.fallbacks }),
     ...(persisted.checkpointsTaken === undefined ? {} : { checkpointsTaken: persisted.checkpointsTaken }),
-    ...(persisted.resumeReport === undefined ? {} : { resumeReport: persisted.resumeReport }),
+    ...(persisted.resumeReport === undefined
+      ? {}
+      : { resumeReport: currentResumeReport(persisted.resumeReport) }),
     ...(persisted.replayEligibility === undefined
       ? {}
       : { replayEligibility: persisted.replayEligibility }),

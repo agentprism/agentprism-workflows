@@ -30,7 +30,6 @@ const sourceCall: WorkflowCallRecord = {
   inputsHash: HASH,
   outcome: "result",
   origin: "runner",
-  budgetDebit: 8,
   resumeSafety: "declared-read-only",
   scope: "source-run",
 };
@@ -45,7 +44,6 @@ const candidate: PersistedResumeCandidate = {
     scope: "source-run",
   },
   call: sourceCall,
-  logicalBudgetDebit: 8,
 };
 const injection: PersistedCheckpointInjection = {
   sourceRunId: "source-run",

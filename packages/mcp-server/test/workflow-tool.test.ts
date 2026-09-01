@@ -24,7 +24,6 @@ function field(value: unknown, key: string): unknown {
 
 const LIMITS = {
   maxAgents: 1_000,
-  tokenBudget: null,
   concurrency: 6,
   agentRetries: 0,
   agentTimeoutMs: null,

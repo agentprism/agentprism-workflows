@@ -58,6 +58,16 @@ export interface RunObservabilityAgent {
   errorCode?: WorkflowErrorCode;
 }
 
+function projectRunLimits(limits: WorkflowRunLimits): WorkflowRunLimits {
+  return {
+    maxAgents: limits.maxAgents,
+    concurrency: limits.concurrency,
+    agentRetries: limits.agentRetries,
+    agentTimeoutMs: limits.agentTimeoutMs,
+    agentIdleTimeoutMs: limits.agentIdleTimeoutMs ?? null,
+  };
+}
+
 interface SanitizedText {
   value: string;
   redacted: boolean;
@@ -418,7 +428,7 @@ export function projectWorkflowRunStatus(
     ...(source.errorCode === undefined ? {} : { errorCode: source.errorCode }),
     ...(source.limits === undefined
       ? {}
-      : { limits: { ...source.limits, agentIdleTimeoutMs: source.limits.agentIdleTimeoutMs ?? null } }),
+      : { limits: projectRunLimits(source.limits) }),
     ...(source.replayEligibility === undefined
       ? {}
       : { replayEligibility: source.replayEligibility }),
@@ -696,7 +706,6 @@ function projectCallRecord(
     ...(record.worktree === undefined ? {} : { worktree: record.worktree }),
     ...(record.isolation === undefined ? {} : { isolation: record.isolation }),
     ...(record.resolvedCwd === undefined ? {} : { resolvedCwd: projectText(record.resolvedCwd, state) }),
-    ...(record.budgetDebit === undefined ? {} : { budgetDebit: record.budgetDebit }),
     ...(record.settlementOrdinal === undefined ? {} : { settlementOrdinal: record.settlementOrdinal }),
     ...(record.provenance === undefined ? {} : { provenance: projectProvenance(record.provenance, state) }),
     ...(record.scope === undefined ? {} : { scope: projectText(record.scope, state) }),

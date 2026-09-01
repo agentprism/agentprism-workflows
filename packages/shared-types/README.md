@@ -152,8 +152,8 @@ From [`src/index.ts`](./src/index.ts):
   `replayEligibility`, a bounded admission and
   progress summary with the predicted/observed prefix, first non-replay, engine/input-format
   diagnostics, and non-gating operational changes.
-- `WorkflowRunLimits` — resolved `maxAgents`, `tokenBudget`, `concurrency`, `agentRetries`, and
-  per-attempt `agentTimeoutMs` / `agentIdleTimeoutMs`; it is returned as `WorkflowRunResult.effectiveLimits` and as
+- `WorkflowRunLimits` — resolved `maxAgents`, `concurrency`, `agentRetries`, and per-attempt
+  `agentTimeoutMs` / `agentIdleTimeoutMs`; it is returned as `WorkflowRunResult.effectiveLimits` and as
   `WorkflowRunStatus.limits` (optional only for legacy persisted records).
 
 **MCP config**

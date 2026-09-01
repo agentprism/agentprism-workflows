@@ -194,7 +194,7 @@ async function runColdContinuation(method: ReattachMethod): Promise<void> {
     const replayedPrefix = result.calls?.find((call) => call.index === prefix.index);
     assert.equal(replayedPrefix?.hash, prefix.hash);
     assert.equal(replayedPrefix?.origin, "journal-replay");
-    assert.equal(replayedPrefix?.budgetDebit, 0);
+    assert.equal(Object.hasOwn(replayedPrefix ?? {}, "budgetDebit"), false);
     const continuedTail = result.calls?.find((call) => call.index === interrupted.index);
     assert.deepEqual(continuedTail?.provenance, {
       source: "live",

@@ -151,7 +151,6 @@ export interface WorkflowExecuteToolInput {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number | null;
-  tokenBudget?: number | null;
   resumeFromRunId?: string;
   checkpointReplies?: Record<number, unknown>;
   /** Default false. True acknowledges after admission and executes in this server process. */
@@ -225,8 +224,7 @@ A valid background request is:
   "script": "export const meta = { name: 'review', description: 'review a change' };\nconst report = await agent('Review ' + args.target, { label: 'review' });\nreturn report;",
   "args": { "target": "src/auth.ts" },
   "background": true,
-  "concurrency": 4,
-  "tokenBudget": 200000
+  "concurrency": 4
 }
 ```
 

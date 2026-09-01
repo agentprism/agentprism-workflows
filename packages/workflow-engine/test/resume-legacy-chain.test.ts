@@ -25,6 +25,10 @@ test("a markerless 0.23 chained journal accepts persisted ancestors but excludes
   });
   try {
     const source = JSON.parse(readFileSync(FIXTURE, "utf8")) as PersistedRunState;
+    const legacyFixture = readFileSync(FIXTURE, "utf8");
+    assert.match(legacyFixture, /"tokenBudget"/);
+    assert.match(legacyFixture, /"budgetDebit"/);
+    assert.match(legacyFixture, /"logicalBudgetDebit"/);
     const ancestorRunId = source.journal?.[0]?.scope;
     assert.equal(typeof ancestorRunId, "string");
     source.effectiveCwd = cwd;
@@ -90,6 +94,14 @@ test("a markerless 0.23 chained journal accepts persisted ancestors but excludes
     assert.equal(persisted?.runtime?.inputsFormat, 2);
     assert.ok(persisted?.runtime?.engineVersion);
     assert.ok(persisted?.journal?.every((entry) => entry.scope === "legacy-chain-target"));
+    assert.equal(persisted?.calls?.some((call) => Object.hasOwn(call, "budgetDebit")), false);
+    assert.equal(
+      persisted?.calls?.some((call) => Object.hasOwn(call.replay ?? {}, "logicalBudgetDebit")),
+      false,
+    );
+    assert.equal(Object.hasOwn(persisted?.limits ?? {}, "tokenBudget"), false);
+    const rewritten = readFileSync(join(persistence.getRunsDir(), "legacy-chain-target.json"), "utf8");
+    assert.doesNotMatch(rewritten, /"tokenBudget"|"budgetDebit"|"logicalBudgetDebit"/);
 
     assert.equal(persistence.delete(ancestorRunId), true);
     listCalls = 0;

@@ -450,6 +450,16 @@ function latestRootRows<T extends { index: number; scope?: string }>(rows: T[], 
   return [...latest.values()].sort((a, b) => a.index - b.index);
 }
 
+function stripLegacyCallBudgetFields(call: WorkflowCallRecord): WorkflowCallRecord {
+  const { budgetDebit: _budgetDebit, ...currentCall } = call as WorkflowCallRecord & {
+    budgetDebit?: unknown;
+  };
+  if (currentCall.replay === undefined) return currentCall;
+  const { logicalBudgetDebit: _logicalBudgetDebit, ...currentReplay } = currentCall.replay as
+    NonNullable<WorkflowCallRecord["replay"]> & { logicalBudgetDebit?: unknown };
+  return { ...currentCall, replay: currentReplay };
+}
+
 function latestRows<T extends { index: number }>(rows: T[]): T[] {
   const latest = new Map<number, T>();
   for (const row of rows) latest.set(row.index, row);
@@ -1292,7 +1302,8 @@ export class WorkflowManager extends EventEmitter {
       injectedCheckpointReplies.add(syntheticEntry.index);
     }
     managed.journal = latestRows([...sourceJournal.values()]);
-    managed.calls = positionalSourceRows(sourceCallRows, source.runId, persistedRunIds);
+    managed.calls = positionalSourceRows(sourceCallRows, source.runId, persistedRunIds)
+      .map(stripLegacyCallBudgetFields);
     this.initializeResumeReporting(
       managed,
       source,
@@ -2800,7 +2811,7 @@ export class WorkflowManager extends EventEmitter {
       journal: latestRootRows(persisted.journal ?? [], runId),
       fallbacks: [],
       checkpointsTaken: [],
-      calls: latestRootRows(persisted.calls ?? [], runId),
+      calls: latestRootRows(persisted.calls ?? [], runId).map(stripLegacyCallBudgetFields),
       effectiveCwd,
       runtime: runtimeIdentity(),
       environment: captureRunEnvironment(effectiveCwd, exec.environmentKey ?? this.environmentKey),

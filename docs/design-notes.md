@@ -924,9 +924,10 @@ typed fatal divergence. Once latched, every later arrival rethrows before servin
 strict posture is what makes "held fixed" meaningful: propagation mode remains the correct tool for
 scripts that cannot prove isolated correspondence.
 
-**Settlement trajectory and gate freedom.** Every recorded call has a dense settlement ordinal and
-every agent call retains its sealed token-accounting debit for record compatibility. Baselines at
-the agent-limit boundary, with abort residue, or without complete limits/trajectory facts are
+**Settlement order and gate freedom.** Current recordings retain dense settlement ordinals for
+deterministic ordering, but token usage is observational telemetry rather than an execution or
+replay gate. Historical budget fields are ignored on read and omitted from new artifacts.
+Baselines at the agent-limit boundary, with abort residue, or without complete required limits are
 refused before provider use. Concurrency reproduces the scheduling envelope, not timing; timeout
 and retry settings affect only the live target because served calls resolve at the replay seam.
 
