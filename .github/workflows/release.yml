@@ -62,6 +62,10 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # Persist the app credential for changesets/action's git push too. Passing the app token
+          # only as GITHUB_TOKEN covers API calls, but an update to an existing Version PR otherwise
+          # pushes through checkout's recursion-guarded GITHUB_TOKEN and produces no runnable CI job.
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
