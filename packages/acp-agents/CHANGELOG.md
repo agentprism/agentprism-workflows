@@ -1,5 +1,13 @@
 # @automatalabs/acp-agents
 
+## 0.43.1
+
+### Patch Changes
+
+- 52c7701: Refresh `@agentclientprotocol/claude-agent-acp` to 0.73.0 and its wrapped Claude Agent SDK runtime to 0.3.258. Engine-owned Claude sessions now receive a stable label-derived title so the updated adapter does not launch an unobserved background title-generation model call; interactive sessions retain generated titles.
+- Updated dependencies [fd3bda3]
+  - @automatalabs/codex-acp@2.3.1
+
 ## 0.43.0
 
 ### Minor Changes
