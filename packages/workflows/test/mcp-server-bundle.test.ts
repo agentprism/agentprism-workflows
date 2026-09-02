@@ -1,7 +1,7 @@
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { build } from "esbuild";
@@ -201,7 +201,12 @@ test("the bundled stdio server initializes once and advertises docs/workflow/rep
 
 test("the published dist/mcp-server.js reports the mcp-server package version as its identity, not the workflows version", { timeout: 30_000 }, () => {
   assert.ok(existsSync(PUBLISHED_BUNDLE), "workflows dist/mcp-server.js must be built (pnpm build) before this test");
-  assert.notEqual(MCP_PACKAGE.version, WORKFLOWS_PACKAGE.version, "the two packages carry different versions — that is the point");
+  const escapedMcpVersion = MCP_PACKAGE.version.replace(/\./g, "\\.");
+  assert.match(
+    readFileSync(PUBLISHED_BUNDLE, "utf-8"),
+    new RegExp(`\\bSERVER_VERSION\\s*=\\s*true\\s*\\?\\s*"${escapedMcpVersion}"\\s*:`),
+    "the published bundle must bake the mcp-server version into SERVER_VERSION at build time",
+  );
   // `daemon status` prints the CLIENT version (= SERVER_VERSION, the identity the daemon
   // succession compares) without starting anything; an isolated HOME sees no daemon.
   const home = mkdtempSync(join(tmpdir(), "agentprism-workflows-bundle-version-"));
@@ -211,8 +216,12 @@ test("the published dist/mcp-server.js reports the mcp-server package version as
       encoding: "utf-8",
       timeout: 20_000,
     });
-    assert.match(result.stdout, new RegExp(`client v${MCP_PACKAGE.version.replace(/\./g, "\\.")}\\b`), result.stdout + result.stderr);
-    assert.doesNotMatch(result.stdout, new RegExp(`client v${WORKFLOWS_PACKAGE.version.replace(/\./g, "\\.")}\\b`));
+    assert.match(result.stdout, new RegExp(`client v${escapedMcpVersion}\\b`), result.stdout + result.stderr);
+    // Coordinated major releases can legitimately align both package versions. When they differ,
+    // retain the stronger behavioral guard against accidentally resolving workflows/package.json.
+    if (WORKFLOWS_PACKAGE.version !== MCP_PACKAGE.version) {
+      assert.doesNotMatch(result.stdout, new RegExp(`client v${WORKFLOWS_PACKAGE.version.replace(/\./g, "\\.")}\\b`));
+    }
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
