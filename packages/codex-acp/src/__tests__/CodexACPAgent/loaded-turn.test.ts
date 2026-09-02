@@ -42,6 +42,8 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
             ephemeral: false,
             section: null,
             sectionEnteredAt: null,
+            projectId: null,
+            historyMode: "legacy",
             modelProvider: "openai",
             createdAt: 123,
             updatedAt: 124,
@@ -77,6 +79,7 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
                             text: "Hello!",
                             phase: null,
                             memoryCitation: null,
+                            delivery: null,
                         },
                     ],
                 },
@@ -317,6 +320,7 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
             text: "partial ",
             phase: null,
             memoryCitation: null,
+            delivery: null,
         };
         const fixture = setupFixture(thread);
         await load(fixture, "session-1");
@@ -358,6 +362,7 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
             text: "partial ",
             phase: null,
             memoryCitation: null,
+            delivery: null,
         };
         const fixture = setupFixture(thread);
         await load(fixture, "session-1");
