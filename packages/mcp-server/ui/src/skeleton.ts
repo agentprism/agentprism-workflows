@@ -1,10 +1,9 @@
 // Static structure ("skeleton") of a workflow script: every agent()/checkpoint()/workflow()
-// call site, phase() markers, parallel()/pipeline() groups, and loop containers, extracted
-// from the script text with acorn. Sites are keyed by the innermost component of the engine's
-// structural call path ("line:column", body-relative), so runtime agentStart events join a
-// site with a dictionary lookup. The body MUST be derived exactly like the engine derives it
-// (parseWorkflowScript splices the `export const meta` statement out by character offsets);
-// positions are computed on that spliced text or they will not match.
+// call site, phase() marker, parallel()/pipeline() group, loop, and quality-control primitive.
+// Sites are keyed by the innermost component of the engine's structural call path
+// ("line:column", body-relative), so runtime agentStart events join a site with one lookup.
+// The body MUST be derived exactly like the engine derives it (parseWorkflowScript splices the
+// `export const meta` statement out by character offsets), or positions will not match.
 import { parse } from "acorn";
 
 interface AnyNode {
@@ -19,7 +18,7 @@ export interface SkeletonSite {
   kind: "agent" | "checkpoint" | "workflow" | "stdlib";
   /** Innermost call-path component: `${line}:${column + 1}` of the callee identifier start. */
   key: string;
-  /** kind "stdlib" only: the helper's name (verify / judgePanel / completenessCheck). */
+  /** kind "stdlib" only: the helper's name. */
   helper?: string;
   /** Static prefix of the prompt (literal text, or leading quasi of a template). */
   promptPreview?: string;
@@ -27,7 +26,12 @@ export interface SkeletonSite {
   labelPreview?: string;
   /** options.phase when a string literal. */
   phaseLiteral?: string;
+  /** Number of runtime agents this one site is statically known to fan out into. */
+  expectedInstances?: number;
 }
+
+export type SkeletonLoopMode = "loop" | "gate" | "loopUntilDry";
+export type SkeletonPanelMode = "verify" | "judgePanel";
 
 export type SkeletonNode =
   | { kind: "phase"; title?: string }
@@ -41,10 +45,35 @@ export type SkeletonNode =
       /** Fan-out width when the items argument is an array literal. */
       staticCount?: number;
     }
-  | { kind: "loop"; children: SkeletonNode[] };
+  | {
+      kind: "loop";
+      mode: SkeletonLoopMode;
+      children: SkeletonNode[];
+      /** Gate only: producer and validator lanes, in that order. */
+      stages?: SkeletonNode[][];
+      /** gate attempts or loopUntilDry maxRounds when statically known. */
+      maxIterations?: number;
+      /** loopUntilDry consecutiveEmpty when statically known. */
+      consecutiveEmpty?: number;
+    }
+  | {
+      kind: "panel";
+      mode: SkeletonPanelMode;
+      children: SkeletonNode[];
+      /** verify reviewers or judgePanel judges per candidate. */
+      members: number;
+      /** judgePanel candidate count when its first argument is statically countable. */
+      candidates?: number;
+      /** verify acceptance ratio when literal. */
+      threshold?: number;
+      /** verify lens count when an array literal is supplied. */
+      lenses?: number;
+    };
 
 export interface Skeleton {
   roots: SkeletonNode[];
+  /** Workflow name from the leading meta literal, when statically readable. */
+  name?: string;
   /** Every call site keyed by its innermost call-path component. */
   byKey: Map<string, SkeletonSite>;
 }
@@ -103,20 +132,46 @@ function textPreview(node: AnyNode | undefined): string | undefined {
   return undefined;
 }
 
-function optionPreview(options: AnyNode | undefined, name: string): string | undefined {
+function propertyName(property: AnyNode): string | undefined {
+  if (property.type !== "Property" || property.computed === true) return undefined;
+  const keyNode = property.key as AnyNode;
+  return keyNode.type === "Identifier"
+    ? (keyNode.name as string)
+    : keyNode.type === "Literal"
+      ? String(keyNode.value)
+      : undefined;
+}
+
+function objectProperty(options: AnyNode | undefined, name: string): AnyNode | undefined {
   if (options?.type !== "ObjectExpression") return undefined;
   for (const property of options.properties as AnyNode[]) {
-    if (property.type !== "Property" || property.computed === true) continue;
-    const keyNode = property.key as AnyNode;
-    const keyName =
-      keyNode.type === "Identifier"
-        ? (keyNode.name as string)
-        : keyNode.type === "Literal"
-          ? String(keyNode.value)
-          : undefined;
-    if (keyName === name) return textPreview(property.value as AnyNode);
+    if (propertyName(property) === name) return property.value as AnyNode;
   }
   return undefined;
+}
+
+function optionPreview(options: AnyNode | undefined, name: string): string | undefined {
+  return textPreview(objectProperty(options, name));
+}
+
+function finiteNumber(node: AnyNode | undefined): number | undefined {
+  if (node?.type !== "Literal" || typeof node.value !== "number" || !Number.isFinite(node.value)) {
+    return undefined;
+  }
+  return node.value;
+}
+
+function positiveIntegerOption(
+  options: AnyNode | undefined,
+  name: string,
+  fallback: number,
+): number {
+  const value = finiteNumber(objectProperty(options, name));
+  return value === undefined ? fallback : Math.max(1, Math.floor(value));
+}
+
+function arrayLiteralCount(node: AnyNode | undefined): number | undefined {
+  return node?.type === "ArrayExpression" ? (node.elements as unknown[]).length : undefined;
 }
 
 /** Fan-out width when statically knowable: an array literal, or `.map` on an array literal. */
@@ -138,12 +193,18 @@ function staticItemCount(items: AnyNode | undefined): number | undefined {
   return undefined;
 }
 
+function workflowName(ast: AnyNode): string | undefined {
+  const first = (ast.body as AnyNode[] | undefined)?.[0];
+  if (first?.type !== "ExportNamedDeclaration") return undefined;
+  const declaration = first.declaration as AnyNode | undefined;
+  if (declaration?.type !== "VariableDeclaration") return undefined;
+  const meta = (declaration.declarations as AnyNode[] | undefined)?.[0]?.init as AnyNode | undefined;
+  return optionPreview(meta, "name");
+}
+
 const SITE_CALLEES = new Set(["agent", "checkpoint", "workflow"]);
-/** Engine-side agent-backed helpers: their agents' innermost VM stack frame is the helper's
- *  call site in the script (all engine frames are filtered from the call path), so the call
- *  becomes a fan-out site. `retry`/`gate` take SCRIPT thunks and stay transparent instead —
- *  their inner agent() calls carry their own positions. */
-const STDLIB_SITE_CALLEES = new Set(["verify", "judgePanel", "completenessCheck"]);
+/** Engine-side one-agent helper. verify/judgePanel get semantic panel containers below. */
+const STDLIB_SITE_CALLEES = new Set(["completenessCheck"]);
 const LOOP_STATEMENTS = new Set([
   "ForStatement",
   "ForInStatement",
@@ -156,6 +217,29 @@ interface ExtractContext {
   byKey: Map<string, SkeletonSite>;
 }
 
+function registerSite(
+  name: string,
+  callee: AnyNode,
+  args: AnyNode[],
+  context: ExtractContext,
+  expectedInstances?: number,
+): SkeletonNode | undefined {
+  const key = siteKey(callee);
+  if (key === undefined) return undefined;
+  const kind = SITE_CALLEES.has(name) ? (name as SkeletonSite["kind"]) : "stdlib";
+  const site: SkeletonSite = { kind, key };
+  if (kind === "stdlib") site.helper = name;
+  const prompt = textPreview(args[0]);
+  if (prompt !== undefined) site.promptPreview = prompt;
+  const label = optionPreview(args[1], "label");
+  if (label !== undefined) site.labelPreview = label;
+  const phase = optionPreview(args[1], "phase");
+  if (phase !== undefined) site.phaseLiteral = phase;
+  if (expectedInstances !== undefined) site.expectedInstances = expectedInstances;
+  context.byKey.set(key, site);
+  return { kind: "site", site };
+}
+
 function extractInto(node: unknown, out: SkeletonNode[], context: ExtractContext): void {
   if (Array.isArray(node)) {
     for (const child of node) extractInto(child, out, context);
@@ -166,7 +250,7 @@ function extractInto(node: unknown, out: SkeletonNode[], context: ExtractContext
   if (LOOP_STATEMENTS.has(node.type)) {
     const children: SkeletonNode[] = [];
     extractInto(node.body, children, context);
-    if (children.length > 0) out.push({ kind: "loop", children });
+    if (children.length > 0) out.push({ kind: "loop", mode: "loop", children });
     return;
   }
 
@@ -180,40 +264,76 @@ function extractInto(node: unknown, out: SkeletonNode[], context: ExtractContext
         out.push(title === undefined ? { kind: "phase" } : { kind: "phase", title });
         return;
       }
-      if (SITE_CALLEES.has(name)) {
-        const key = siteKey(callee);
-        if (key !== undefined) {
-          const site: SkeletonSite = { kind: name as SkeletonSite["kind"], key };
-          const prompt = textPreview(args[0]);
-          if (prompt !== undefined) site.promptPreview = prompt;
-          const label = optionPreview(args[1], "label");
-          if (label !== undefined) site.labelPreview = label;
-          const phase = optionPreview(args[1], "phase");
-          if (phase !== undefined) site.phaseLiteral = phase;
-          out.push({ kind: "site", site });
-          context.byKey.set(key, site);
-        }
-        // Arguments are the prompt/options; anything nested inside them is noise.
+      if (SITE_CALLEES.has(name) || STDLIB_SITE_CALLEES.has(name)) {
+        const site = registerSite(name, callee, args, context);
+        if (site !== undefined) out.push(site);
+        // Arguments are prompt/data/options, not script thunks.
         return;
       }
-      if (STDLIB_SITE_CALLEES.has(name)) {
-        const key = siteKey(callee);
-        if (key !== undefined) {
-          const site: SkeletonSite = { kind: "stdlib", key, helper: name };
-          const prompt = textPreview(args[0]);
-          if (prompt !== undefined) site.promptPreview = prompt;
-          out.push({ kind: "site", site });
-          context.byKey.set(key, site);
+      if (name === "verify") {
+        const reviewers = positiveIntegerOption(args[1], "reviewers", 2);
+        const site = registerSite(name, callee, args, context, reviewers);
+        if (site !== undefined) {
+          const threshold = finiteNumber(objectProperty(args[1], "threshold"));
+          const lens = objectProperty(args[1], "lens");
+          const lenses = arrayLiteralCount(lens) ?? (textPreview(lens) === undefined ? undefined : 1);
+          out.push({
+            kind: "panel",
+            mode: "verify",
+            children: [site],
+            members: reviewers,
+            ...(threshold === undefined ? {} : { threshold }),
+            ...(lenses === undefined ? {} : { lenses }),
+          });
         }
-        // Arguments are data (claim/attempts/results), not script thunks.
+        return;
+      }
+      if (name === "judgePanel") {
+        const judges = positiveIntegerOption(args[1], "judges", 3);
+        const candidates = staticItemCount(args[0]);
+        const expected = candidates === undefined ? undefined : judges * candidates;
+        const site = registerSite(name, callee, args, context, expected);
+        if (site !== undefined) {
+          out.push({
+            kind: "panel",
+            mode: "judgePanel",
+            children: [site],
+            members: judges,
+            ...(candidates === undefined ? {} : { candidates }),
+          });
+        }
+        return;
+      }
+      if (name === "gate") {
+        const producer: SkeletonNode[] = [];
+        const validator: SkeletonNode[] = [];
+        extractInto(args[0], producer, context);
+        extractInto(args[1], validator, context);
+        const children = [...producer, ...validator];
+        if (children.length > 0) {
+          out.push({
+            kind: "loop",
+            mode: "gate",
+            children,
+            stages: [producer, validator],
+            maxIterations: positiveIntegerOption(args[2], "attempts", 3),
+          });
+        }
         return;
       }
       if (name === "loopUntilDry") {
-        // Engine-side loop over a SCRIPT round callback: the callback's agent sites carry
-        // their own positions, and repeats page as iterations like a syntactic loop.
         const children: SkeletonNode[] = [];
-        extractInto(args, children, context);
-        if (children.length > 0) out.push({ kind: "loop", children });
+        const options = args[0];
+        extractInto(objectProperty(options, "round"), children, context);
+        if (children.length > 0) {
+          out.push({
+            kind: "loop",
+            mode: "loopUntilDry",
+            children,
+            maxIterations: positiveIntegerOption(options, "maxRounds", 50),
+            consecutiveEmpty: positiveIntegerOption(options, "consecutiveEmpty", 2),
+          });
+        }
         return;
       }
       if (name === "parallel") {
@@ -263,6 +383,12 @@ function extractInto(node: unknown, out: SkeletonNode[], context: ExtractContext
  * script cannot be parsed or has no leading meta export (callers fall back to the wave view).
  */
 export function extractSkeleton(script: string): Skeleton | undefined {
+  let sourceAst: AnyNode;
+  try {
+    sourceAst = parse(script, ACORN_OPTIONS) as unknown as AnyNode;
+  } catch {
+    return undefined;
+  }
   const body = spliceMetaForBody(script);
   if (body === undefined) return undefined;
   let ast: AnyNode;
@@ -274,5 +400,6 @@ export function extractSkeleton(script: string): Skeleton | undefined {
   const context: ExtractContext = { byKey: new Map() };
   const roots: SkeletonNode[] = [];
   extractInto(ast.body, roots, context);
-  return { roots, byKey: context.byKey };
+  const name = workflowName(sourceAst);
+  return { roots, byKey: context.byKey, ...(name === undefined ? {} : { name }) };
 }

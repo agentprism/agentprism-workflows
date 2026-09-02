@@ -13,6 +13,7 @@
   --err: #e5484d;
   --warn: #d8a03d;
   --live: #d8a03d;
+  --flow: #6f9fd8;
   --mono: var(--font-mono, ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace);
   --radius: var(--border-radius-sm, 4px);
 }
@@ -202,6 +203,7 @@ body {
 .graph-edges {
   position: absolute;
   inset: 0;
+  z-index: 1;
   pointer-events: none;
 }
 
@@ -215,11 +217,6 @@ body {
   fill: none;
   stroke: var(--text-faint);
   stroke-width: 1;
-}
-
-.graph-nodes {
-  position: absolute;
-  inset: 0;
 }
 
 .parallel-label {
@@ -323,33 +320,108 @@ body {
   border-style: dashed;
 }
 
-.loop-box {
+.graph-controls,
+.graph-nodes {
   position: absolute;
+  inset: 0;
+}
+
+.graph-controls {
+  z-index: 0;
+}
+
+.graph-nodes {
+  z-index: 2;
+}
+
+.control-box {
+  position: absolute;
+  overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--bg-raised) 45%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-raised) 74%, transparent);
 }
 
-.loop-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
+.control-head {
+  display: grid;
+  grid-template-columns: 8px max-content minmax(0, 1fr) max-content;
+  grid-template-rows: 18px 16px;
+  align-content: center;
+  column-gap: 8px;
+  min-height: 47px;
+  padding: 4px 12px;
   color: var(--text-dim);
-  font-size: 12px;
-  letter-spacing: 0.04em;
-  border-bottom: 1px dashed var(--border-dim);
+  font-size: 11px;
+  border-bottom: 1px solid var(--border-dim);
+  white-space: nowrap;
 }
 
-.loop-glyph {
-  font-size: 14px;
+.control-mark {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  border: 1px solid currentColor;
+}
+
+.control-label {
+  grid-column: 2 / 4;
+  grid-row: 1;
+  align-self: center;
+  color: var(--text);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.control-detail {
+  grid-column: 2 / -1;
+  grid-row: 2;
+  min-width: 0;
+  overflow: hidden;
+  align-self: center;
   color: var(--text-faint);
+  text-overflow: ellipsis;
+}
+
+.control-gate {
+  border-color: color-mix(in srgb, var(--warn) 52%, var(--border));
+  background: color-mix(in srgb, var(--warn) 4%, var(--bg-raised));
+}
+
+.control-gate .control-head {
+  border-bottom-color: color-mix(in srgb, var(--warn) 22%, var(--border-dim));
+}
+
+.control-gate .control-mark {
+  color: var(--warn);
+  transform: rotate(45deg);
+}
+
+.control-loopUntilDry .control-mark,
+.control-loop .control-mark {
+  color: var(--flow);
+  border-radius: 50%;
+  border-right-style: dashed;
+}
+
+.control-verify .control-mark {
+  color: var(--ok);
+  border-radius: 50%;
+}
+
+.control-judgePanel .control-mark {
+  color: var(--flow);
+  box-shadow: 4px 0 0 -2px var(--bg-raised), 5px 0 0 -2px var(--flow);
 }
 
 .loop-iter {
   display: inline-flex;
+  grid-column: 4;
+  grid-row: 1;
   align-items: center;
   gap: 6px;
+  color: var(--text-dim);
   font-variant-numeric: tabular-nums;
 }
 
@@ -371,9 +443,40 @@ body {
   border-color: var(--text-faint);
 }
 
+.iter-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.iter-btn:focus-visible,
+.node:focus-visible,
+.stop-btn:focus-visible,
+.back-btn:focus-visible {
+  outline: 2px solid var(--flow);
+  outline-offset: 2px;
+}
+
 .iter-btn:disabled {
   opacity: 0.35;
   cursor: default;
+}
+
+.graph-edges .edge-feedback {
+  stroke: var(--warn);
+  stroke-dasharray: 4 4;
+  opacity: 0.72;
+}
+
+#feedback-arrow path {
+  fill: var(--warn);
+}
+
+.feedback-label {
+  position: absolute;
+  width: 68px;
+  color: var(--warn);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-align: center;
 }
 
 /* ---------- detail view ---------- */

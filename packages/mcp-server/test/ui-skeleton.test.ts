@@ -55,6 +55,7 @@ return { notes, verdicts }`;
 test("every engine call path resolves to an extractor site by innermost key", async () => {
   const skeleton = extractSkeleton(SCRIPT);
   assert.notEqual(skeleton, undefined);
+  assert.equal(skeleton?.name, "skeleton-fixture");
   const paths = await enginePathsFor(SCRIPT);
   // 3 mapped + 1 helper + 2 loop iterations + 2 literal thunks.
   assert.equal(paths.length, 8);
@@ -149,9 +150,16 @@ return { audit, flaky, swept }`;
   const verifySite = sites.find((site) => site.kind === "stdlib" && site.helper === "verify");
   assert.notEqual(verifySite, undefined);
   assert.equal(verifySite?.promptPreview, "claim to refute");
-  // retry is transparent (its thunk is script code); loopUntilDry becomes a loop container.
+  // retry is transparent (its thunk is script code); quality helpers keep their semantic shells.
   assert.equal(sites.filter((site) => site.kind === "agent").length, 2);
-  assert.equal(skeleton?.roots.some((node) => node.kind === "loop"), true);
+  assert.equal(
+    skeleton?.roots.some((node) => node.kind === "panel" && node.mode === "verify"),
+    true,
+  );
+  assert.equal(
+    skeleton?.roots.some((node) => node.kind === "loop" && node.mode === "loopUntilDry"),
+    true,
+  );
 
   const paths = await enginePathsFor(script);
   // 2 verify reviewers + 1 retry attempt + 1 loopUntilDry round.
@@ -165,6 +173,61 @@ return { audit, flaky, swept }`;
   }
   const verifyPaths = paths.filter((path) => innermostKey(path) === verifySite?.key);
   assert.equal(verifyPaths.length, 2);
+});
+
+test("gate and judgePanel preserve their control-flow shape and static limits", async () => {
+  const script = `${META}
+const gated = await gate(
+  (_feedback, attempt) => agent(\`draft \${attempt}\`, { label: \`draft:\${attempt}\` }),
+  (draft) => agent(\`review \${draft}\`, { label: 'gate-review' }),
+  { attempts: 2 },
+)
+const winner = await judgePanel(['candidate-a', 'candidate-b'], { judges: 3, rubric: 'correctness' })
+return { gated, winner }`;
+  const skeleton = extractSkeleton(script);
+  assert.notEqual(skeleton, undefined);
+
+  const [gateNode, panelNode] = skeleton?.roots ?? [];
+  assert.equal(gateNode?.kind, "loop");
+  if (gateNode?.kind === "loop") {
+    assert.equal(gateNode.mode, "gate");
+    assert.equal(gateNode.maxIterations, 2);
+    assert.equal(gateNode.stages?.length, 2);
+    assert.deepEqual(gateNode.stages?.map((stage) => stage.length), [1, 1]);
+  }
+  assert.equal(panelNode?.kind, "panel");
+  if (panelNode?.kind === "panel") {
+    assert.equal(panelNode.mode, "judgePanel");
+    assert.equal(panelNode.members, 3);
+    assert.equal(panelNode.candidates, 2);
+    const site = panelNode.children[0];
+    assert.equal(site?.kind, "site");
+    if (site?.kind === "site") assert.equal(site.site.expectedInstances, 6);
+  }
+
+  const paths = await enginePathsFor(script);
+  // Two rejected gate attempts each run producer + reviewer; two candidates get three judges each.
+  assert.equal(paths.length, 10);
+  for (const path of paths) {
+    assert.notEqual(skeleton?.byKey.get(innermostKey(path)), undefined);
+  }
+});
+
+test("verify exposes panel configuration instead of collapsing to an anonymous agent site", () => {
+  const script = `${META}
+return await verify('claim', { reviewers: 4, threshold: 0.75, lens: ['security', 'correctness'] })`;
+  const skeleton = extractSkeleton(script);
+  const panel = skeleton?.roots[0];
+  assert.equal(panel?.kind, "panel");
+  if (panel?.kind === "panel") {
+    assert.equal(panel.mode, "verify");
+    assert.equal(panel.members, 4);
+    assert.equal(panel.threshold, 0.75);
+    assert.equal(panel.lenses, 2);
+    const site = panel.children[0];
+    assert.equal(site?.kind, "site");
+    if (site?.kind === "site") assert.equal(site.site.expectedInstances, 4);
+  }
 });
 
 test("limiter saturation never costs a path: capture happens at agent() entry, pre-limiter", async () => {

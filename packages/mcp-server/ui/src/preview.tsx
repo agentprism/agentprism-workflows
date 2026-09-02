@@ -16,33 +16,30 @@ import type { RunModel } from "./state.js";
 import "./style.css";
 
 const DEMO_SCRIPT = `export const meta = {
-  name: 'research-review',
-  description: 'demo run for the skeleton preview',
-  phases: [{ title: 'Research' }, { title: 'Adversarial Review' }, { title: 'Polish' }, { title: 'Synthesize' }],
+  name: 'quality-control-review',
+  description: 'demo run for the semantic skeleton preview',
+  phases: [{ title: 'Research' }, { title: 'Quality control' }, { title: 'Synthesize' }],
 }
 phase('Research')
 const notes = await parallel(['transports', 'auth', 'resumability'].map(
   (topic) => () => agent(\`Research \${topic}\`, { label: \`research:\${topic}\` }),
 ))
-let dry = 0
-while (dry < 2) {
-  phase('Adversarial Review')
-  const verdicts = await parallel([
-    () => agent('Refute via correctness lens', { label: 'lens:correctness' }),
-    () => agent('Refute via security lens', { label: 'lens:security' }),
-  ])
-  dry += verdicts.every(Boolean) ? 1 : 2
-}
-phase('Polish')
-const polished = await pipeline(
-  ['draft-a', 'draft-b'],
-  (draft) => agent(\`Edit \${draft}\`, { label: \`edit:\${draft}\` }),
-  (edited) => agent(\`Fact-check \${edited}\`, { label: 'fact-check' }),
+phase('Quality control')
+const draft = await gate(
+  (feedback, attempt) => agent(\`Draft attempt \${attempt}: \${feedback ?? ''}\`, { label: \`draft:\${attempt + 1}\` }),
+  (result) => agent(\`Review \${result}\`, { label: 'gate-review' }),
+  { attempts: 3 },
 )
-const audit = await verify(notes[0], { reviewers: 2 })
+const findings = await loopUntilDry({
+  round: (round) => agent(\`Hunt round \${round + 1}\`, { label: 'hunt' }).then((item) => [item]),
+  consecutiveEmpty: 2,
+  maxRounds: 6,
+})
+const audit = await verify(notes[0], { reviewers: 2, threshold: 0.5, lens: ['correctness', 'security'] })
+const best = await judgePanel(['candidate-a', 'candidate-b'], { judges: 2, rubric: 'correctness' })
 const approved = await checkpoint('Ship the synthesis?', { kind: 'confirm' })
 phase('Synthesize')
-return await agent(\`Synthesize: \${polished.join(', ')}\`, { label: 'synthesize' })`;
+return await agent(\`Synthesize: \${draft.value}, \${findings.length}, \${best.index}\`, { label: 'synthesize' })`;
 
 const RUN_ID = "wf_preview-demo";
 const skeleton = extractSkeleton(DEMO_SCRIPT);
@@ -51,11 +48,11 @@ if (skeleton === undefined) throw new Error("preview script must parse");
 // Pick site keys from the extractor itself so the demo never hardcodes coordinates.
 const sites = [...skeleton.byKey.values()];
 const researchKey = sites.find((site) => site.labelPreview?.startsWith("research"))?.key ?? "";
-const correctnessKey = sites.find((site) => site.labelPreview === "lens:correctness")?.key ?? "";
-const securityKey = sites.find((site) => site.labelPreview === "lens:security")?.key ?? "";
-const editKey = sites.find((site) => site.labelPreview?.startsWith("edit:"))?.key ?? "";
-const checkKey = sites.find((site) => site.labelPreview === "fact-check")?.key ?? "";
+const draftKey = sites.find((site) => site.labelPreview?.startsWith("draft:"))?.key ?? "";
+const gateReviewKey = sites.find((site) => site.labelPreview === "gate-review")?.key ?? "";
+const huntKey = sites.find((site) => site.labelPreview === "hunt")?.key ?? "";
 const verifyKey = sites.find((site) => site.helper === "verify")?.key ?? "";
+const judgeKey = sites.find((site) => site.helper === "judgePanel")?.key ?? "";
 const checkpointKey = sites.find((site) => site.kind === "checkpoint")?.key ?? "";
 const synthesizeKey = sites.find((site) => site.labelPreview === "synthesize")?.key ?? "";
 
@@ -114,57 +111,59 @@ const TIMELINE: RunEventLogRecord[] = [
   transcript(2, 0, { kind: "text", text: "Comparing resumability approaches…" }),
   end(0, "research:transports", 61_402),
   end(2, "research:resumability", 55_870),
-  record({ type: "phase", title: "Adversarial Review" }),
-  start(3, "lens:correctness", correctnessKey),
-  start(4, "lens:security", securityKey, "sonnet"),
-  end(3, "lens:correctness", 22_004),
-  end(4, "lens:security", 19_772),
-  // Iteration 2 of the loop: same call sites fire again.
-  record({ type: "phase", title: "Adversarial Review" }),
-  start(5, "lens:correctness", correctnessKey),
-  start(6, "lens:security", securityKey, "sonnet"),
-  end(5, "lens:correctness", 24_118),
-  end(6, "lens:security", 18_559),
-  // Pipeline: no barrier between stages — draft-a fact-checks while draft-b still edits.
-  record({ type: "phase", title: "Polish" }),
-  start(7, "edit:draft-a", editKey, "sonnet"),
-  start(8, "edit:draft-b", editKey, "sonnet"),
-  end(7, "edit:draft-a", 9_310),
-  start(9, "fact-check", checkKey, "haiku"),
-  end(8, "edit:draft-b", 10_054),
-  start(10, "fact-check", checkKey, "haiku"),
-  end(9, "fact-check", 4_882),
-  end(10, "fact-check", 5_113),
-  // Engine-side verify() fan-out: both reviewers attach to the verify call site.
-  start(11, "verify 1", verifyKey),
-  start(12, "verify 2", verifyKey),
-  end(11, "verify 1", 8_144),
-  end(12, "verify 2", 7_961),
+  record({ type: "phase", title: "Quality control" }),
+  // gate(): producer → reviewer, then a rejected verdict feeds back into a fresh attempt.
+  start(3, "draft:1", draftKey, "sonnet"),
+  end(3, "draft:1", 18_310),
+  start(4, "gate-review", gateReviewKey),
+  end(4, "gate-review", 9_882),
+  start(5, "draft:2", draftKey, "sonnet"),
+  end(5, "draft:2", 12_054),
+  start(6, "gate-review", gateReviewKey),
+  end(6, "gate-review", 7_113),
+  // loopUntilDry(): the same round site repeats and can be paged in the control frame.
+  start(7, "hunt", huntKey),
+  end(7, "hunt", 11_004),
+  start(8, "hunt", huntKey),
+  end(8, "hunt", 9_772),
+  // Engine-side panels attach every generated reviewer/judge to their semantic helper.
+  start(9, "verify 1", verifyKey),
+  start(10, "verify 2", verifyKey),
+  end(9, "verify 1", 8_144),
+  end(10, "verify 2", 7_961),
+  start(11, "judge 1.1", judgeKey),
+  start(12, "judge 1.2", judgeKey),
+  start(13, "judge 2.1", judgeKey),
+  start(14, "judge 2.2", judgeKey),
+  end(11, "judge 1.1", 5_201),
+  end(12, "judge 1.2", 4_992),
+  end(13, "judge 2.1", 5_108),
+  end(14, "judge 2.2", 5_041),
   // Human checkpoint: run pauses, a decision arrives, the site lights up.
   record({
     type: "paused",
     reason: "checkpoint_required",
-    checkpointContext: { callIndex: 13, hash: "h", prompt: "Ship the synthesis?", kind: "confirm" },
+    checkpointContext: { callIndex: 15, hash: "h", prompt: "Ship the synthesis?", kind: "confirm" },
   }),
   record({ type: "resumed" }),
   record({
     type: "callRecord",
-    record: { index: 13, kind: "checkpoint", hash: "h", path: checkpointKey, outcome: "result", origin: "confirm" },
+    record: { index: 15, kind: "checkpoint", hash: "h", path: checkpointKey, outcome: "result", origin: "confirm" },
   }),
   record({ type: "phase", title: "Synthesize" }),
-  start(14, "synthesize", synthesizeKey),
-  transcript(14, 0, { kind: "text", text: "Merging the polished drafts…" }),
-  end(14, "synthesize", 71_226),
+  start(16, "synthesize", synthesizeKey),
+  transcript(16, 0, { kind: "text", text: "Merging the approved results…" }),
+  end(16, "synthesize", 71_226),
   record({ type: "tokenUsage", usage: { total: 372_910, cost: 0.3729 } }),
   record({
     type: "complete",
     summary: {
       status: "completed",
-      workflowName: "research-review",
-      agentCount: 14,
+      workflowName: "quality-control-review",
+      agentCount: 17,
       durationMs: 52_000,
-      phaseCount: 4,
-      callCount: 15,
+      phaseCount: 3,
+      callCount: 18,
       tokenUsage: { total: 372_910, cost: 0.3729 },
       result: { preview: '"shipped"', redacted: false, truncated: false },
     },
@@ -222,7 +221,7 @@ function Preview() {
   return (
     <>
       <header className="bar top">
-        <span className="wf-name">{model.name ?? "research-review"}</span>
+        <span className="wf-name">{model.name ?? "quality-control-review"}</span>
         <span className="run-id">run {shortRunId(model.runId)}</span>
         <span className="run-id">{agentCount(model)} agents</span>
         {model.status === "completed" ? (

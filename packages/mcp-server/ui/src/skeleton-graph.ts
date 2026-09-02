@@ -1,21 +1,28 @@
-// Skeleton-driven graph layout: the script's static structure (phases, call sites,
-// parallel/pipeline groups, loop containers) is drawn from t=0 with unexecuted sites muted,
-// and runtime NodeModels attach to sites by the innermost component of their call path.
-// Loops show one iteration at a time (latest by default, selectable); iteration boundaries
-// are derived by walking a loop's instances in callIndex order and starting a new iteration
-// whenever a site key repeats. Pure geometry — rendering lives in GraphView.tsx.
+// Skeleton-driven graph layout: the script's static structure is drawn from t=0 with
+// unexecuted sites muted, while runtime NodeModels attach by structural call path. Quality
+// primitives are first-class containers: gates expose producer/reviewer lanes and feedback,
+// loopUntilDry exposes rounds and its dry condition, and verify/judgePanel expose panel shape.
+// Pure geometry — rendering lives in GraphView.tsx.
 import { NODE_H, NODE_W, PHASE_W } from "./graph.js";
 import { innermostKey } from "./skeleton.js";
-import type { Skeleton, SkeletonNode, SkeletonSite } from "./skeleton.js";
+import type {
+  Skeleton,
+  SkeletonLoopMode,
+  SkeletonNode,
+  SkeletonPanelMode,
+  SkeletonSite,
+} from "./skeleton.js";
 import type { NodeModel, NodeStatus, RunModel } from "./state.js";
 
 const H_GAP = 92;
 const V_GAP = 36;
 const PADDING = 44;
-const LOOP_PAD = 26;
-const LOOP_HEAD = 38;
+const CONTAINER_PAD = 26;
+const CONTAINER_HEAD = 48;
 const STAGE_GAP = 56;
+const FEEDBACK_SPACE = 34;
 const MAX_VISIBLE_STACK = 6;
+const MAX_STATIC_INSTANCES = 100;
 
 export type SkelStatus = "pending" | NodeStatus;
 
@@ -38,13 +45,27 @@ export interface SkelPlacedNode {
 
 export interface SkelLoopBox {
   loopId: string;
+  mode: SkeletonLoopMode;
   x: number;
   y: number;
   w: number;
   h: number;
+  label: string;
+  detail: string;
   iterations: number;
   /** 0-based index of the iteration currently displayed. */
   shown: number;
+}
+
+export interface SkelPanelBox {
+  panelId: string;
+  mode: SkeletonPanelMode;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label: string;
+  detail: string;
 }
 
 export interface SkelBracket {
@@ -59,6 +80,9 @@ export interface SkelEdge {
   y1: number;
   x2: number;
   y2: number;
+  kind?: "flow" | "feedback";
+  /** Feedback edges route beneath their enclosing gate. */
+  bendY?: number;
 }
 
 export interface SkelLayout {
@@ -66,15 +90,16 @@ export interface SkelLayout {
   height: number;
   placed: SkelPlacedNode[];
   loops: SkelLoopBox[];
+  panels: SkelPanelBox[];
   brackets: SkelBracket[];
   edges: SkelEdge[];
   /** Instances that could not be attached to any site (no path, foreign scope, alias). */
   unmatchedCount: number;
 }
 
-/** A skeleton with no keyed call sites cannot improve on the wave view. */
+/** Even a control-only script has a more truthful static view than a timing-inferred wave. */
 export function skeletonIsUseful(skeleton: Skeleton): boolean {
-  return skeleton.byKey.size > 0;
+  return skeleton.roots.length > 0;
 }
 
 interface Box {
@@ -82,12 +107,13 @@ interface Box {
   h: number;
   placed: SkelPlacedNode[];
   loops: SkelLoopBox[];
+  panels: SkelPanelBox[];
   brackets: SkelBracket[];
   edges: SkelEdge[];
 }
 
 function emptyBox(): Box {
-  return { w: 0, h: 0, placed: [], loops: [], brackets: [], edges: [] };
+  return { w: 0, h: 0, placed: [], loops: [], panels: [], brackets: [], edges: [] };
 }
 
 function shift(box: Box, dx: number, dy: number): void {
@@ -99,6 +125,10 @@ function shift(box: Box, dx: number, dy: number): void {
     loop.x += dx;
     loop.y += dy;
   }
+  for (const panel of box.panels) {
+    panel.x += dx;
+    panel.y += dy;
+  }
   for (const bracket of box.brackets) {
     bracket.x += dx;
     bracket.yTop += dy;
@@ -109,12 +139,14 @@ function shift(box: Box, dx: number, dy: number): void {
     edge.y1 += dy;
     edge.x2 += dx;
     edge.y2 += dy;
+    if (edge.bendY !== undefined) edge.bendY += dy;
   }
 }
 
 function merge(into: Box, from: Box): void {
   into.placed.push(...from.placed);
   into.loops.push(...from.loops);
+  into.panels.push(...from.panels);
   into.brackets.push(...from.brackets);
   into.edges.push(...from.edges);
 }
@@ -128,6 +160,7 @@ interface LayoutContext {
   expanded: ReadonlySet<string>;
   loopMeta: Map<string, { iterations: number; shown: number }>;
   nextLoopId: () => string;
+  nextPanelId: () => string;
   nextPhaseId: () => string;
 }
 
@@ -146,34 +179,51 @@ function instanceNode(node: NodeModel, x: number, y: number): SkelPlacedNode {
   };
 }
 
-function layoutSite(site: SkeletonSite, context: LayoutContext): Box {
+function siteLabel(site: SkeletonSite): string {
+  return site.labelPreview ?? site.promptPreview ?? `${site.helper ?? site.kind}()`;
+}
+
+function pendingSub(site: SkeletonSite, index: number, total: number): string {
+  const kind = site.kind === "agent" ? "agent" : (site.helper ?? site.kind);
+  return total > 1 ? `${kind} · ${index + 1}/${total} pending` : `${kind} · pending`;
+}
+
+function layoutSite(site: SkeletonSite, context: LayoutContext, staticInvocations = 1): Box {
   const box = emptyBox();
   if (site.kind === "checkpoint") return layoutCheckpointSite(site, context);
+
   const instances = context.visibleInstances.get(site.key) ?? [];
-  if (instances.length === 0) {
-    box.placed.push({
-      id: `s${site.key}`,
-      kind: "site",
-      x: 0,
-      y: 0,
-      w: NODE_W,
-      h: NODE_H,
-      label: site.labelPreview ?? site.promptPreview ?? `${site.helper ?? site.kind}()`,
-      sub: site.kind === "agent" ? "pending" : (site.helper ?? site.kind),
-      status: "pending",
-      siteKey: site.key,
-    });
-    box.w = NODE_W;
-    box.h = NODE_H;
-    return box;
-  }
-  const visible = context.expanded.has(site.key) ? instances : instances.slice(0, MAX_VISIBLE_STACK);
+  const rawExpected = Math.max((site.expectedInstances ?? 1) * staticInvocations, 1);
+  const total = Math.max(instances.length, rawExpected);
+  const expanded = context.expanded.has(site.key);
+  const visibleCount = Math.min(
+    total,
+    expanded ? MAX_STATIC_INSTANCES : MAX_VISIBLE_STACK,
+  );
   let y = 0;
-  for (const node of visible) {
-    box.placed.push(instanceNode(node, 0, y));
+
+  for (let index = 0; index < visibleCount; index += 1) {
+    const instance = instances[index];
+    if (instance !== undefined) {
+      box.placed.push(instanceNode(instance, 0, y));
+    } else {
+      box.placed.push({
+        id: `s${site.key}:${index}`,
+        kind: "site",
+        x: 0,
+        y,
+        w: NODE_W,
+        h: NODE_H,
+        label: siteLabel(site),
+        sub: pendingSub(site, index, rawExpected),
+        status: "pending",
+        siteKey: site.key,
+      });
+    }
     y += NODE_H + V_GAP;
   }
-  const hidden = instances.length - visible.length;
+
+  const hidden = total - visibleCount;
   if (hidden > 0) {
     box.placed.push({
       id: `m${site.key}`,
@@ -183,22 +233,20 @@ function layoutSite(site: SkeletonSite, context: LayoutContext): Box {
       w: NODE_W,
       h: NODE_H,
       label: `+${hidden} more`,
-      sub: "agents",
+      sub: instances.length < rawExpected ? `${rawExpected} planned` : "agents",
       status: "pending",
       siteKey: site.key,
     });
     y += NODE_H + V_GAP;
   }
   box.w = NODE_W;
-  box.h = y - V_GAP;
+  box.h = Math.max(NODE_H, y - V_GAP);
   return box;
 }
 
 /**
  * Checkpoints emit no agentStart; their settlement callRecords carry the path. The site
- * stays muted until at least one decision lands, then shows the latest outcome. Checkpoint
- * cards are not iteration-partitioned (a same-site repeat inside a loop shows its most
- * recent decision).
+ * stays muted until at least one decision lands, then shows the latest outcome.
  */
 function layoutCheckpointSite(site: SkeletonSite, context: LayoutContext): Box {
   const box = emptyBox();
@@ -214,14 +262,14 @@ function layoutCheckpointSite(site: SkeletonSite, context: LayoutContext): Box {
   const label = site.promptPreview ?? site.labelPreview ?? "checkpoint()";
   if (latest === undefined) {
     box.placed.push({
-      id: `s${site.key}`,
+      id: `s${site.key}:0`,
       kind: "site",
       x: 0,
       y: 0,
       w: NODE_W,
       h: NODE_H,
       label,
-      sub: "checkpoint",
+      sub: "checkpoint · pending",
       status: "pending",
       siteKey: site.key,
     });
@@ -246,13 +294,17 @@ function layoutCheckpointSite(site: SkeletonSite, context: LayoutContext): Box {
 
 function groupObservedCount(node: SkeletonNode, context: LayoutContext): number {
   if (node.kind === "site") return (context.allInstances.get(node.site.key) ?? []).length;
-  if (node.kind === "group" || node.kind === "loop") {
+  if (node.kind === "group" || node.kind === "loop" || node.kind === "panel") {
     return node.children.reduce((sum, child) => sum + groupObservedCount(child, context), 0);
   }
   return 0;
 }
 
-function layoutNode(node: SkeletonNode, context: LayoutContext): Box | undefined {
+function layoutNode(
+  node: SkeletonNode,
+  context: LayoutContext,
+  staticInvocations = 1,
+): Box | undefined {
   switch (node.kind) {
     case "phase": {
       const box = emptyBox();
@@ -266,7 +318,7 @@ function layoutNode(node: SkeletonNode, context: LayoutContext): Box | undefined
         w: PHASE_W,
         h: NODE_H,
         label: node.title ?? "phase",
-        sub: "phase",
+        sub: "phase boundary",
         status: reached ? "done" : "pending",
         ...(phaseIndex !== undefined && phaseIndex >= 0 ? { phaseIndex } : {}),
       });
@@ -275,15 +327,21 @@ function layoutNode(node: SkeletonNode, context: LayoutContext): Box | undefined
       return box;
     }
     case "site":
-      return layoutSite(node.site, context);
+      return layoutSite(node.site, context, staticInvocations);
     case "group": {
       const inner =
         node.mode === "pipeline" && node.stages !== undefined && node.stages.length > 0
           ? layoutRow(
-              node.stages.map((stage) => layoutColumn(stage, context)),
+              node.stages.map((stage) =>
+                layoutColumn(stage, context, stage.length === 1 ? node.staticCount : undefined),
+              ),
               STAGE_GAP,
             )
-          : layoutColumn(node.children, context);
+          : layoutColumn(
+              node.children,
+              context,
+              node.children.length === 1 ? node.staticCount : undefined,
+            );
       if (inner.placed.length === 0) return undefined;
       const observed = groupObservedCount(node, context);
       const count = node.staticCount ?? (observed > 0 ? observed : undefined);
@@ -291,37 +349,127 @@ function layoutNode(node: SkeletonNode, context: LayoutContext): Box | undefined
       inner.brackets.push({ x: -18, yTop: -6, yBottom: inner.h + 6, label });
       return inner;
     }
-    case "loop": {
-      const loopId = context.nextLoopId();
-      const inner = layoutColumnAsSequence(node.children, context);
-      if (inner.placed.length === 0) return undefined;
-      const meta = context.loopMeta.get(loopId) ?? { iterations: 0, shown: 0 };
-      const box = emptyBox();
-      shift(inner, LOOP_PAD, LOOP_HEAD);
-      merge(box, inner);
-      box.w = inner.w + LOOP_PAD * 2;
-      box.h = inner.h + LOOP_HEAD + LOOP_PAD;
-      box.loops.push({
-        loopId,
-        x: 0,
-        y: 0,
-        w: box.w,
-        h: box.h,
-        iterations: meta.iterations,
-        shown: meta.shown,
-      });
-      return box;
-    }
+    case "panel":
+      return layoutPanel(node, context, staticInvocations);
+    case "loop":
+      return layoutLoop(node, context, staticInvocations);
   }
 }
 
+function layoutPanel(
+  node: Extract<SkeletonNode, { kind: "panel" }>,
+  context: LayoutContext,
+  staticInvocations: number,
+): Box | undefined {
+  const panelId = context.nextPanelId();
+  const inner = layoutColumn(node.children, context, staticInvocations);
+  if (inner.placed.length === 0) return undefined;
+  const box = emptyBox();
+  shift(inner, CONTAINER_PAD, CONTAINER_HEAD);
+  merge(box, inner);
+  box.w = inner.w + CONTAINER_PAD * 2;
+  box.h = inner.h + CONTAINER_HEAD + CONTAINER_PAD;
+  const label = node.mode === "verify" ? "VERIFY" : "JUDGE PANEL";
+  const detail =
+    node.mode === "verify"
+      ? `${node.members} reviewer${node.members === 1 ? "" : "s"} · pass ≥ ${Math.round((node.threshold ?? 0.5) * 100)}%${node.lenses === undefined ? "" : ` · ${node.lenses} lenses`}`
+      : node.candidates === undefined
+        ? `${node.members} judge${node.members === 1 ? "" : "s"} per candidate`
+        : `${node.candidates} candidate${node.candidates === 1 ? "" : "s"} × ${node.members} judges`;
+  box.panels.push({ panelId, mode: node.mode, x: 0, y: 0, w: box.w, h: box.h, label, detail });
+  return box;
+}
+
+function loopLabel(mode: SkeletonLoopMode): string {
+  if (mode === "gate") return "GATE";
+  if (mode === "loopUntilDry") return "LOOP UNTIL DRY";
+  return "LOOP";
+}
+
+function loopDetail(
+  node: Extract<SkeletonNode, { kind: "loop" }>,
+  iterations: number,
+  shown: number,
+): string {
+  if (node.mode === "gate") {
+    const observed = iterations > 0 ? `attempt ${shown + 1} of ${iterations} observed` : "produce → validate";
+    return `${observed} · ${node.maxIterations ?? 3} max`;
+  }
+  if (node.mode === "loopUntilDry") {
+    const observed = iterations > 0 ? `round ${shown + 1}/${iterations} · ` : "";
+    return `${observed}${node.consecutiveEmpty ?? 2} dry to stop · ${node.maxIterations ?? 50} rounds max`;
+  }
+  return iterations > 0 ? `iteration ${shown + 1} of ${iterations}` : "repeating block";
+}
+
+function layoutGateStages(
+  stages: SkeletonNode[][],
+  context: LayoutContext,
+  staticInvocations: number,
+): Box {
+  const lanes = stages.map((stage) => layoutColumn(stage, context, staticInvocations));
+  const inner = connectSequence(lanes);
+  if (lanes.length >= 2 && inner.placed.length > 0) {
+    const left = lanes[0];
+    const right = lanes.at(-1);
+    if (left !== undefined && right !== undefined) {
+      inner.edges.push({
+        x1: inner.w,
+        y1: inner.h / 2,
+        x2: 0,
+        y2: inner.h / 2,
+        kind: "feedback",
+        bendY: inner.h + FEEDBACK_SPACE - 8,
+      });
+      inner.h += FEEDBACK_SPACE;
+    }
+  }
+  return inner;
+}
+
+function layoutLoop(
+  node: Extract<SkeletonNode, { kind: "loop" }>,
+  context: LayoutContext,
+  staticInvocations: number,
+): Box | undefined {
+  const loopId = context.nextLoopId();
+  const inner =
+    node.mode === "gate" && node.stages !== undefined
+      ? layoutGateStages(node.stages, context, staticInvocations)
+      : layoutColumnAsSequence(node.children, context, staticInvocations);
+  if (inner.placed.length === 0) return undefined;
+  const meta = context.loopMeta.get(loopId) ?? { iterations: 0, shown: 0 };
+  const box = emptyBox();
+  shift(inner, CONTAINER_PAD, CONTAINER_HEAD);
+  merge(box, inner);
+  box.w = inner.w + CONTAINER_PAD * 2;
+  box.h = inner.h + CONTAINER_HEAD + CONTAINER_PAD;
+  box.loops.push({
+    loopId,
+    mode: node.mode,
+    x: 0,
+    y: 0,
+    w: box.w,
+    h: box.h,
+    label: loopLabel(node.mode),
+    detail: loopDetail(node, meta.iterations, meta.shown),
+    iterations: meta.iterations,
+    shown: meta.shown,
+  });
+  return box;
+}
+
 /** Vertical stack (parallel members, one pipeline stage). */
-function layoutColumn(nodes: SkeletonNode[], context: LayoutContext): Box {
+function layoutColumn(
+  nodes: SkeletonNode[],
+  context: LayoutContext,
+  staticInvocations = 1,
+): Box {
   const box = emptyBox();
   let y = 0;
   let width = 0;
   for (const node of nodes) {
-    const child = layoutNode(node, context);
+    const child = layoutNode(node, context, nodes.length === 1 ? staticInvocations : 1);
     if (child === undefined || child.placed.length === 0) continue;
     shift(child, 0, y);
     merge(box, child);
@@ -350,10 +498,14 @@ function layoutRow(boxes: Box[], gap: number): Box {
 }
 
 /** Horizontal sequence with connector edges between adjacent members. */
-function layoutColumnAsSequence(nodes: SkeletonNode[], context: LayoutContext): Box {
+function layoutColumnAsSequence(
+  nodes: SkeletonNode[],
+  context: LayoutContext,
+  staticInvocations = 1,
+): Box {
   const boxes: Box[] = [];
   for (const node of nodes) {
-    const child = layoutNode(node, context);
+    const child = layoutNode(node, context, nodes.length === 1 ? staticInvocations : 1);
     if (child !== undefined && child.placed.length > 0) boxes.push(child);
   }
   return connectSequence(boxes);
@@ -365,6 +517,7 @@ function connectSequence(boxes: Box[]): Box {
   let x = 0;
   let previous: { x: number; w: number; centerY: number } | undefined;
   for (const box of boxes) {
+    if (box.placed.length === 0) continue;
     const y = (height - box.h) / 2;
     shift(box, x, y);
     merge(out, box);
@@ -375,6 +528,7 @@ function connectSequence(boxes: Box[]): Box {
         y1: previous.centerY,
         x2: x,
         y2: centerY,
+        kind: "flow",
       });
     }
     previous = { x, w: box.w, centerY };
@@ -387,8 +541,7 @@ function connectSequence(boxes: Box[]): Box {
 
 /**
  * Assign loop ids in the same DFS order layout visits them, and compute per-loop iteration
- * partitions. A site belongs to its nearest enclosing loop; nested inner loops partition
- * independently of their parent.
+ * partitions. A site belongs to its nearest enclosing loop; nested loops partition independently.
  */
 function computeLoopData(
   skeleton: Skeleton,
@@ -405,7 +558,7 @@ function computeLoopData(
   const directSiteKeys = (nodes: SkeletonNode[], into: string[]): void => {
     for (const node of nodes) {
       if (node.kind === "site") into.push(node.site.key);
-      else if (node.kind === "group") directSiteKeys(node.children, into);
+      else if (node.kind === "group" || node.kind === "panel") directSiteKeys(node.children, into);
       // A nested loop owns its own sites.
     }
   };
@@ -436,8 +589,7 @@ function computeLoopData(
 
         const total = iterations.length;
         const selection = loopSelections.get(loopId);
-        const shown =
-          total === 0 ? 0 : Math.min(Math.max(selection ?? total - 1, 0), total - 1);
+        const shown = total === 0 ? 0 : Math.min(Math.max(selection ?? total - 1, 0), total - 1);
         loopMeta.set(loopId, { iterations: total, shown });
 
         const shownSet = new Set(iterations[shown]?.map((instance) => instance.callIndex) ?? []);
@@ -448,7 +600,7 @@ function computeLoopData(
           );
         }
         visit(node.children);
-      } else if (node.kind === "group") {
+      } else if (node.kind === "group" || node.kind === "panel") {
         visit(node.children);
       }
     }
@@ -482,6 +634,7 @@ export function layoutSkeletonGraph(
   const { loopMeta, visibleInstances } = computeLoopData(skeleton, bySite, loopSelections);
 
   let loopCounter = 0;
+  let panelCounter = 0;
   let phaseCounter = 0;
   const context: LayoutContext = {
     model,
@@ -490,6 +643,7 @@ export function layoutSkeletonGraph(
     expanded,
     loopMeta,
     nextLoopId: () => `loop${loopCounter++}`,
+    nextPanelId: () => `panel${panelCounter++}`,
     nextPhaseId: () => `ph${phaseCounter++}`,
   };
 
@@ -499,15 +653,14 @@ export function layoutSkeletonGraph(
     if (box !== undefined && box.placed.length > 0) boxes.push(box);
   }
 
-  // Instances that did not attach to a site cluster at the end of the flow: agents of
-  // nested workflow() runs (foreign scope — a different script, so no site can match)
-  // grouped per child run, then own-scope strays (path capture failed, aliased calls).
+  // Instances that did not attach to a site cluster at the end of the flow: agents of nested
+  // workflow() runs grouped per child run, then own-scope strays (path capture failed, aliases).
   const clusters = new Map<string, { label: string; nodes: NodeModel[] }>();
   for (const node of unmatched) {
     const foreign = node.scope !== undefined && node.scope !== model.runId;
     const clusterKey = foreign ? `nested:${node.scope}` : "unmatched";
     const label = foreign
-      ? `▸ nested ${node.scope?.split("-nested").at(-1) ?? ""}`.trim()
+      ? `nested ${node.scope?.split("-nested").at(-1) ?? ""}`.trim()
       : "unmapped";
     const cluster = clusters.get(clusterKey);
     if (cluster === undefined) clusters.set(clusterKey, { label, nodes: [node] });
@@ -557,6 +710,7 @@ export function layoutSkeletonGraph(
     height: Math.max(root.h + PADDING * 2, 320),
     placed: root.placed,
     loops: root.loops,
+    panels: root.panels,
     brackets: root.brackets,
     edges: root.edges,
     unmatchedCount: unmatched.length,
