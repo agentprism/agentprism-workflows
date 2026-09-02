@@ -165,7 +165,7 @@ test("shutdown admission control rejects every new workflow tool call", async ()
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   try {
     server.stopAcceptingWork();
-    const result = await client.callTool({ name: "workflow", arguments: {} });
+    const result = await client.callTool({ name: "workflow", arguments: { action: "config" } });
     assert.equal(result.isError, true);
     assert.match((result.content[0] as { text: string }).text, /shutting down/);
   } finally {

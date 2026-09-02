@@ -78,11 +78,12 @@ dispatch:
 - legacy `await` preserves an explicit `waitMs`, or uses its historical omitted default of 20,000
   ms.
 
-Legacy-only action types remain deprecated TypeScript aliases. They are not members of the
-canonical `WorkflowToolInput` union. No second handler or output contract is retained, and the
-server does not publish two ways to observe a run. This train intentionally does not introduce the
-final per-action discriminated JSON Schema; the existing combined schema remains until all workflow
-action and output changes are complete.
+Legacy-only action types remain deprecated TypeScript migration aliases. They are not members of
+the canonical `WorkflowToolInput` union. No second handler or output contract is retained, and the
+server does not publish two ways to observe a run. The completed action train now publishes the
+strict seven-action `oneOf`; status requires its literal action, runId, and only its optional
+`waitMs`/inspection fields. Runtime alias normalization occurs before that canonical validation and
+does not add aliases to discovery. Omitted-action run receives the same compatibility treatment.
 
 ## Preserved boundaries
 

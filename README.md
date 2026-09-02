@@ -318,9 +318,15 @@ reference host's generic core client must advertise.
 
 **Tool: `workflow`** — input parameters:
 
+Tool discovery publishes a strict seven-action `oneOf`: `action` is required, each branch lists
+only its valid fields, and cross-action fields are rejected as MCP Invalid Params. During migration,
+the runtime still maps an omitted action to `run`, legacy `inspect` to immediate `status`, and legacy
+`await` to `status` with its historical 20-second omitted wait. New callers should use only the
+published canonical forms.
+
 | Param | Type | Notes |
 |---|---|---|
-| `action` | `"config" \| "run" \| "resume" \| "status" \| "result" \| "permissions-response" \| "stop"` | `"config"` performs zero-token live backend discovery. Omit or use `"run"` for validation plus explicit-content execution. `"resume"` creates a new run from a source run's stored script and args. `"status"` is the one run-observation action. `"result"` pages a completed exact JSON result. `permissions-response` resolves one live ACP request using an exact advertised option. |
+| `action` | `"config" \| "run" \| "resume" \| "status" \| "result" \| "permissions-response" \| "stop"` | Required canonical discriminator. `"config"` performs zero-token live backend discovery. `"run"` validates and executes explicit content. `"resume"` creates a new run from stored script and args. `"status"` is the one run-observation action. `"result"` pages completed exact JSON. `permissions-response` resolves one live ACP request using an exact advertised option. |
 | `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for resume/status/result/permissions-response/stop. |
 | `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for resume/status/result/permissions-response/stop. |
 | `projectDir` | absolute path string | Config/run: project-sensitive discovery cwd and the run's project store/default cwd. Required for both on the shared daemon; defaults to the server's project under `--in-process`. Resume locates the project from its source `runId`. |
@@ -359,7 +365,7 @@ mode. These defaults are applied at session start instead of inheriting ambient 
 Every run is statically checked, mock-executed, and config-probed before admission. Invalid scripts return `status:"rejected"` diagnostics without a run ID, background reservation, or token spend. Foreground remains the default. For long work, start it and retain the new run ID:
 
 ```json
-{ "script": "export const meta = { name: 'review', description: 'review' }; return await agent('Review the repo');", "background": true }
+{ "action": "run", "script": "export const meta = { name: 'review', description: 'review' }; return await agent('Review the repo');", "background": true }
 ```
 
 Then long-poll in ordinary bounded tool calls until `outcome` appears:

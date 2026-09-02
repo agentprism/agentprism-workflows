@@ -1371,7 +1371,7 @@ interface WorkflowConfigToolInput {
 }
 
 interface WorkflowExecuteToolInput {
-  action?: "run";
+  action: "run";
   script: string;
   projectDir?: string; // absolute project directory: selects the project-scoped run store and
                        // default execution cwd. REQUIRED on the shared workflow daemon; optional
@@ -1458,13 +1458,22 @@ interface WorkflowExecutionToolResult<T = unknown> {
 
 `action:"config"` reuses the server's runner to open bounded no-prompt sessions and returns live model/mode/config catalogs without creating a manager run. Mode names, descriptions, and `_meta` are preserved verbatim in structured and human-readable output, alongside `defaultModeId` (`auto` / `agent` / `build` for the three mode-capable first-class backends). `action:"resume"` first locates the source project from `runId`, rejects missing/unreadable persisted content or unreplayable stored args directly, then submits the immutable stored script and stored-or-explicit args through the same new-run validation/admission path with `resumeFromRunId` set internally. It works from supported paused and terminal sources, never mutates the source, never inherits its operational limits, and returns a fresh linked run ID; `scriptSource:"stored"` identifies this admission. Ordinary `action:"run"` with explicit script content plus `resumeFromRunId` remains the edited replay path. Every execution request is statically parsed, mock-executed, and probed before run admission; an invalid preflight returns `{ action:"run", status:"rejected", validation }` with no run ID, persistence record, background reservation, or live `AgentRunner.run()` call.
 
+The published input is a strict draft-2020-12 `oneOf` with seven top-level branches in this order:
+config, run, resume, status, result, permissions-response, and stop. Every object variant requires
+its literal `action` and has `additionalProperties:false`. Run has structural sub-variants for
+inline/path content and fresh/edited replay, so exactly one content source is required and
+`resumePolicy`/`checkpointReplies` can appear only with required `resumeFromRunId`. Stop has separate
+whole-run and targeted variants, making `forceOwner` and `callIndex` structurally exclusive.
+
 Mixed/missing branches, invalid run IDs, invalid status bounds, and `waitMs` outside 0–25,000
-are MCP Invalid Params (`-32602`). Omitted action/background preserves foreground execution byte for
+are MCP Invalid Params (`-32602`). `background` omission preserves foreground execution byte for
 byte for executions that do not block on an ACP permission: it streams progress, honors request cancellation and live checkpoint elicitation, and returns
 `WorkflowExecutionToolResult<T>`. If a permission blocks first, foreground returns a running admission with `pendingPermissions` and the run stays live. `action:"status"` with omitted or zero `waitMs` observes lifecycle state immediately; when a permission is pending it also projects that request and may elicit one exact option from a capable client.
-The published schema advertises only `status`; runtime compatibility normalizes legacy `inspect` to
-an immediate status request and legacy `await` to status with its historical 20-second omitted
-default.
+Compatibility normalization runs before canonical validation but is absent from discovery: an
+omitted action becomes `run`, legacy `inspect` becomes immediate `status`, and legacy `await`
+becomes `status` while preserving explicit `waitMs` or using its historical 20-second default.
+Deprecated inspect/await TypeScript aliases remain migration input types only; neither belongs to
+`WorkflowToolInput`, and new callers must use the seven published actions.
 
 After preflight succeeds, `background:true` reserves one of four process-local active-or-starting slots, performs lease acquisition and the durable initial save, then returns:
 

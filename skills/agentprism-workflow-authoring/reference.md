@@ -225,7 +225,7 @@ interface WorkflowConfigToolInput {
 }
 
 interface WorkflowExecuteToolInputBase {
-  action?: "run";
+  action: "run";
   args?: unknown;
   maxAgents?: number;
   concurrency?: number;
@@ -240,6 +240,9 @@ type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase & (
   | { script: string; scriptPath?: never }
   | { script?: never; scriptPath: string } // absolute path on the server
 );
+
+// Discovery publishes a strict seven-action oneOf. The runtime temporarily accepts omitted-action
+// run plus inspect/await aliases before canonical validation, but new callers use required action.
 
 interface WorkflowResumeToolInput {
   action: "resume";

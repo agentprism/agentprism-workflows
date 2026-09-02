@@ -156,38 +156,31 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     );
     const tool = tools.find((candidate) => candidate.name === "workflow");
     assert.ok(tool, "the workflow tool is registered");
-    assert.match(tool.description ?? "", /registry built-ins—currently Claude, Codex, OpenCode, and pi/);
-    assert.match(tool.description ?? "", /action:\"config\"/);
-    assert.match(tool.description ?? "", /action:\"result\"/);
-    assert.match(tool.description ?? "", /action:\"status\"/);
+    assert.equal(tool.title, "Run and manage deterministic agent workflows");
+    assert.match(tool.description ?? "", /workflow\/quickstart/);
+    assert.match(tool.description ?? "", /workflow\/run-lifecycle/);
+    assert.match(tool.description ?? "", /status for an immediate snapshot or request-bounded wait/);
     assert.doesNotMatch(tool.description ?? "", /action:\"(?:inspect|await)\"/);
-    assert.match(tool.description ?? "", /automatically performs static validation, a mocked dry run, and routed config checks/);
-    assert.match(tool.description ?? "", /Every parallel entry must be a thunk/);
-    assert.match(tool.description ?? "", /phases must be an array of objects shaped `\{ title: string, detail\?: string, model\?: string \}`, never an array of strings/);
-    assert.match(tool.description ?? "", /Minimal script:.*phases: \[\{ title: \"Review\" \}\].*phase\(\"Review\"\)/);
-    assert.match(tool.description ?? "", /configOptions, schema, cwd, retries/);
+    assert.doesNotMatch(tool.description ?? "", /parallel\(|Minimal script|first statement|agent option keys/);
     assert.doesNotMatch(tool.description ?? "", /npx|CLI|shell out/i);
+    assert.ok((tool.description ?? "").length < 1_200, "the model-facing description stays compact");
 
-    assert.deepEqual(tool.inputSchema.required, undefined, "the raw shape leaves branch requirements to the discriminator");
-    const inputProps = Object.keys(tool.inputSchema.properties ?? {});
-    assert.ok(!inputProps.includes("startInBackground"), "startInBackground is not advertised");
-    assert.ok(inputProps.includes("resumeFromRunId"), "explicit resume knob is advertised");
-    assert.ok(inputProps.includes("resumePolicy"), "resume matching policy is advertised");
-    assert.ok(inputProps.includes("action") && inputProps.includes("runId"), "status action fields are advertised");
-    assert.ok(inputProps.includes("background") && inputProps.includes("waitMs"), "detached lifecycle fields are advertised");
-    assert.ok(inputProps.includes("lastN") && inputProps.includes("labelGlob") && inputProps.includes("logLines"));
-    assert.ok(inputProps.includes("checkpointReplies"), "durable checkpoint reply channel is advertised");
-    assert.ok(inputProps.includes("concurrency") && inputProps.includes("agentRetries"));
-    assert.ok(inputProps.includes("forceOwner"), "explicit predecessor-force authorization is advertised");
-    assert.ok(inputProps.includes("harnesses") && inputProps.includes("modelSpecs") && inputProps.includes("modelFilter"));
-    assert.ok(!inputProps.includes("probeTimeoutMs"));
-    assert.ok(!inputProps.includes("agentTimeoutMs") && !inputProps.includes("agentIdleTimeoutMs"));
-    assert.deepEqual(
-      field(field(tool.inputSchema, "properties"), "action") &&
-        field(field(field(tool.inputSchema, "properties"), "action"), "enum"),
-      ["run", "resume", "config", "status", "result", "stop", "permissions-response"],
-      "the published action enum contains only canonical actions",
-    );
+    assert.deepEqual(Object.keys(tool.inputSchema).sort(), ["$schema", "oneOf", "type"].sort());
+    assert.equal(tool.inputSchema.type, "object");
+    const inputVariants = field(tool.inputSchema, "oneOf") as Array<Record<string, unknown>>;
+    assert.equal(inputVariants.length, 7, "one published branch per canonical action");
+    const actions = inputVariants.map((variant) => {
+      const direct = field(field(variant, "properties"), "action");
+      if (direct !== undefined) return field(direct, "const");
+      const nested = field(variant, "oneOf") as Array<Record<string, unknown>>;
+      const nestedActions = new Set(
+        nested.map((candidate) => field(field(field(candidate, "properties"), "action"), "const")),
+      );
+      assert.equal(nestedActions.size, 1, "structural sub-variants retain one action discriminator");
+      return [...nestedActions][0];
+    });
+    assert.deepEqual(actions, ["config", "run", "resume", "status", "result", "permissions-response", "stop"]);
+    assert.doesNotMatch(JSON.stringify(tool.inputSchema), /inspect|await|startInBackground|agentTimeoutMs|agentIdleTimeoutMs/);
 
     // The machine-readable output core includes structured pause contexts.
     assert.ok(tool.outputSchema, "an output schema is declared");

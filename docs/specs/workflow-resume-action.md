@@ -75,9 +75,10 @@ background simple-resume responses. Later status cannot infer an admission sourc
 omit that field. MCP Apps must use the result's new `runId` for resume calls, never the input's
 source ID.
 
-The runtime parser and TypeScript types are action-specific, but this train intentionally retains
-the combined published Zod object schema. A genuinely discriminated published action schema is a
-later combined-surface change after all action and output branches are final.
+The completed action train publishes a strict seven-action Zod `oneOf`. Resume is one object branch
+with required literal `action` and `runId`, only its optional args/new-run/replay fields, and
+`additionalProperties:false`; script/project/status/result/control fields therefore fail at the
+MCP schema boundary. The same canonical Zod union performs runtime validation.
 
 ## Verification
 

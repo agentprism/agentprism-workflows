@@ -286,7 +286,7 @@ All versions below were re-verified from the installed workspace dependency grap
 ## 4. The MCP side — exposing the `workflow` tool
 
 The `workflow` tool grew from Pi's single-form input
-([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into an **action union** — `config`, `run` (the default when `action` is omitted), `resume`, `status`, `result`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. The MCP SDK validates the primitive fields, then a discriminator enforces each action's exact field set (status fields on a run, or execution fields on observation/control actions, are `InvalidParams`):
+([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into a strict **action union** — `config`, `run`, `resume`, `status`, `result`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. Tool discovery publishes a draft-2020-12 `oneOf` with one top-level branch per canonical action, literal required discriminators, branch-local properties, and `additionalProperties:false`. Run nests exact inline/path plus fresh/edited-replay variants; stop nests whole-run/targeted variants. The same Zod union performs runtime validation, so action combinations are no longer maintained by a separate manual discriminator. A pre-validation migration normalizer still accepts omitted-action run and retired inspect/await inputs, but those forms are absent from discovery and from the canonical TypeScript union:
 
 - **Run** — supply **exactly one** of `script` or `scriptPath` (a raw JS string with no Markdown
   fences, or an absolute server-side path read once at admission; the first statement must be
@@ -370,7 +370,7 @@ resolver that parks the original `session/request_permission` promise and record
 projection keyed by run/call/permission id. The projection omits the private ACP session id, redacts
 credential-shaped diagnostics, bounds scalars and structure, and preserves every exact ordered option
 id inside a 64 KiB envelope; an unrepresentable option set is cancelled rather than partially shown.
-Inspect and await expose the exact ordered backend options;
+Status exposes the exact ordered backend options;
 legacy elicitation-capable clients receive a form immediately, modern clients use an integrity-bound
 `inputRequired` retry, and non-elicitation clients call `permissions-response`. Responses validate the
 selected option against the parked request and route through signed daemon control to the process that

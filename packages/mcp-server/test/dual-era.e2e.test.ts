@@ -71,7 +71,7 @@ async function exerciseEra(
   mode: "legacy" | "modern",
   daemonUrl: string,
   projectDir: string,
-): Promise<{ tools: string[]; status: unknown }> {
+): Promise<{ tools: string[]; status: unknown; workflowInputSchema: unknown }> {
   const connected = await connectHttp(daemonUrl, {
     protocolMode: mode,
     uiCapability: "matching",
@@ -85,6 +85,8 @@ async function exerciseEra(
     const listed = await connected.client.listTools();
     const tools = listed.tools.map((tool) => tool.name).sort();
     assert.deepEqual(tools, ["docs", "repl", "workflow", "workflow-events"]);
+    const workflow = listed.tools.find((tool) => tool.name === "workflow");
+    assert.ok(workflow);
     const panel = await connected.client.readResource({
       uri: "ui://agentprism-workflow/run-monitor.html",
     });
@@ -92,10 +94,14 @@ async function exerciseEra(
 
     const result = await connected.client.callTool({
       name: "workflow",
-      arguments: { script: SCRIPT, projectDir },
+      arguments: { action: "run", script: SCRIPT, projectDir },
     });
     assert.equal(result.isError, false);
-    return { tools, status: structured(result)?.status };
+    return {
+      tools,
+      status: structured(result)?.status,
+      workflowInputSchema: workflow.inputSchema,
+    };
   } finally {
     await connected.dispose();
   }
@@ -108,6 +114,14 @@ test("one daemon serves legacy sessions and modern 2026-07-28 requests through t
     const legacy = await exerciseEra("legacy", daemon.url, projectDir);
     const modern = await exerciseEra("modern", daemon.url, projectDir);
     assert.deepEqual(modern.tools, legacy.tools);
+    assert.deepEqual(
+      modern.workflowInputSchema,
+      legacy.workflowInputSchema,
+      "legacy and modern discovery publish the same discriminated workflow schema",
+    );
+    const published = modern.workflowInputSchema as { oneOf?: unknown[]; properties?: unknown };
+    assert.equal(published.oneOf?.length, 7);
+    assert.equal(published.properties, undefined, "neither transport regresses to the flat field superset");
     assert.equal(legacy.status, "completed");
     assert.equal(modern.status, "completed");
     assert.equal(daemon.sessions.size, 1, "only the legacy client allocates an MCP session");

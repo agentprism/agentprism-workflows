@@ -63,6 +63,7 @@ script does not call MCP actions itself):
 
 ```json
 {
+  "action": "run",
   "script": "<contents of repo-triage.workflow.js>",
   "args": { "target": "." },
   "background": true
@@ -102,6 +103,7 @@ For a workflow that pauses at `checkpoint(..., { headless:"pause" })`, terminal 
 
 ```json
 {
+  "action": "run",
   "script": "<the same workflow source>",
   "args": { "target": "." },
   "background": true,

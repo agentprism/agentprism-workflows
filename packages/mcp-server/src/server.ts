@@ -172,7 +172,7 @@ export const SERVER_INSTRUCTIONS = [
     "Backend credentials come from each agent's own login (claude, codex, opencode, pi), so there " +
     "is nothing auth-shaped to configure here.",
   "• docs — SELECTIVE VERSION-MATCHED REFERENCE. Omit topic or use topic:\"index\" for the bounded catalog, then read exactly one workflow/* or repl/* topic. It embeds the selected text/markdown resource, runs no code, opens no backend, and needs no projectDir. Use it when the compact tool descriptions do not contain enough syntax or lifecycle detail.",
-  "• workflow — DETERMINISTIC BATCH orchestration. Supply a JavaScript workflow script (inline or " +
+  "• workflow — DETERMINISTIC BATCH orchestration. Use action:\"run\" with a JavaScript workflow script (inline or " +
     "by absolute scriptPath) that fans out agent() subagents and optional checkpoint() gates; it " +
     "runs to completion in the foreground, or background:true returns a durable runId for bounded " +
     "action:\"status\"/\"permissions-response\"/\"stop\" calls, with journaling and replay. " +
@@ -180,7 +180,7 @@ export const SERVER_INSTRUCTIONS = [
     "Status surfaces exact live ACP permission options when an agent needs external action. Reach " +
     "for it when the orchestration is known up front and you want it repeatable and resumable. " +
     "action:\"config\" discovers the live backend/model option catalog without starting a run, and " +
-    "every run is statically checked, mock-executed, and config-probed before admission. Read docs topic workflow/quickstart first when authoring is unfamiliar.",
+    "every run is statically checked, mock-executed, and config-probed before admission. Read docs topic workflow/quickstart for authoring and workflow/run-lifecycle for actions.",
   "• repl — INTERACTIVE STATEFUL orchestration. A persistent per-project JavaScript VM you drive " +
     "incrementally with action:\"eval\"; named bindings, pending subagent calls, raised checkpoints, " +
     "and `_` (the previous eval's completion value) persist between calls and survive daemon restarts. " +
@@ -1916,6 +1916,7 @@ export function createWorkflowServer(
     if (
       input.action === "status" ||
       input.action === "resume" ||
+      input.action === "result" ||
       input.action === "stop" ||
       input.action === "permissions-response"
     ) {
@@ -1954,43 +1955,15 @@ export function createWorkflowServer(
 
   const workflowToolOutputSchema = workflowToolOutputShape;
   const workflowToolConfig = {
-    title: "Discover, validate, run, resume, observe status, answer permissions, stop, or narrow-cancel a workflow",
+    title: "Run and manage deterministic agent workflows",
     description:
-        "Author and operate JavaScript agent workflows through one project-scoped tool. " +
-        "A script's first statement must be `export const meta = { name, description, phases? }`. When present, phases must be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings. " +
-        "Inside the deterministic script realm use agent(prompt, options?) for one subagent; parallel([thunks]) for a barrier; " +
-        "pipeline(items, ...stages) for streaming stages; checkpoint(prompt, options?) for a human gate; phase(title) and log(message) " +
-        "for progress; and return the final JSON-serializable value. Top-level await is supported. Imports, require, network APIs, " +
-        "Date.now(), and Math.random() are unavailable. Always label agent calls; schema is a plain JSON Schema object for structured results. " +
-        "The only agent option keys are label, phase, model, tier, mode, configOptions, schema, cwd, retries, isolation:\"worktree\", resume, agentType, mcpServers, images, meta, promptMeta, and keepSession; unknown keys reject before admission. " +
-        "Every parallel entry must be a thunk: parallel([() => agent(...), () => agent(...)]). For deeper syntax, read docs topic workflow/quickstart and then one related workflow/* topic. " +
-        "Minimal script: `export const meta = { name: \"review\", description: \"Review a target\", phases: [{ title: \"Review\" }] }; phase(\"Review\"); const report = await agent(\"Review \" + args.target, { label: \"review\" }); return { report };`. " +
-        "Omit model for the server default (explicit AGENTPRISM_DEFAULT_BACKEND, else a zero-token auto-selected project pin), or use a backend name alone to preserve that backend's configured default. " +
-        "Before choosing a pinned model, mode, or configOptions, call action:\"config\" with projectDir and optional harnesses/modelFilter; after choosing a model, pass modelSpecs to read its model-specific options. " +
-        "Config returns every harness-advertised mode name, description, and metadata plus AgentPrism's omitted-mode default: Claude auto, Codex agent, OpenCode build, and no Pi mode. Pin only exact advertised ids. " +
-        "Config opens no-prompt sessions, spends zero tokens, and starts no workflow. " +
-        "action:\"run\" automatically performs static validation, a mocked dry run, and routed config checks before admission. " +
-        "Invalid scripts return bounded diagnostics with status:\"rejected\" and create no run ID, reserve no background slot, and spend no tokens. " +
-        "Run, resume, observe status, retrieve an exact completed result, answer a live ACP permission, or stop an admitted workflow through the same tool. The " +
-        "script orchestrates agent() subagents (and optional checkpoint() gates) over registry built-ins—currently Claude, Codex, OpenCode, and pi—" +
-        "ACP backends, plus registered custom agents. Supply exactly one of inline script or absolute scriptPath; path content is " +
-        "read once and snapshotted at admission. " +
+        "Validate, run, resume, observe, and control deterministic JavaScript agent workflows. " +
+        "Use config before pinning live model, mode, or config-option ids; run validates explicit script or scriptPath content; resume creates a new run from stored immutable content. " +
+        "Use status for an immediate snapshot or request-bounded wait, result for exact completed JSON, permissions-response for a pending ACP choice, and stop for a run or one live call. " +
         (requireProjectDir
-          ? "config and run REQUIRE projectDir (absolute): it is the discovery cwd and selects the project-scoped run store/default execution cwd. "
-          : "run optionally takes projectDir (absolute) to select the project-scoped run store; default is this server's own project. ") +
-        "resume/status/result/stop/permissions-response locate the project store from runId and never accept projectDir. " +
-        "Foreground is the default and streams progress; background:true returns " +
-        "a durable runId for bounded action:\"status\" calls. run and status honor _meta.progressToken " +
-        "with notifications/progress while they block. Use action:\"resume\" with runId to create a new run from that source's stored immutable script and strict-JSON args; an explicit args value overrides the stored args, and operational limits come only from the new request. Use action:\"run\" with explicit script or scriptPath plus resumeFromRunId for edited-script replay. " +
-        "In hosts that render MCP Apps, every call of this tool shows a live self-updating run-monitor " +
-        "panel and the panel reports phase starts, pauses, and terminal outcomes on its own — do NOT poll " +
-        'action:"status" only when you need machine-readable state or want to wait for a milestone. ' +
-        'Use action:"status" with a runId and optional waitMs for a safe bounded status, log tail, attributed call previews, and pending ACP permissions. Omitted or zero waitMs reads immediately; a positive value waits only for this MCP request and never cancels the run. Status returns early with action-required when one appears. Elicitation-capable hosts can present the exact backend options; otherwise use action:"permissions-response" with the returned permissionId and an exact advertised optionId or cancelled outcome. ' +
-        'Use action:"stop" to durably abort through the run\'s execution owner; cross-generation control may return a durable pending operationId before final settlement. Add callIndex to cancel only that live agent and keep the run live. forceOwner explicitly authorizes terminating a superseded owner and is forbidden with callIndex. ' +
-        "labelGlob remains an output filter. A final whole-run stop makes resume safe immediately; pending control must be retried or observed with status. " +
-        "Every admitted script is readable at workflow://runs/{runId}/script. Completed JSON results are readable at workflow://runs/{runId}/result; small results are also copied into text for content-first hosts, while large results can be paged exactly with action:\"result\", offset, and maxBytes. Result and script resource links are labelled separately. " +
-        "Background runs are tracked per project, capped at four active/starting runs, and use " +
-        "headless checkpoint semantics; checkpointReplies continue a checkpoint pause in a new run.",
+          ? "Config and run require an absolute projectDir on this shared daemon. "
+          : "Config and run may omit projectDir on this single-project server. ") +
+        "For script syntax start with docs topic workflow/quickstart; for action, background, permission, resource, stop, and resume semantics read workflow/run-lifecycle, then only its relevant related topic.",
     inputSchema: workflowToolInputSchema,
     outputSchema: workflowToolOutputSchema,
     annotations: undefined,
@@ -2199,7 +2172,7 @@ export function createWorkflowServer(
         if (
           (parsedInput.action !== undefined && parsedInput.action !== "run" && parsedInput.action !== "resume") ||
           parsedInput.background ||
-          parsedInput.resumeFromRunId !== undefined ||
+          (parsedInput.action === "run" && parsedInput.resumeFromRunId !== undefined) ||
           parsedInput.checkpointReplies !== undefined
         ) {
           throw new ProtocolError(
@@ -2274,7 +2247,7 @@ export function createWorkflowServer(
             };
       }
 
-      if ((parsedInput.action === undefined || parsedInput.action === "run") && parsedInput.resumeFromRunId !== undefined) {
+      if (parsedInput.action === "run" && parsedInput.resumeFromRunId !== undefined) {
         // Cross-project resume is an explicit redirect, never a silent miss in the wrong store.
         if (!manager.getPersistence().load(parsedInput.resumeFromRunId)) {
           const elsewhere = projects.storeFor(parsedInput.resumeFromRunId);

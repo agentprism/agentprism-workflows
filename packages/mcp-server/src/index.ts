@@ -37,6 +37,8 @@ export type {
 export {
   clampWorkflowInput,
   parseWorkflowToolInput,
+  workflowToolCanonicalInputSchema,
+  workflowToolInputBranches,
   workflowToolInputSchema,
   workflowToolInputShape,
   WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT,

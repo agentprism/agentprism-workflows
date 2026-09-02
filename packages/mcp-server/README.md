@@ -179,15 +179,17 @@ Canonical MCP topic sources live under `docs/authoring/` in the repository and a
 
 ### Input parameters
 
-The tool uses a config/run/resume/status/result/permissions-response/stop union. `config` performs zero-token, no-prompt discovery, and every new run performs static validation, a mocked dry run, and routed model/config checks before admission. Invalid scripts return bounded `status:"rejected"` diagnostics without creating a run ID or reserving background capacity. Execution resource maxima remain runtime clamps;
+The tool publishes a strict config/run/resume/status/result/permissions-response/stop `oneOf`.
+`action` is required in discovery, each branch exposes only its own fields, and mixed branches fail
+at the MCP validation boundary. `config` performs zero-token, no-prompt discovery, and every new run performs static validation, a mocked dry run, and routed model/config checks before admission. Invalid scripts return bounded `status:"rejected"` diagnostics without creating a run ID or reserving background capacity. Execution resource maxima remain runtime clamps;
 status limits are contract bounds and invalid values are MCP Invalid Params (`-32602`).
-The published schema advertises only `status`. During migration the runtime normalizes legacy
+During migration the runtime maps an omitted action to `run`, normalizes legacy
 `inspect` to immediate status and legacy `await` to status with its historical 20-second omitted
-default; new callers should not emit those aliases.
+default; these compatibility forms are not published and new callers should not emit them.
 
 | Param | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `action` | `"config" \| "run" \| "resume" \| "status" \| "result" \| "permissions-response" \| "stop"` | no | run | `"config"` discovers live backend/model/mode/config options without starting a workflow. Omit or use `"run"` for automatic validation followed by explicit-content execution. `"resume"` creates a new run from a source run's stored script and args. `"status"` is the canonical run-observation action. `"result"` retrieves one bounded UTF-8 page of a completed run's exact JSON result. |
+| `action` | `"config" \| "run" \| "resume" \| "status" \| "result" \| "permissions-response" \| "stop"` | yes | — | Canonical discriminator. `"config"` discovers live backend/model/mode/config options without starting a workflow. `"run"` validates and executes explicit content. `"resume"` creates a new run from stored content. `"status"` observes or request-bounded waits. `"result"` retrieves one bounded exact-JSON page. |
 | `script` | string (non-empty) | run XOR | — | Raw JavaScript workflow script (no Markdown fences). Exactly one of `script`/`scriptPath` is required for run. The first statement **must** be `export const meta = { name, description, phases? }`. Forbidden for resume/status/result/permissions-response/stop. |
 | `scriptPath` | absolute path string | run XOR | — | Absolute path on the **server's filesystem**. Read once as UTF-8 before admission; the content is snapshotted, and later file edits do not change that run. Relative paths and unreadable files are Invalid Params. Forbidden for resume/status/result/permissions-response/stop. |
 | `projectDir` | absolute path string | config/run (daemon) | in-process: the server's own project | Project cwd for discovery and the run store/default execution cwd for execution. Required for config and run on the shared daemon. Resume/status/result/permissions-response/stop locate it from `runId`. |
@@ -229,6 +231,7 @@ Example run arguments (validation is automatic):
 
 ```json
 {
+  "action": "run",
   "script": "export const meta = { name: 'review', description: 'review a diff' };\nconst r = await agent('Review this diff and summarize risks:\\n' + args.diff);\nreturn r;",
   "args": { "diff": "diff --git a/x b/x\n+console.log(1)" },
   "concurrency": 4
@@ -257,6 +260,7 @@ The same run delivered from disk:
 
 ```json
 {
+  "action": "run",
   "scriptPath": "/absolute/path/to/review.workflow.js",
   "args": { "target": "src/auth.ts" }
 }
@@ -277,6 +281,7 @@ Background start and bounded collection:
 
 ```json
 {
+  "action": "run",
   "script": "export const meta = { name: 'review', description: 'review a change' };\nconst report = await agent('Review ' + args.target, { label: 'review' });\nreturn report;",
   "args": { "target": "src/auth.ts" },
   "background": true,
@@ -988,8 +993,8 @@ await serveStdio(({ era }) => createWorkflowServer(runner, { protocolEra: era, p
 
 > **Use an SDK serving entry for dual-era hosting.** A hand-constructed server connected directly to `StdioServerTransport` intentionally serves only the legacy era. `serveStdio(factory)` performs the official modern/legacy arbitration while registering each tool once through the factory. The bundled `main()` additionally supplies its internal relay transport, whose worker-thread stdin reader can fire the out-of-band eval-break for a fully synchronous runaway; a vanilla stdio transport remains bounded by the per-eval deadline for that case.
 
-The REPL-specific exports are `replToolInputShape` / `replToolOutputShape` (the tool's Zod input/output schemas), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). Other workflow-side exports include `workflowToolInputShape` / `workflowToolInputSchema` / `parseWorkflowToolInput` /
-`clampWorkflowInput` (canonical primitive schema, compatibility-normalizing parser, execution clamp),
+The REPL-specific exports are `replToolInputShape` / `replToolOutputShape` (the tool's Zod input/output schemas), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). Other workflow-side exports include the individual-validator catalog `workflowToolInputShape`, canonical `workflowToolInputBranches` / `workflowToolCanonicalInputSchema`, compatibility-normalizing `workflowToolInputSchema` / `parseWorkflowToolInput`,
+`clampWorkflowInput`,
 `CreateWorkflowServerOptions`,
 `WorkflowExecuteToolInput`, `WorkflowResumeToolInput`, `WorkflowStatusToolInput`, `WorkflowPermissionResponseToolInput`, `WorkflowStopToolInput`,
 `WorkflowExecutionToolResult`, `WorkflowBackgroundAccepted`, `WorkflowStatusWaitMetadata`,
