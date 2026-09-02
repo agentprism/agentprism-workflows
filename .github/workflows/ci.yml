@@ -85,6 +85,12 @@ jobs:
       - name: ACP dependency freshness gate
         run: node scripts/check-acp-deps.mjs
 
+      # These tests use a local fixture npm registry and need no install or credentials.
+      # They pin the public ACP registry's format, version/package alignment, and
+      # fail-closed behavior before the Pages workflow can publish anything.
+      - name: Repository generator tests
+        run: node --test scripts/test/*.test.mjs
+
       # --frozen-lockfile restores the exact dependency tree (incl. the
       # @automatalabs/codex-acp fork, which bakes the outputSchema forward into
       # its dist) AND fetches the linux-x64 codex/claude native binaries. Keep

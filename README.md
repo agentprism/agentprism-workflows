@@ -174,6 +174,19 @@ The five packages below are **internal building blocks**. Most are composed by t
 
 Dependency direction: `mcp-server` → `{ workflows, repl-engine, shared-types }`; `workflows` → `{ workflow-engine, acp-agents, shared-types }`; `acp-agents` → `{ codex-acp, pi-acp, shared-types }`; `repl-engine` → `{ workflows, acp-agents, shared-types }`. The SDK (`workflows`) is the single facade that composes the deterministic engine and the ACP backend, which meet only at the `AgentRunner` seam in `shared-types`. The engine never names a backend; the agents never know they're inside a workflow. `acp-agents` spawns the bundled `codex-acp` / `pi-acp` ACP servers as its Codex and pi backends. `repl-engine` composes the QuickJS-in-WASM shim with `workflows` (for the shared per-project key) and `acp-agents` (the REPL's subagents are ACP sessions against the same backends the SDK drives), and ships its `repl` tool in `mcp-server`.
 
+### Published ACP registry
+
+Our independently published ACP servers are available as an [ACP-format registry](https://github.com/agentclientprotocol/registry/blob/main/FORMAT.md):
+
+```text
+https://agentprism.github.io/agentprism-workflows/acp-registry/v1/latest/registry.json
+```
+
+It currently contains the `@automatalabs/codex-acp` fork and the from-scratch
+`@automatalabs/pi-acp` server. Each npx distribution is pinned to the npm `latest` version that CI
+has verified is actually published; the GitHub Pages data workflow refreshes the registry after
+successful releases and on its regular schedule.
+
 ---
 
 ## Quickstart — SDK
