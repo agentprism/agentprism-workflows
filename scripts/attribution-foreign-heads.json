@@ -95,6 +95,11 @@
       "sha": "4823131475b3b0d996ccc305e49dcf9fdaa6ee52",
       "imported": "2026-08-31",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (feat: AI session title generation and /rename command (#392))"
+    },
+    {
+      "sha": "87997e2627e8fa246a49de533c612f6196c4004e",
+      "imported": "2026-09-02",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (chore(main): release 1.8.0 (#445))"
     }
   ]
 }
