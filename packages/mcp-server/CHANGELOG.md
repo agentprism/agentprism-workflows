@@ -1,5 +1,37 @@
 # @automatalabs/mcp-server
 
+## 1.0.0
+
+### Major Changes
+
+- c562237: Remove model-facing agent execution timeout fields, idle-watchdog callbacks, and timeout error codes from the shared runtime contract.
+
+  Remove total-wall and idle agent timers from workflow execution while preserving explicit call and run cancellation and compatibility reads for historical timeout records.
+
+  Remove the ACP runner activity/interaction callbacks that existed only to drive the engine idle watchdog.
+
+  Remove agent execution limits and configurable config-probe timing from the workflow SDK surface.
+
+  Remove agent and probe timeout inputs and timeout projections from the MCP workflow tool schema and status output.
+
+- c562237: Publish the workflow tool as a strict seven-action discriminated JSON Schema whose runtime validator rejects cross-action fields, while retaining unadvertised migration normalization for omitted-action run and retired inspect/await requests.
+
+### Minor Changes
+
+- c562237: Consolidate workflow run observation under the canonical `status` action with optional request-bounded `waitMs`, while normalizing legacy `inspect` and `await` requests during migration.
+- c562237: Add the stored-content workflow resume action and allow completed calls from supported aborted source recordings to replay.
+- c562237: Remove obsolete workflow token-budget and debit metadata from current SDK and MCP limits, call records, resume provenance and reports, durable events, and isolation admission. Historical persisted fields remain readable as ignored compatibility input, while provider usage telemetry remains available.
+- c562237: Expose each durable workflow events URI and labelled resource link on admitted and observable runs, and add bounded per-call latest activity to status without copying the detailed transcript into tool results.
+
+### Patch Changes
+
+- c562237: Stop advertising the events resource for integrity-unsafe runs. A run whose journal append faulted mid-run persists `eventLogIncomplete` and its event read/watch seam fails closed, so `eventsUri`, the labelled events resource link, `latestActivity`, and the events resource listing now omit it — matching the existing legacy/stream-less and durable-stop handling — while status, result, and the immutable snapshot stay available.
+- Updated dependencies [c562237]
+- Updated dependencies [c562237]
+  - @automatalabs/shared-types@1.0.0
+  - @automatalabs/workflows@1.0.0
+  - @automatalabs/repl-engine@0.4.14
+
 ## 0.38.2
 
 ### Patch Changes

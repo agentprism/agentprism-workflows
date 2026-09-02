@@ -1,5 +1,23 @@
 # @automatalabs/shared-types
 
+## 1.0.0
+
+### Major Changes
+
+- c562237: Remove model-facing agent execution timeout fields, idle-watchdog callbacks, and timeout error codes from the shared runtime contract.
+
+  Remove total-wall and idle agent timers from workflow execution while preserving explicit call and run cancellation and compatibility reads for historical timeout records.
+
+  Remove the ACP runner activity/interaction callbacks that existed only to drive the engine idle watchdog.
+
+  Remove agent execution limits and configurable config-probe timing from the workflow SDK surface.
+
+  Remove agent and probe timeout inputs and timeout projections from the MCP workflow tool schema and status output.
+
+### Minor Changes
+
+- c562237: Remove obsolete workflow token-budget and debit metadata from current SDK and MCP limits, call records, resume provenance and reports, durable events, and isolation admission. Historical persisted fields remain readable as ignored compatibility input, while provider usage telemetry remains available.
+
 ## 0.34.0
 
 ### Minor Changes
