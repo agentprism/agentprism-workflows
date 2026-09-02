@@ -68,7 +68,9 @@ const agents = await Promise.all(
 );
 agents.sort((left, right) => left.id.localeCompare(right.id));
 
-const registry = { version: REGISTRY_VERSION, agents };
+// `extensions` is currently empty, but is intentionally present to mirror the
+// complete top-level shape published by the official ACP registry.
+const registry = { version: REGISTRY_VERSION, agents, extensions: [] };
 const registryDir = join(outputDir, ...REGISTRY_SITE_PATH.split("/"));
 await mkdir(registryDir, { recursive: true });
 await Promise.all([
