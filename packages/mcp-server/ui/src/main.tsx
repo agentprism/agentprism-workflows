@@ -8,16 +8,17 @@ import type { CallToolResult } from "@modelcontextprotocol/client";
 //   - the tool RESULT's structuredContent.runId for run/resume calls (background admission
 //     returns it immediately; foreground returns it with the terminal result). Resume input names
 //     the source run, so it must never win over the newly-created result runId.
-// Once a runId is known the panel keeps itself live with the MCP Apps Interactive Updates
-// pattern: it polls the app-only `workflow-events` tool (~2s while live, adaptive backoff when
-// idle or faulted) and folds structured event pages into the render model. Server-side capability
+// Before a new runId is known, inline run input (or a resume source resource) supplies the static
+// plan. Once known, the panel keeps itself live with the MCP Apps Interactive Updates pattern: it
+// polls the app-only `workflow-events` tool (~2s while live, adaptive backoff when idle or faulted)
+// and folds structured event pages into the render model. Server-side capability
 // negotiation gates access to that tool and this panel. Polling itself carries no model-notification
 // machinery; selected folded events use ui/message. Hosts that narrate app-originated tool calls
 // diverge from the official design; that compatibility issue is tracked at
 // nicobailon/pi-mcp-adapter#314. Stop issues `workflow` action:"stop" through the host bridge.
 import type { App } from "@modelcontextprotocol/ext-apps";
 import { useApp, useHostFonts, useHostStyleVariables } from "@modelcontextprotocol/ext-apps/react";
-import { StrictMode, useEffect, useRef, useState } from "react";
+import { StrictMode, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 
 import { DetailView } from "./DetailView.js";
@@ -35,19 +36,15 @@ import {
 import { extractSkeleton } from "./skeleton.js";
 import type { Skeleton } from "./skeleton.js";
 import { agentCount, createRunModel, foldRecord } from "./state.js";
+import {
+  inlineSkeletonFromArgs,
+  observedRunIdFromArgs,
+  skeletonSourceRunIdFromArgs,
+} from "./tool-input.js";
 import type { RunModel, RunStatus } from "./state.js";
 import { readWorkflowEventsPage } from "./workflow-events-poll.js";
 import type { EventsDoc } from "./workflow-events-poll.js";
 import "./style.css";
-
-function runIdFromArgs(args: Record<string, unknown> | null): string | undefined {
-  const action = args?.["action"];
-  if (action === undefined || action === "run" || action === "resume" || action === "config") {
-    return undefined;
-  }
-  const runId = args?.["runId"];
-  return typeof runId === "string" && runId.length > 0 ? runId : undefined;
-}
 
 function runIdFromResult(result: CallToolResult | null): string | undefined {
   const structured = result?.structuredContent as { runId?: unknown } | undefined;
@@ -214,33 +211,42 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
 }
 
 /**
- * Fetch the run's admitted script and extract its structural skeleton. Any failure — the
- * host not supporting resource reads, the resource missing, an unparseable script — yields
- * undefined and the graph falls back to the timing-based wave layout.
+ * Prefer an admitted script resource once its run id is available, with the inline run-input plan
+ * as an immediate fallback. Any resource or parse failure yields the fallback skeleton (or the
+ * timing-based wave view when no static source exists).
  */
-function useSkeleton(app: App | null, runId: string | undefined): Skeleton | undefined {
-  const [skeleton, setSkeleton] = useState<Skeleton | undefined>(undefined);
+function useSkeleton(
+  app: App | null,
+  runId: string | undefined,
+  inlineSkeleton: Skeleton | undefined,
+): Skeleton | undefined {
+  const [loaded, setLoaded] = useState<
+    { runId: string; skeleton: Skeleton | undefined } | undefined
+  >(undefined);
   useEffect(() => {
     if (!app || runId === undefined) return;
     let cancelled = false;
-    setSkeleton(undefined);
+    setLoaded(undefined);
     void (async () => {
+      let skeleton: Skeleton | undefined;
       try {
         const result = await app.readServerResource({ uri: `workflow://runs/${runId}/script` });
         if (cancelled) return;
         const text = (result.contents as Array<{ text?: unknown }>).find(
           (content) => typeof content.text === "string",
         )?.text as string | undefined;
-        if (text !== undefined) setSkeleton(extractSkeleton(text));
+        if (text !== undefined) skeleton = extractSkeleton(text);
       } catch {
-        // Fall back silently; the wave view needs nothing beyond the event stream.
+        // Fall back silently; inline run input or the wave view needs no resource read.
       }
+      if (!cancelled) setLoaded({ runId, skeleton });
     })();
     return () => {
       cancelled = true;
     };
   }, [app, runId]);
-  return runId === undefined ? undefined : skeleton;
+  if (runId === undefined || loaded?.runId !== runId) return inlineSkeleton;
+  return loaded.skeleton ?? inlineSkeleton;
 }
 
 function ElapsedClock({ model }: { model: RunModel }) {
@@ -400,6 +406,52 @@ function MonitorBody({
   );
 }
 
+function StartingSkeleton({
+  skeleton,
+  rejected,
+}: {
+  skeleton: Skeleton;
+  rejected: boolean;
+}) {
+  const [expandedWaves, setExpandedWaves] = useState<ReadonlySet<string>>(new Set());
+  const [loopSelections, setLoopSelections] = useState<ReadonlyMap<string, number>>(new Map());
+  const model = createRunModel("pending-run");
+  if (skeleton.name !== undefined) model.name = skeleton.name;
+
+  return (
+    <>
+      <header className="bar top">
+        <span className="wf-name">{skeleton.name ?? "workflow"}</span>
+        <span className="run-id">planned structure</span>
+        {rejected ? (
+          <span className="chip chip-err">Not admitted</span>
+        ) : (
+          <span className="chip chip-live">
+            <span className="pulse" />
+            Starting
+          </span>
+        )}
+      </header>
+      <GraphView
+        model={model}
+        skeleton={skeleton}
+        expandedWaves={expandedWaves}
+        onExpandWave={(key) => setExpandedWaves((current) => new Set([...current, key]))}
+        loopSelections={loopSelections}
+        onSelectLoopIteration={(loopId, iteration) =>
+          setLoopSelections((current) => new Map([...current, [loopId, iteration]]))
+        }
+        onSelect={() => undefined}
+      />
+      <footer className="bar bottom">
+        <span className="hint">
+          {rejected ? "The request failed before a run was created" : "Static workflow structure"}
+        </span>
+      </footer>
+    </>
+  );
+}
+
 function RunMonitor() {
   const [toolArgs, setToolArgs] = useState<Record<string, unknown> | null>(null);
   const [toolResult, setToolResult] = useState<CallToolResult | null>(null);
@@ -425,15 +477,25 @@ function RunMonitor() {
   useHostStyleVariables(app, app?.getHostContext());
   useHostFonts(app, app?.getHostContext());
 
-  const runId = runIdFromArgs(toolArgs) ?? runIdFromResult(toolResult);
+  const runId = observedRunIdFromArgs(toolArgs) ?? runIdFromResult(toolResult);
+  const inlineSkeleton = useMemo(() => inlineSkeletonFromArgs(toolArgs), [toolArgs]);
+  const skeletonRunId = runId ?? skeletonSourceRunIdFromArgs(toolArgs);
   const { model, connectionLost, disconnected, fatal } = useRunModel(app, runId, tornDown);
-  const skeleton = useSkeleton(app, runId);
+  const skeleton = useSkeleton(app, skeletonRunId, inlineSkeleton);
 
   if (error) return <div className="log-empty">Failed to connect to host: {error.message}</div>;
   if (!app) return <div className="log-empty">Connecting…</div>;
   if (runId === undefined || !model) {
-    // Execute calls reveal the runId in their result: instantly for background admissions,
-    // at termination for foreground runs. Until then there is nothing to monitor yet.
+    // Foreground calls cannot reveal their server-assigned runId until their result. Inline run
+    // input (or a resume source resource) still exposes the plan, so render it while waiting.
+    const rejected = toolResult?.isError === true;
+    if (skeleton !== undefined) {
+      return <StartingSkeleton skeleton={skeleton} rejected={rejected} />;
+    }
+    if (rejected) return <div className="log-empty">Workflow was not admitted.</div>;
+    if (toolArgs?.["action"] === "config" && toolResult !== null) {
+      return <div className="log-empty">No workflow run for this configuration request.</div>;
+    }
     return <div className="log-empty">Workflow starting…</div>;
   }
   return (

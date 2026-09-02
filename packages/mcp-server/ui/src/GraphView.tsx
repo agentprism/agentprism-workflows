@@ -5,7 +5,7 @@
 import { bracketPath, edgePath, layoutGraph } from "./graph.js";
 import type { PlacedNode } from "./graph.js";
 import { layoutSkeletonGraph, skeletonIsUseful } from "./skeleton-graph.js";
-import type { SkelPlacedNode } from "./skeleton-graph.js";
+import type { SkelEdge, SkelPlacedNode } from "./skeleton-graph.js";
 import type { Skeleton } from "./skeleton.js";
 import type { RunModel } from "./state.js";
 
@@ -102,6 +102,17 @@ function skelNodeClass(item: SkelPlacedNode): string {
   return `node status-${item.status}`;
 }
 
+function skelEdgePath(edge: SkelEdge): string {
+  if (edge.kind !== "feedback") return edgePath(edge);
+  const bendY = edge.bendY ?? Math.max(edge.y1, edge.y2) + 28;
+  return (
+    `M ${edge.x1} ${edge.y1} ` +
+    `C ${edge.x1 + 24} ${edge.y1}, ${edge.x1 + 24} ${bendY}, ${edge.x1} ${bendY} ` +
+    `H ${edge.x2 - 24} ` +
+    `C ${edge.x2 - 24} ${bendY}, ${edge.x2 - 24} ${edge.y2}, ${edge.x2} ${edge.y2}`
+  );
+}
+
 function SkeletonGraph({
   model,
   skeleton,
@@ -141,46 +152,89 @@ function SkeletonGraph({
           height={layout.height}
           viewBox={`0 0 ${layout.width} ${layout.height}`}
         >
+          <defs>
+            <marker
+              id="feedback-arrow"
+              viewBox="0 0 8 8"
+              refX="7"
+              refY="4"
+              markerWidth="6"
+              markerHeight="6"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 0 L 8 4 L 0 8 z" />
+            </marker>
+          </defs>
           {layout.edges.map((edge, index) => (
-            <path key={index} className="edge" d={edgePath(edge)} />
+            <path
+              key={index}
+              className={`edge${edge.kind === "feedback" ? " edge-feedback" : ""}`}
+              d={skelEdgePath(edge)}
+              markerEnd={edge.kind === "feedback" ? "url(#feedback-arrow)" : undefined}
+            />
           ))}
           {layout.brackets.map((bracket, index) => (
             <path key={index} className="bracket" d={bracketPath(bracket)} />
           ))}
         </svg>
+        <div className="graph-controls">
+          {[...layout.loops, ...layout.panels]
+            .sort((left, right) => right.w * right.h - left.w * left.h)
+            .map((control) => {
+              const isLoop = "loopId" in control;
+              return (
+                <div
+                  key={isLoop ? control.loopId : control.panelId}
+                  className={`control-box control-${control.mode}`}
+                  style={{ left: control.x, top: control.y, width: control.w, height: control.h }}
+                >
+                  <div className="control-head">
+                    <span className="control-mark" aria-hidden="true" />
+                    <span className="control-label">{control.label}</span>
+                    <span className="control-detail">{control.detail}</span>
+                    {isLoop && control.iterations > 1 && (
+                      <span className="loop-iter">
+                        <button
+                          className="iter-btn"
+                          aria-label="Previous iteration"
+                          disabled={control.shown === 0}
+                          onClick={() => onSelectLoopIteration(control.loopId, control.shown - 1)}
+                        >
+                          ‹
+                        </button>
+                        {control.mode === "gate" ? "attempt" : "iteration"} {control.shown + 1}/
+                        {control.iterations}
+                        <button
+                          className="iter-btn"
+                          aria-label="Next iteration"
+                          disabled={control.shown >= control.iterations - 1}
+                          onClick={() => onSelectLoopIteration(control.loopId, control.shown + 1)}
+                        >
+                          ›
+                        </button>
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+        </div>
         <div className="graph-nodes">
-          {layout.loops.map((loop) => (
-            <div
-              key={loop.loopId}
-              className="loop-box"
-              style={{ left: loop.x, top: loop.y, width: loop.w, height: loop.h }}
-            >
-              <div className="loop-head">
-                <span className="loop-glyph">↺</span>
-                {loop.iterations > 1 ? (
-                  <span className="loop-iter">
-                    <button
-                      className="iter-btn"
-                      disabled={loop.shown === 0}
-                      onClick={() => onSelectLoopIteration(loop.loopId, loop.shown - 1)}
-                    >
-                      ‹
-                    </button>
-                    iteration {loop.shown + 1}/{loop.iterations}
-                    <button
-                      className="iter-btn"
-                      disabled={loop.shown >= loop.iterations - 1}
-                      onClick={() => onSelectLoopIteration(loop.loopId, loop.shown + 1)}
-                    >
-                      ›
-                    </button>
-                  </span>
-                ) : (
-                  <span className="loop-iter">loop</span>
-                )}
-              </div>
-            </div>
-          ))}
+          {layout.edges.map(
+            (edge, index) =>
+              edge.kind === "feedback" && (
+                <div
+                  key={`feedback-${index}`}
+                  className="feedback-label"
+                  style={{
+                    left: Math.min(edge.x1, edge.x2) + Math.abs(edge.x1 - edge.x2) / 2 - 34,
+                    top: (edge.bendY ?? Math.max(edge.y1, edge.y2) + 28) - 18,
+                  }}
+                >
+                  feedback
+                </div>
+              ),
+          )}
           {layout.brackets.map((bracket, index) => (
             <div
               key={index}
