@@ -858,6 +858,7 @@ function formatCompletedSummary(run: WorkflowRunResult): string {
 function formatResumeSummary(
   eligibility: WorkflowReplayEligibility | undefined,
   report?: WorkflowResumeReport,
+  options: { admission?: boolean } = {},
 ): string {
   if (!eligibility) {
     if (!report) return "resume: eligibility unavailable";
@@ -885,13 +886,20 @@ function formatResumeSummary(
   const zeroPrefix = evaluated
     ? eligibility.replayedPrefix === 0
     : eligibility.predictedReplayablePrefix === 0;
-  const lines = [
-    `${zeroPrefix ? "WARNING: " : ""}resume: ${strategy}; ` +
-      `predicted replayable prefix ${eligibility.predictedReplayablePrefix}; ` +
-      `replayed prefix ${eligibility.replayedPrefix}; ` +
-      `${eligibility.replayed} replayed, ${eligibility.live} live, ${eligibility.failed} failed`,
-    "prediction is an admission-time upper bound; every call is checked before replay",
-  ];
+  const lines = options.admission && !evaluated
+    ? [
+        `${zeroPrefix ? "WARNING: " : ""}resume admission: ${strategy}; ` +
+          `predicted replayable prefix ${eligibility.predictedReplayablePrefix}; ` +
+          "observed replay is pending until the new run reaches its calls",
+        "Call status for observed replayed/live/failed counts; every call is checked before replay.",
+      ]
+    : [
+        `${zeroPrefix ? "WARNING: " : ""}resume: ${strategy}; ` +
+          `predicted replayable prefix ${eligibility.predictedReplayablePrefix}; ` +
+          `replayed prefix ${eligibility.replayedPrefix}; ` +
+          `${eligibility.replayed} replayed, ${eligibility.live} live, ${eligibility.failed} failed`,
+        "prediction is an admission-time upper bound; every call is checked before replay",
+      ];
   if (report?.checkpointReply?.status === "not-applied") {
     lines.push(report.checkpointReply.message);
   }
@@ -971,8 +979,35 @@ function formatRunSummary(run: WorkflowRunResult): string {
   return run.status === "completed" ? formatCompletedSummary(run) : formatTerminalSummary(run);
 }
 
+function latestActivitySummaryLines(activity: WorkflowRunLatestActivity[] | undefined): string[] {
+  if (!activity || activity.length === 0) return [];
+  const visible = activity.slice(-10);
+  const lines = [
+    `latest activity (last ${visible.length} of ${activity.length} calls with durable progress):`,
+  ];
+  for (const item of visible) {
+    const attribution = item.label ? `agent "${item.label}"` : `call ${item.callIndex}`;
+    const latestText = item.latestText?.replace(/\s+/g, " ").trim();
+    const details = [
+      ...(latestText ? [`assistant: ${latestText}`] : []),
+      ...(item.lastToolName ? [`tool: ${item.lastToolName}`] : []),
+    ];
+    const detail = details.length > 0 ? details.join(" · ") : "progress event observed";
+    const counters = [
+      `${item.observedEvents} event${item.observedEvents === 1 ? "" : "s"}`,
+      `${item.turnCount} turn${item.turnCount === 1 ? "" : "s"}`,
+      ...(item.tokensObserved === undefined ? [] : [`${item.tokensObserved} tokens observed`]),
+    ];
+    lines.push(
+      `  [${item.callIndex}] ${attribution} (${item.relevance}): ` +
+        `${truncateUtf8(detail, 256, "…")} · ${counters.join(", ")}`,
+    );
+  }
+  return lines;
+}
+
 function inspectionSummaryLines(
-  status: WorkflowRunStatus,
+  status: WorkflowRunStatus & { latestActivity?: WorkflowRunLatestActivity[] },
   options: { includeReplayEligibility?: boolean } = {},
 ): string[] {
   const lines = [`Workflow "${status.workflowName}" is ${status.status}.`, `runId: ${status.runId}`];
@@ -983,6 +1018,7 @@ function inspectionSummaryLines(
   if (status.replayEligibility && options.includeReplayEligibility !== false) {
     lines.push(formatResumeSummary(status.replayEligibility));
   }
+  lines.push(...latestActivitySummaryLines(status.latestActivity));
   lines.push(`recent run log (last ${status.logTail.lines.length} of ${status.logTail.totalLines}):`);
   for (const line of status.logTail.lines) lines.push(`  ${line}`);
   lines.push(`recent calls (${status.calls.length} of ${status.truncation.calls.matched} matching):`);
@@ -2018,12 +2054,31 @@ export function createWorkflowServer(
             );
           }
         }
-        const report = await probeHarnessConfig({
+        let report = await probeHarnessConfig({
           harnesses: parsedInput.harnesses,
           modelSpecs: parsedInput.modelSpecs,
           cwd,
           probeRunner,
         });
+        const missingCatalogBackends = [...new Set(
+          report.harnessOptions
+            .filter((harness) => !harness.probed && harness.model !== undefined)
+            .map((harness) => harness.backendId)
+            .filter((backendId) => !report.harnessOptions.some((harness) =>
+              harness.probed && harness.backendId === backendId && harness.model === undefined)),
+        )];
+        if (missingCatalogBackends.length > 0) {
+          const catalogs = await probeHarnessConfig({
+            harnesses: missingCatalogBackends,
+            cwd,
+            probeRunner,
+          });
+          report = {
+            ok: false,
+            exitCode: 1,
+            harnessOptions: [...report.harnessOptions, ...catalogs.harnessOptions],
+          };
+        }
         let projected;
         try {
           projected = configSummary(report, parsedInput.modelFilter);
@@ -2953,7 +3008,9 @@ export function createWorkflowServer(
 
         let defaultModel: string | undefined;
         let defaultBackendWarning: string | undefined;
-        if (workflowNeedsPinnedDefault(routingDiscovery) || workflowMayUseDefaultModel(admittedScript)) {
+        const reachedModelLessCall = workflowNeedsPinnedDefault(routingDiscovery);
+        const mayReachModelLessCall = workflowMayUseDefaultModel(admittedScript);
+        if (reachedModelLessCall || mayReachModelLessCall) {
           const explicitDefault = process.env[DEFAULT_BACKEND_ENV] !== undefined;
           if (explicitDefault) {
             // Preserve the explicit operator contract, including its historical unknown/empty ->
@@ -2965,16 +3022,24 @@ export function createWorkflowServer(
               : null;
             defaultModel = recordedDefaultModel(source);
             if (defaultModel) {
-              defaultBackendWarning =
-                `Model-less agent calls inherit pinned backend ${JSON.stringify(defaultModel)} from the resume source; ` +
-                "the run will not switch providers automatically.";
+              defaultBackendWarning = reachedModelLessCall
+                ? `Model-less agent calls inherit pinned backend ${JSON.stringify(defaultModel)} from the resume source; ` +
+                  "the run will not switch providers automatically."
+                : `Conservative routing analysis could not prove every agent call has an authored model or tier ` +
+                  `(for example, options assembled through a spread or a call hidden behind an unvisited branch). ` +
+                  `Backend ${JSON.stringify(defaultModel)} remains pinned only as the inherited fallback for otherwise ` +
+                  "model-less calls; every explicit per-call model or tier still wins.";
             } else if (probeRunner.defaultBackendId && probeRunner.listBackends) {
               try {
                 const selected = await discoverProjectDefaultBackend(context, probeRunner);
                 defaultModel = selected.backendId;
-                defaultBackendWarning =
-                  `Model-less agent calls use auto-selected backend ${JSON.stringify(selected.backendId)} for this run ` +
-                  `(${selected.reason}); the run will not switch providers automatically.`;
+                defaultBackendWarning = reachedModelLessCall
+                  ? `Model-less agent calls use auto-selected backend ${JSON.stringify(selected.backendId)} for this run ` +
+                    `(${selected.reason}); the run will not switch providers automatically.`
+                  : `Conservative routing analysis could not prove every agent call has an authored model or tier ` +
+                    `(for example, options assembled through a spread or a call hidden behind an unvisited branch). ` +
+                    `Backend ${JSON.stringify(selected.backendId)} is pinned only as the fallback for otherwise model-less ` +
+                    `calls (${selected.reason}); every explicit per-call model or tier still wins.`;
               } catch (error) {
                 if (error instanceof NoAutoDefaultBackendError) {
                   return {
@@ -3134,7 +3199,7 @@ export function createWorkflowServer(
                   `runId: ${started.runId}\n` +
                   (preflightWarningText ? `${preflightWarningText.trimStart()}\n` : "") +
                   (admittedRun.replayEligibility
-                    ? `${formatResumeSummary(admittedRun.replayEligibility)}\n`
+                    ? `${formatResumeSummary(admittedRun.replayEligibility, undefined, { admission: true })}\n`
                     : "") +
                   `Call workflow with action="status" and this runId to read it immediately, or add a positive ` +
                   `waitMs to wait for a milestone. Status returns early when an ACP ` +

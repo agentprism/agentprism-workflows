@@ -17,6 +17,7 @@ import {
   okRunner,
   persistedRunFile,
   structured,
+  textOf,
   type ToolCallResult,
 } from "./_harness.js";
 
@@ -215,6 +216,9 @@ test("status exposes live redacted activity and retains terminal activity after 
     assert.ok(Buffer.byteLength(liveActivity?.[0]?.latestText ?? "", "utf8") <= 512);
     assert.ok((liveActivity?.[0]?.cursor ?? 0) > 0);
     assert.match(liveActivity?.[0]?.timestamp ?? "", /^\d{4}-\d{2}-\d{2}T/);
+    assert.match(textOf(live), /latest activity \(last 1 of 1 calls with durable progress\)/);
+    assert.match(textOf(live), /agent "active-review" \(current\): assistant:/);
+    assert.match(textOf(live), /77 tokens observed/);
 
     const cancelled = await first.client.callTool({
       name: "workflow",
@@ -225,6 +229,7 @@ test("status exposes live redacted activity and retains terminal activity after 
     assert.equal(cancelledActivity?.[0]?.relevance, "terminal");
     assert.equal(cancelledActivity?.[0]?.lastToolName, "read_file");
     assert.equal(cancelledActivity?.[0]?.observedEvents, 3);
+    assert.match(textOf(cancelled), /tool: read_file/);
 
     const terminal = await first.client.callTool({
       name: "workflow",
