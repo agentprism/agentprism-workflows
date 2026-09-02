@@ -1,5 +1,11 @@
 # @automatalabs/mcp-server
 
+## 1.1.0
+
+### Minor Changes
+
+- 368d529: Show static workflow structure while run calls are pending, and render `gate`, `loopUntilDry`, `verify`, and `judgePanel` as semantic graph containers with planned fan-out and iteration feedback.
+
 ## 1.0.1
 
 ### Patch Changes
