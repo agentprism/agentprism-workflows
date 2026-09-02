@@ -376,6 +376,48 @@ test("action=config discovers the live runner catalog without creating or execut
   }
 });
 
+test("failed exact model probes suggest valid routed model specs from the live catalog", async () => {
+  const probes: Array<{ spec?: string; selectModel?: boolean }> = [];
+  const runner = Object.assign(okRunner(), {
+    listBackends: () => ["pi"],
+    async probeConfigOptions(spec?: string, options?: { selectModel?: boolean }) {
+      probes.push({ spec, selectModel: options?.selectModel });
+      if (spec === "pi/deepseek-v4-flash") throw new Error("Invalid params");
+      return {
+        backendId: "pi",
+        options: [{
+          id: "model",
+          name: "Model",
+          type: "select" as const,
+          currentValue: "deepseek/deepseek-v4-flash",
+          options: [
+            { value: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+            { value: "anthropic/claude-opus-4-6", name: "Claude Opus 4.6" },
+          ],
+        }],
+      };
+    },
+  });
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const result = await client.callTool({
+      name: "workflow",
+      arguments: { action: "config", modelSpecs: ["pi/deepseek-v4-flash"] },
+    });
+    assert.notEqual(result.isError, true);
+    assert.equal(structured(result)?.ok, false, "the requested exact model remains a failed probe");
+    assert.deepEqual(probes, [
+      { spec: "pi/deepseek-v4-flash", selectModel: true },
+      { spec: "pi", selectModel: false },
+    ]);
+    assert.match(textOf(result), /Invalid params/);
+    assert.match(textOf(result), /suggested exact modelSpecs: "pi\/deepseek\/deepseek-v4-flash"/);
+    assert.match(textOf(result), /modelFilter: "deepseek-v4-flash"/);
+  } finally {
+    await dispose();
+  }
+});
+
 test("config discovery structured diagnostics stay within 24 KiB", async () => {
   const huge = "x".repeat(4_000);
   const runner = Object.assign(okRunner(), {
@@ -637,6 +679,59 @@ test("fully pinned and agent-less workflows do not trigger automatic backend dis
   }
 });
 
+test("conservative routing warnings distinguish spread-built explicit models from model-less calls", async () => {
+  const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
+  delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+  const liveModels: Array<string | undefined> = [];
+  const runner = Object.assign(
+    makeRunner((_prompt, options) => {
+      liveModels.push(options.model);
+      return "ok";
+    }),
+    {
+      defaultBackendId: () => "claude",
+      listBackends: () => ["codex", "pi"],
+      listCustomBackends: () => [],
+      async probeConfigOptions(spec?: string) {
+        const backendId = spec?.split("/", 1)[0] ?? "codex";
+        return {
+          backendId,
+          options: [{
+            id: "model",
+            name: "Model",
+            type: "select" as const,
+            currentValue: backendId === "pi" ? "deepseek/deepseek-v4-flash" : "gpt",
+            options: [{ value: backendId === "pi" ? "deepseek/deepseek-v4-flash" : "gpt", name: "default" }],
+          }],
+        };
+      },
+    },
+  );
+  const { client, dispose } = await connect(runner, { listTools: true });
+  try {
+    const result = await client.callTool({
+      name: "workflow",
+      arguments: {
+        script: [
+          'export const meta = { name: "spread-model", description: "d" };',
+          'const shared = { model: "pi/deepseek/deepseek-v4-flash" };',
+          'return agent("work", { label: "work", ...shared });',
+        ].join("\n"),
+      },
+    });
+    assert.notEqual(result.isError, true);
+    assert.deepEqual(liveModels, ["pi/deepseek/deepseek-v4-flash"]);
+    assert.match(textOf(result), /Conservative routing analysis could not prove every agent call/);
+    assert.match(textOf(result), /pinned only as the fallback for otherwise model-less calls/);
+    assert.match(textOf(result), /every explicit per-call model or tier still wins/);
+    assert.doesNotMatch(textOf(result), /^Model-less agent calls/m);
+  } finally {
+    await dispose();
+    if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+    else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
+  }
+});
+
 test("static routing discovery pins the default for a model-less branch the fabricated dry run does not reach", async () => {
   const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
   delete process.env.AGENTPRISM_DEFAULT_BACKEND;
@@ -680,7 +775,7 @@ test("static routing discovery pins the default for a model-less branch the fabr
     });
     assert.notEqual(result.isError, true);
     assert.deepEqual(liveModels, ["claude", "codex"]);
-    assert.match(textOf(result), /auto-selected backend "codex"/);
+    assert.match(textOf(result), /Backend "codex" is pinned only as the fallback/);
   } finally {
     await dispose();
     if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;

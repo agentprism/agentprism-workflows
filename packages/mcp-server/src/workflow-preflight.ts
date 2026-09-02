@@ -238,11 +238,52 @@ export function configSummary(report: HarnessConfigReport, modelFilter?: string)
   return summary;
 }
 
+function routedModelSpec(backendId: string, modelId: string): string {
+  return modelId.startsWith(`${backendId}/`) ? modelId : `${backendId}/${modelId}`;
+}
+
+function modelProbeSuggestion(
+  report: HarnessConfigReport,
+  failed: HarnessConfigReport["harnessOptions"][number],
+): { filter: string; matches: string[]; omittedMatches: number } | undefined {
+  if (failed.probed || !failed.model) return undefined;
+  const rawModel = failed.model.startsWith(`${failed.backendId}/`)
+    ? failed.model.slice(failed.backendId.length + 1)
+    : failed.model;
+  const filters = [...new Set([rawModel, rawModel.split("/").at(-1)].filter((value): value is string =>
+    typeof value === "string" && value.length > 0))];
+  const baseReport: HarnessConfigReport = {
+    ...report,
+    harnessOptions: report.harnessOptions.filter((harness) =>
+      harness.probed && harness.backendId === failed.backendId && harness.model === undefined),
+  };
+  for (const filter of filters) {
+    const matches = buildHarnessModelsView(baseReport, filter)[0]?.matches ?? [];
+    if (matches.length > 0) {
+      return {
+        filter,
+        matches: matches.slice(0, MAX_MODEL_MATCHES).map((modelId) =>
+          routedModelSpec(failed.backendId, modelId)),
+        omittedMatches: Math.max(0, matches.length - MAX_MODEL_MATCHES),
+      };
+    }
+  }
+  return undefined;
+}
+
 export function configText(report: HarnessConfigReport, modelFilter?: string): string {
-  const lines = [
-    "Live workflow backend configuration (no workflow was started):",
-    formatHarnessConfigReport(report),
-  ];
+  const lines = ["Live workflow backend configuration (no workflow was started):"];
+  for (const harness of report.harnessOptions) {
+    const suggestion = modelProbeSuggestion(report, harness);
+    if (!suggestion) continue;
+    lines.push(
+      `${harness.model}: suggested exact modelSpecs: ` +
+        suggestion.matches.map((match) => JSON.stringify(match)).join(", ") +
+        (suggestion.omittedMatches > 0 ? ` (+${suggestion.omittedMatches} more)` : ""),
+      `Discover similar models with modelFilter: ${JSON.stringify(suggestion.filter)}`,
+    );
+  }
+  lines.push(formatHarnessConfigReport(report));
   if (modelFilter !== undefined) {
     const views = buildHarnessModelsView(report, modelFilter);
     for (const view of views) {

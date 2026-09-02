@@ -62,6 +62,42 @@ Every `{ action:"run", ... }` request is statically parsed, mock-executed, and c
 
 Use foreground execution for short work. Use `background:true` for work that may outlive one tool request; retain the returned `runId`, then use bounded `status` or `stop` calls.
 
+The input is a strict action union: send only fields belonging to the selected action. In particular, `projectDir` belongs to `config` and `run`, not `status`, `result`, `resume`, or `stop`. Some MCP clients report every rejected union branch; when that happens, first check the branch matching your `action` and remove cross-action fields.
+
+## Minimal MCP lifecycle
+
+This is the complete long-running loop. First admit a background run and retain its `runId`:
+
+```json
+{
+  "action": "run",
+  "projectDir": "/absolute/project",
+  "background": true,
+  "script": "export const meta = { name: 'review', description: 'Review a target' }; return await agent(`Review ${args.target}`, { label: 'review' });",
+  "args": { "target": "packages/core" }
+}
+```
+
+Observe without imposing an execution deadline. A `waitMs` timeout returns current progress and never cancels the run:
+
+```json
+{ "action": "status", "runId": "RUN_ID", "waitMs": 25000 }
+```
+
+After completion, retrieve the exact result. If `hasMore` is true, repeat with `offset` set to the previous `endOffset`:
+
+```json
+{ "action": "result", "runId": "RUN_ID", "offset": 0, "maxBytes": 16384 }
+```
+
+To retry an incomplete source from its stored immutable script and args, create a new run; do not resend `script`:
+
+```json
+{ "action": "resume", "runId": "RUN_ID", "background": true }
+```
+
+The new admission reports a predicted replayable prefix. Use `status` on the new `runId` for observed replayed/live/failed counts, then use `result` after completion.
+
 ## What to read next
 
 - `workflow/composition-and-failure` — metadata, fan-out, phases, and null semantics.

@@ -462,7 +462,10 @@ test("background admission, status, and foreground expose the same replay eligib
         "source recorded concurrency=2; this run: 7",
       ],
     );
+    assert.match(textOf(accepted), /resume admission: identity-v1/);
     assert.match(textOf(accepted), /predicted replayable prefix 2/);
+    assert.match(textOf(accepted), /observed replay is pending/);
+    assert.doesNotMatch(textOf(accepted), /replayed prefix 0/);
     assert.match(textOf(accepted), /provenance changes: source recorded runtime\.node=v0\.0\.0-recorded/);
 
     const resumedRunId = String(acceptedContent?.runId);
@@ -514,7 +517,8 @@ test("a zero-prefix background acknowledgement warns with a named first miss", a
     const eligibility = structured(accepted)?.replayEligibility;
     assert.equal(field(eligibility, "predictedReplayablePrefix"), 0);
     assert.equal(field(field(eligibility, "firstNonReplay"), "reason"), "not-recorded");
-    assert.match(textOf(accepted), /WARNING: resume: identity-v1/);
+    assert.match(textOf(accepted), /WARNING: resume admission: identity-v1/);
+    assert.match(textOf(accepted), /observed replay is pending/);
     assert.match(textOf(accepted), /first non-replay: call 0 not-recorded/);
 
     const awaited = await client.callTool({
