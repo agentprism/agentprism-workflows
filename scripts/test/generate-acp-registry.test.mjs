@@ -11,7 +11,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const script = join(repoRoot, "scripts", "generate-acp-registry.mjs");
 const packageFixtures = await loadPackageFixtures();
 
-test("generator publishes the standard ACP registry shape with pinned npm versions and icons", async () => {
+test("generator publishes the official ACP top-level shape with pinned npm versions and icons", async () => {
   const outputDir = await mkdtemp(join(tmpdir(), "agentprism-acp-registry-"));
   const registry = await startRegistry(packageFixtures);
 
@@ -21,8 +21,9 @@ test("generator publishes the standard ACP registry shape with pinned npm versio
 
     const publishedDir = join(outputDir, "acp-registry", "v1", "latest");
     const document = JSON.parse(await readFile(join(publishedDir, "registry.json"), "utf8"));
-    assert.deepEqual(Object.keys(document), ["version", "agents"]);
+    assert.deepEqual(Object.keys(document), ["version", "agents", "extensions"]);
     assert.equal(document.version, "1.0.0");
+    assert.deepEqual(document.extensions, []);
     assert.deepEqual(
       document.agents.map((agent) => agent.id),
       ["agentprism-codex-acp", "agentprism-pi-acp"],
