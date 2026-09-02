@@ -17,6 +17,7 @@ export {
   type WorkflowRunOptions,
   type WorkflowCallbackContext,
   type WorkflowAgentAttemptControl,
+  type WorkflowAgentConfiguration,
   type WorkflowAgentOptions,
   type AgentOptions,
   type CheckpointOptions,

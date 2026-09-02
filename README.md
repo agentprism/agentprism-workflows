@@ -272,10 +272,13 @@ killing the process; add `--in-process` to the args for the old single-process b
 
 The server is bundled in the `@automatalabs/workflows` tarball, so this needs no separate
 server installation. The independently published `@automatalabs/mcp-server` package and its
-`agentprism-workflow` bin remain available as an alternative. With no
-`AGENTPRISM_DEFAULT_BACKEND`, a workflow that reaches a model-less `agent()` call probes configured
-backends without prompting, prefers positive session-open readiness evidence, and pins one backend
-for that project/run. Set the environment variable only when you want an explicit operator default.
+`agentprism-workflow` bin remain available as an alternative. When the MCP client advertises form
+elicitation, every run with dry-run-observed `agent()` calls first presents one structured user
+request: choose each call's provider/model and optional advertised mode/config, with its phase title
+and description shown. The selected values are fully preflighted before execution. Clients without
+form elicitation retain automatic default routing: with no `AGENTPRISM_DEFAULT_BACKEND`, a
+model-less call triggers zero-token readiness probes and pins one backend for that project/run. Set
+the environment variable only when you want an explicit operator default for those headless clients.
 
 From a source checkout, point at the built entry instead:
 
@@ -648,7 +651,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `AGENTPRISM_DEFAULT_BACKEND` | unset | Explicit backend when the model/tier doesn't imply one (`claude` \| `codex` \| `opencode` \| `pi` \| a registered custom name). When absent, the MCP server auto-selects and pins a project default from zero-token readiness probes; the SDK runner retains its historical Claude fallback. |
+| `AGENTPRISM_DEFAULT_BACKEND` | unset | Explicit fallback backend when the model/tier doesn't imply one (`claude` \| `codex` \| `opencode` \| `pi` \| a registered custom name). MCP clients with form elicitation choose each observed call before execution; other clients auto-select and pin a project default from zero-token readiness probes when this variable is absent. The SDK runner retains its historical Claude fallback. |
 | `AGENTPRISM_BACKENDS` | (none) | Custom ACP backends as JSON: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}}}`. Programmatic `createAcpRunner({ backends })` wins per name. |
 | `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` | (unset) | MCP server only: `1`/`true` approves **script-declared** `meta.backends` headlessly (for clients without elicitation support). |
 | `AGENTPRISM_PERSISTENCE_ROOT` | `~/.agentprism/workflows` | Absolute root for persisted run state, logs, journals, and resume data. |

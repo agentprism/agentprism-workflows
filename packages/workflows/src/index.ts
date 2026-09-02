@@ -132,6 +132,7 @@ export type {
   WorkflowRunOptions,
   WorkflowRunLimitOptions,
   WorkflowAgentAttemptControl,
+  WorkflowAgentConfiguration,
   WorkflowAgentCallCancellation,
   PersistedRunStopResult,
   AgentOptions,

@@ -19,7 +19,7 @@ const SCRIPT_WITH_BACKENDS = [
   'return await agent("p", { model: "browser" });',
 ].join("\n");
 
-const PLAIN_SCRIPT = 'export const meta = { name: "plain", description: "d" };\nreturn await agent("p");';
+const PLAIN_SCRIPT = 'export const meta = { name: "plain", description: "d" };\nreturn await agent("p", { model: "claude" });';
 
 function capturingRunner(): { runner: AgentRunner; backends: () => unknown } {
   let captured: unknown;
@@ -48,6 +48,18 @@ async function connectEliciting(
   const client = new Client({ name: "mcp-server-test", version: "0.0.0" }, { capabilities: { elicitation: {} } });
   const prompts: string[] = [];
   client.setRequestHandler('elicitation/create', async (request) => {
+    const schema = request.params.requestedSchema;
+    const required = schema.required ?? [];
+    if (required.some((field) => field.startsWith("agent_") && field.endsWith("_model"))) {
+      const content: Record<string, string> = {};
+      for (const field of required) {
+        const property = schema.properties[field] as { oneOf?: Array<{ const: string }> } | undefined;
+        const choices = property?.oneOf ?? [];
+        const preferred = choices.find((choice) => choice.const === "browser") ?? choices[0];
+        if (preferred) content[field] = preferred.const;
+      }
+      return { action: "accept" as const, content };
+    }
     prompts.push(request.params.message);
     const { action, approve } = respond(request.params.message);
     return action === "accept" ? { action, content: { approve: approve ?? true } } : { action };
@@ -156,7 +168,7 @@ test("eliciting client: accept-with-approve:false is a DENY (explicit false beat
   }
 });
 
-test("scripts WITHOUT meta.backends never hit the gate (no elicitation, no error)", async () => {
+test("scripts WITHOUT meta.backends never hit the backend-approval gate", async () => {
   const { runner, backends } = capturingRunner();
   const conn = await connectEliciting(runner, () => ({ action: "decline" }));
   try {

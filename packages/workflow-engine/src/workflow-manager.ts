@@ -76,6 +76,7 @@ import {
   type CheckpointOptions,
   type EngineRunResult,
   type WorkflowAgentAttemptControl,
+  type WorkflowAgentConfiguration,
   type WorkflowRunOptions,
   parseWorkflowScript,
   resolveWorkflowRunLimits,
@@ -300,6 +301,10 @@ export interface ExecOptions {
    * tier, or phase/meta route. Persisted with the run and included in call identity.
    */
   defaultModel?: string;
+  /** Host-selected configuration for each root-execution-wide agent occurrence ordinal. */
+  agentConfigurations?: Readonly<Record<number, WorkflowAgentConfiguration>>;
+  /** Refuse any live occurrence that was not covered by agentConfigurations. */
+  requireAgentConfiguration?: boolean;
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
@@ -1763,6 +1768,8 @@ export class WorkflowManager extends EventEmitter {
         agent,
         mainModel: managed.mainModel,
         defaultModel: managed.defaultModel,
+        agentConfigurations: exec.agentConfigurations,
+        requireAgentConfiguration: exec.requireAgentConfiguration,
         agentsDir: managed.agentsDir,
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,

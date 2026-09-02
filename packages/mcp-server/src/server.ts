@@ -64,6 +64,7 @@ import type {
   WorkflowResumeReport,
 } from "@automatalabs/workflows";
 import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
+import { buildWorkflowAgentConfigurationPlan } from "./workflow-agent-configuration.js";
 import {
   createEvalBreakChannel,
   loadShippedWasm,
@@ -588,7 +589,26 @@ type WorkflowMcpRequestState =
       checkpointHash: string;
       approvedKeys: string[];
       expiresAt?: number;
+    }
+  | {
+      version: 1;
+      flow: "agent-configuration";
+      inputHash: string;
+      scriptHash: string;
+      approvedKeys: string[];
+      selectionHash: string;
     };
+
+function supportsFormElicitation(capabilities: unknown): boolean {
+  if (capabilities === null || typeof capabilities !== "object" || Array.isArray(capabilities)) return false;
+  const elicitation = (capabilities as { elicitation?: unknown }).elicitation;
+  if (elicitation === null || typeof elicitation !== "object" || Array.isArray(elicitation)) return false;
+  const fields = Object.keys(elicitation);
+  // The legacy capability was the empty object. Modern clients advertise the explicit form mode.
+  if (fields.length === 0) return true;
+  const form = (elicitation as { form?: unknown }).form;
+  return form !== null && typeof form === "object" && !Array.isArray(form);
+}
 
 function canonicalJson(value: unknown): string {
   if (value === null) return "null";
@@ -646,6 +666,25 @@ function parseWorkflowRequestState(value: unknown, inputHash: string): WorkflowM
       scriptHash: state.scriptHash as string,
       approvedKeys: [...new Set(state.approvedKeys)],
       pendingKey: state.pendingKey,
+    };
+  }
+  if (state.flow === "agent-configuration") {
+    if (
+      !Array.isArray(state.approvedKeys) ||
+      state.approvedKeys.length > 64 ||
+      !state.approvedKeys.every((key) => typeof key === "string" && /^[0-9a-f]{64}$/.test(key)) ||
+      typeof state.selectionHash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(state.selectionHash)
+    ) {
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid workflow agent-configuration requestState");
+    }
+    return {
+      version: 1,
+      flow: "agent-configuration",
+      inputHash,
+      scriptHash: state.scriptHash as string,
+      approvedKeys: [...new Set(state.approvedKeys)],
+      selectionHash: state.selectionHash,
     };
   }
   if (state.flow === "permission") {
@@ -2013,9 +2052,12 @@ export function createWorkflowServer(
         );
       }
       const inputHash = workflowInputHash(args);
-      const requestState = options.protocolEra === "modern"
-        ? parseWorkflowRequestState(ctx.mcpReq.requestState<unknown>(), inputHash)
+      // inputRequired's SDK shim re-enters this handler for legacy elicitation too, while
+      // modern 2026-07-28 clients retry over the wire. The signed state contract is shared.
+      const encodedRequestState = typeof ctx.mcpReq.requestState === "function"
+        ? ctx.mcpReq.requestState<unknown>()
         : undefined;
+      const requestState = parseWorkflowRequestState(encodedRequestState, inputHash);
       let parsedInput = parseWorkflowToolInput(args, { requireProjectDir });
       const approvedBackendKeys = new Set<string>();
       let declinedBackendKey: string | undefined;
@@ -3006,11 +3048,88 @@ export function createWorkflowServer(
           loadSavedWorkflow: (name) => context.manager.resolveSavedWorkflow(name),
         });
 
+        let agentConfigurations: ExecOptions["agentConfigurations"];
+        const canConfigureAgents = supportsFormElicitation(toolCatalog.clientCapabilities(ctx));
+        if (canConfigureAgents && (routingDiscovery.dryRun?.agentCalls.length ?? 0) > 0) {
+          const configuredHarnesses = [
+            ...(probeRunner.listBackends?.() ?? []),
+            ...Object.keys(backendsGate.backends ?? {}),
+          ].filter((value, index, all) => all.indexOf(value) === index);
+          const advertised = await probeHarnessConfig({
+            cwd: context.projectDir,
+            ...(configuredHarnesses.length === 0 ? {} : { harnesses: configuredHarnesses }),
+            backends: backendsGate.backends,
+            probeRunner,
+          });
+          let plan;
+          try {
+            plan = buildWorkflowAgentConfigurationPlan(
+              staticValidation.parse.meta!,
+              routingDiscovery.dryRun?.agentCalls ?? [],
+              advertised.harnessOptions,
+            );
+          } catch (error) {
+            return {
+              content: [{
+                type: "text",
+                text: truncateUtf8(
+                  `Cannot configure this workflow before execution: ${error instanceof Error ? error.message : String(error)}`,
+                  8_192,
+                  "…[provider diagnostics truncated]",
+                ),
+              }],
+              isError: true,
+            };
+          }
+          if (plan !== undefined) {
+            const selectionState = requestState?.flow === "agent-configuration" ? requestState : undefined;
+            const response = selectionState?.selectionHash === plan.selectionHash
+              ? inputResponse(ctx.mcpReq.inputResponses, "agentConfiguration")
+              : { kind: "missing" as const };
+            if (response.kind === "elicit") {
+              if (response.action !== "accept") {
+                return {
+                  content: [{ type: "text", text: "Workflow execution cancelled because agent configuration was not accepted." }],
+                  isError: true,
+                };
+              }
+              try {
+                agentConfigurations = plan.parse(response.content ?? {});
+              } catch (error) {
+                throw new ProtocolError(
+                  ProtocolErrorCode.InvalidParams,
+                  `Invalid workflow agent configuration response: ${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+            } else {
+              const state: WorkflowMcpRequestState = {
+                version: 1,
+                flow: "agent-configuration",
+                inputHash,
+                scriptHash: workflowScriptHash(admittedScript),
+                approvedKeys: [...approvedBackendKeys].sort(),
+                selectionHash: plan.selectionHash,
+              };
+              return inputRequired({
+                inputRequests: {
+                  agentConfiguration: inputRequired.elicit(plan.request as ElicitRequestFormParams),
+                },
+                requestState: await requestStateCodec.mint(state, ctx),
+              });
+            }
+          }
+        } else if (requestState?.flow === "agent-configuration") {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            "Invalid workflow agent-configuration retry: the workflow no longer has an observed agent call",
+          );
+        }
+
         let defaultModel: string | undefined;
         let defaultBackendWarning: string | undefined;
         const reachedModelLessCall = workflowNeedsPinnedDefault(routingDiscovery);
         const mayReachModelLessCall = workflowMayUseDefaultModel(admittedScript);
-        if (reachedModelLessCall || mayReachModelLessCall) {
+        if (agentConfigurations === undefined && (reachedModelLessCall || mayReachModelLessCall)) {
           const explicitDefault = process.env[DEFAULT_BACKEND_ENV] !== undefined;
           if (explicitDefault) {
             // Preserve the explicit operator contract, including its historical unknown/empty ->
@@ -3063,6 +3182,8 @@ export function createWorkflowServer(
           maxAgents: input.maxAgents,
           timeoutMs: 30_000,
           defaultModel,
+          agentConfigurations,
+          requireAgentConfiguration: agentConfigurations !== undefined,
           probeRunner,
           loadSavedWorkflow: (name) => context.manager.resolveSavedWorkflow(name),
         });
@@ -3109,6 +3230,8 @@ export function createWorkflowServer(
           agent: runner,
           executionAdmission: executionLatch.decision,
           defaultModel,
+          agentConfigurations,
+          requireAgentConfiguration: agentConfigurations !== undefined,
           scriptBackends: backendsGate.backends,
           maxAgents: input.maxAgents,
           concurrency: input.concurrency,

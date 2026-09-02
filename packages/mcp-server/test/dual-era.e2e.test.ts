@@ -67,6 +67,22 @@ async function rawModernToolCall(
   return await response.json() as RawJsonRpcResponse;
 }
 
+function acceptAgentConfiguration(request: { params: { requestedSchema?: {
+  required?: string[];
+  properties: Record<string, unknown>;
+} } }): Record<string, string> | undefined {
+  const schema = request.params.requestedSchema;
+  const required = schema?.required ?? [];
+  if (!required.some((field) => field.startsWith("agent_") && field.endsWith("_model"))) return undefined;
+  return Object.fromEntries(required.map((field) => {
+    const property = schema?.properties[field] as { oneOf?: Array<{ const: string }> } | undefined;
+    const choices = property?.oneOf ?? [];
+    const selected = choices.find((choice) => choice.const.startsWith("codex")) ?? choices[0];
+    assert.ok(selected);
+    return [field, selected.const];
+  }));
+}
+
 async function exerciseEra(
   mode: "legacy" | "modern",
   daemonUrl: string,
@@ -203,7 +219,12 @@ test("modern input_required resolves a live workflow permission with the exact o
   const connected = await connectHttp(daemon.url, {
     protocolMode: "modern",
     uiCapability: "absent",
-    elicit: () => ({ action: "accept", content: { optionId: "allow_for_session" } }),
+    elicit: (request) => {
+      const configuration = acceptAgentConfiguration(request);
+      return configuration
+        ? { action: "accept", content: configuration }
+        : { action: "accept", content: { optionId: "allow_for_session" } };
+    },
   });
   try {
     const script = `export const meta = { name: "modern-permission", description: "modern permission" };
@@ -224,7 +245,7 @@ return await agent("work", { label: "worker", model: "codex" });`;
     assert.equal(structured(resolved)?.permissionResponse?.outcome?.optionId, "allow_for_session");
     assert.equal(structured(resolved)?.wait?.requestedMs, 5_000);
     assert.equal(structured(resolved)?.wait?.returnedBecause, "permission-resolved");
-    assert.equal(connected.elicitations.length, 1);
+    assert.equal(connected.elicitations.length, 2);
 
     const terminal = await connected.client.callTool({
       name: "workflow",
@@ -247,7 +268,12 @@ test("modern input_required enforces script-backend approval before admission", 
   const connected = await connectHttp(daemon.url, {
     protocolMode: "modern",
     uiCapability: "absent",
-    elicit: () => ({ action: "accept", content: { approve: true } }),
+    elicit: (request) => {
+      const configuration = acceptAgentConfiguration(request);
+      return configuration
+        ? { action: "accept", content: configuration }
+        : { action: "accept", content: { approve: true } };
+    },
   });
   try {
     const script = `export const meta = { name: "modern-backend", description: "modern backend", backends: { browser: { command: "browser-acp" } } };
@@ -259,8 +285,8 @@ return await agent("approved backend", { model: "browser" });`;
     assert.equal(result.isError, false);
     assert.equal(structured(result)?.status, "completed");
     assert.deepEqual(capturedBackends, { browser: { command: "browser-acp" } });
-    assert.equal(connected.elicitations.length, 1);
-    assert.match(connected.elicitations[0]?.params.message ?? "", /browser-acp/);
+    assert.equal(connected.elicitations.length, 2);
+    assert.ok(connected.elicitations.some((request) => /browser-acp/.test(request.params.message)));
   } finally {
     await connected.dispose();
     await daemon.close();

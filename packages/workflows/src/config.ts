@@ -84,7 +84,12 @@ export async function probeHarnessConfig(
     for (const target of targets) {
       try {
         const result = await withProbeTimeout(
-          (signal) => runner.probeConfigOptions(target.spec, { cwd, selectModel: target.selectModel, signal }),
+          (signal) => runner.probeConfigOptions(target.spec, {
+            cwd,
+            selectModel: target.selectModel,
+            backends: options.backends,
+            signal,
+          }),
           DEFAULT_PROBE_TIMEOUT_MS,
         );
         harnessOptions.push({

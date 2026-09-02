@@ -161,6 +161,20 @@ test("a host-owned probe runner supplies default targets and is never disposed",
   }
 });
 
+test("probeHarnessConfig passes custom backend definitions to a host-owned probe runner", async () => {
+  const backends = { visual: { command: "visual-acp", args: ["serve"] } };
+  let observed: unknown;
+  const probeRunner = {
+    async probeConfigOptions(spec?: string, options?: { backends?: unknown }) {
+      observed = options?.backends;
+      return { backendId: spec ?? "visual", options: [] };
+    },
+  };
+  const report = await probeHarnessConfig({ harnesses: ["visual"], backends, probeRunner });
+  assert.equal(report.ok, true);
+  assert.deepEqual(observed, backends);
+});
+
 test("explicit harnesses replace the defaults and deduplicate in request order", async () => {
   const probes: string[] = [];
   const restore = setValidateProbeFactoryForTests(() => ({

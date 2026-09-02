@@ -12,13 +12,17 @@
 
 This is an MCP composition-root policy. The SDK runner's routing contract remains unchanged: an
 omitted model still uses `AGENTPRISM_DEFAULT_BACKEND`, whose historical fallback is Claude.
-The MCP `workflow` tool adds automatic selection only when all of these are true:
+For MCP clients that advertise form elicitation, the workflow tool now supersedes automatic routing
+for every dry-run-observed `agent()` occurrence with one pre-execution user selection form (see the
+MCP server API contract). Automatic selection remains the compatibility path only when all of these
+are true:
 
-1. a mock routing-discovery pass reaches an unmodelled call, or conservative static analysis finds a direct model-less `agent()`/default-model helper/nested workflow hidden behind another branch;
-2. `AGENTPRISM_DEFAULT_BACKEND` is truly absent from the daemon environment; and
-3. the injected runner exposes backend listing, default identity, and no-prompt config probing.
+1. the connected client does not support form elicitation;
+2. a mock routing-discovery pass reaches an unmodelled call, or conservative static analysis finds a direct model-less `agent()`/default-model helper/nested workflow hidden behind another branch;
+3. `AGENTPRISM_DEFAULT_BACKEND` is truly absent from the daemon environment; and
+4. the injected runner exposes backend listing, default identity, and no-prompt config probing.
 
-An explicitly present environment value always wins, including the historical empty/unknown value
+For a non-eliciting client, an explicitly present environment value always wins, including the historical empty/unknown value
 behavior. Agent-less workflows and workflows whose direct calls are statically pinned (including a top-level
 `meta.model`) do not run automatic discovery. Dynamic model expressions and unresolved branch shapes
 fail conservatively toward discovery.
@@ -49,7 +53,7 @@ succeed.
 
 ## Determinism and resume
 
-The selected backend name is injected as the engine's host-pinned `defaultModel` before full
+On the compatibility path, the selected backend name is injected as the engine's host-pinned `defaultModel` before full
 validation and execution. It applies after explicit model, agent-definition model, tier, and
 phase/meta routing. Consequently it is passed to the runner as a backend-only model spec and enters
 the existing model field of the agent identity hash.

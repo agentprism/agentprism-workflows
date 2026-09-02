@@ -18,6 +18,7 @@ import {
   WorkflowManager,
   parseWorkflowScript,
   redactText,
+  type WorkflowAgentConfiguration,
 } from "@automatalabs/workflow-engine";
 import {
   BUILTIN_BACKEND_IDS,
@@ -75,6 +76,10 @@ export interface ValidateWorkflowOptions {
    * or phase/meta route. The dry run resolves and reports it like live execution.
    */
   defaultModel?: string;
+  /** Host-selected configuration keyed by the dry run's zero-based agent occurrence ordinal. */
+  agentConfigurations?: Readonly<Record<number, WorkflowAgentConfiguration>>;
+  /** Refuse any live occurrence not covered by agentConfigurations. */
+  requireAgentConfiguration?: boolean;
   /** Run routed no-prompt config probes after the mock dry run. Default true. */
   probeConfig?: boolean;
   /** Host-owned no-prompt probe runner. When supplied it is reused and never disposed. */
@@ -117,6 +122,8 @@ export interface ValidatedMockAnswers {
 
 /** One agent() call observed during the dry run, with its backend attribution. */
 export interface ValidatedAgentCall {
+  /** Zero-based occurrence ordinal shared with WorkflowAgentConfiguration selection. */
+  index: number;
   label: string;
   phase?: string;
   /** The verbatim model spec the call requested (undefined = the run/session default). */
@@ -1572,15 +1579,6 @@ export async function validateWorkflowScript(
   const agentCalls: ValidatedAgentCall[] = [];
   const pendingAgentCalls: ValidatedAgentCall[] = [];
   const checkpoints: ValidatedCheckpoint[] = [];
-  const mockMeta = new Map<
-    string,
-    {
-      tier?: string;
-      mode?: string;
-      configOptions?: Record<string, string | boolean>;
-      schema: boolean;
-    }
-  >();
   const runner = {
     async run(_prompt: string, runOptions: MockRunOptions = {}) {
       const label = runOptions.label ?? "";
@@ -1590,8 +1588,7 @@ export async function validateWorkflowScript(
         configOptions: runOptions.configOptions,
         schema: runOptions.schema !== undefined,
       };
-      mockMeta.set(label, metadata);
-      const pendingCall = mockAnswerState ? pendingAgentCalls.shift() : undefined;
+      const pendingCall = pendingAgentCalls.shift();
       if (pendingCall) {
         pendingCall.tier = metadata.tier;
         pendingCall.mode = metadata.mode;
@@ -1645,7 +1642,9 @@ export async function validateWorkflowScript(
   const manager = new WorkflowManager({
     agent: runner,
     cwd: baseCwd,
-    ...(mockAnswerState ? { concurrency: 1 } : {}),
+    // Serial dry-run dispatch makes agentStart -> mock runner correlation deterministic,
+    // including worktree setup and duplicate labels. It does not affect authored semantics.
+    concurrency: 1,
     journaling: false,
     persistenceRoot,
     loadSavedWorkflow: options.loadSavedWorkflow ?? flows?.resolve,
@@ -1656,19 +1655,17 @@ export async function validateWorkflowScript(
     model?: string;
     configOptions?: Record<string, string | boolean>;
   }) => {
-    const extra = mockMeta.get(event.label) ?? mockMeta.get("") ?? { schema: false };
     const call: ValidatedAgentCall = {
+      index: agentCalls.length,
       label: event.label,
       phase: event.phase,
       model: event.model,
-      tier: extra.tier,
-      mode: extra.mode,
-      configOptions: event.configOptions ?? extra.configOptions,
-      backend: routeBackend(event.model, extra.tier, backendRegistry, hostRegistry, declaredBackends).display,
-      schema: extra.schema,
+      configOptions: event.configOptions,
+      backend: routeBackend(event.model, undefined, backendRegistry, hostRegistry, declaredBackends).display,
+      schema: false,
     };
     agentCalls.push(call);
-    if (mockAnswerState) pendingAgentCalls.push(call);
+    pendingAgentCalls.push(call);
   });
 
   try {
@@ -1677,6 +1674,8 @@ export async function validateWorkflowScript(
       signal: controller.signal,
       maxAgents: options.maxAgents,
       defaultModel: options.defaultModel,
+      agentConfigurations: options.agentConfigurations,
+      requireAgentConfiguration: options.requireAgentConfiguration,
       scriptBackends: declaredBackends,
       confirm: async (promptText: string, checkpointOptions: unknown) => {
         const opts = (checkpointOptions ?? {}) as { kind?: string; default?: unknown; headless?: string };
@@ -1691,27 +1690,6 @@ export async function validateWorkflowScript(
         return reply;
       },
     });
-
-    // agentStart fires BEFORE the mock records its options, so backfill attribution for
-    // any call whose mock metadata arrived after the event (same tick ordering).
-    if (!mockAnswerState) {
-      for (const call of agentCalls) {
-        const extra = mockMeta.get(call.label);
-        if (extra) {
-          call.tier = extra.tier;
-          call.mode = extra.mode;
-          call.configOptions = extra.configOptions;
-          call.schema = extra.schema;
-          call.backend = routeBackend(
-            call.model,
-            extra.tier,
-            backendRegistry,
-            hostRegistry,
-            declaredBackends,
-          ).display;
-        }
-      }
-    }
 
     const runOk = run.status === "completed";
     if (!runOk && flows === undefined && run.reason?.includes("must be the first statement") && /\bworkflow\s*\(/.test(script)) {

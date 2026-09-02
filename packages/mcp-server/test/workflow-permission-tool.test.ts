@@ -151,9 +151,20 @@ test("elicitation-capable status presents the exact options and resumes the agen
   });
   const connected = await connect(runner, { permissionBroker: broker, elicitation: true });
   connected.client.setRequestHandler("elicitation/create", async (request) => {
-    const schema = request.params.requestedSchema as { properties?: { optionId?: { enum?: string[] } } };
-    assert.deepEqual(schema.properties?.optionId?.enum, ["allow_once", "allow_for_session"]);
-    return { action: "accept", content: { optionId: "allow_for_session" } };
+    const schema = request.params.requestedSchema as {
+      required?: string[];
+      properties?: Record<string, { enum?: string[]; oneOf?: Array<{ const: string }> }>;
+    };
+    if (schema.properties?.optionId) {
+      assert.deepEqual(schema.properties.optionId.enum, ["allow_once", "allow_for_session"]);
+      return { action: "accept" as const, content: { optionId: "allow_for_session" } };
+    }
+    const content = Object.fromEntries((schema.required ?? []).map((field) => {
+      const selected = schema.properties?.[field]?.oneOf?.[0]?.const;
+      assert.ok(selected);
+      return [field, selected];
+    }));
+    return { action: "accept" as const, content };
   });
   try {
     const started = structured(await connected.client.callTool({

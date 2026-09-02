@@ -128,6 +128,74 @@ return agent('x', { label: 'config-agent', configOptions: { reasoning_effort: 'h
   ]);
 });
 
+test("host agent configurations replace provider-specific model/mode/config before dispatch", async () => {
+  const seen: Array<{
+    model?: string;
+    mode?: string;
+    configOptions?: Record<string, string | boolean>;
+  }> = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'host_config', description: 'host selected configuration' }
+await agent('one', { label: 'one', mode: 'authored', configOptions: { keep: true, effort: 'low' } })
+return agent('two', { label: 'two' })`,
+    {
+      agent: {
+        async run(
+          _prompt: string,
+          options: { model?: string; mode?: string; configOptions?: Record<string, string | boolean> },
+        ) {
+          seen.push({ model: options.model, mode: options.mode, configOptions: options.configOptions });
+          return "ok";
+        },
+      },
+      agentConfigurations: {
+        0: {
+          model: "claude/opus",
+          mode: "code",
+          configOptions: { effort: "high", fast: false },
+        },
+        1: { model: "codex/gpt-5" },
+      },
+      requireAgentConfiguration: true,
+      persistLogs: false,
+    },
+  );
+
+  assert.deepEqual(seen, [
+    {
+      model: "claude/opus",
+      mode: "code",
+      configOptions: { effort: "high", fast: false },
+    },
+    { model: "codex/gpt-5", mode: undefined, configOptions: undefined },
+  ]);
+  assert.deepEqual(result.calls.map((call) => call.modelRequested), ["claude/opus", "codex/gpt-5"]);
+});
+
+test("strict host configuration fails before any uncovered occurrence dispatches", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () => runWorkflow(
+      `export const meta = { name: 'strict_host_config', description: 'strict host configuration' }
+return agent('uncovered', { label: 'uncovered' })`,
+      {
+        agent: { async run() { calls++; return "must not run"; } },
+        agentConfigurations: {},
+        requireAgentConfiguration: true,
+        persistLogs: false,
+      },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+      assert.match(error.message, /occurrence 0/);
+      assert.match(error.message, /preflight control path/);
+      return true;
+    },
+  );
+  assert.equal(calls, 0);
+});
+
 test('configOptions "model" is rejected before the runner can open a session', async () => {
   let calls = 0;
   await assert.rejects(
