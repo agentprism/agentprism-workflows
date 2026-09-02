@@ -60,11 +60,6 @@ export type AgentResultProvenance =
       hashMatched?: boolean;
     };
 
-export interface AgentInteractionState {
-  kind: "permission";
-  state: "waiting" | "running";
-}
-
 export interface PromptImage {
   readonly data: string;
   readonly mimeType: string;
@@ -82,11 +77,9 @@ export interface PromptImage {
  *
  * FIELD NAMES ARE FROZEN: the engine binds these by name through an `as any` cast
  * (workflow.ts:488), so a renamed field would NOT raise a compile error — it would
- * mis-bind at runtime. Engine-passed core fields (16): label, schema, signal, instructions,
+ * mis-bind at runtime. Engine-passed core fields: label, schema, signal, instructions,
  * images, model, mode, tier, toolNames, disallowedToolNames, cwd, onModelResolved, onModelFallback,
- * onUsage, onHistory, onActivity, onInteractionStateChange. `onActivity` is the backend-neutral
- * liveness signal; interaction state suspends idle detection during a live host wait. Both are
- * telemetry, not identity. Plus ADDITIVE run inputs that wire
+ * onUsage, and onHistory. Plus ADDITIVE run inputs that wire
  * infrastructure / shape the backend, so none enters the resume identity hash (hashAgentCall): `mcpServers`,
  * `runId`, the generic ACP `_meta` passthroughs `meta` / `promptMeta`, the run-scoped custom
  * backend registry `backends`, the Codex-only `baseInstructions` / `developerInstructions`,
@@ -153,14 +146,6 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
   onModelFallback?: (requestedSpec: string) => void;
   /** A compact snapshot of this subagent's message/tool history (diagnostic only). */
   onHistory?: (history: AgentHistoryEntry[]) => void;
-  /** Report one real backend activity event for this attempt. The ACP runner invokes this for
-   *  every received `session/update`; synthetic host heartbeats never enter this callback.
-   *  Best-effort telemetry: throwing callbacks are isolated by runners. Custom runners that
-   *  support the engine's idle watchdog should invoke it whenever their backend makes progress. */
-  onActivity?: () => void;
-  /** Report that this attempt entered or left a live host-interaction wait. The engine suspends
-   *  its no-backend-activity watchdog while waiting; total wall-clock limits continue. */
-  onInteractionStateChange?: (state: AgentInteractionState) => void;
   /** Client-provided MCP servers to attach to this run (ACP `session/new { mcpServers }`).
    *  ADDITIVE and NOT part of the resume identity hash (hashAgentCall) — it wires tools,
    *  not the logical call. Omitted/empty => the runner sends `mcpServers: []` (the default). */

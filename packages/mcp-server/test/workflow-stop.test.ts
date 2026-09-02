@@ -188,7 +188,10 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
       arguments: { scriptPath, background: true },
     });
     const runId = runIdOf(accepted);
-    assert.deepEqual(links(accepted).map((link) => link.uri), [`workflow://runs/${runId}/script`]);
+    assert.deepEqual(links(accepted).map((link) => link.uri), [
+      `workflow://runs/${runId}/script`,
+      `workflow://runs/${runId}/events`,
+    ]);
     await waitUntil(() => controlled.calls.length === 1, "the first agent should start");
     controlled.calls[0].resolve("first result");
     await waitUntil(() => controlled.calls.length === 2, "the second agent should start");
@@ -204,7 +207,10 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
     assert.equal(controlled.calls[1].options.signal?.aborted, true);
     assert.match(textOf(stopped), /snapshot is final for run fate/i);
     assert.match(textOf(stopped), /Agent-session cancellation may still be winding down/i);
-    assert.deepEqual(links(stopped).map((link) => link.uri), [`workflow://runs/${runId}/script`]);
+    assert.deepEqual(links(stopped).map((link) => link.uri), [
+      `workflow://runs/${runId}/script`,
+      `workflow://runs/${runId}/events`,
+    ]);
 
     const persistedFile = persistedRunFile(runId);
     assert.ok(persistedFile);
@@ -225,7 +231,7 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
 
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 25_000, lastN: 1, logLines: 0 },
+      arguments: { action: "status", runId, waitMs: 25_000, lastN: 1, logLines: 0 },
     });
     assert.equal(structured(awaited)?.status, "aborted");
     assert.equal((structured(awaited)?.wait as Record<string, unknown>).returnedBecause, "terminal");
@@ -240,25 +246,22 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
       name: "workflow",
       arguments: { scriptPath, resumeFromRunId: runId, resumePolicy: "positional" },
     });
-    await waitUntil(() => controlled.calls.length === 3, "the stopped source should fail live safely");
-    assert.equal(controlled.calls[2].prompt, "first");
-    controlled.calls[2].resolve("first rerun");
-    await waitUntil(() => controlled.calls.length === 4, "the patched call should run after the live prefix");
-    assert.equal(controlled.calls[3].prompt, "second patched");
-    controlled.calls[3].resolve("patched result");
+    await waitUntil(() => controlled.calls.length === 3, "the patched call should run after the replayed prefix");
+    assert.equal(controlled.calls[2].prompt, "second patched");
+    controlled.calls[2].resolve("patched result");
     const resumed = await resumedPromise;
     const resumedRunId = runIdOf(resumed);
     assert.equal(structured(resumed)?.status, "completed", JSON.stringify(structured(resumed)));
     assert.equal(
       JSON.stringify(structured(resumed)?.result),
-      JSON.stringify({ first: "first rerun", second: "patched result" }),
+      JSON.stringify({ first: "first result", second: "patched result" }),
     );
     const resumeReport = structured(resumed)?.resumeReport as Record<string, unknown>;
-    assert.equal(resumeReport.replayed, 0);
-    assert.equal(resumeReport.live, 2);
+    assert.equal(resumeReport.replayed, 1);
+    assert.equal(resumeReport.live, 1);
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId: resumedRunId },
+      arguments: { action: "status", runId: resumedRunId },
     });
     assert.deepEqual(
       (structured(inspected)?.lineage as Array<Record<string, unknown>>).map((entry) => entry.runId),
@@ -337,7 +340,7 @@ test("stop with callIndex cancels one agent, keeps the run live, and treats labe
 
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId, lastN: 5, logLines: 5 },
+      arguments: { action: "status", runId, lastN: 5, logLines: 5 },
     });
     const cancelledCall = (structured(inspected)?.calls as Array<Record<string, unknown>>)
       .find((call) => call.index === 1);
@@ -351,7 +354,7 @@ test("stop with callIndex cancels one agent, keeps the run live, and treats labe
     controlled.calls[0].resolve("peer-ok");
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 25_000 },
+      arguments: { action: "status", runId, waitMs: 25_000 },
     });
     assert.equal(structured(awaited)?.status, "completed");
     const outcome = structured(awaited)?.outcome as Record<string, unknown>;
@@ -513,7 +516,7 @@ test("stop refuses a final acknowledgement when the terminal snapshot save fails
     fresh = await connectWithManager(freshRunner, freshManager);
     const inspected = await fresh.client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(inspected)?.status, "paused");
     const coldStop = await fresh.client.callTool({

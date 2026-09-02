@@ -7,7 +7,7 @@
  * They are re-exported here so the lifted engine modules can keep importing them from
  * "./errors.js".
  *
- * wrapError / errorMessage / isAbortError / isTimeoutError stay engine-local: they are
+ * wrapError / errorMessage / isAbortError stay engine-local: they are
  * the engine's own classification/formatting of the failures it observes when calling
  * the injected runner or executing workflow code.
  */
@@ -32,11 +32,6 @@ export function isAbortError(error: unknown): boolean {
   return readName(error) === "AbortError";
 }
 
-export function isTimeoutError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return /\btimeout\b/i.test(errorMessage(error)) || readName(error) === "TimeoutError";
-}
-
 /**
  * Wrap an unknown error into a WorkflowError with appropriate classification.
  */
@@ -48,14 +43,6 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
       errorMessage(error),
       WorkflowErrorCode.WORKFLOW_ABORTED,
       { recoverable: true },
-    );
-  }
-
-  if (isTimeoutError(error)) {
-    return new WorkflowError(
-      errorMessage(error),
-      WorkflowErrorCode.AGENT_TIMEOUT,
-      { recoverable: true, agentLabel: context?.agentLabel },
     );
   }
 

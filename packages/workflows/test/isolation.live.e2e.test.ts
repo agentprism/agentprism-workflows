@@ -34,7 +34,6 @@ test(
         maxAgents: 10,
         concurrency: 1,
         agentRetries: 0,
-        agentTimeoutMs: null,
         environmentKey: ENVIRONMENT_KEY,
       });
       assert.equal(baseline.status, "completed");

@@ -101,7 +101,7 @@ Options (`RunDynamicWorkflowOptions`):
 | `args`   | `unknown`      | The value handed to the script's `args` global. |
 | `cwd`    | `string`       | Base working directory for the run (e.g. the project root): every subagent session runs here (a per-agent `agent({ cwd })` or worktree isolation overrides it), worktrees branch from it, and `agentType` definitions are scanned from it. Omitted ⇒ `process.cwd()`. |
 | `runner` | `AgentRunner`  | Swap the backend (or stub it in tests). Omitted ⇒ `createAcpRunner()`. |
-| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: total-wall `agentTimeoutMs`, no-activity `agentIdleTimeoutMs`, `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … |
+| `exec`   | `ExecOptions`  | Per-run controls forwarded to the manager: `concurrency`, `agentRetries`, `signal`, `onProgress`, `confirm`, `resumeFromRunId`, `resumePolicy`, `checkpointReplies`, … |
 | `allowScriptBackends` | `boolean \| callback` | Approve the commands declared in `meta.backends`; declarations are inert without host approval. |
 | `workflows` | `string \| string[] \| WorkflowDir` | Resolve the first argument and nested `workflow("name")` calls from one or more directories. |
 
@@ -189,7 +189,7 @@ try {
 `backends`, `meta` / `promptMeta` (generic ACP `_meta` passthroughs merged into `session/new` /
 `session/prompt`), `baseInstructions` / `developerInstructions` (Codex-only), `keepSession`, and
 the out-of-band callbacks `onUsage` / `onModelResolved` / `onModelFallback` / `onHistory` /
-`onActivity` / `onInteractionStateChange` / `onSessionOpen`. `onActivity` reports real backend progress; a live permission wait reports waiting/running through `onInteractionStateChange` so only the idle watchdog is suspended. Omitted modes explicitly apply Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi/custom mode. Token/cost usage is delivered via `onUsage` (it may never fire — ACP usage is
+`onSessionOpen`. Omitted modes explicitly apply Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi/custom mode. Token/cost usage is delivered via `onUsage` (it may never fire — ACP usage is
 experimental), never via the return value.
 
 > **Codex session instructions.** When the run routes to the Codex backend, `baseInstructions`
@@ -313,15 +313,11 @@ decision bound to changing content should interpolate that content into the chec
 participates in the checkpoint's hashed replay identity and a divergence re-asks instead of
 injecting.
 
-`WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence` implementation, per-agent total-wall/idle timeout and retry defaults, and an optional opaque `leaseOwnerId` for multi-process hosts. Default filesystem persistence exposes read-only lease-owner inspection/validation. `stopPersistedRun(runId)` cold-stops only after acquiring the lease, returning `owned-elsewhere` rather than stealing a live writer's lock.
+`WorkflowManagerOptions` lets you set a default `agent`, `concurrency`, `cwd`, a `loadSavedWorkflow` resolver (enables nested `workflow('name')`), a custom `persistence` implementation, a per-agent retry default, and an optional opaque `leaseOwnerId` for multi-process hosts. Default filesystem persistence exposes read-only lease-owner inspection/validation. `stopPersistedRun(runId)` cold-stops only after acquiring the lease, returning `owned-elsewhere` rather than stealing a live writer's lock.
 
-A finite run-level `agentTimeoutMs` is the total-wall ceiling for every attempt. Script-level
-`timeoutMs` may tighten it but cannot raise or disable it. It is not an idle timer. The separate
-opt-in `agentIdleTimeoutMs` / per-call `idleTimeoutMs` pair uses the same ceiling rules and fires
-after that long without real backend activity. ACP `session/update` traffic re-arms the idle clock;
-synthetic progress heartbeats do not. Retries get fresh clocks. Final exhaustion resolves `null`
-with recoverable `AGENT_TIMEOUT` or `AGENT_IDLE_TIMEOUT`, releases the concurrency slot, and the
-ACP runner closes/recycles a backend session that ignores cancellation.
+Agent attempts have no wall-clock or idle budget. They remain live until completion, failure, or
+explicit call/run cancellation. Internal protocol startup, cancellation-grace, cleanup, lease, and
+transport bounds remain fixed safety controls and are not exposed as agent work limits.
 
 `cancelAgentCall(runId, callIndex)` is the stateful host seam for a single live attempt. It returns
 `WorkflowAgentCallCancellation` after the failed record and agent-end state are committed, while
@@ -349,7 +345,7 @@ per-execution `exec.agent` until that promise settles, including rejection. Read
 `getRun()`, `getSnapshot()`, or `inspectRun()`, and subscribe to cumulative `tokenUsage` events while
 work is running. Live attempts update `snapshot.tokenUsage` monotonically; replayed calls add zero.
 Run results expose `effectiveLimits`; inspect status exposes the same values as `limits`, and failed
-agent rows carry their resolved `timeoutMs` / `idleTimeoutMs` plus `errorCode`.
+agent rows carry their terminal `errorCode`.
 
 `exec.resumeFromRunId` asks the manager to admit a terminal source, persist a self-contained seed
 under a new run ID, and match completed calls by exact path/hash or unique hash+input fingerprint.
@@ -363,8 +359,8 @@ index/prefix matching but cannot bypass new-format format/metadata/manifest/inpu
 same-ID `resume()` and low-level `resumeJournal` paths remain permanently legacy positional and
 emit no `resumeReport`. See the [full contract](../../docs/api.md#content-addressed-incremental-resume).
 Operational limits are resolved from the new execution's `exec` options and manager defaults, not
-copied from the source run; pass the desired timeout/idle-timeout/retry/concurrency values again. Host
-`agentTimeoutMs`, `agentIdleTimeoutMs`, `agentRetries`, and `concurrency`, plus per-call `timeoutMs`, `idleTimeoutMs`, and `retries`, enter
+copied from the source run; pass the desired retry/concurrency values again. Host
+`agentRetries` and `concurrency`, plus per-call `retries`, enter
 neither replay identity nor the execution-input fingerprint and may change without invalidating
 completed calls or interrupted-turn continuation.
 
@@ -501,9 +497,8 @@ const run = await runDynamicWorkflow(script, { runner: echoRunner });
 
 Seam contract (summarized): `run()` returns the **raw** value (schema ⇒ validated object, no schema
 ⇒ string) — never an envelope; usage flows out-of-band via `options.onUsage`; on failure **throw**
-(ideally a `WorkflowError` so `instanceof` holds across packages); honor `options.signal`, invoke
-`options.onActivity` for real backend progress when supporting the opt-in idle watchdog, and do
-**not** implement your own timeout (the engine owns timeout/abort). This makes the SDK fully
+(ideally a `WorkflowError` so `instanceof` holds across packages); honor `options.signal` for
+explicit cancellation and do not add a model-facing execution timeout. This makes the SDK fully
 testable without a live agent — pass a stub runner.
 
 ---
@@ -767,9 +762,9 @@ A harness that reports spawn/session/auth failure during `session/new` produces
 `probed: false` with the reason and never blocks the others. A successful row proves only that
 session/config discovery completed; some agents defer credential validation until the first prompt,
 so `probed:true` is not a universal authentication-status result. Flags: `--cwd <dir>` (probe
-session cwd; default the current directory), `--timeout-ms <n>` (per-harness bound, default
-60000), `--models[=<filter>]`, `--json`. Exit codes: `0` all probed, `1` at least one probe
-failed, `3` usage error.
+session cwd; default the current directory), `--models[=<filter>]`, `--json`. Exit codes: `0` all
+probed, `1` at least one probe failed, `3` usage error. Probe startup and cleanup remain bounded by
+fixed internal safety limits; callers do not configure those protocol bounds.
 
 A harness with a large model catalog (pi, opencode advertise hundreds) has its `model` choices —
 any select above ~24 leaves — collapsed to a grouped summary (total + per-provider/group counts)
@@ -790,7 +785,7 @@ report.harnessOptions; // [{ backendId, model?, probed, modes?: SessionModeState
 formatHarnessConfigReport(report); // the CLI's human table
 ```
 
-`probeHarnessConfig({ harnesses?, modelSpecs?, backends?, cwd?, timeoutMs?, probeRunner? })` — `modelSpecs` selects exact routed models before reading their model-specific option domains; `probeRunner` reuses a host-owned live runner without disposing it; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner({ backends })`.
+`probeHarnessConfig({ harnesses?, modelSpecs?, backends?, cwd?, probeRunner? })` — `modelSpecs` selects exact routed models before reading their model-specific option domains; `probeRunner` reuses a host-owned live runner without disposing it; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner({ backends })`.
 
 ---
 
@@ -814,7 +809,7 @@ By default `mcp` runs a thin **stdio shim** that proxies to the shared local **w
 daemon** (Streamable HTTP on loopback, auto-started on first use), so workflow runs survive
 the MCP client killing the stdio process. Every `run` call names its project via the required
 `projectDir` tool argument, so one registration — even in global MCP settings — serves every
-project; `inspect`/`await`/`stop` locate a runId's project automatically. `--in-process`
+project; `status`/`stop` locate a runId's project automatically. `--in-process`
 restores the pre-daemon single-process stdio server (there `projectDir` is optional and
 defaults to that server's own cwd). Manage the daemon with `agentprism-workflows daemon
 <start|stop|status|url|run|logs>` — `daemon url` prints registration snippets for HTTP-capable

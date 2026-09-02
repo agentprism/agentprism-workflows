@@ -493,7 +493,6 @@ test("live workflow config discovery: every backend exposes its no-prompt catalo
         action: "config",
         projectDir,
         harnesses: ["claude", "codex", "opencode", "pi"],
-        probeTimeoutMs: 120_000,
       },
     }, { timeout: 240_000, maxTotalTimeout: 240_000 });
     assert.notEqual(result.isError, true, JSON.stringify(result));
@@ -530,7 +529,6 @@ test("live workflow config discovery: every backend exposes its no-prompt catalo
         action: "config",
         projectDir,
         modelSpecs: [`pi/${PI_E2E_MODEL}`],
-        probeTimeoutMs: 120_000,
       },
     }, { timeout: 240_000, maxTotalTimeout: 240_000 });
     assert.notEqual(exactPi.isError, true, JSON.stringify(exactPi));

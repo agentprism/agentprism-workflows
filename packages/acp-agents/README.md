@@ -48,7 +48,7 @@ try {
 }
 ```
 
-`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, base/developer instructions, session hand-off fields, and telemetry callbacks. `onActivity` reports real ACP updates; `onInteractionStateChange` reports permission wait/resume so an engine can suspend only its idle watchdog. See `@automatalabs/shared-types` for the field-by-field contract.
+`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, base/developer instructions, session hand-off fields, and telemetry callbacks. See `@automatalabs/shared-types` for the field-by-field contract.
 
 Aborting `signal` sends ACP `session/cancel` for that session. If its active turn does not settle
 within five seconds, the client sends `session/close` when the agent advertised it and quarantines

@@ -5,8 +5,8 @@
 // method only: it is the exact shape behind `Pick<WorkflowAgent,"run">` (pi
 // workflow.ts:59). It is BOUND at workflow.ts:283 (`const agentRunner = options.agent`
 // — now REQUIRED; the Pi `?? new WorkflowAgent(options)` default is DROPPED) and
-// CALLED exactly ONCE per agent() at workflow.ts:465, inside the limiter thunk,
-// wrapped by withTimeout(promise, timeout, label). The call site casts the opts bag
+// CALLED exactly ONCE per agent() at workflow.ts:465, inside the limiter thunk.
+// The call site casts the opts bag
 // `as any` (workflow.ts:488) — so FIELD NAMES are the real contract: renaming a field
 // silently mis-binds at runtime with NO compile error. This file freezes that seam.
 import type { TSchema } from "typebox";
@@ -46,14 +46,11 @@ export interface AgentRunner {
    *      AGENT_EMPTY_OUTPUT     (recoverable)      no assistant text on a no-schema call
    *      SCHEMA_NONCOMPLIANCE   (non-recoverable)  schema never satisfied after the ladder
    *      PROVIDER_USAGE_LIMIT   (non-recoverable)  quota/rate wall -> engine PAUSES, carries resetHint
-   *    (AGENT_TIMEOUT + AGENT_IDLE_TIMEOUT + AGENT_CANCELLED + WORKFLOW_ABORTED + SCRIPT_ERROR are added by the ENGINE, not the runner.)
+   *    (AGENT_CANCELLED + WORKFLOW_ABORTED + SCRIPT_ERROR are added by the ENGINE, not the runner.)
    *
-   *  - TIMEOUT and ABORT are the ENGINE's responsibility, not the runner's:
-   *    the engine owns the total-wall and idle watchdog races, passes options.signal, and calls
-   *    throwIfAborted() before/after. The runner SHOULD honor options.signal (wire it to the
-   *    backend session cancel -> ACP session/cancel), MUST NOT implement its own timeout, and
-   *    SHOULD invoke options.onActivity for real backend progress so an opted-in idle watchdog
-   *    can distinguish a live stream from a wedge.
+   *  - ABORT is the ENGINE's responsibility: the engine passes options.signal and calls
+   *    throwIfAborted() before/after. The runner SHOULD honor options.signal by wiring it to
+   *    backend session cancellation (ACP session/cancel).
    *
    *  - There is NO checkpoint method: human-in-the-loop is the engine's options.confirm
    *    callback (workflow.ts:798-829), not a runner concern.

@@ -11,7 +11,7 @@
     {
       "id": "workflow/run-lifecycle",
       "title": "Workflow tool lifecycle",
-      "description": "Config, run, background admission, await, inspect, stop, resume, run resources, and events.",
+      "description": "Config, run, background admission, bounded status, stop, resume, run resources, and events.",
       "file": "workflow/run-lifecycle.md",
       "related": ["workflow/quickstart", "workflow/determinism-and-resume", "workflow/models-and-config"]
     },

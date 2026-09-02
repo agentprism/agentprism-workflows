@@ -11,11 +11,10 @@
 //      provider wall (thrown) -> PROVIDER_USAGE_LIMIT (non-recoverable, resetHint)
 //      pooled process crash (thrown) -> recoverable AGENT_EXECUTION_ERROR (engine retries on a
 //        fresh process; the dead connection is evicted from the pool)
-//   7. usage -> onUsage on BOTH paths; session/update -> onActivity; honor opts.signal (-> session/cancel)
+//   7. usage -> onUsage on BOTH paths; honor opts.signal (-> session/cancel)
 //   8. RELEASE the session (session/close) WITHOUT killing the process; return it to the pool
 //
-// Timeout and abort are the ENGINE's job: we honor opts.signal (wired to ACP session/cancel),
-// report real session/update activity for its opt-in idle watchdog, and never implement a timeout.
+// Run cancellation is the ENGINE's job: we honor opts.signal (wired to ACP session/cancel).
 import { isAbsolute } from "node:path";
 import {
   isWorkflowError,
@@ -131,8 +130,6 @@ interface SessionPreparationOptions {
   runId?: string;
   label?: string;
   callIndex?: number;
-  onActivity?: AnyRunOptions["onActivity"];
-  onInteractionStateChange?: AnyRunOptions["onInteractionStateChange"];
   baseInstructions?: string;
   developerInstructions?: string;
 }
@@ -1419,9 +1416,6 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         label: opts.label,
         // Direct engine-call correlation on emitted events only; never sent on the ACP wire.
         callIndex: opts.callIndex,
-        // Backend-neutral liveness callback; MultiplexClient invokes it for this session only.
-        onActivity: opts.onActivity,
-        onInteractionStateChange: opts.onInteractionStateChange,
         // CODEX-ONLY session instruction overrides -> session/new _meta bare keys. Additive;
         // never hashed. The Claude backend ignores them.
         baseInstructions: opts.baseInstructions,

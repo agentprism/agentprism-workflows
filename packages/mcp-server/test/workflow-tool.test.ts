@@ -24,14 +24,9 @@ function field(value: unknown, key: string): unknown {
 
 const LIMITS = {
   maxAgents: 1_000,
-  tokenBudget: null,
   concurrency: 6,
   agentRetries: 0,
-  agentTimeoutMs: null,
-  agentIdleTimeoutMs: null,
 } as const;
-const ADMISSION_LOG =
-  "agent timeout admission: total-wall ceiling none; idle ceiling disabled; each retry re-arms both clocks";
 
 function inspectionFixture(status: "running" | "completed" | "failed" | "aborted" = "running") {
   return {
@@ -72,12 +67,12 @@ const terminalOutcomeFixture = {
 
 function outputVariantFixtures() {
   const inspection = inspectionFixture();
-  const terminalAwait = {
+  const terminalStatus = {
     ...inspectionFixture("completed"),
     wait: { requestedMs: 100, elapsedMs: 5, returnedBecause: "terminal" as const },
     outcome: terminalOutcomeFixture,
   };
-  const nonterminalAwait = {
+  const nonterminalStatus = {
     ...inspection,
     wait: { requestedMs: 100, elapsedMs: 5, returnedBecause: "timeout" as const },
     tokenUsage: { input: 1, output: 2, total: 3, cost: 0 },
@@ -103,11 +98,13 @@ function outputVariantFixtures() {
     status: "running" as const,
     scriptSource: "inline" as const,
     scriptUri: "workflow://runs/fixture-run/script",
+    eventsUri: "workflow://runs/fixture-run/events",
     limits: LIMITS,
   };
   const execution = {
     ...terminalOutcomeFixture,
     scriptSource: "inline" as const,
+    eventsUri: "workflow://runs/fixture-run/events",
   };
   const resultRetrieval = {
     action: "result" as const,
@@ -140,7 +137,7 @@ function outputVariantFixtures() {
       omittedWarnings: 0,
     },
   };
-  return { resultRetrieval, config, rejected, execution, background, inspection, terminalAwait, nonterminalAwait, stop, pendingStop };
+  return { resultRetrieval, config, rejected, execution, background, terminalStatus, nonterminalStatus, stop, pendingStop };
 }
 
 // Engine-owned run id shape (run-persistence.generateRunId): `${base36ts}-${base36rand}`.
@@ -159,28 +156,31 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     );
     const tool = tools.find((candidate) => candidate.name === "workflow");
     assert.ok(tool, "the workflow tool is registered");
-    assert.match(tool.description ?? "", /registry built-ins—currently Claude, Codex, OpenCode, and pi/);
-    assert.match(tool.description ?? "", /action:\"config\"/);
-    assert.match(tool.description ?? "", /action:\"result\"/);
-    assert.match(tool.description ?? "", /automatically performs static validation, a mocked dry run, and routed config checks/);
-    assert.match(tool.description ?? "", /Every parallel entry must be a thunk/);
-    assert.match(tool.description ?? "", /phases must be an array of objects shaped `\{ title: string, detail\?: string, model\?: string \}`, never an array of strings/);
-    assert.match(tool.description ?? "", /Minimal script:.*phases: \[\{ title: \"Review\" \}\].*phase\(\"Review\"\)/);
-    assert.match(tool.description ?? "", /configOptions, schema, cwd, timeoutMs, idleTimeoutMs, retries/);
+    assert.equal(tool.title, "Run and manage deterministic agent workflows");
+    assert.match(tool.description ?? "", /workflow\/quickstart/);
+    assert.match(tool.description ?? "", /workflow\/run-lifecycle/);
+    assert.match(tool.description ?? "", /status for an immediate snapshot or request-bounded wait/);
+    assert.doesNotMatch(tool.description ?? "", /action:\"(?:inspect|await)\"/);
+    assert.doesNotMatch(tool.description ?? "", /parallel\(|Minimal script|first statement|agent option keys/);
     assert.doesNotMatch(tool.description ?? "", /npx|CLI|shell out/i);
+    assert.ok((tool.description ?? "").length < 1_200, "the model-facing description stays compact");
 
-    assert.deepEqual(tool.inputSchema.required, undefined, "the raw shape leaves branch requirements to the discriminator");
-    const inputProps = Object.keys(tool.inputSchema.properties ?? {});
-    assert.ok(!inputProps.includes("startInBackground"), "startInBackground is not advertised");
-    assert.ok(inputProps.includes("resumeFromRunId"), "explicit resume knob is advertised");
-    assert.ok(inputProps.includes("resumePolicy"), "resume matching policy is advertised");
-    assert.ok(inputProps.includes("action") && inputProps.includes("runId"), "inspection action fields are advertised");
-    assert.ok(inputProps.includes("background") && inputProps.includes("waitMs"), "detached lifecycle fields are advertised");
-    assert.ok(inputProps.includes("lastN") && inputProps.includes("labelGlob") && inputProps.includes("logLines"));
-    assert.ok(inputProps.includes("checkpointReplies"), "durable checkpoint reply channel is advertised");
-    assert.ok(inputProps.includes("concurrency") && inputProps.includes("agentRetries"));
-    assert.ok(inputProps.includes("forceOwner"), "explicit predecessor-force authorization is advertised");
-    assert.ok(inputProps.includes("harnesses") && inputProps.includes("modelSpecs") && inputProps.includes("modelFilter") && inputProps.includes("probeTimeoutMs"));
+    assert.deepEqual(Object.keys(tool.inputSchema).sort(), ["$schema", "oneOf", "type"].sort());
+    assert.equal(tool.inputSchema.type, "object");
+    const inputVariants = field(tool.inputSchema, "oneOf") as Array<Record<string, unknown>>;
+    assert.equal(inputVariants.length, 7, "one published branch per canonical action");
+    const actions = inputVariants.map((variant) => {
+      const direct = field(field(variant, "properties"), "action");
+      if (direct !== undefined) return field(direct, "const");
+      const nested = field(variant, "oneOf") as Array<Record<string, unknown>>;
+      const nestedActions = new Set(
+        nested.map((candidate) => field(field(field(candidate, "properties"), "action"), "const")),
+      );
+      assert.equal(nestedActions.size, 1, "structural sub-variants retain one action discriminator");
+      return [...nestedActions][0];
+    });
+    assert.deepEqual(actions, ["config", "run", "resume", "status", "result", "permissions-response", "stop"]);
+    assert.doesNotMatch(JSON.stringify(tool.inputSchema), /inspect|await|startInBackground|agentTimeoutMs|agentIdleTimeoutMs/);
 
     // The machine-readable output core includes structured pause contexts.
     assert.ok(tool.outputSchema, "an output schema is declared");
@@ -190,6 +190,7 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       "status",
       "result",
       "resultUri",
+      "eventsUri",
       "tokenUsage",
       "logs",
       "authContext",
@@ -215,6 +216,7 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       "pendingPermissions",
       "interaction",
       "permissionResponse",
+      "latestActivity",
       "mimeType",
       "encoding",
       "totalBytes",
@@ -232,10 +234,10 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       ["action", "runId", "status", "resultUri", "mimeType", "encoding", "totalBytes", "offset", "endOffset", "hasMore", "chunk"],
       ["action", "ok", "harnessOptions", "omittedHarnesses", "models"],
       ["action", "status", "validation"],
-      ["runId", "status", "scriptUri", "scriptSource", "limits"],
-      ["runId", "status", "scriptUri", "scriptSource", "limits"],
-      ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage"],
+      ["runId", "status", "scriptUri", "eventsUri", "scriptSource", "limits"],
+      ["runId", "status", "scriptUri", "eventsUri", "scriptSource", "limits"],
       ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage", "wait"],
+      ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage"],
       [
         "runId",
         "status",
@@ -699,11 +701,11 @@ test("runtime and advertised output schemas enforce exact result branches", asyn
     })(),
     "result retrieval with script URI": { ...fixtures.resultRetrieval, scriptUri: "workflow://runs/fixture-run/script" },
     "result retrieval with run limits": { ...fixtures.resultRetrieval, limits: LIMITS },
-    "failed inspection with result URI": {
+    "failed status with result URI": {
       ...inspectionFixture("failed"),
       resultUri: "workflow://runs/fixture-run/result",
     },
-    "failed await outcome with result URI": {
+    "failed status outcome with result URI": {
       ...inspectionFixture("failed"),
       wait: { requestedMs: 100, elapsedMs: 5, returnedBecause: "terminal" as const },
       outcome: {
@@ -722,37 +724,43 @@ test("runtime and advertised output schemas enforce exact result branches", asyn
       const { limits: _limits, ...withoutLimits } = fixtures.execution;
       return withoutLimits;
     })(),
+    "execution without events URI": (() => {
+      const { eventsUri: _eventsUri, ...withoutEventsUri } = fixtures.execution;
+      return withoutEventsUri;
+    })(),
     "background without limits": (() => {
       const { limits: _limits, ...withoutLimits } = fixtures.background;
       return withoutLimits;
+    })(),
+    "background without events URI": (() => {
+      const { eventsUri: _eventsUri, ...withoutEventsUri } = fixtures.background;
+      return withoutEventsUri;
     })(),
     "background with execution logs": { ...fixtures.background, logs: [] },
     "background with execution usage": {
       ...fixtures.background,
       tokenUsage: { input: 1, output: 2, total: 3, cost: 0 },
     },
-    "background with await outcome": { ...fixtures.background, outcome: terminalOutcomeFixture },
-    "inspection with execution result": { ...fixtures.inspection, result: 42 },
-    "inspection with execution usage": {
-      ...fixtures.inspection,
-      tokenUsage: { input: 1, output: 2, total: 3, cost: 0 },
+    "background with status outcome": { ...fixtures.background, outcome: terminalOutcomeFixture },
+    "status with execution result": { ...fixtures.nonterminalStatus, result: 42 },
+    "nonterminal status with outcome": {
+      ...fixtures.nonterminalStatus,
+      outcome: terminalOutcomeFixture,
     },
-    "inspection with await outcome": { ...fixtures.inspection, outcome: terminalOutcomeFixture },
+    "terminal status without outcome": (() => {
+      const { outcome: _outcome, ...withoutOutcome } = fixtures.terminalStatus;
+      return withoutOutcome;
+    })(),
+    "nonterminal status with execution logs": { ...fixtures.nonterminalStatus, logs: [] },
     "stop with execution logs": { ...fixtures.stop, logs: [] },
     "stop with execution usage": {
       ...fixtures.stop,
       tokenUsage: { input: 1, output: 2, total: 3, cost: 0 },
     },
-    "stop with await outcome": { ...fixtures.stop, outcome: terminalOutcomeFixture },
+    "stop with status outcome": { ...fixtures.stop, outcome: terminalOutcomeFixture },
     "pending stop claiming terminal status": { ...fixtures.pendingStop, status: "aborted" },
     "pending stop claiming completion": { ...fixtures.pendingStop, stopped: true },
-    "terminal await with top-level logs": { ...fixtures.terminalAwait, logs: [] },
-    "terminal await without outcome": (() => {
-      const { outcome: _outcome, ...withoutOutcome } = fixtures.terminalAwait;
-      return withoutOutcome;
-    })(),
-    "nonterminal await with execution logs": { ...fixtures.nonterminalAwait, logs: [] },
-    "nonterminal await with outcome": { ...fixtures.nonterminalAwait, outcome: terminalOutcomeFixture },
+    "terminal status with top-level logs": { ...fixtures.terminalStatus, logs: [] },
   };
   for (const [name, fixture] of Object.entries(invalid)) {
     assert.equal(workflowToolOutputShape.safeParse(fixture).success, false, `${name} runtime rejection`);
@@ -776,7 +784,7 @@ test("runtime and advertised output schemas enforce exact result branches", asyn
   }
 });
 
-test("foreground and await outcomes expose result observability while inspection status stays bounded", async () => {
+test("foreground and terminal status outcomes expose result observability while status stays bounded", async () => {
   let sessions = 0;
   const runner = makeRunner((_prompt, options) => {
     options.onSessionOpen?.({
@@ -806,7 +814,7 @@ test("foreground and await outcomes expose result observability while inspection
 
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId: String(foregroundResult?.runId) },
+      arguments: { action: "status", runId: String(foregroundResult?.runId) },
     });
     const status = structured(inspected);
     assert.equal(Object.hasOwn(status ?? {}, "fallbacks"), false);
@@ -815,7 +823,7 @@ test("foreground and await outcomes expose result observability while inspection
     const accepted = await client.callTool({ name: "workflow", arguments: { script, background: true } });
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId: String(structured(accepted)?.runId), waitMs: 1_000 },
+      arguments: { action: "status", runId: String(structured(accepted)?.runId), waitMs: 1_000 },
     });
     const awaitResult = structured(awaited);
     assert.equal(Object.hasOwn(awaitResult ?? {}, "fallbacks"), false);
@@ -830,7 +838,7 @@ test("foreground and await outcomes expose result observability while inspection
   }
 });
 
-test("run and inspect both validate after listTools caching; inspect is read-only and chronologically filtered", async () => {
+test("run and status both validate after listTools caching; status is read-only and chronologically filtered", async () => {
   let calls = 0;
   const runner = makeRunner((prompt, options) => {
     calls++;
@@ -864,7 +872,7 @@ test("run and inspect both validate after listTools caching; inspect is read-onl
     const inspected = await client.callTool({
       name: "workflow",
       arguments: {
-        action: "inspect",
+        action: "status",
         runId: String(runStatus?.runId),
         lastN: 2,
         labelGlob: "review-*",
@@ -890,7 +898,7 @@ test("run and inspect both validate after listTools caching; inspect is read-onl
   }
 });
 
-test("inspecting a live run surfaces its in-flight agent calls", async () => {
+test("status surfaces a live run's in-flight agent calls", async () => {
   let release!: (value: string) => void;
   const gate = new Promise<string>((resolve) => {
     release = resolve;
@@ -911,7 +919,7 @@ test("inspecting a live run surfaces its in-flight agent calls", async () => {
     // Wait until the held agent is actually in flight (its start is durable in the event log).
     let liveStatus: Record<string, unknown> | undefined;
     for (let attempt = 0; attempt < 100; attempt++) {
-      const inspected = await client.callTool({ name: "workflow", arguments: { action: "inspect", runId } });
+      const inspected = await client.callTool({ name: "workflow", arguments: { action: "status", runId } });
       assert.equal(inspected.isError, false);
       liveStatus = structured(inspected);
       const calls = (liveStatus?.calls as Array<Record<string, unknown>>) ?? [];
@@ -930,10 +938,10 @@ test("inspecting a live run surfaces its in-flight agent calls", async () => {
     release("held-done");
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 10_000 },
+      arguments: { action: "status", runId, waitMs: 10_000 },
     });
     assert.equal(structured(awaited)?.status, "completed");
-    const settled = await client.callTool({ name: "workflow", arguments: { action: "inspect", runId } });
+    const settled = await client.callTool({ name: "workflow", arguments: { action: "status", runId } });
     const settledCalls = (structured(settled)?.calls as Array<Record<string, unknown>>) ?? [];
     assert.equal(settledCalls.length, 2);
     assert.ok(
@@ -945,7 +953,54 @@ test("inspecting a live run surfaces its in-flight agent calls", async () => {
   }
 });
 
-test("unknown inspection is an exact tool error; inspecting a failed run is a successful read", async () => {
+test("legacy inspect and await requests normalize to the canonical status behavior", async () => {
+  let release!: (value: string) => void;
+  let released = false;
+  const held = new Promise<string>((resolve) => {
+    release = resolve;
+  });
+  const { client, dispose } = await connect(makeRunner(() => held), { listTools: true });
+  try {
+    const accepted = await client.callTool({
+      name: "workflow",
+      arguments: { script: ONE_AGENT_SCRIPT, background: true },
+    });
+    const runId = String(structured(accepted)?.runId);
+
+    const immediate = await client.callTool({
+      name: "workflow",
+      arguments: { action: "inspect", runId },
+    });
+    assert.notEqual(immediate.isError, true);
+    assert.equal(field(structured(immediate)?.wait, "requestedMs"), 0);
+    assert.equal(field(structured(immediate)?.wait, "returnedBecause"), "immediate");
+    assert.ok(Number(field(structured(immediate)?.wait, "elapsedMs")) >= 0);
+
+    const timed = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId, waitMs: 1 },
+    });
+    assert.notEqual(timed.isError, true);
+    assert.equal(field(structured(timed)?.wait, "requestedMs"), 1);
+    assert.equal(field(structured(timed)?.wait, "returnedBecause"), "timeout");
+
+    released = true;
+    release("legacy-migrated");
+    const terminal = await client.callTool({
+      name: "workflow",
+      arguments: { action: "await", runId },
+    });
+    assert.notEqual(terminal.isError, true);
+    assert.equal(field(structured(terminal)?.wait, "requestedMs"), 20_000);
+    assert.equal(field(structured(terminal)?.wait, "returnedBecause"), "terminal");
+    assert.equal(structured(terminal)?.status, "completed");
+  } finally {
+    if (!released) release("cleanup");
+    await dispose();
+  }
+});
+
+test("unknown status is an exact tool error; reading a failed run is successful", async () => {
   const runner = throwingRunner(
     () => new WorkflowError("FAIL-CLOSED", WorkflowErrorCode.SCRIPT_ERROR, { recoverable: false }),
   );
@@ -953,7 +1008,7 @@ test("unknown inspection is an exact tool error; inspecting a failed run is a su
   try {
     const missing = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId: "missing-run" },
+      arguments: { action: "status", runId: "missing-run" },
     });
     assert.equal(missing.isError, true);
     assert.equal(missing.structuredContent, undefined);
@@ -967,7 +1022,7 @@ test("unknown inspection is an exact tool error; inspecting a failed run is a su
     const failedRun = structured(failed);
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId: String(failedRun?.runId) },
+      arguments: { action: "status", runId: String(failedRun?.runId) },
     });
     assert.equal(inspected.isError, false, "the read succeeds even when the run status is failed");
     assert.equal(structured(inspected)?.status, "failed");
@@ -977,7 +1032,7 @@ test("unknown inspection is an exact tool error; inspecting a failed run is a su
   }
 });
 
-test("inspection structured content is at most 24 KiB and text is at most 8 KiB", async () => {
+test("status keeps its observation projection within 24 KiB and text within 8 KiB", async () => {
   const large = "safe".repeat(1_000);
   const runner = makeRunner((prompt) => ({ prompt, large }));
   const { client, dispose } = await connect(runner, { listTools: true });
@@ -993,11 +1048,12 @@ test("inspection structured content is at most 24 KiB and text is at most 8 KiB"
     const runId = String(structured(run)?.runId);
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId, lastN: 50, logLines: 50 },
+      arguments: { action: "status", runId, lastN: 50, logLines: 50 },
     });
     const status = structured(inspected);
     assert.ok(status);
-    assert.ok(Buffer.byteLength(JSON.stringify(status), "utf8") <= 24_576);
+    const { outcome: _outcome, ...boundedObservation } = status;
+    assert.ok(Buffer.byteLength(JSON.stringify(boundedObservation), "utf8") <= 24_576);
     assert.ok(Buffer.byteLength(textOf(inspected), "utf8") <= 8_192);
     assert.equal(field(status?.truncation, "byteCapApplied"), true);
   } finally {
@@ -1028,11 +1084,11 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     assert.equal(pausedTail[0], "line-6");
     assert.equal(pausedTail.at(-1), "line-25");
     assert.equal(pausedTail.some((line) => line.includes(token)), false);
-    assert.match(textOf(paused), /recent run log \(last 20 of 26\):/);
+    assert.match(textOf(paused), /recent run log \(last 20 of 25\):/);
     assert.match(textOf(paused), /\n  line-6\n/);
     assert.doesNotMatch(textOf(paused), /\n  line-[1-5]\n/);
     assert.doesNotMatch(textOf(paused), /ghp_/);
-    assert.match(textOf(paused), /resumeFromRunId/);
+    assert.match(textOf(paused), /action="resume"/);
 
     const failed = await client.callTool({
       name: "workflow",
@@ -1043,7 +1099,7 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     assert.equal(failed.isError, true);
     const failedTail = field(structured(failed)?.logTail, "lines") as string[];
     assert.equal(failedTail[0], "line-7");
-    assert.match(textOf(failed), /recent run log \(last 20 of 27\):/);
+    assert.match(textOf(failed), /recent run log \(last 20 of 26\):/);
 
     const empty = await client.callTool({
       name: "workflow",
@@ -1052,9 +1108,8 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
       },
     });
     const emptyLines = field(structured(empty)?.logTail, "lines") as string[];
-    assert.equal(emptyLines[0], ADMISSION_LOG);
-    assert.equal(emptyLines.length, 2);
-    assert.match(textOf(empty), /recent run log \(last 2 of 2\):/);
+    assert.equal(emptyLines.length, 1);
+    assert.match(textOf(empty), /recent run log \(last 1 of 1\):/);
   } finally {
     await dispose();
   }
@@ -1139,7 +1194,10 @@ test("paused run -> shell does NOT throw: isError:false, status 'paused', resetH
     const text = textOf(res);
     assert.match(text, /paused/, "summary reports the paused status");
     assert.ok(text.includes("Resets in ~3h"), "the provider resetHint passes through verbatim");
-    assert.ok(text.includes(String(sc.runId)) && text.includes("resumeFromRunId"), "summary tells the host how to resume");
+    assert.ok(
+      text.includes(String(sc.runId)) && text.includes('action="resume"'),
+      "summary tells the host how to resume",
+    );
   } finally {
     await dispose();
   }

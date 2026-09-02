@@ -1,6 +1,6 @@
 ---
 name: agentprism-workflow-authoring
-description: Write and run AgentPrism workflow scripts — the `export const meta` + agent()/parallel()/pipeline() JavaScript DSL executed by @automatalabs/workflows and by the @automatalabs/mcp-server `workflow` tool. Use when writing or editing a workflow script, or when running one through the MCP `workflow` tool. Covers the script API, per-call routing to ACP backends (Claude Code, Codex, OpenCode, pi, custom agents), structured outputs via JSON Schema, human checkpoints, worktree isolation, the resume rules, and run operations (run, await, inspect, stop, execution logs).
+description: Write and run AgentPrism workflow scripts — the `export const meta` + agent()/parallel()/pipeline() JavaScript DSL executed by @automatalabs/workflows and by the @automatalabs/mcp-server `workflow` tool. Use when writing or editing a workflow script, or when running one through the MCP `workflow` tool. Covers the script API, per-call routing to ACP backends (Claude Code, Codex, OpenCode, pi, custom agents), structured outputs via JSON Schema, human checkpoints, worktree isolation, the resume rules, and run operations (run, status, stop, execution logs).
 ---
 
 # Writing AgentPrism workflow scripts
@@ -14,7 +14,7 @@ A workflow script is plain JavaScript, passed around as a **string**, not a modu
 <!-- guide-index:begin -->
 Read the section your task needs — each is a separate document in this skill directory:
 
-1. **[Running workflows](mcp-server-setup.md)** — register `@automatalabs/mcp-server`; the `workflow` tool's run/await/inspect/stop actions; background runs; execution logs through the events resource.
+1. **[Running workflows](mcp-server-setup.md)** — register `@automatalabs/mcp-server`; the `workflow` tool's run/resume/status/stop actions; background runs; execution logs through the events resource.
 2. **[Backends and structured output](models-and-output.md)** — per-call model routing, `configOptions`, and schema-validated outputs on every backend.
 3. **[Composition and failure](composition-and-failure.md)** — the `meta` header, `parallel` and `pipeline`, null semantics, and phases.
 4. **[Quality helpers and checkpoints](gates-and-lenses.md)** — `gate`, `retry`, `verify`, `judgePanel`, `loopUntilDry`, `completenessCheck`, and the human `checkpoint()` gate.
@@ -48,7 +48,7 @@ const summary = await agent(
 return { summary };
 ```
 
-Run scripts through the MCP server's `workflow` tool — registration, the run/await/inspect/stop actions, and the `args`/`cwd` globals are covered in **Running workflows** ([mcp-server-setup.md](mcp-server-setup.md)).
+Run scripts through the MCP server's `workflow` tool — registration, the run/status/stop actions, and the `args`/`cwd` globals are covered in **Running workflows** ([mcp-server-setup.md](mcp-server-setup.md)).
 
 ## Pre-flight checklist
 

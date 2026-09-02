@@ -4,7 +4,7 @@
  * streams within it are the SDK's per-POST streams plus the standalone GET stream.
  *
  * Bounded on purpose: replay here is a transport nicety for notifications in flight. Run
- * truth always lives in the persisted journal and the inspect/await tools, so eviction
+ * truth always lives in the persisted journal and the status action, so eviction
  * degrades to a missed notification, never to lost run state. On a replay whose cursor was
  * evicted, the parsed streamId is still returned so the SDK re-binds the reconnected stream
  * to live traffic.

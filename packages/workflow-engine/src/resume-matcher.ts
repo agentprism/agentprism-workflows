@@ -33,7 +33,7 @@ import {
 import { cloneFrozenStrictJson, cloneStrictJsonValue, deepFreeze } from "./strict-json.js";
 
 const SHA256 = /^[0-9a-f]{64}$/;
-const TERMINAL_STATUSES = new Set(["completed", "paused", "failed"]);
+const TERMINAL_STATUSES = new Set(["completed", "paused", "failed", "aborted"]);
 const RESUME_MATCHES = new Set(["path-hash", "unique-hash", "index-hash"]);
 const RESUME_SAFETY = new Set(["declared-read-only", "isolated-worktree"]);
 
@@ -157,7 +157,6 @@ export type PositionalResumeMatchDecision =
       action: "replay";
       entry: JournalEntry;
       match: "index-hash";
-      logicalBudgetDebit?: number;
       nextFirstMiss: number;
     }
   | {
@@ -305,7 +304,6 @@ function isReplayProvenance(value: unknown): value is NonNullable<WorkflowCallRe
     isNonNegativeSafeInteger(value.recordedIndex) &&
     typeof value.match === "string" &&
     RESUME_MATCHES.has(value.match) &&
-    (value.logicalBudgetDebit === undefined || isFiniteNonNegative(value.logicalBudgetDebit)) &&
     (value.sourceResumeSafety === undefined || isResumeSafety(value.sourceResumeSafety)) &&
     (value.checkpointHostDecision === undefined || value.checkpointHostDecision === true) &&
     (value.checkpointInjected === undefined || value.checkpointInjected === true) &&
@@ -314,16 +312,16 @@ function isReplayProvenance(value: unknown): value is NonNullable<WorkflowCallRe
   );
 }
 
-function effectiveLogicalDebit(call: WorkflowCallRecord): number | undefined {
-  if (call.origin === "runner") {
-    return isFiniteNonNegative(call.budgetDebit) ? call.budgetDebit : undefined;
-  }
-  if (call.origin === "journal-replay") {
-    return call.budgetDebit === 0 && isFiniteNonNegative(call.replay?.logicalBudgetDebit)
-      ? call.replay.logicalBudgetDebit
-      : undefined;
-  }
-  return undefined;
+/** Historical budget fields are accepted as inert JSON input but never copied into a
+ * current call record, resume seed, provenance object, or report. */
+function stripLegacyBudgetFields(call: WorkflowCallRecord): WorkflowCallRecord {
+  const { budgetDebit: _budgetDebit, ...currentCall } = call as WorkflowCallRecord & {
+    budgetDebit?: unknown;
+  };
+  if (currentCall.replay === undefined) return currentCall;
+  const { logicalBudgetDebit: _logicalBudgetDebit, ...currentReplay } = currentCall.replay as
+    NonNullable<WorkflowCallRecord["replay"]> & { logicalBudgetDebit?: unknown };
+  return { ...currentCall, replay: currentReplay };
 }
 
 function validateReplayForCall(call: WorkflowCallRecord): boolean {
@@ -332,13 +330,11 @@ function validateReplayForCall(call: WorkflowCallRecord): boolean {
   if (!isReplayProvenance(call.replay)) return false;
   if (call.kind === "agent") {
     return (
-      isFiniteNonNegative(call.replay.logicalBudgetDebit) &&
       call.replay.checkpointHostDecision === undefined &&
       call.replay.checkpointInjected === undefined
     );
   }
   return (
-    call.replay.logicalBudgetDebit === undefined &&
     call.replay.sourceResumeSafety === undefined &&
     (call.replay.checkpointInjected !== true || call.replay.checkpointHostDecision === true)
   );
@@ -361,7 +357,6 @@ function validateBasicCall(value: unknown, sourceRunId: string): value is Workfl
   if (value.resumeSafety !== undefined && !isResumeSafety(value.resumeSafety)) return false;
   if (value.isolation !== undefined && value.isolation !== "worktree") return false;
   if (value.worktree !== undefined && value.worktree !== true) return false;
-  if (value.budgetDebit !== undefined && !isFiniteNonNegative(value.budgetDebit)) return false;
   if (value.settlementOrdinal !== undefined && !isPositiveSafeInteger(value.settlementOrdinal)) return false;
   if (value.usage !== undefined && !isUsage(value.usage)) return false;
   if (value.outcome === "result") {
@@ -383,10 +378,8 @@ function validateCallFacts(call: WorkflowCallRecord): boolean {
   if (call.outcome !== "result") return true;
   if (!isPath(call.path) || !isHash(call.inputsHash)) return false;
   if (call.kind === "agent") {
-    if (call.origin !== "runner" && call.origin !== "journal-replay") return false;
-    return effectiveLogicalDebit(call) !== undefined;
+    return call.origin === "runner" || call.origin === "journal-replay";
   }
-  if (call.budgetDebit !== undefined) return false;
   return (
     call.origin === "confirm" ||
     call.origin === "headless" ||
@@ -472,15 +465,11 @@ function validateCandidate(value: unknown): PersistedResumeCandidate | undefined
   ) {
     return undefined;
   }
-  if (value.call.kind === "agent") {
-    const debit = effectiveLogicalDebit(value.call);
-    if (debit === undefined || value.logicalBudgetDebit !== debit) {
-      return undefined;
-    }
-  } else if (value.logicalBudgetDebit !== undefined) {
-    return undefined;
-  }
-  return strictClone(value as unknown as PersistedResumeCandidate);
+  const { logicalBudgetDebit: _logicalBudgetDebit, ...currentCandidate } = value;
+  return strictClone({
+    ...currentCandidate,
+    call: stripLegacyBudgetFields(value.call),
+  } as PersistedResumeCandidate);
 }
 
 function validateCallBlocker(value: unknown): PersistedResumeCallBlocker | undefined {
@@ -497,7 +486,10 @@ function validateCallBlocker(value: unknown): PersistedResumeCallBlocker | undef
   ) {
     return undefined;
   }
-  return strictClone(value as unknown as PersistedResumeCallBlocker);
+  return strictClone({
+    ...value,
+    call: stripLegacyBudgetFields(value.call),
+  } as unknown as PersistedResumeCallBlocker);
 }
 
 function validateInjection(value: unknown): PersistedCheckpointInjection | undefined {
@@ -688,16 +680,11 @@ export function cloneResumeCandidate(
   ) {
     return undefined;
   }
-  const logicalBudgetDebit = call.kind === "agent" ? effectiveLogicalDebit(call) : undefined;
-  if (call.kind === "agent" && logicalBudgetDebit === undefined) {
-    return undefined;
-  }
   return strictClone({
     sourceRunId,
     recordedIndex: call.index,
     entry,
-    call,
-    ...(logicalBudgetDebit === undefined ? {} : { logicalBudgetDebit }),
+    call: stripLegacyBudgetFields(call),
   });
 }
 
@@ -793,9 +780,6 @@ export function admitResumeSource(input: ResumeAdmissionInput): ResumeAdmissionD
       undefined,
       checkpointReplyIndex,
     );
-  }
-  if (source.status === "aborted" || source.abortSignaled === true) {
-    return liveDecision(sourceRunId, requestedPolicy, "abort-residue", undefined, checkpointReplyIndex);
   }
   if (!TERMINAL_STATUSES.has(String(source.status))) {
     return liveDecision(
@@ -1113,14 +1097,10 @@ export function selectPositionalResume(
   if (!hashMatches || emptyAgent || !safePrefixMatches) {
     return { action: "live", reason: "positional-miss", nextFirstMiss: input.index };
   }
-  const logicalBudgetDebit = input.sourceCall?.kind === "agent"
-    ? effectiveLogicalDebit(input.sourceCall)
-    : undefined;
   return {
     action: "replay",
     entry: input.cached as JournalEntry,
     match: "index-hash",
-    ...(logicalBudgetDebit === undefined ? {} : { logicalBudgetDebit }),
     nextFirstMiss: firstMiss,
   };
 }

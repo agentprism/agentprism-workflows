@@ -58,13 +58,13 @@ Omit `model` for the server default, or use a backend-only value such as `"codex
 
 ## Validation and execution
 
-Every run is statically parsed, mock-executed, and checked against no-prompt backend configuration before admission. A rejection creates no run ID, reserves no background slot, and spends no tokens. Read the diagnostic, correct the script, and submit it again.
+Every `{ action:"run", ... }` request is statically parsed, mock-executed, and checked against no-prompt backend configuration before admission. A rejection creates no run ID, reserves no background slot, and spends no tokens. Read the diagnostic, correct the script, and submit it again.
 
-Use foreground execution for short work. Use `background:true` for work that may outlive one tool request; retain the returned `runId`, then use bounded `await`, `inspect`, or `stop` calls.
+Use foreground execution for short work. Use `background:true` for work that may outlive one tool request; retain the returned `runId`, then use bounded `status` or `stop` calls.
 
 ## What to read next
 
 - `workflow/composition-and-failure` — metadata, fan-out, phases, and null semantics.
 - `workflow/api-agents` — every `agent()` option and structured output.
-- `workflow/run-lifecycle` — config, run, await, inspect, stop, and resume.
+- `workflow/run-lifecycle` — config, run, status, stop, and resume.
 - `workflow/examples` — complete composition patterns.

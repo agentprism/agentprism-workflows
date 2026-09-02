@@ -136,7 +136,7 @@ test("workflow-events pages a background run's event log to terminal state", asy
 
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 10_000 },
+      arguments: { action: "status", runId, waitMs: 10_000 },
     });
     assert.equal(structured(awaited)?.status, "completed");
 

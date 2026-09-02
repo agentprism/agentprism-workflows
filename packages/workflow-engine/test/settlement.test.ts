@@ -100,66 +100,6 @@ describe("guarded exactly-once settlement", () => {
     }
   });
 
-  it("seals timed-out attempts, aborts only their signal, and drops late telemetry", async () => {
-    const histories: AgentHistoryEntry[][] = [];
-    const ends: Array<{
-      usage?: AgentUsage;
-      modelResolved?: string;
-      provenance?: AgentResultProvenance;
-      modelFallbacks?: string[];
-    }> = [];
-    const attemptSignals: AbortSignal[] = [];
-    let invocation = 0;
-    const result = await runWorkflow(script, {
-      runId: "timeout-seal",
-      agentRetries: 1,
-      agentTimeoutMs: 10,
-      persistLogs: false,
-      agent: {
-        async run(_prompt: string, options?: RunOptions) {
-          invocation++;
-          assert.ok(options?.signal);
-          attemptSignals.push(options.signal);
-          if (invocation === 1) {
-            return await new Promise<string>(() => {
-              options.signal?.addEventListener(
-                "abort",
-                () => {
-                  options.onUsage?.(usage(1000));
-                  options.onModelResolved?.("late-model");
-                  options.onModelFallback?.("late-fallback");
-                  options.onResultProvenance?.({ source: "replay", recordedIndex: 99 });
-                  options.onHistory?.([{ role: "assistant", kind: "text", text: "late" }]);
-                },
-                { once: true },
-              );
-            });
-          }
-          options.onUsage?.(usage(5));
-          options.onModelResolved?.("sealed-model");
-          options.onModelFallback?.("kept-fallback");
-          options.onResultProvenance?.({ source: "live", overrideModel: "candidate" });
-          options.onHistory?.([{ role: "assistant", kind: "text", text: "kept" }]);
-          return "ok";
-        },
-      },
-      onAgentHistory: (event) => histories.push(event.history),
-      onAgentEnd: (event) => ends.push(event),
-    });
-
-    assert.equal(result.result, "ok");
-    assert.equal(attemptSignals.length, 2);
-    assert.equal(attemptSignals[0].aborted, true);
-    assert.equal(attemptSignals[1].aborted, false);
-    assert.deepEqual(histories, [[{ role: "assistant", kind: "text", text: "kept" }]]);
-    assert.deepEqual(ends[0].usage, usage(5));
-    assert.equal(ends[0].modelResolved, "sealed-model");
-    assert.deepEqual(ends[0].modelFallbacks, ["kept-fallback"]);
-    assert.deepEqual(ends[0].provenance, { source: "live", overrideModel: "candidate" });
-    assert.equal(result.calls?.[0].modelResolved, "sealed-model");
-    assert.equal(result.calls?.[0].modelFallback, true);
-  });
-
   it("uses the last valid cumulative usage snapshot, copies at receipt, and sums attempts", async () => {
     let invocation = 0;
     let terminal: WorkflowCallRecord | undefined;

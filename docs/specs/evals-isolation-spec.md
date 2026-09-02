@@ -8,12 +8,11 @@ ACCEPTED by the design owner) and the five round-6 advisories under the directiv
 BUILD-PREFERENCE ordering: (1) an additive build wherever one resolves the finding —
 the widened target fingerprint + engine cwd observation (§2.7, §4.6.2), the
 nested-invocation callback (§2.3), candidate-model evidence (§4.6.2 rule T),
-budget-trajectory replay (§3.5, §4.6.8), the engine-owned manifest (§3.2), per-attempt
+the engine-owned manifest (§3.2), per-attempt
 abort (§3.5), the environment-identity manifest (§3.3a, §4.9); (2) narrowing only where
 a build would reproduce the problem one level down; (3) normative limitations in §4.12
 that FAIL CLOSED, reserved for the three owner-sanctioned residuals (silent third-party
-runners, cancellation-ignoring backends, vm-escaping scripts) plus the one
-owner-approved budget-read race residual (§4.12 item 5). Dispositions are indexed
+runners, cancellation-ignoring backends, vm-escaping scripts). Dispositions are indexed
 in §10.
 
 This document is the normative design for exactly three deliverables that together form
@@ -147,7 +146,7 @@ them); for those steps, propagation mode exists today.
 - **Input fingerprint** — `hashCallInputs` (§2.7): sha256 of the canonical strict-JSON
   of the call's resolved unhashed execution inputs — cwd, isolation, images,
   mcpServers, meta, promptMeta, keepSession, the resolved label, the effective
-  timeout/retry values, and the approved-backends digest (r6 B1). Recorded per call
+  retry value, and the approved-backends digest (r6 B1). Recorded per call
   (`WorkflowCallRecord.inputsHash`), threaded to the seam
   (`RunOptions.callInputsHash`), and REQUIRED to match for target binding — the
   fail-closed guard against a live target executing with unhashed context the baseline
@@ -166,7 +165,7 @@ them); for those steps, propagation mode exists today.
 - **Recorded call table** — the preflight-normalized view of a recording: one row per
   root call index, built from `calls[]` with `{kind, hash, path, inputsHash?, outcome,
   origin, usage?, error?, modelRequested?, modelResolved?, backendId?, modelFallback?,
-  worktree?, isolation?, resolvedCwd?, budgetDebit?, settlementOrdinal?,
+  worktree?, isolation?, resolvedCwd?, settlementOrdinal?,
   journalEntry?}`.
 - **Target** — a call the isolation run executes live on the inner runner, optionally
   with a model override. Targets are matched at runtime by exact identity plus input
@@ -192,26 +191,16 @@ are the contract. Injection points: `WorkflowManagerOptions.agent`
 (`workflow-manager.ts:135`), per-run `ExecOptions.agent` (`:78`),
 `RunDynamicWorkflowOptions.runner` (`packages/workflows/src/index.ts:465`).
 
-**Pre-allocation gates (r5 B2).** Four checks run BEFORE `callIndex = state.callSeq++`
-and leave no journal or manifest trace when they throw: abort (`workflow.ts:435`), agent
-limit (`shared.agentCount >= maxAgents`, `:438-444`), run token budget (only when
-`options.tokenBudget` is set, `:446-450`), and phase sub-budget (only when the script
-called `phase(title, { budget })`, `:458-474`). `checkpoint()` has the same
+**Pre-allocation gates (r5 B2).** Two checks run BEFORE `callIndex = state.callSeq++`
+and leave no journal or manifest trace when they throw: abort and the agent limit.
+`checkpoint()` has the same
 pre-allocation abort + agent-limit gates (`:998-1006`). Both primitives increment
 `shared.agentCount` immediately after allocation (`:518`, `:1011/:1015`), so for a
 completed non-nested run the final `agentCount` equals `callsAllocated`, and
 `callsAllocated < maxAgents` PROVES no agent-limit gate ever fired (the counter is
 monotonic and checked strictly-before increment). §4.9 turns the limit/abort gates into
-admissibility conditions; the budget gates are REPRODUCED by trajectory replay (below).
-
-**The script-visible budget surface (r5 B4 / r6 B4).** The vm receives a frozen
-`budget = { total, spent(), remaining() }` (`workflow.ts:415-419`, injected `:1081`).
-`spent()` accrues in SETTLEMENT order (`recordTokens` fires as each attempt settles,
-`:597-609`, `:685`, `:704`). Under isolation the recorded per-call debits are replayed
-at this surface in recorded settlement order (§3.5 capture, §4.6.8 application rule), so budget
-reads, run `tokenBudget` gates, and phase sub-budget gates reproduce the recording up
-to the disclosed concurrent-read race (§4.12 item 5). No budget-based admissibility
-exclusion exists (r6 B4 removed the r6-draft AST probe and budget-recording refusals).
+admissibility conditions. Provider token usage remains observational telemetry and is
+never an allocation, replay, or isolation gate.
 
 **Invocation and failure paths.** The runner is invoked inside the limiter thunk, once
 per retry *attempt* (retry loop `workflow.ts:611-739`, up to `agentRetries + 1`
@@ -384,7 +373,7 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
 
   /** The input fingerprint for THIS call (§2.7): sha256 of the canonical strict-JSON
    *  of the call's resolved unhashed execution inputs (cwd/isolation/images/mcpServers/
-   *  meta/promptMeta/keepSession/label/effective timeout+retries/approved-backends
+   *  meta/promptMeta/keepSession/label/effective retries/approved-backends
    *  digest — r6 B1). Identical across retry attempts. ABSENT when any component fails
    *  strict-JSON canonicalization — never fabricated. ADDITIVE, not a hash input. */
   callInputsHash?: string;
@@ -631,8 +620,6 @@ that executes live:
   mcpServers: agentOptions.mcpServers ?? null, meta: agentOptions.meta ?? null,
   promptMeta: agentOptions.promptMeta ?? null,
   label: <the resolved label — requestedLabel || defaultAgentLabel(...), workflow.ts:519>,
-  timeoutMs: <the effective value: agentOptions.timeoutMs !== undefined ?
-  agentOptions.timeoutMs : agentTimeoutMs, :550, null when none>,
   retries: normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0)
   <the normalized capped value, :551/:1397-1400>,
   backends: <the run's approved-backends digest, below> }` (r6 B1). Every component is
@@ -640,8 +627,8 @@ that executes live:
   pre-resolution, so the fingerprint is stable across runs (the resolved worktree cwd
   embeds `runId`/`callIndex` via `createWorktree(baseCwd,
   `\`${runId}-${callIndex}-${label}\``)`, `workflow.ts:568-573`, and would never
-  match); the effective timeout/retry components fold in run-level settings, which §4.3
-  reproduces from the recording, so they too are replay-stable.
+  match); the effective retry component folds in run-level settings, which §4.3
+  reproduces from the recording, so it too is replay-stable.
   `resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation`.
 - **Approved-backends digest.** Once per run: `backends = options.scriptBackends ?
   sha256(canonicalStrictJson(<the registry as a name→config record>)) : null` — a
@@ -850,13 +837,9 @@ export interface WorkflowCallRecord {
   /** The post-resolution execution directory handed to the runner (workflow.ts:578,
    *  :638) — the engine-observed cwd/worktree outcome (r6 B1). Agent×runner rows. */
   resolvedCwd?: string;
-  /** What this logical call added to the run's script-visible spent (shared.spent) —
-   *  all attempts summed, chars/4 estimates included when the provider reported
-   *  nothing (r6 B4). 0 on journal-replayed rows; absent on checkpoint rows. */
-  budgetDebit?: number;
   /** 1-based position of this call's terminal transition in the run's settlement
    *  sequence (run-wide monotonic counter, serialized by the event loop; checkpoint
-   *  transitions consume ordinals too). The budget-trajectory replay key (§4.6.8). */
+   *  transitions consume ordinals too). */
   settlementOrdinal?: number;
   /** The terminal attempt's SEALED runner-reported result provenance (§3.3): whether
    *  the result was produced live or replayed from a recording. Absent when the
@@ -911,26 +894,23 @@ persisted by the manager (§3.3a). A recording is *complete* iff
 `status === "completed"` AND `callsAllocated === calls.length` AND indexes dense
 from 0; §4.9 rejects incomplete recordings naming the missing indexes.
 Pre-allocation gate failures (§1) are structurally invisible to this accounting;
-§4.9's limit/abort admissibility conditions prove those gates never fired, and the
-budget gates reproduce under trajectory replay (§4.6.8) (r5 B2 / r6 B4).
+§4.9's limit/abort admissibility conditions prove those gates never fired.
 
 **Effective execution inputs and abort accounting (r5 B2/B4).** The engine returns
-`WorkflowRunResult.effectiveLimits?: { maxAgents: number; tokenBudget: number |
-null; concurrency: number; agentRetries: number; agentTimeoutMs: number | null }` —
-the RESOLVED values in force: `maxAgents` (`workflow.ts:346`), `agentTimeoutMs`
-(`:347`), `concurrency` (`:384-385` — the default derives from the HOST's
+`WorkflowRunResult.effectiveLimits?: { maxAgents: number; concurrency: number;
+agentRetries: number }` —
+the RESOLVED values in force: `maxAgents` (`workflow.ts:346`), `concurrency` (`:384-385` — the default derives from the HOST's
 `hardwareConcurrency`, so it must be recorded, not re-derived), the run-level
 `agentRetries` as NORMALIZED and capped by `normalizeAgentRetries` (consulted per
 call at `:551`, capped at `:1397-1400` — the value in force, never the raw option;
-r6 B12), and `options.tokenBudget ?? null`. Per-call script-authored overrides
+r6 B12). Per-call script-authored overrides
 (`:550-551`) reproduce from the byte-identical script and are pinned per call by
 the fingerprint (§2.7). The engine also returns
 `WorkflowRunResult.abortSignaled?: true` (set iff the composed signal was ever
 observed aborted). The manager persists both (§3.3a). These are the admissibility
 and reproduction inputs: a completed baseline with `callsAllocated < maxAgents` and
-no `abortSignaled` provably never hit the limit/abort pre-allocation gates, §4.3
-reproduces every recorded execution setting (tokenBudget included — r6 B4), and the
-budget gates reproduce under trajectory replay (§4.6.8).
+no `abortSignaled` provably never hit the limit/abort pre-allocation gates, and §4.3
+reproduces every recorded execution setting.
 
 **Persistence.** `PersistedRunState.calls?: WorkflowCallRecord[]` — collected
 latest-per-index, root-scope only (§2.3), reset to the current execution on resume
@@ -1053,9 +1033,9 @@ consumers under structural contravariance):
   onAgentHistory: { …existing…, callIndex: number, scope: string }
 ```
 
-**Why sealed telemetry rides the event (r5 B7 — the directive-2 hook).** The
-engine's timeout races OUTSIDE the wrapper (`workflow.ts:621-675`, `:1405-1427`), so
-a wrapper CANNOT know a callback it forwards belongs to a timed-out loser; only the
+**Why sealed telemetry rides the event (r5 B7 — the directive-2 hook).** Runner
+callbacks can arrive after explicit abort or attempt settlement, so a wrapper cannot
+know that a callback it forwards belongs to a settled attempt; only the
 engine's attempt-sealed slots (§3.5) hold the truth, surfaced on the one
 exactly-once settlement signal (§2.6) — the isolation report consumes ONLY that
 (§4.6 rule T). The wrapper intercepts NO observation callbacks (§4.5).
@@ -1147,10 +1127,9 @@ nested-child events patching parent rows).
   callsAllocated?: number;
   /** NEW — the run's resolved execution inputs (§3.2), from
    *  WorkflowRunResult.effectiveLimits on completion: every run-level setting that is
-   *  control-flow-visible (gates, retries-to-null conversion, timeouts) or
+   *  control-flow-visible (gates and retries-to-null conversion) or
    *  host-derived (concurrency). §4.3 defaults the replay to these. */
-  limits?: { maxAgents: number; tokenBudget: number | null; concurrency: number;
-             agentRetries: number; agentTimeoutMs: number | null };
+  limits?: { maxAgents: number; concurrency: number; agentRetries: number };
   /** NEW — set when the run's abort signal was ever observed aborted (engine-returned
    *  abortSignaled, OR managed.controller.signal.aborted at terminal save). */
   abortSignaled?: true;
@@ -1260,8 +1239,8 @@ Normative rules replacing the single reset-per-attempt closures
 
 - **Attempt-scoped slots.** One slot set per attempt for every per-attempt callback:
   `onUsage`, `onSessionOpen` (backendId), `onModelResolved`, `onModelFallback`
-  (an append-list of specs), `onResultProvenance` (§3.3), `onBudgetReplay` (§4.6.8),
-  and the `onHistory` forward. Each wrapper closes over its attempt token and writes
+  (an append-list of specs), `onResultProvenance` (§3.3), and the `onHistory` forward.
+  Each wrapper closes over its attempt token and writes
   only its own slot. **Snapshot-at-receipt (r6 advisory 2):** every report is COPIED
   into its slot at callback time — later mutation of the runner-owned object never
   changes a received value — and validated there: an `AgentUsage` report carrying any
@@ -1274,23 +1253,13 @@ Normative rules replacing the single reset-per-attempt closures
   once, in `finally` — already conformant.)
 - **The settlement seal.** An attempt settles when the engine's await of the seam
   returns or throws (`withTimeout` resolution `:621` or the catch at `:699`). At
-  settlement the attempt's slots seal; a callback arriving afterwards (a timed-out
-  loser's eventual report) is DROPPED — it never mutates a slot, an artifact, an
+  settlement the attempt's slots seal; a callback arriving afterwards is DROPPED —
+  it never mutates a slot, an artifact, an
   event, or the run aggregate.
-- **Per-attempt abort (r6 B13).** Every attempt gets a FRESH `AbortController`; the
-  runner's `RunOptions.signal` is `AbortSignal.any([runSignal, attempt.signal])`.
-  When `withTimeout`'s timer wins, the engine ABORTS the attempt controller — the
-  loser is actively cancelled through the seam (the ACP runner maps signal abort to
-  `session/cancel`, `acp-agents/src/acp-client.ts:1876-1883,2086-2089`), not merely
-  floated. Settlement is unchanged: the attempt is already classified as the timeout
-  outcome, its slots sealed, the loser's eventual rejection/reports dropped by the
-  seal. Residual: a signal-ignoring third-party runner (§4.12 item 4). Disclosed
-  (§8 item 10).
-- **`budgetDebit` capture (r6 B4).** The manifest row's `budgetDebit` is the EXACT
-  amount the call's attempts added to `shared.spent` via `recordTokens`
-  (`:597-609,:685,:704`) — provider tokens where reported, the chars/4 estimate
-  where not; 0 on journal-replayed rows. The §4.6.8 replay fact, deliberately
-  distinct from `usage` (`AgentUsage.total` cannot reconstruct an estimate charge).
+- **Explicit abort (r6 B13).** The runner's `RunOptions.signal` carries whole-run or
+  targeted-call cancellation. The ACP runner maps signal abort to `session/cancel`;
+  attempt slots seal at settlement and drop any later reports from an uncooperative
+  runner. Residual: a signal-ignoring third-party runner (§4.12 item 4).
 - **Per-call usage** = the field-wise sum of each attempt's sealed winning `onUsage`
   report (attempts with no report contribute nothing; no reports at all →
   `undefined`). **Per-call model/backend/provenance telemetry** = the terminal
@@ -1427,18 +1396,15 @@ export interface RunIsolationOptions {
   /** APPROVED script-declared backends (ExecOptions.scriptBackends semantics). */
   scriptBackends?: Record<string, WorkflowBackendConfig>;
   // Execution-setting overrides (ExecOptions semantics). DEFAULTS (normative):
-  // the RECORDING's persisted limits — concurrency ?? limits.concurrency,
-  // agentTimeoutMs ?? limits.agentTimeoutMs, agentRetries ?? limits.agentRetries —
+  // the RECORDING's persisted limits — concurrency ?? limits.concurrency and
+  // agentRetries ?? limits.agentRetries —
   // so the replay runs under the baseline's effective settings unless the caller
   // deliberately deviates (recorded concurrency reproduces the scheduling ENVELOPE,
   // not latencies — §4.12 item 1). In practice they govern only live-target behavior:
-  // served calls resolve at the seam and never hit timeout/retry machinery.
-  // NOTE (r6 B4): tokenBudget and maxAgents are NOT accepted — §4.3 FORCES both to
-  // the recording's persisted limits, so together with trajectory replay (§4.6.8)
-  // the pre-allocation budget gates fire in the replay exactly where they fired
-  // when recording; agent-limit gate-freedom is separately proven (§4.9 check 6).
+  // served calls resolve at the seam and never hit retry machinery.
+  // maxAgents is not accepted: §4.3 forces the recording's persisted limit and
+  // agent-limit gate-freedom is separately proven (§4.9 check 6).
   concurrency?: number;
-  agentTimeoutMs?: number | null;
   agentRetries?: number;
   signal?: AbortSignal;
   /** Model-resolution reproduction inputs. Defaults (normative):
@@ -1590,16 +1556,12 @@ export interface ReplayRunner extends AgentRunner {
    baselineRunId }, cwd: recording.effectiveCwd ?? recording.cwd ?? executionCwd,
    journaling, scriptBackends, onProgress, signal: <combined>,
    concurrency: concurrency ?? recording.limits.concurrency,
-   agentTimeoutMs: agentTimeoutMs !== undefined ? agentTimeoutMs :
-   recording.limits.agentTimeoutMs, agentRetries: agentRetries ??
-   recording.limits.agentRetries, tokenBudget: recording.limits.tokenBudget,
-   maxAgents: recording.limits.maxAgents,
-   budgetReplay: <the §4.6.8 trajectory built from the recording's calls[]>,
+   agentRetries: agentRetries ??
+   recording.limits.agentRetries, maxAgents: recording.limits.maxAgents,
    onNestedWorkflow: <latch fatal REPLAY_DIVERGENCE "nested-workflow-call" + fire the
    internal abort — spend stops the moment an unsupported child is INVOKED, even a
-   zero-call one (r6 B2)> })`. The REPRODUCED `tokenBudget`/`maxAgents` (r6 B4 —
-   never caller-overridable) plus trajectory replay make the pre-allocation budget
-   gates fire exactly where the baseline's did, and §4.9 check 6 proves the
+   zero-call one (r6 B2)> })`. The reproduced `maxAgents` is never caller-overridable,
+   and §4.9 check 6 proves the
    agent-limit gate never fired (runaway spend is impossible — the wrapper's latch
    stops every post-divergence call, and structural drift diverges within one
    arrival). The script and args ALWAYS come from the recording — callers cannot
@@ -1693,9 +1655,8 @@ Resolution (preflight; violations reject `REPLAY_TARGET_INVALID` with
 The target's model override is the wrapper's ONLY delegation rewrite: for a target
 call it delegates `inner.run(prompt, { ...options, model: target.model ??
 options.model })`, forwarding every other field — INCLUDING every observation
-callback — untouched. (It additionally CALLS `options.onResultProvenance` and
-`options.onBudgetReplay` per §4.6.2/§4.6.8 — reporting through the engine's
-channels, not interception.) The wrapper intercepts no telemetry: round 5 (B7)
+callback — untouched. (It additionally calls `options.onResultProvenance` per §4.6.2 —
+reporting through the engine's channel, not interception.) The wrapper intercepts no telemetry: round 5 (B7)
 proved wrapper-side interception cannot distinguish a timed-out loser's late
 reports from sealed ones, so ALL live-target telemetry in the report comes from the
 engine's sealed terminal event via `observeAgentEnd` (§3.3, §4.6 rule T). An
@@ -1881,9 +1842,7 @@ named typed error, never a wrong serve:
   override (`REPLAY_TARGET_INVALID`, `"unproven-baseline-model"`, §4.4).
 - Recordings made at the agent-limit boundary or with abort residue (§4.9 — those
   pre-allocation gates are untraceable, so admissibility must prove they never
-  fired). Budget-reading scripts and budget-gated recordings are NOT refused: the
-  budget gates and the script-visible `budget` surface reproduce under trajectory
-  replay (§4.6.8, r6 B4).
+  fired).
 - Live control flow that grows, shrinks structurally mid-run (`unrecorded-call` /
   `identity-reexecuted`), or completes without visiting recorded rows (§4.6.6).
 
@@ -1996,39 +1955,15 @@ cost comparison the evals layer needs is `recordedUsage` vs `liveUsage` on targe
 plus the served rows' `recordedUsage` — nothing else; the isolation run's own
 `tokenUsage`/per-agent `tokens` are estimate-polluted and NOT comparable (§4.8).
 
-#### 4.6.8 Budget-trajectory replay (r6 B4 — owner-prescribed build)
+#### 4.6.8 Usage telemetry
 
-The script-visible budget surface (`budget.spent()`/`remaining()`, the run
-`tokenBudget` gate, phase sub-budget gates — §1) reproduces the recording by replaying
-the RECORDED debits, in recorded settlement order, at the budget surface:
-
-- **Inputs.** The recorded per-row `budgetDebit` + `settlementOrdinal` (§3.2, §3.5;
-  §4.9 check 6 requires both) and the reproduced budget inputs — `tokenBudget`/
-  `maxAgents` forced to the recording's limits (§4.3), phase budgets from the
-  byte-identical script.
-- **Channels (additive).** `WorkflowRunOptions.budgetReplay?: { trajectory:
-  Array<{ ordinal: number; debit: number }> }` — the recording's agent rows,
-  ascending ordinal, built by `runIsolation`; and `RunOptions.onBudgetReplay?:
-  (r: { settlementOrdinal: number }) => void` — the wrapper reports the bound row's
-  ordinal before resolving every serve and before every target delegation
-  (attempt-sealed, §3.5). Absent `budgetReplay` (every normal run), accrual is
-  unchanged.
-- **The ordinal-cursor rule (ordering under parallel settlement).** Under
-  `budgetReplay` the engine suppresses live `recordTokens` accrual into
-  `shared.spent` entirely — a live target's usage stays report telemetry. One
-  run-level cursor walks the trajectory: when a call with sealed ordinal `k`
-  settles, BEFORE that settlement is exposed to script code the engine applies every
-  not-yet-applied debit with `ordinal ≤ k` (apply-once, monotonic). Ordinals totally
-  order the baseline's settlements, so `spent()` observed in call `k`'s continuation
-  EQUALS the recording's value at that point; pre-applying a lower ordinal still in
-  flight makes the rule deadlock-free (no exposure ever waits). Checkpoint ordinals
-  carry no debit. A `budget` read RACING concurrent settlements may observe a cursor
-  state the baseline sample did not — the owner-approved residual, §4.12 item 5.
-- **Gate reproduction.** The pre-allocation run/phase budget gates read
-  `shared.spent` at invocation; with identical budget inputs and the exact recorded
-  trajectory at every exposure point they fire in replay exactly where they fired
-  when recording — including gates the baseline script CAUGHT (why no budget
-  admissibility exclusion remains, §4.9 check 6).
+Isolation has no token-budget or debit replay channel. Served calls invoke no provider
+and are free; live targets report their own sealed `AgentUsage`. The report preserves
+recorded usage beside current target usage for comparison, while the isolation run's
+aggregate token estimate remains observational. Settlement ordinals continue to record
+deterministic terminal ordering, but preflight does not require a debit trajectory and
+usage never controls correspondence or admission. Historical budget properties in old
+run files are ignored and stripped from newly written isolation artifacts.
 
 ### 4.7 Checkpoint serving
 
@@ -2143,18 +2078,17 @@ on both API paths. `RECORDING_UNUSABLE` reasons are FROZEN kebab-case literals
 `"isolation-artifact"`, `"legacy-resume"`, `"abort-residue"`, `"engine-origin-row"`,
 `"replayed-row"`, `"unreplayable-error"`, `"args-unreplayable"`,
 `"ambiguous-identity"`, `"path-missing"`, `"runtime-mismatch"`, `"no-limits"`,
-`"agent-limit-boundary"`, `"no-budget-trajectory"`, `"no-execution-cwd"`,
+`"agent-limit-boundary"`, `"no-execution-cwd"`,
 `"no-environment-identity"`, `"environment-mismatch"`,
-`"journal-manifest-mismatch"`. (r6 B4 removed `"budget-gated-recording"` and
-`"budget-sensitive-script"` — the budget gates now reproduce, §4.6.8.)
+`"journal-manifest-mismatch"`.
 
 1. **Structural validity over every consumed field** (`"corrupt-structure"`).
    `runId`/`script` non-empty strings; `status` a string; `effectiveCwd`/`cwd`/
    `mainModel`/`agentsDir` strings when present; `runtime.node` a string and
    `runtime.pathFormat` an integer when present; `callsAllocated` a non-negative
    integer when present; `limits` when present: `maxAgents`/`concurrency` positive
-   integers, `agentRetries` a non-negative integer, `tokenBudget`/`agentTimeoutMs`
-   null-or-number; `args` anything JSON. `agents[]`: per row, `label`
+   integers and `agentRetries` a non-negative integer; historical budget and timeout
+   properties are ignored; `args` anything JSON. `agents[]`: per row, `label`
    string, `status` in the §3.4 enum, `callIndex`/`scope`/`model`/`usage` type-checked
    when present. `journal[]`: may be EMPTY; per entry `index` non-negative integer,
    indexes unique, `hash` non-empty string, `kind`/`scope` in-enum/non-empty when
@@ -2195,14 +2129,11 @@ on both API paths. `RECORDING_UNUSABLE` reasons are FROZEN kebab-case literals
    the persisted args are not a faithful replay input). `provenance`, where present,
    must sit on an agent×runner row with `source` in-enum and fields type-checked
    (else `"corrupt-structure"`).
-6. **Gate freedom and budget trajectory (r5 B2 / r6 B4):** `limits` present → else
+6. **Gate freedom (r5 B2):** `limits` present → else
    `"no-limits"`; `callsAllocated < limits.maxAgents` → else
-   `"agent-limit-boundary"` (monotonic-counter proof, §1). Every row carries a
-   `settlementOrdinal` (unique, dense 1..`calls.length`) and every agent row a
-   finite non-negative `budgetDebit` → else `"no-budget-trajectory"` (the §4.6.8
-   replay facts). No budget-shaped exclusion exists: r6 B4 removed the draft AST
-   probe and tokenBudget/budget-reading refusals — §4.3 + §4.6.8 make the budget
-   gates fire in replay exactly where the baseline's did.
+   `"agent-limit-boundary"` (monotonic-counter proof, §1). Settlement ordinals, when
+   present, remain ordering diagnostics; missing historical debit metadata never makes
+   a recording inadmissible.
 7. **Identity uniqueness:** no two `calls[]` rows share `(kind, path, hash)` → else
    `"ambiguous-identity"`, listing indexes (§4.6.4).
 8. **Paths present:** every row carries `path` → else `"path-missing"` ("re-record
@@ -2314,13 +2245,6 @@ implementers/docs must present it as a boundary, not a bug.
    spending on its own account. The run is already classified (`"target-failed"` /
    `"failed"`), the manager drops post-terminal events (§3.3a), and the wrapper
    rejects post-finalize arrivals — state stays sealed even when spend continues.
-5. **The budget-read race (owner-approved residual, r6 B4).** Trajectory replay
-   reproduces the recorded `spent()` at every settlement-exposure point (§4.6.8),
-   but a `budget` read RACING concurrent settlements can observe a cursor state the
-   baseline sample never exposed; where it influences only non-call outputs (log
-   lines, the script's return value — surfaces the verdict never compares) it may
-   differ from the baseline. Never call structure: any call-structure consequence
-   still fails closed through the §4.6.2 refusals.
 ---
 
 ## 5. Run-file contract status (decision, per Q7)
@@ -2354,8 +2278,7 @@ Precisely (resolving r5 advisory 5's ambiguity):
 **`@automatalabs/shared-types`** (`src/agent-run.ts`, `src/workflow-result.ts`,
 `src/errors.ts`):
 - `RunOptions` + `callIndex?`/`callHash?`/`callPath?`/`callInputsHash?` (§2.1),
-  `onResultProvenance?` (§3.3), `onBudgetReplay?` (§4.6.8); normative cardinality
-  doc on `onUsage` (§3.5).
+  `onResultProvenance?` (§3.3); normative cardinality doc on `onUsage` (§3.5).
 - New `AgentResultProvenance` (§3.3), `WorkflowCallRecord` (§3.2),
   `WorkflowRecordedError` (§3.2a).
 - `JournalEntry` + `kind?`/`usage?`/`scope?` (§3.1).
@@ -2376,9 +2299,8 @@ Precisely (resolving r5 advisory 5's ambiguity):
   engine-owned manifest append FIRST — r6 B7); §3.5 attempt-scoped slots
   (snapshot-at-receipt + usage validation, r6 advisory 2) + settlement seal for
   `onUsage`/`onSessionOpen`/`onModelResolved`/`onModelFallback`/`onResultProvenance`/
-  `onBudgetReplay`/`onHistory`; per-attempt AbortController + timeout abort (§3.5,
-  r6 B13); `budgetDebit`/`settlementOrdinal` capture (§3.2, §3.5) + the
-  `WorkflowRunOptions.budgetReplay` ordinal-cursor (§4.6.8); §3.0 strict-JSON
+  `onHistory`; explicit abort handling (§3.5, r6 B13);
+  `settlementOrdinal` capture (§3.2, §3.5); §3.0 strict-JSON
   validation + deep-freeze at every capture boundary (agent results, checkpoint
   replies, headless defaults); `onCallRecord` emission at every §3.2 exit;
   `WorkflowRunOptions.onCallRecord?`; event payloads per §3.3 (incl. `errorRecord`,
@@ -2454,10 +2376,9 @@ origin `"engine"`; post-allocation abort → `aborted: true`; journal-replay
 short-circuits (agent + checkpoint) with carried usage; checkpoint
 confirm/headless/durable-pause/reply-validation exits with origins and §3.2a
 projections; `callsAllocated` returned and persisted; `effectiveLimits` carries all
-FIVE resolved values (incl. host-derived concurrency); `abortSignaled`; **[r6 B4]**
-every row carries a dense unique `settlementOrdinal` and agent rows carry
-`budgetDebit` equal to the exact `recordTokens` charge — provider-reported AND
-chars/4-estimate cases both pinned; `resolvedCwd` on every agent×runner row
+resolved values (incl. host-derived concurrency); `abortSignaled`; every row carries
+a dense unique `settlementOrdinal`; usage telemetry is preserved without debit fields;
+`resolvedCwd` on every agent×runner row
 **[r6 B1]**; **[r5 B2 structure]** a pre-allocation gate throw (maxAgents:1 second
 call) leaves NO row and NO index shift; a floated call at script settlement →
 missing row + `callsAllocated ≠ calls.length` (the §3.2 exception window,
@@ -2475,8 +2396,8 @@ signal is ABORTED when the timer wins (mock observes it; the run signal stays li
 multi-report cumulative `onUsage` last-wins within one attempt; **[r6 advisory 2]**
 mutating a usage object after reporting never changes the received copy, and a
 non-finite/negative report is dropped; per-call usage = field-wise sum of sealed
-winners; `modelFallbacks` attempt-ordered, duplicates kept; `onResultProvenance` and
-`onBudgetReplay` sealed like the rest.
+winners; `modelFallbacks` attempt-ordered, duplicates kept; `onResultProvenance` is
+sealed like the rest.
 
 **`workflow-engine/test/frozen-snapshot.test.ts` (new).** **[r5 B9]** a `journal`
 event listener mutating `entry.result` does NOT change what is persisted; the same
@@ -2510,8 +2431,8 @@ never enter the persisted file.
 **`workflow-engine/test/input-fingerprint.test.ts` (new).** Canonicalization: sorted
 keys, arrays ordered; identical across runs for worktree-isolated calls
 (pre-resolution values); each of images/cwd/mcpServers/meta/promptMeta/keepSession/
-isolation — and **[r6 B1]** label (incl. the default-label path), effective
-timeoutMs, normalized retries, and the approved-backends digest (same name,
+isolation — and **[r6 B1]** label (incl. the default-label path), normalized retries,
+and the approved-backends digest (same name,
 different config) — changes the fingerprint; a non-qualifying component (function in
 `meta`) → fingerprint absent, never partial. **[r6 B5]** every fingerprint fixture
 object is created INSIDE the vm realm (actual script-authored literals), never a
@@ -2539,17 +2460,9 @@ record → replay, one case per rule:
   `modelResolved`) → `"completed"` WITH `candidateEvidence: "unverified"` +
   `report.unverifiedTargets`; a verified candidate → `"verified"`.
 - **[r5 B2]** the maxAgents:1 caught-`AGENT_LIMIT_EXCEEDED` recording →
-  `"agent-limit-boundary"`; missing `budgetDebit`/`settlementOrdinal` →
-  `"no-budget-trajectory"`.
-- **[r6 B4]** budget-trajectory replay: a `budget.spent()`-reading script replays
-  with `spent()` EQUAL to the recording at every settlement-exposure point
-  (estimate debits included); `phase(t, { budget })` and tokenBudget recordings
-  whose gates FIRED and were caught replay the same gate at the same call; parallel
-  settlement: a lower-ordinal debit pre-applies before a faster-settling
-  higher-ordinal serve is exposed (apply-once pinned); replay forces
-  `tokenBudget`/`maxAgents` to the recorded limits; recorded limits default
-  concurrency/agentTimeoutMs/agentRetries (asserted at the engine boundary); the
-  live target's OWN usage never reaches `shared.spent` (the recorded debit does).
+  `"agent-limit-boundary"`; historical rows missing debit metadata remain admissible.
+- **Usage telemetry:** served calls add no provider usage, live targets retain sealed
+  current usage, and current artifacts omit historical budget/debit properties.
 - **[r5 B3]** a recording with an engine-origin row → `"engine-origin-row"`.
 - Serving: exact serve; unique-path serve with `hashMatched: false`; each refusal —
   `ambiguous-path` (incl. the no-lens `verify()` shape → `"ambiguous-identity"` at
@@ -2662,7 +2575,7 @@ cost-surface sentence marker.
 **`docs/design-notes.md`** — the load-bearing rationale, condensed from this spec:
 call-path capture + honest stability boundary (§2.5), guarded terminal settlement
 (§2.6), record-time freezing (§3.0), the serving algebra + strict fail-fast posture
-(§4.6), budget-trajectory replay (§4.6.8) + limit/abort gate-freedom admissibility
+(§4.6), observational usage (§4.6.8) + limit/abort gate-freedom admissibility
 (§4.9).
 
 **`docs/roadmap/evals.md`** — status update: substrate contract frozen
@@ -2729,9 +2642,9 @@ recordings are structurally refused (§4.9) — no migration tooling is built (�
 | Finding | Resolution |
 |---|---|
 | sol B1 (unhashed target-input drift) | §2.7 input fingerprint; §4.6.2 rule 3 `target-inputs-drift`; regression pinned §7 |
-| sol B2 (pre-allocation gates invisible) | §3.2 `effectiveLimits`/`abortSignaled`/`callsAllocated`; §4.9 check 6 limit/abort gate-freedom proof; budget gates reproduce via §4.6.8 (r6 B4) |
+| sol B2 (pre-allocation gates invisible) | §3.2 `effectiveLimits`/`abortSignaled`/`callsAllocated`; §4.9 check 6 limit/abort gate-freedom proof |
 | sol B3 (engine-origin rows ignored) | §4.9 `"engine-origin-row"` rejects the recording; §4.6.6 visits EVERY row |
-| sol B4 (exec/budget state unreproduced) | limits record all five resolved inputs (§3.2/§3.3a); §4.3 recorded defaults; budget trajectory replayed (§4.6.8, per r6 B4) |
+| sol B4 (execution state unreproduced) | limits record current resolved inputs (§3.2/§3.3a); §4.3 recorded defaults; usage remains telemetry (§4.6.8) |
 | sol B5 (sibling scope reuse) | §2.3 `nestedSeq` ordinal; pinned §7 |
 | sol B6 (onAgentEnd not exactly-once) | §2.6 guarded terminal-transition settlement; `ReplayObservation` as the concrete harness signal (§4.3) |
 | sol B7 (wrapper-sealed telemetry impossible) | §3.5 engine-sealed slots → terminal event (§3.3); wrapper intercepts nothing (§4.5) |
@@ -2777,13 +2690,8 @@ r6 advisories: 1 → exported `RECORDING_UNUSABLE_REASONS`/`REPLAY_DIVERGENCE_KI
 
 **Rejected alternatives (standing; with the round that killed them):**
 
-- **Budget-trajectory seeding — REJECTION OVERRULED (r6 B4, owner adjudication).**
-  The r6-draft refusal conflated per-call usage seeding with ordinal-ordered debit
-  replay. The shipping build (§4.6.8) persists the ACTUAL charged `budgetDebit` +
-  `settlementOrdinal` and applies debits through an apply-once ordinal cursor BEFORE
-  each settlement is exposed, so `spent()` equals the recording at every exposure
-  point; only the concurrent-read race remains (§4.12 item 5). Kept as the
-  disposition record — the former rejection no longer states the contract.
+- **Budget-trajectory seeding — removed.** Provider usage remains observational;
+  historical budget/debit fields are ignored and never gate or steer isolation.
 - **Settlement rides a new `onCallSettled` hook** (directive-3(f) shape). §2.6 makes
   the terminal transition exactly-once with `onCallRecord` FIRST; the manager's
   `agentEnd` re-emission is the harness channel because it alone carries the frozen
@@ -2795,8 +2703,7 @@ r6 advisories: 1 → exported `RECORDING_UNUSABLE_REASONS`/`REPLAY_DIVERGENCE_KI
 - **Settlement-order recording/replay** (r5 B1's alternative): order is
   microtask-level, script-visible, not an engine-controlled input; recording it
   would promise reproduction the engine cannot deliver. Fingerprint guard + §4.12
-  item 1 instead. (Budget-trajectory replay needs no order reproduction — the
-  ordinal cursor reproduces VALUES at exposure points, §4.6.8.)
+  item 1 instead.
 - **Engine-side served/live classification** (rounds 3–4): the engine cannot know
   what a wrapper served; provenance is therefore RUNNER-reported through a generic
   callback and engine-sealed (§3.3) — reporting, not engine inference.
@@ -2828,4 +2735,3 @@ r6 advisories: 1 → exported `RECORDING_UNUSABLE_REASONS`/`REPLAY_DIVERGENCE_KI
 - **In-memory recording overload on `runIsolation`**: one code path via persistence;
   in-memory composition exists through `createReplayRunner`'s normalized copy
   (§4.3).
-

@@ -4,7 +4,7 @@
  * A WorkflowManager's cwd keys its whole persistence store (workflowProjectKey), so a server
  * that serves more than one project holds one manager per project directory — all sharing a
  * single AgentRunner, whose agent sessions carry their own cwd. `run` calls select their
- * project explicitly (the tool's `projectDir` argument); `inspect`/`await`/`stop`/`resume`
+ * project explicitly (the tool's `projectDir` argument); `status`/`stop`/`resume`
  * route by locating the runId: first across live contexts, then by scanning the on-disk
  * project stores, whose `project.json` manifests (written by the engine) map the one-way
  * store key back to its project directory.
@@ -30,7 +30,7 @@ export const MAX_BACKGROUND_RUNS = 4;
 /**
  * Tracks live background-run promises against the MAX_BACKGROUND_RUNS admission cap. One
  * registry per project: every session/server sharing a project shares its cap, and a
- * cross-session `action:"await"` finds the live promise instead of falling back to polling.
+ * cross-session `action:"status"` can find the live promise instead of falling back to polling.
  */
 export class BackgroundRunRegistry {
   private starting = 0;
@@ -210,7 +210,7 @@ export class WorkflowProjectRegistry implements RunStoreRouter {
         };
         // The manifest path was resolve()'d by the engine when the store was written; use it
         // verbatim so the store key round-trips even if the directory no longer exists
-        // (inspect/await of a deleted project's runs still work; execution would fail later).
+        // (status reads of a deleted project's runs still work; execution would fail later).
         if (typeof manifest.projectDir !== "string" || !isAbsolute(manifest.projectDir)) continue;
         return this.getOrCreate(manifest.projectDir);
       } catch {

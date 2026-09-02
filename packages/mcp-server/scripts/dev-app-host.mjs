@@ -12,7 +12,7 @@
 //   #   { capabilities: { extensions: { "io.modelcontextprotocol/ui": {
 //   #       mimeTypes: ["text/html;profile=mcp-app"] } } } }
 //   SERVERS='["http://localhost:3001/mcp"]' npm run start   # open http://localhost:8080
-//   # call workflow with { action: "inspect", runId: "<printed id>" } to render the panel
+//   # call workflow with { action: "status", runId: "<printed id>" } to render the panel
 //
 // The stub runner needs no agent backends or credentials; set AGENTPRISM_DEV_LIVE=1 to use
 // the real ACP runner instead (requires logged-in backends).

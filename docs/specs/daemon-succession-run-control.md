@@ -2,6 +2,10 @@
 
 Status: **implemented contract for the daemon run-control release train**.
 
+> **Current MCP action name:** historical `inspect`/`await` references below map to
+> `action:"status"`; daemon ownership and control behavior are unchanged. See
+> [`workflow-status-action.md`](workflow-status-action.md).
+
 ## Source request
 
 > Okay go ahead and add docs/specs/daemon-succession-run-control.md as the implementation authority for this train, and then get it implemented and shipped in a new release.

@@ -142,9 +142,11 @@ test("initialize advertises full resources capabilities and scriptPath snapshots
     assert.equal(result.isError, false);
     assert.equal(structured(result)?.scriptSource, "path");
     assert.equal(structured(result)?.scriptUri, uri);
+    assert.equal(structured(result)?.eventsUri, `workflow://runs/${runId}/events`);
     assert.deepEqual(resourceLinks(result).map((link) => link.uri), [
       `workflow://runs/${runId}/result`,
       uri,
+      `workflow://runs/${runId}/events`,
     ]);
 
     writeFileSync(scriptPath, `${NO_AGENT_SCRIPT}\n// later edit`, "utf8");
@@ -477,7 +479,7 @@ test("path and inline delivery share journal identity and changed path content r
 
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId: thirdRunId },
+      arguments: { action: "status", runId: thirdRunId },
     });
     assert.deepEqual(
       (structured(inspected)?.lineage as Array<Record<string, unknown>>).map((entry) => ({
@@ -491,6 +493,7 @@ test("path and inline delivery share journal identity and changed path content r
       [
         `workflow://runs/${thirdRunId}/result`,
         ...[firstRunId, secondRunId, thirdRunId].map((runId) => `workflow://runs/${runId}/script`),
+        `workflow://runs/${thirdRunId}/events`,
       ],
     );
   } finally {
@@ -499,7 +502,7 @@ test("path and inline delivery share journal identity and changed path content r
   }
 });
 
-test("concurrent inline and path results report source without persisting it into await", async () => {
+test("concurrent inline and path results report source without persisting it into status", async () => {
   const dir = mkdtempSync(join(tmpdir(), "agentprism-mcp-concurrent-source-"));
   const scriptPath = join(dir, "same.workflow.js");
   writeFileSync(scriptPath, TWO_AGENT_SCRIPT, "utf8");
@@ -532,11 +535,11 @@ test("concurrent inline and path results report source without persisting it int
     const pathRunId = String(structured(pathResult)?.runId);
     const inlineAwait = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId: inlineRunId, waitMs: 0 },
+      arguments: { action: "status", runId: inlineRunId, waitMs: 0 },
     });
     const pathAwait = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId: pathRunId, waitMs: 0 },
+      arguments: { action: "status", runId: pathRunId, waitMs: 0 },
     });
     assert.equal((structured(inlineAwait)?.outcome as Record<string, unknown>).scriptSource, undefined);
     assert.equal((structured(pathAwait)?.outcome as Record<string, unknown>).scriptSource, undefined);
@@ -936,7 +939,7 @@ test("lineage walks every engine ancestry pointer oldest to newest", async () =>
   }
 });
 
-test("public inspect lineage compaction retains newest diagnostics and recomputes every counter", async () => {
+test("public status lineage compaction retains newest diagnostics and recomputes every counter", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-compaction-"));
   const runner = okRunner();
   const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: runner });
@@ -995,7 +998,7 @@ test("public inspect lineage compaction retains newest diagnostics and recompute
   try {
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId: run.runId, lastN: 50, logLines: 50 },
+      arguments: { action: "status", runId: run.runId, lastN: 50, logLines: 50 },
     });
     const payload = structured(inspected)!;
     const returnedPhases = payload.phases as string[];
@@ -1016,7 +1019,8 @@ test("public inspect lineage compaction retains newest diagnostics and recompute
     };
 
     assert.equal(truncation.maxStructuredBytes, 24_576);
-    assert.ok(Buffer.byteLength(JSON.stringify(payload), "utf8") <= truncation.maxStructuredBytes);
+    const { outcome: _outcome, ...boundedObservation } = payload;
+    assert.ok(Buffer.byteLength(JSON.stringify(boundedObservation), "utf8") <= truncation.maxStructuredBytes);
     assert.equal(truncation.byteCapApplied, true);
     assert.ok(
       returnedPhases.length > 0 && returnedPhases.length < phases.length,
@@ -1086,12 +1090,13 @@ test("a 300-hop public resume lineage remains complete and reports a truthful st
 
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId: runIds.at(-1) },
+      arguments: { action: "status", runId: runIds.at(-1) },
     });
     const payload = structured(inspected);
     const lineage = payload?.lineage as Array<Record<string, unknown>>;
     const truncation = payload?.truncation as Record<string, unknown>;
-    const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+    const { outcome: _outcome, ...boundedObservation } = payload ?? {};
+    const bytes = Buffer.byteLength(JSON.stringify(boundedObservation), "utf8");
     assert.deepEqual(lineage.map((entry) => entry.runId), runIds);
     assert.equal(new Set(lineage.map((entry) => entry.runId)).size, 300);
     assert.deepEqual(
@@ -1099,6 +1104,7 @@ test("a 300-hop public resume lineage remains complete and reports a truthful st
       [
         `workflow://runs/${runIds.at(-1)}/result`,
         ...runIds.map((runId) => `workflow://runs/${runId}/script`),
+        `workflow://runs/${runIds.at(-1)}/events`,
       ],
     );
     assert.ok(Number(truncation.maxStructuredBytes) > 24_576);
@@ -1125,7 +1131,7 @@ test("a fresh MCP session can retrieve an inline checkpoint script resource and 
     runId = String(structured(accepted)?.runId);
     const paused = await first.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 1_000 },
+      arguments: { action: "status", runId, waitMs: 1_000 },
     });
     assert.equal(structured(paused)?.status, "paused");
     retrieved = resourceText(
@@ -1152,7 +1158,7 @@ test("a fresh MCP session can retrieve an inline checkpoint script resource and 
     const resumedRunId = String(structured(resumed)?.runId);
     const coldAwait = await second.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId: resumedRunId, waitMs: 0 },
+      arguments: { action: "status", runId: resumedRunId, waitMs: 0 },
     });
     assert.equal((structured(coldAwait)?.outcome as Record<string, unknown>).scriptSource, undefined);
     assert.equal(
@@ -1164,7 +1170,7 @@ test("a fresh MCP session can retrieve an inline checkpoint script resource and 
   }
 });
 
-test("cold await does not infer an admission-only script source", async () => {
+test("cold status does not infer an admission-only script source", async () => {
   const first = await connect(okRunner());
   let runId: string;
   try {
@@ -1188,7 +1194,7 @@ test("cold await does not infer an admission-only script source", async () => {
   try {
     const awaited = await second.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId: runId!, waitMs: 0 },
+      arguments: { action: "status", runId: runId!, waitMs: 0 },
     });
     assert.equal(awaited.isError, false);
     assert.equal((structured(awaited)?.outcome as Record<string, unknown>).scriptSource, undefined);
@@ -1334,6 +1340,20 @@ test("a slow events subscriber holds one promise plus one dirty bit while durabl
     const run = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "events-backpressure"));
     const uri = `workflow://runs/${run.runId}/events`;
     const initial = eventDocument(await client.readResource({ uri }));
+    // Count every watcher delivery so the release below waits for the WHOLE backlog to drain, not
+    // just the first record. Otherwise records still draining after releaseFirst() each re-dirty
+    // the settled subscription and emit their own hint — the very non-coalescing this test forbids —
+    // which made the assertion flake under load.
+    const internals = resources as unknown as {
+      eventSubscriptions: Map<string, { dirty: boolean; inFlight: boolean }>;
+      markEventSubscriptionDirty: (subscription: { dirty: boolean; inFlight: boolean }) => void;
+    };
+    let drainedRecords = 0;
+    const markSubscriptionDirty = internals.markEventSubscriptionDirty.bind(resources);
+    internals.markEventSubscriptionDirty = (subscription) => {
+      drainedRecords += 1;
+      markSubscriptionDirty(subscription);
+    };
     await client.subscribeResource({ uri });
     const persistence = manager.getPersistence();
     const state = persistence.load(run.runId);
@@ -1347,11 +1367,9 @@ test("a slow events subscriber holds one promise plus one dirty bit while durabl
       state.eventSeq = record.seq;
     }
     persistence.save(state);
-    const internals = resources as unknown as {
-      eventSubscriptions: Map<string, { dirty: boolean; inFlight: boolean }>;
-    };
-    await waitUntil(() => notificationCalls === 1 && internals.eventSubscriptions.get(uri)?.dirty === true,
-      "the slow subscriber should coalesce its backlog into one dirty bit");
+    await waitUntil(
+      () => drainedRecords >= 1_005 && notificationCalls === 1 && internals.eventSubscriptions.get(uri)?.dirty === true,
+      "the slow subscriber should coalesce its whole drained backlog into one dirty bit");
     assert.equal(internals.eventSubscriptions.get(uri)?.inFlight, true);
     releaseFirst();
     await waitUntil(() => notificationCalls >= 2, "one coalesced follow-up hint should be sent");

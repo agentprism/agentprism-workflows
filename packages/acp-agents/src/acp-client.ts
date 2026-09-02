@@ -106,7 +106,6 @@ import {
   WorkflowError,
   WorkflowErrorCode,
   type AgentHistoryEntry,
-  type AgentInteractionState,
   type McpServerConfig,
 } from "@automatalabs/shared-types";
 import type {
@@ -458,27 +457,8 @@ class SessionState {
     modes?: SessionModeState | null,
     readonly mcpServerIds: readonly string[] = [],
     private readonly retainSessionLog = true,
-    private readonly onActivity?: () => void,
-    private readonly onInteractionStateChange?: (state: AgentInteractionState) => void,
   ) {
     this.modes = modes;
-  }
-
-  /** Report one real session/update to the engine-owned attempt watchdog. */
-  observeActivity(): void {
-    try {
-      this.onActivity?.();
-    } catch {
-      // Liveness telemetry is best-effort and never perturbs the ACP update drain.
-    }
-  }
-
-  reportPermissionWait(state: "waiting" | "running"): void {
-    try {
-      this.onInteractionStateChange?.({ kind: "permission", state });
-    } catch {
-      // Host wait-state telemetry is best-effort and never changes permission settlement.
-    }
   }
 
   /** Mark the start of a new turn so currentTurnText()/structured_output read only this turn.
@@ -1037,13 +1017,10 @@ class MultiplexClient {
         if (settled) return;
         settled = true;
         state.pendingPermissions.delete(settle);
-        if (state.pendingPermissions.size === 0) state.reportPermissionWait("running");
         this.onEvent?.("permission_request", { ...ctx, request: params, outcome });
         resolve(outcome);
       };
-      const firstPending = state.pendingPermissions.size === 0;
       state.pendingPermissions.add(settle);
-      if (firstPending) state.reportPermissionWait("waiting");
       this.onEvent?.("permission_pending", { ...ctx, request: params });
 
       try {
@@ -1219,7 +1196,6 @@ class MultiplexClient {
     const state = this.sessions.get(params.sessionId);
     // Fold into the accumulator FIRST (the drain contract), THEN bubble the event up unchanged.
     state?.applyUpdate(params.update);
-    state?.observeActivity();
     if (this.onEvent) {
       emitSessionUpdate(this.onEvent, params.update, this.contextFor(params.sessionId));
     }
@@ -1551,10 +1527,6 @@ export interface AcpSessionOptions {
   label?: string;
   /** `RunOptions.callIndex`, propagated onto emitted events as context. NOT sent on the wire. */
   callIndex?: number;
-  /** Backend-neutral attempt liveness callback. Invoked for every routed session/update. */
-  onActivity?: () => void;
-  /** Host-interaction wait callback. Permission resolver waits pause the engine idle watchdog. */
-  onInteractionStateChange?: (state: AgentInteractionState) => void;
   /** CODEX-ONLY session instruction overrides. The backend folds these into session/new `_meta`
    *  (bare keys) for the codex-acp adapter; the Claude backend ignores them. Omitted => unset. */
   baseInstructions?: string;
@@ -2241,8 +2213,6 @@ export class PooledConnection {
       response.modes,
       acpMcpServerIds(opts.mcpServers),
       opts.retainSessionLog ?? true,
-      opts.onActivity,
-      opts.onInteractionStateChange,
     );
     this.client.register(response.sessionId, state);
     return new SessionHandle(this, response.sessionId, state, response.configOptions ?? [], opts, onReleased);
@@ -2279,8 +2249,6 @@ export class PooledConnection {
         undefined,
         acpMcpServerIds(opts.mcpServers),
         opts.retainSessionLog ?? true,
-        opts.onActivity,
-        opts.onInteractionStateChange,
       );
       const meta = this.sessionRequestMeta(opts);
       const request = {
@@ -2358,8 +2326,6 @@ export class PooledConnection {
         undefined,
         acpMcpServerIds(opts.mcpServers),
         opts.retainSessionLog ?? true,
-        opts.onActivity,
-        opts.onInteractionStateChange,
       );
       const meta = this.sessionRequestMeta(opts);
       const request = {

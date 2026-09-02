@@ -230,6 +230,48 @@ test(
 );
 
 test(
+  "legacy call-record events read successfully and omit historical debit metadata",
+  withPersistence(({ persistence, eventPath }) => {
+    const runId = "legacy-budget-event";
+    persistence.save(state(runId));
+    const current = persistence.appendEvent(runId, {
+      seq: 1,
+      timestamp: TIMESTAMP,
+      event: {
+        type: "callRecord",
+        runId,
+        scope: runId,
+        record: {
+          index: 0,
+          kind: "agent",
+          hash: "hash",
+          outcome: "result",
+          origin: "runner",
+          usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, total: 5, cost: 0.01 },
+        },
+      },
+    });
+    assert.equal(current.event.type, "callRecord");
+    if (current.event.type !== "callRecord") throw new Error("expected projected call record");
+    const legacy = {
+      ...current,
+      event: {
+        ...current.event,
+        record: { ...current.event.record, budgetDebit: 5 },
+      },
+    };
+    writeFileSync(eventPath(runId), `${JSON.stringify(legacy)}\n`);
+
+    const event = persistence.readEvents(runId).events[0]?.event;
+    assert.equal(event?.type, "callRecord");
+    if (event?.type === "callRecord") {
+      assert.equal(Object.hasOwn(event.record, "budgetDebit"), false);
+      assert.equal(event.record.usage?.total, 5);
+    }
+  }),
+);
+
+test(
   "a resumed start supersedes crash-dangling live observability state",
   withPersistence(async ({ persistence }) => {
     const runId = "crash-resumed-events";

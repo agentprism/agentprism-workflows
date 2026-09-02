@@ -35,9 +35,6 @@ export interface ProbeHarnessConfigOptions {
   /** Session cwd for the probes. Default `process.cwd()` — harnesses may resolve
    *  project-level configuration (and hence their catalog) from it. */
   cwd?: string;
-  /** Per-harness wall-clock bound. A timed-out harness reports `probed:false` without
-   *  affecting the others. Default 60000. */
-  timeoutMs?: number;
   /** Host-owned no-prompt probe runner. When supplied it is reused and never disposed. */
   probeRunner?: ValidateProbeRunner;
 }
@@ -62,10 +59,6 @@ const DEFAULT_PROBE_TIMEOUT_MS = 60_000;
 export async function probeHarnessConfig(
   options: ProbeHarnessConfigOptions = {},
 ): Promise<HarnessConfigReport> {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    throw new TypeError("probeHarnessConfig: timeoutMs must be a positive number");
-  }
   const cwd = options.cwd ?? process.cwd();
   const registry = resolveBackendRegistry(options.backends);
   const defaultHarnesses = options.probeRunner?.listBackends?.() ?? [...BUILTIN_BACKEND_IDS, ...registry.keys()];
@@ -92,7 +85,7 @@ export async function probeHarnessConfig(
       try {
         const result = await withProbeTimeout(
           (signal) => runner.probeConfigOptions(target.spec, { cwd, selectModel: target.selectModel, signal }),
-          timeoutMs,
+          DEFAULT_PROBE_TIMEOUT_MS,
         );
         harnessOptions.push({
           backendId: result.backendId,

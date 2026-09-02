@@ -11,7 +11,7 @@ worked examples aren't enough. The first two are **verbatim copies** of the runn
 | [`quick-wins.workflow.js`](quick-wins.workflow.js) | A small nested-or-standalone hunter: `loopUntilDry()` with a per-round vendor rotation, dedup threading via a `seen` list interpolated into each prompt, and a tracked round bound inside the round. |
 | [`resume-loop-cap.workflow.js`](resume-loop-cap.workflow.js) | Content-addressed journal replay: run with `maxRounds: 6`, then resume with `maxRounds: 8` so identity matching serves the six unchanged calls from the recording for zero tokens and only two new calls run live. No filesystem-safety annotation is needed. |
 
-`resume-loop-cap.workflow.js` defaults to eight rounds and therefore validates successfully without args. Its six-round failure is intentional: call the MCP `workflow` tool with `args: { "maxRounds": 6 }`, then repeat the script with `args: { "maxRounds": 8 }` and the returned `runId` as `resumeFromRunId`. Identity matching pairs each call by its content (prompt, model, options, input fingerprint), so keep the cap out of the agent prompt — a changed prompt is a changed identity and that round runs live. Filesystem/world drift is diagnostic only and does not force the unchanged rounds live.
+`resume-loop-cap.workflow.js` defaults to eight rounds and therefore validates successfully without args. Its six-round failure is intentional: call the MCP `workflow` tool with `args: { "maxRounds": 6 }`, then call `{ "action":"resume", "runId":"…", "args":{ "maxRounds":8 } }`. The immutable stored script is reused. Identity matching pairs each call by its content (prompt, model, options, input fingerprint), so keep the cap out of the agent prompt — a changed prompt is a changed identity and that round runs live. Filesystem/world drift is diagnostic only and does not force the unchanged rounds live.
 
 Validate either one for free (zero tokens; each routed backend/model pair opens one no-prompt option probe,
 with a warning-only degradation when unavailable):
@@ -27,12 +27,12 @@ reject once and approve once. Its first partial `{ "ok": false }` answer demonst
 fresh-base deep merge; the second supplies `{ "ok": true, "feedback": "" }` and
 finishes the existing gate.
 
-After running either script through MCP, retain the returned `runId`. Inspect the most recent
+After running either script through MCP, retain the returned `runId`. Check the most recent
 triage workers without re-running anything:
 
 ```json
 {
-  "action": "inspect",
+  "action": "status",
   "runId": "mabc1234-k9x2pq",
   "lastN": 10,
   "labelGlob": "verify:*",
@@ -44,7 +44,7 @@ For the nested quick-wins hunt, narrow the same run journal to its round labels:
 
 ```json
 {
-  "action": "inspect",
+  "action": "status",
   "runId": "mabc1234-k9x2pq",
   "lastN": 20,
   "labelGlob": "hunt:*",
@@ -53,7 +53,7 @@ For the nested quick-wins hunt, narrow the same run journal to its round labels:
 ```
 
 If a run paused or failed, read the execution response's immediate final-20 `logTail` first, then
-use inspection for attributed compact results. Host MCP actions stay outside workflow scripts; the
+use status for attributed compact results. Host MCP actions stay outside workflow scripts; the
 shipped `.workflow.js` files call only DSL globals.
 
 ## Complete background host-call transcript
@@ -63,6 +63,7 @@ script does not call MCP actions itself):
 
 ```json
 {
+  "action": "run",
   "script": "<contents of repo-triage.workflow.js>",
   "args": { "target": "." },
   "background": true
@@ -77,7 +78,7 @@ The host retains that ID and waits in bounded 20-second calls. A first timeout r
 than failing the workflow:
 
 ```json
-{ "action": "await", "runId": "mabc1234-k9x2pq", "waitMs": 20000 }
+{ "action": "status", "runId": "mabc1234-k9x2pq", "waitMs": 20000 }
 ```
 
 ```json
@@ -94,14 +95,15 @@ than failing the workflow:
 }
 ```
 
-Call the same await again until `returnedBecause:"terminal"`; then `outcome.result` is the complete
+Call the same status request again until `returnedBecause:"terminal"`; then `outcome.result` is the complete
 authored result and `outcome.logs` the foreground-equivalent full logs.
 
-For a workflow that pauses at `checkpoint(..., { headless:"pause" })`, terminal await returns
+For a workflow that pauses at `checkpoint(..., { headless:"pause" })`, terminal status returns
 `outcome.checkpointContext.callIndex`. Resume through a second background run:
 
 ```json
 {
+  "action": "run",
   "script": "<the same workflow source>",
   "args": { "target": "." },
   "background": true,
@@ -114,6 +116,6 @@ For a workflow that pauses at `checkpoint(..., { headless:"pause" })`, terminal 
 { "runId": "mabc5678-z1n4rs", "status": "running" }
 ```
 
-The second ID is intentional: resume executes a new run. Retain it and await it in turn. Before its
+The second ID is intentional: resume executes a new run. Retain it and check its status in turn. Before its
 acknowledgement, the new record already contains the inherited call prefix and checkpoint answer, so
 another pause/crash can resume from `mabc5678-z1n4rs` without re-running that prefix.

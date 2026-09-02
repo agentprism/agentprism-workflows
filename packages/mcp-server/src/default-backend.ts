@@ -139,7 +139,6 @@ export function selectAutoDefaultBackend(
 export async function discoverProjectDefaultBackend(
   context: ProjectContext,
   probeRunner: ValidateProbeRunner,
-  timeoutMs = 60_000,
 ): Promise<AutoDefaultBackendSelection> {
   if (context.autoDefaultBackend) return context.autoDefaultBackend;
   if (context.autoDefaultBackendPending) return context.autoDefaultBackendPending;
@@ -152,7 +151,6 @@ export async function discoverProjectDefaultBackend(
       probeHarnessConfig({
         harnesses: [backendId],
         cwd: context.projectDir,
-        timeoutMs,
         probeRunner,
       })
     ),

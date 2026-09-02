@@ -46,7 +46,6 @@ export const RECORDING_UNUSABLE_REASONS = Object.freeze([
   "runtime-mismatch",
   "no-limits",
   "agent-limit-boundary",
-  "no-budget-trajectory",
   "no-execution-cwd",
   "no-environment-identity",
   "environment-mismatch",
@@ -179,8 +178,6 @@ export interface RunIsolationOptions {
   persistenceRoot?: string;
   scriptBackends?: Record<string, WorkflowBackendConfig>;
   concurrency?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
   agentRetries?: number;
   signal?: AbortSignal;
   agentsDir?: string;
@@ -343,9 +340,6 @@ function validateCallStructure(recording: PersistedRunState, row: unknown, posit
   }
   if (row.worktree !== undefined && row.worktree !== true) corrupt(recording, "calls[].worktree", index);
   if (row.isolation !== undefined && row.isolation !== "worktree") corrupt(recording, "calls[].isolation", index);
-  if (row.budgetDebit !== undefined && typeof row.budgetDebit !== "number") {
-    corrupt(recording, "calls[].budgetDebit", index);
-  }
   if (row.settlementOrdinal !== undefined && !isPositiveInteger(row.settlementOrdinal)) {
     corrupt(recording, "calls[].settlementOrdinal", index);
   }
@@ -416,7 +410,6 @@ function validateCallStructure(recording: PersistedRunState, row: unknown, posit
       row.attempts !== undefined ||
       row.usage !== undefined ||
       row.worktree !== undefined ||
-      row.budgetDebit !== undefined ||
       row.provenance !== undefined
     ) {
       corrupt(recording, "checkpoint row", index);
@@ -434,7 +427,6 @@ function validateCallStructure(recording: PersistedRunState, row: unknown, posit
       row.usage !== undefined ||
       row.error !== undefined ||
       row.aborted !== undefined ||
-      row.budgetDebit !== undefined ||
       row.provenance !== undefined
     ) {
       corrupt(recording, "checkpoint journal-replay row", index);
@@ -449,7 +441,6 @@ function validateCallStructure(recording: PersistedRunState, row: unknown, posit
       !isRecord(row.error) ||
       row.error.form !== "workflow-error" ||
       row.error.code !== WorkflowErrorCode.WORKFLOW_ABORTED ||
-      row.budgetDebit !== undefined ||
       row.provenance !== undefined
     ) {
       corrupt(recording, "checkpoint engine row", index);
@@ -516,25 +507,6 @@ function validateStructure(recording: PersistedRunState): void {
     if (!isPositiveInteger(recording.limits.maxAgents)) corrupt(recording, "limits.maxAgents");
     if (!isPositiveInteger(recording.limits.concurrency)) corrupt(recording, "limits.concurrency");
     if (!isNonNegativeInteger(recording.limits.agentRetries)) corrupt(recording, "limits.agentRetries");
-    if (
-      recording.limits.tokenBudget !== null &&
-      (typeof recording.limits.tokenBudget !== "number" || !Number.isFinite(recording.limits.tokenBudget))
-    ) {
-      corrupt(recording, "limits.tokenBudget");
-    }
-    if (
-      recording.limits.agentTimeoutMs !== null &&
-      (typeof recording.limits.agentTimeoutMs !== "number" || !Number.isFinite(recording.limits.agentTimeoutMs))
-    ) {
-      corrupt(recording, "limits.agentTimeoutMs");
-    }
-    if (
-      recording.limits.agentIdleTimeoutMs !== undefined &&
-      recording.limits.agentIdleTimeoutMs !== null &&
-      (typeof recording.limits.agentIdleTimeoutMs !== "number" || !Number.isFinite(recording.limits.agentIdleTimeoutMs))
-    ) {
-      corrupt(recording, "limits.agentIdleTimeoutMs");
-    }
   }
 
   if (recording.agents !== undefined && !Array.isArray(recording.agents)) corrupt(recording, "agents");
@@ -649,25 +621,6 @@ function preflight(recording: PersistedRunState, options: PreflightOptions = {})
       indexes: [recording.callsAllocated],
     });
   }
-  const ordinals = calls.map((row) => row.settlementOrdinal);
-  const expectedOrdinals = new Set(Array.from({ length: calls.length }, (_value, index) => index + 1));
-  const trajectoryBad =
-    ordinals.some((ordinal) => ordinal === undefined || !expectedOrdinals.has(ordinal)) ||
-    new Set(ordinals).size !== calls.length ||
-    calls.some((row) => row.kind === "agent" && !isFiniteNonNegative(row.budgetDebit));
-  if (trajectoryBad) {
-    failRecording(recording, "no-budget-trajectory", "recording has no complete budget trajectory", {
-      indexes: calls
-        .filter(
-          (row) =>
-            row.settlementOrdinal === undefined ||
-            !expectedOrdinals.has(row.settlementOrdinal) ||
-            (row.kind === "agent" && !isFiniteNonNegative(row.budgetDebit)),
-        )
-        .map((row) => row.index),
-    });
-  }
-
   const identities = buildResumeExactIndex(calls, (row) => ({
     kind: row.kind,
     path: row.path ?? "",
@@ -1596,14 +1549,6 @@ export async function runIsolation<T = unknown>(
         onProgress: options.onProgress,
         signal: combinedSignal,
         concurrency: options.concurrency ?? recording.limits?.concurrency,
-        agentTimeoutMs:
-          options.agentTimeoutMs !== undefined
-            ? options.agentTimeoutMs
-            : recording.limits?.agentTimeoutMs,
-        agentIdleTimeoutMs:
-          options.agentIdleTimeoutMs !== undefined
-            ? options.agentIdleTimeoutMs
-            : recording.limits?.agentIdleTimeoutMs ?? null,
         agentRetries: options.agentRetries ?? recording.limits?.agentRetries,
         maxAgents: recording.limits?.maxAgents,
         onNestedWorkflow: (_ordinal, childRunId) => {

@@ -8,8 +8,6 @@ export {
   parseWorkflowScript,
   workflowMayUseDefaultModel,
   hashCheckpointInputs,
-  resolveAgentTimeoutMs,
-  resolveAgentIdleTimeoutMs,
   resolveWorkflowRunLimits,
   CALL_PATH_FORMAT,
   CALL_INPUTS_FORMAT,
@@ -104,7 +102,6 @@ export {
   isAuthRequired,
   wrapError,
   isAbortError,
-  isTimeoutError,
   type WorkflowErrorOptions,
   type AuthErrorContext,
   type CheckpointContext,
@@ -116,8 +113,6 @@ export {
   MAX_AGENTS_PER_RUN,
   MAX_CONCURRENCY,
   MAX_AGENT_RETRIES,
-  DEFAULT_AGENT_TIMEOUT_MS,
-  DEFAULT_AGENT_IDLE_TIMEOUT_MS,
   AGENTS_DIR,
 } from "./config.js";
 

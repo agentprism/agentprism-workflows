@@ -1,319 +1,426 @@
-import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
-
-// Input schema and cross-field discriminator for the single MCP `workflow` tool.
-// Numeric execution knobs retain their existing clamp-at-runtime behavior. Inspection
-// bounds are rejected at the Zod boundary because they are wire-contract limits.
 import type { WorkflowRunInspectionOptions } from "@automatalabs/workflows";
+import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 
-const permissionResponseSchema = z.object({
-  outcome: z.discriminatedUnion("outcome", [
-    z.object({ outcome: z.literal("cancelled") }).strict(),
-    z.object({ outcome: z.literal("selected"), optionId: z.string().min(1).max(512) }).strict(),
-  ]),
-}).strict();
+// The published schema is an action-discriminated oneOf. Every object variant is strict, so
+// cross-action fields fail at the MCP validation boundary instead of being stripped and rejected
+// later by a prose-maintained discriminator. Compatibility aliases are normalized before this
+// canonical schema (see normalizeCompatibilityInput), never published as competing actions.
+
+const permissionResponseSchema = z
+  .object({
+    outcome: z.discriminatedUnion("outcome", [
+      z.object({ outcome: z.literal("cancelled") }).strict(),
+      z.object({ outcome: z.literal("selected"), optionId: z.string().min(1).max(512) }).strict(),
+    ]),
+  })
+  .strict();
 
 export const WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT = 16_384;
 export const WORKFLOW_RESULT_CHUNK_BYTES_MAX = 16_384;
 export const WORKFLOW_RESULT_CHUNK_BYTES_MIN = 4;
 
-const checkpointRepliesSchema = z.record(
-  z.string().refine(
-    (key) => {
-      const callIndex = Number(key);
-      return Number.isSafeInteger(callIndex) && callIndex >= 0 && String(callIndex) === key;
-    },
-    "checkpoint reply keys must be canonical non-negative safe integer call indexes",
-  ),
-  z.unknown(),
-);
+const actionSchema = z
+  .enum(["config", "run", "resume", "status", "result", "permissions-response", "stop"])
+  .describe("Workflow operation. See docs topic workflow/run-lifecycle for the action guide.");
+const scriptSchema = z
+  .string()
+  .min(1)
+  .describe("Run only: raw JavaScript workflow source, without Markdown fences.");
+const scriptPathSchema = z
+  .string()
+  .min(1)
+  .refine((value) => isAbsolute(value), "scriptPath must be an absolute path")
+  .describe("Run only: absolute server-side script path, read once at admission.");
+const projectDirSchema = z
+  .string()
+  .min(1)
+  .refine((value) => isAbsolute(value), "projectDir must be an absolute path")
+  .describe("Config/run project directory; required by the shared daemon.");
+const harnessesSchema = z
+  .array(z.string().regex(/^[a-z][a-z0-9._-]*$/i, "invalid backend name"))
+  .min(1)
+  .max(16)
+  .describe("Config only: backend names to probe; omit to probe all registered backends.");
+const modelSpecsSchema = z
+  .array(z.string().min(1).max(256))
+  .min(1)
+  .max(16)
+  .describe("Config only: exact routed model specs whose model-specific options should be read.");
+const modelFilterSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .describe("Config only: case-insensitive model-id substring or /regular expression/ filter.");
+const argsSchema = z.unknown().describe("Run/resume JSON value exposed to the script as `args`.");
+const maxAgentsSchema = z.number().int().positive().describe("Maximum agents for the new run; default 1000.");
+const concurrencySchema = z
+  .number()
+  .int()
+  .positive()
+  .describe("Maximum concurrent agents; values above 16 are clamped.");
+const agentRetriesSchema = z
+  .number()
+  .int()
+  .min(0)
+  .describe("Recoverable retries per agent; values above 3 are clamped.");
+const resumeFromRunIdSchema = z
+  .string()
+  .min(1)
+  .describe("Run only: source run for edited-script replay. Use resume for stored-script replay.");
+const resumePolicySchema = z
+  .enum(["auto", "positional"])
+  .describe("Replay matching policy; default auto.");
+const checkpointRepliesSchema = z
+  .record(
+    z.string().refine(
+      (key) => {
+        const callIndex = Number(key);
+        return Number.isSafeInteger(callIndex) && callIndex >= 0 && String(callIndex) === key;
+      },
+      "checkpoint reply keys must be canonical non-negative safe integer call indexes",
+    ),
+    z.unknown(),
+  )
+  .describe("Checkpoint decisions keyed by the source checkpoint call index.");
+const backgroundSchema = z
+  .boolean()
+  .describe("Run/resume only: acknowledge after durable admission; default false.");
+const runIdSchema = z
+  .string()
+  .max(128)
+  .regex(/^[a-z0-9]+-[a-z0-9]+$/, "runId must be an engine-generated run ID")
+  .describe("Project-scoped engine run ID.");
+const permissionIdSchema = z
+  .string()
+  .uuid()
+  .describe("Permissions-response only: opaque pending permission ID returned by status.");
+const callIndexSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .safe()
+  .describe("Stop only: cancel this in-flight agent call without aborting the run.");
+const forceOwnerSchema = z
+  .boolean()
+  .describe("Whole-run stop only: authorize terminating a superseded owner daemon.");
+const lastNSchema = z
+  .number()
+  .int()
+  .min(1)
+  .max(50)
+  .describe("Status/stop latest matching calls; default 20, range 1..50.");
+const labelGlobSchema = z
+  .string()
+  .refine((value) => [...value].length >= 1 && [...value].length <= 128, {
+    message: "labelGlob must contain from 1 through 128 Unicode code points",
+  })
+  .describe("Status/stop case-sensitive whole-label glob using *, ?, and backslash escaping.");
+const logLinesSchema = z
+  .number()
+  .int()
+  .min(0)
+  .max(50)
+  .describe("Status/stop latest log lines; default 20, range 0..50.");
+const waitMsSchema = z
+  .number()
+  .int()
+  .min(0)
+  .max(25_000)
+  .describe("Status request bound in milliseconds, 0..25000; it never cancels workflow work.");
+const offsetSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .safe()
+  .describe("Result UTF-8 byte offset; default 0, then use the previous endOffset.");
+const maxBytesSchema = z
+  .number()
+  .int()
+  .min(WORKFLOW_RESULT_CHUNK_BYTES_MIN)
+  .max(WORKFLOW_RESULT_CHUNK_BYTES_MAX)
+  .describe(`Result chunk bound; default and maximum ${WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT} bytes.`);
 
+/**
+ * Public field catalog retained for hosts that reuse individual validators. It is not the tool
+ * schema: workflowToolInputBranches and workflowToolInputSchema are the canonical action union.
+ */
 export const workflowToolInputShape = {
-  action: z
-    .enum(["run", "config", "inspect", "await", "result", "stop", "permissions-response"])
-    .optional()
-    .describe(
-      "Operation. Omit or use run to validate then execute; config discovers live backend/model/mode/config options; inspect/await expose lifecycle and action requirements; result pages the exact completed JSON result; permissions-response resolves one pending ACP permission; stop aborts a run or one in-flight agent.",
-    ),
-  script: z
-    .string()
-    .min(1)
-    .optional()
-    .describe(
-      "Raw JavaScript workflow script (no Markdown fences). Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/result/stop/permissions-response. First statement MUST be `export const meta = { name, description, phases? }`. When present, phases MUST be an array of objects shaped `{ title: string, detail?: string, model?: string }`, never an array of strings.",
-    ),
-  scriptPath: z
-    .string()
-    .min(1)
-    .refine((value) => isAbsolute(value), "scriptPath must be an absolute path")
-    .optional()
-    .describe(
-      "Absolute path, on the server's filesystem, to a workflow script file read once at admission. " +
-        "Exactly one of script or scriptPath is required for run; both are forbidden for config/inspect/await/result/stop/permissions-response. " +
-        "Relative paths are rejected.",
-    ),
-  projectDir: z
-    .string()
-    .min(1)
-    .refine((value) => isAbsolute(value), "projectDir must be an absolute path")
-    .optional()
-    .describe(
-      "Absolute project directory used as the cwd for config discovery and, for run, the project-scoped store " +
-        "(where the runId, journal, and resume state live) plus default execution cwd. " +
-        "Required for run and config on the shared workflow daemon; on a single-project (in-process) server it " +
-        "defaults to that server's own project. Forbidden for inspect/await/result/stop/permissions-response — a runId locates its project.",
-    ),
-  harnesses: z
-    .array(z.string().regex(/^[a-z][a-z0-9._-]*$/i, "invalid backend name"))
-    .min(1)
-    .max(16)
-    .optional()
-    .describe('With action="config", backend names to probe. Omit to probe every backend registered on this server.'),
-  modelSpecs: z
-    .array(z.string().min(1).max(256))
-    .min(1)
-    .max(16)
-    .optional()
-    .describe(
-      'With action="config", exact routed model specs to select before reading their model-specific mode and config-option catalogs. Use mode only when modes.availableModes explicitly lists its exact id; modes:null means unsupported.',
-    ),
-  modelFilter: z
-    .string()
-    .min(1)
-    .max(128)
-    .optional()
-    .describe(
-      'With action="config", return model ids matching this case-insensitive substring or /regular expression/. Omit for bounded per-provider model summaries.',
-    ),
-  probeTimeoutMs: z
-    .number()
-    .int()
-    .min(1)
-    .max(120_000)
-    .optional()
-    .describe('With action="config", per-backend no-prompt probe timeout. Default 60000; range 1..120000.'),
-  args: z.unknown().optional().describe("Optional JSON value exposed to the script as the global `args`."),
-  maxAgents: z
-    .number()
-    .int()
-    .positive()
-    .optional()
-    .describe("Max agents allowed in this run. Default 1000 (engine cap MAX_AGENTS_PER_RUN)."),
-  concurrency: z
-    .number()
-    .int()
-    .positive()
-    .optional()
-    .describe("Max concurrent agents. CLAMPED to the runtime max (16) by the engine — not rejected."),
-  agentRetries: z
-    .number()
-    .int()
-    .min(0)
-    .optional()
-    .describe("Retry attempts for recoverable agent failures. CLAMPED to the runtime max (3) by the engine."),
-  agentTimeoutMs: z
-    .number()
-    .int()
-    .positive()
-    .nullable()
-    .optional()
-    .describe("Per-agent total-wall timeout in ms. Omit/null for no hard timeout (the engine owns the timeout)."),
-  agentIdleTimeoutMs: z
-    .number()
-    .int()
-    .positive()
-    .nullable()
-    .optional()
-    .describe("Per-agent no-backend-activity timeout in ms. Omit/null to disable the idle watchdog."),
-  resumeFromRunId: z
-    .string()
-    .min(1)
-    .optional()
-    .describe(
-      "Start a new run from this persisted source run. Re-send the script via script or scriptPath and the desired args; the manager validates replay eligibility and runs live wherever reuse is uncertain. The source ID must exist in this project namespace.",
-    ),
-  resumePolicy: z
-    .enum(["auto", "positional"])
-    .optional()
-    .describe('Resume matching policy. Default "auto"; requires resumeFromRunId.'),
-  checkpointReplies: checkpointRepliesSchema
-    .optional()
-    .describe("With resumeFromRunId, durable-checkpoint decisions keyed by checkpointContext.callIndex."),
-  background: z
-    .boolean()
-    .optional()
-    .describe("Default false. True acknowledges after admission and executes in this server process."),
-  runId: z
-    .string()
-    .max(128)
-    .regex(/^[a-z0-9]+-[a-z0-9]+$/, "runId must be an engine-generated run ID")
-    .optional()
-    .describe("Project-scoped workflow run ID. Required for inspect/await/result/stop/permissions-response; forbidden for config/run."),
-  permissionId: z
-    .string()
-    .uuid()
-    .optional()
-    .describe('With action="permissions-response", the opaque pending permission id returned by inspect/await.'),
-  response: permissionResponseSchema
-    .optional()
-    .describe('With action="permissions-response", an exact ACP selected optionId or cancelled outcome.'),
-  callIndex: z
-    .number()
-    .int()
-    .nonnegative()
-    .safe()
-    .optional()
-    .describe(
-      "With action=stop, cancel exactly this in-flight agent call without aborting the run. Forbidden for every other action.",
-    ),
-  forceOwner: z
-    .boolean()
-    .optional()
-    .describe(
-      "With whole-run action=stop, explicitly authorize terminating a superseded owner daemon when graceful cross-generation control cannot settle. Forbidden with callIndex and every other action.",
-    ),
-  lastN: z.number().int().min(1).max(50).optional().describe("Latest matching calls. Default 20; range 1..50."),
-  labelGlob: z
-    .string()
-    .refine((value) => [...value].length >= 1 && [...value].length <= 128, {
-      message: "labelGlob must contain from 1 through 128 Unicode code points",
-    })
-    .optional()
-    .describe("Case-sensitive whole-label glob using *, ?, and backslash escaping."),
-  logLines: z.number().int().min(0).max(50).optional().describe("Latest run-log lines. Default 20; range 0..50."),
-  waitMs: z
-    .number()
-    .int()
-    .min(0)
-    .max(25_000)
-    .optional()
-    .describe("Await duration in milliseconds. Default 20000; range 0..25000. Zero reads without blocking."),
-  offset: z
-    .number()
-    .int()
-    .nonnegative()
-    .safe()
-    .optional()
-    .describe('With action="result", UTF-8 byte offset into the exact serialized JSON. Default 0; use the previous endOffset.'),
-  maxBytes: z
-    .number()
-    .int()
-    .min(WORKFLOW_RESULT_CHUNK_BYTES_MIN)
-    .max(WORKFLOW_RESULT_CHUNK_BYTES_MAX)
-    .optional()
-    .describe(`With action="result", maximum UTF-8 bytes returned. Default and maximum ${WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT}.`),
+  action: actionSchema,
+  script: scriptSchema,
+  scriptPath: scriptPathSchema,
+  projectDir: projectDirSchema,
+  harnesses: harnessesSchema,
+  modelSpecs: modelSpecsSchema,
+  modelFilter: modelFilterSchema,
+  args: argsSchema,
+  maxAgents: maxAgentsSchema,
+  concurrency: concurrencySchema,
+  agentRetries: agentRetriesSchema,
+  resumeFromRunId: resumeFromRunIdSchema,
+  resumePolicy: resumePolicySchema,
+  checkpointReplies: checkpointRepliesSchema,
+  background: backgroundSchema,
+  runId: runIdSchema,
+  permissionId: permissionIdSchema,
+  response: permissionResponseSchema,
+  callIndex: callIndexSchema,
+  forceOwner: forceOwnerSchema,
+  lastN: lastNSchema,
+  labelGlob: labelGlobSchema,
+  logLines: logLinesSchema,
+  waitMs: waitMsSchema,
+  offset: offsetSchema,
+  maxBytes: maxBytesSchema,
 } as const;
 
+const configInputSchema = z
+  .object({
+    action: z.literal("config").describe("Discover live backend, model, mode, and config options."),
+    projectDir: projectDirSchema.optional(),
+    harnesses: harnessesSchema.optional(),
+    modelSpecs: modelSpecsSchema.optional(),
+    modelFilter: modelFilterSchema.optional(),
+  })
+  .strict();
+
+const executionOptionsShape = {
+  projectDir: projectDirSchema.optional(),
+  args: argsSchema.optional(),
+  maxAgents: maxAgentsSchema.optional(),
+  concurrency: concurrencySchema.optional(),
+  agentRetries: agentRetriesSchema.optional(),
+  background: backgroundSchema.optional(),
+} as const;
+
+const editedReplayShape = {
+  resumeFromRunId: resumeFromRunIdSchema,
+  resumePolicy: resumePolicySchema.optional(),
+  checkpointReplies: checkpointRepliesSchema.optional(),
+} as const;
+
+const runInlineInputSchema = z
+  .object({
+    action: z.literal("run").describe("Validate and execute explicit workflow content."),
+    script: scriptSchema,
+    ...executionOptionsShape,
+  })
+  .strict();
+const runPathInputSchema = z
+  .object({
+    action: z.literal("run").describe("Validate and execute explicit workflow content."),
+    scriptPath: scriptPathSchema,
+    ...executionOptionsShape,
+  })
+  .strict();
+const replayInlineInputSchema = z
+  .object({
+    action: z.literal("run").describe("Execute edited content with replay from a source run."),
+    script: scriptSchema,
+    ...executionOptionsShape,
+    ...editedReplayShape,
+  })
+  .strict();
+const replayPathInputSchema = z
+  .object({
+    action: z.literal("run").describe("Execute edited content with replay from a source run."),
+    scriptPath: scriptPathSchema,
+    ...executionOptionsShape,
+    ...editedReplayShape,
+  })
+  .strict();
+const runInputSchema = z.xor([
+  runInlineInputSchema,
+  runPathInputSchema,
+  replayInlineInputSchema,
+  replayPathInputSchema,
+]);
+
+const resumeInputSchema = z
+  .object({
+    action: z.literal("resume").describe("Create a new run from a source's stored script and args."),
+    runId: runIdSchema,
+    args: argsSchema.optional(),
+    maxAgents: maxAgentsSchema.optional(),
+    concurrency: concurrencySchema.optional(),
+    agentRetries: agentRetriesSchema.optional(),
+    resumePolicy: resumePolicySchema.optional(),
+    checkpointReplies: checkpointRepliesSchema.optional(),
+    background: backgroundSchema.optional(),
+  })
+  .strict();
+
+const inspectionShape = {
+  runId: runIdSchema,
+  lastN: lastNSchema.optional(),
+  labelGlob: labelGlobSchema.optional(),
+  logLines: logLinesSchema.optional(),
+} as const;
+
+const statusInputSchema = z
+  .object({
+    action: z.literal("status").describe("Read status immediately or wait for a milestone."),
+    ...inspectionShape,
+    waitMs: waitMsSchema.optional(),
+  })
+  .strict();
+
+const resultInputSchema = z
+  .object({
+    action: z.literal("result").describe("Page the exact JSON result of a completed run."),
+    runId: runIdSchema,
+    offset: offsetSchema.optional(),
+    maxBytes: maxBytesSchema.optional(),
+  })
+  .strict();
+
+const permissionResponseInputSchema = z
+  .object({
+    action: z.literal("permissions-response").describe("Resolve one pending ACP permission."),
+    runId: runIdSchema,
+    permissionId: permissionIdSchema,
+    response: permissionResponseSchema,
+  })
+  .strict();
+
+const wholeRunStopInputSchema = z
+  .object({
+    action: z.literal("stop").describe("Abort a run through its execution owner."),
+    ...inspectionShape,
+    forceOwner: forceOwnerSchema.optional(),
+  })
+  .strict();
+const callStopInputSchema = z
+  .object({
+    action: z.literal("stop").describe("Cancel one in-flight agent while keeping the run live."),
+    ...inspectionShape,
+    callIndex: callIndexSchema,
+  })
+  .strict();
+const stopInputSchema = z.xor([wholeRunStopInputSchema, callStopInputSchema]);
+
+/** The seven canonical action branches; run and stop contain structural sub-variants. */
+export const workflowToolInputBranches = {
+  config: configInputSchema,
+  run: runInputSchema,
+  resume: resumeInputSchema,
+  status: statusInputSchema,
+  result: resultInputSchema,
+  "permissions-response": permissionResponseInputSchema,
+  stop: stopInputSchema,
+} as const;
+
+export const workflowToolCanonicalInputSchema = z.xor([
+  workflowToolInputBranches.config,
+  workflowToolInputBranches.run,
+  workflowToolInputBranches.resume,
+  workflowToolInputBranches.status,
+  workflowToolInputBranches.result,
+  workflowToolInputBranches["permissions-response"],
+  workflowToolInputBranches.stop,
+]).meta({ type: "object" });
+
+function normalizeCompatibilityInput(value: unknown): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  const raw = value as Record<string, unknown>;
+  if (raw.action === "inspect") {
+    // inspect never accepted a request wait. Leaving the alias untouched makes the canonical
+    // schema reject this invalid hybrid instead of silently changing its meaning.
+    if (raw.waitMs !== undefined) return value;
+    return { ...raw, action: "status", waitMs: 0 };
+  }
+  if (raw.action === "await") {
+    return { ...raw, action: "status", waitMs: raw.waitMs ?? 20_000 };
+  }
+  if (raw.action === undefined) {
+    return { ...raw, action: "run" };
+  }
+  return value;
+}
+
+/**
+ * Runtime wire schema. Discovery publishes only the canonical oneOf, while the preprocess keeps
+ * pre-status inspect/await and omitted-action run clients working during their migration window.
+ */
+export const workflowToolInputSchema = z.preprocess(
+  normalizeCompatibilityInput,
+  workflowToolCanonicalInputSchema,
+);
+
 interface WorkflowExecuteToolInputBase {
-  action?: "run";
+  action: "run";
   /** Absolute project directory selecting the run store and default execution cwd. */
   projectDir?: string;
   args?: unknown;
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
-  resumeFromRunId?: string;
-  resumePolicy?: "auto" | "positional";
-  checkpointReplies?: Record<number, unknown>;
   /** Default false. True acknowledges after admission and executes in this server process. */
   background?: boolean;
-  runId?: never;
-  permissionId?: never;
-  response?: never;
-  callIndex?: never;
-  forceOwner?: never;
-  waitMs?: never;
-  lastN?: never;
-  labelGlob?: never;
-  logLines?: never;
-  offset?: never;
-  maxBytes?: never;
 }
 
+type WorkflowExplicitContent =
+  | { script: string; scriptPath?: never }
+  | { script?: never; scriptPath: string };
+
 export type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase &
+  WorkflowExplicitContent &
   (
-    | { script: string; scriptPath?: never }
-    | { script?: never; scriptPath: string }
+    | { resumeFromRunId?: never; resumePolicy?: never; checkpointReplies?: never }
+    | {
+        resumeFromRunId: string;
+        resumePolicy?: "auto" | "positional";
+        checkpointReplies?: Record<number, unknown>;
+      }
   );
+
+/** Simple stored-content replay that creates and durably links a fresh target run. */
+export interface WorkflowResumeToolInput {
+  action: "resume";
+  /** Persisted source run whose immutable script and, by default, strict-JSON args are reused. */
+  runId: string;
+  args?: unknown;
+  maxAgents?: number;
+  concurrency?: number;
+  agentRetries?: number;
+  resumePolicy?: "auto" | "positional";
+  checkpointReplies?: Record<number, unknown>;
+  background?: boolean;
+}
 
 export interface WorkflowConfigToolInput {
   action: "config";
-  /** Absolute project cwd used for project-sensitive backend discovery. */
   projectDir?: string;
   harnesses?: string[];
   modelSpecs?: string[];
   modelFilter?: string;
-  probeTimeoutMs?: number;
-  script?: never;
-  scriptPath?: never;
-  runId?: never;
-  permissionId?: never;
-  response?: never;
-  forceOwner?: never;
-  offset?: never;
-  maxBytes?: never;
 }
 
-export interface WorkflowInspectToolInput extends WorkflowRunInspectionOptions {
-  action: "inspect";
+export interface WorkflowStatusToolInput extends WorkflowRunInspectionOptions {
+  action: "status";
   runId: string;
-  callIndex?: never;
-  forceOwner?: never;
-  script?: never;
-  scriptPath?: never;
-  projectDir?: never;
-  background?: never;
-  waitMs?: never;
-  resumeFromRunId?: never;
-  resumePolicy?: never;
-  checkpointReplies?: never;
-  offset?: never;
-  maxBytes?: never;
-}
-
-export interface WorkflowAwaitToolInput extends WorkflowRunInspectionOptions {
-  action: "await";
-  runId: string;
-  callIndex?: never;
-  forceOwner?: never;
-  /** Default 20_000; integer range 0..25_000. Zero is a non-blocking status read. */
+  /** Omit or use zero for an immediate observation; positive values wait at most this long. */
   waitMs?: number;
-  script?: never;
-  scriptPath?: never;
-  projectDir?: never;
-  background?: never;
-  resumeFromRunId?: never;
-  resumePolicy?: never;
-  checkpointReplies?: never;
-  offset?: never;
-  maxBytes?: never;
 }
+
+/** @deprecated Runtime migration input only. Use WorkflowStatusToolInput with omitted waitMs. */
+export type WorkflowInspectToolInput = Omit<WorkflowStatusToolInput, "action" | "waitMs"> & {
+  action: "inspect";
+  waitMs?: never;
+};
+
+/** @deprecated Runtime migration input only. Use WorkflowStatusToolInput with a positive waitMs. */
+export type WorkflowAwaitToolInput = Omit<WorkflowStatusToolInput, "action"> & {
+  action: "await";
+  waitMs?: number;
+};
 
 export interface WorkflowResultToolInput {
   action: "result";
   runId: string;
-  /** UTF-8 byte offset; use the previous page's endOffset. */
   offset?: number;
-  /** Bounded chunk size, 4..16,384 bytes. */
   maxBytes?: number;
-  script?: never;
-  scriptPath?: never;
-  projectDir?: never;
-  background?: never;
-  waitMs?: never;
-  callIndex?: never;
-  forceOwner?: never;
-  resumeFromRunId?: never;
-  resumePolicy?: never;
-  checkpointReplies?: never;
-  lastN?: never;
-  labelGlob?: never;
-  logLines?: never;
-  permissionId?: never;
-  response?: never;
 }
 
 export interface WorkflowPermissionResponseToolInput {
@@ -321,322 +428,93 @@ export interface WorkflowPermissionResponseToolInput {
   runId: string;
   permissionId: string;
   response: z.infer<typeof permissionResponseSchema>;
-  script?: never;
-  scriptPath?: never;
-  projectDir?: never;
-  background?: never;
-  waitMs?: never;
-  callIndex?: never;
-  forceOwner?: never;
-  resumeFromRunId?: never;
-  resumePolicy?: never;
-  checkpointReplies?: never;
-  lastN?: never;
-  labelGlob?: never;
-  logLines?: never;
-  offset?: never;
-  maxBytes?: never;
 }
 
-export interface WorkflowStopToolInput extends WorkflowRunInspectionOptions {
+type WorkflowStopToolInputBase = WorkflowRunInspectionOptions & {
   action: "stop";
   runId: string;
-  /** Omitted for whole-run stop; present to cancel exactly one in-flight agent call. */
-  callIndex?: number;
-  /** Explicitly authorize terminating a superseded owner daemon. Forbidden with callIndex. */
-  forceOwner?: boolean;
-  script?: never;
-  scriptPath?: never;
-  projectDir?: never;
-  background?: never;
-  waitMs?: never;
-  resumeFromRunId?: never;
-  resumePolicy?: never;
-  checkpointReplies?: never;
-  offset?: never;
-  maxBytes?: never;
-}
+};
+
+export type WorkflowStopToolInput = WorkflowStopToolInputBase &
+  ({ callIndex: number; forceOwner?: never } | { callIndex?: never; forceOwner?: boolean });
 
 export type WorkflowToolInput =
-  | WorkflowExecuteToolInput
   | WorkflowConfigToolInput
-  | WorkflowInspectToolInput
-  | WorkflowAwaitToolInput
+  | WorkflowExecuteToolInput
+  | WorkflowResumeToolInput
+  | WorkflowStatusToolInput
   | WorkflowResultToolInput
-  | WorkflowStopToolInput
-  | WorkflowPermissionResponseToolInput;
+  | WorkflowPermissionResponseToolInput
+  | WorkflowStopToolInput;
 
-interface RawWorkflowToolInput {
-  action?: "run" | "config" | "inspect" | "await" | "result" | "stop" | "permissions-response";
-  script?: string;
-  scriptPath?: string;
-  projectDir?: string;
-  harnesses?: string[];
-  modelSpecs?: string[];
-  modelFilter?: string;
-  probeTimeoutMs?: number;
-  args?: unknown;
-  maxAgents?: number;
-  concurrency?: number;
-  agentRetries?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
-  resumeFromRunId?: string;
-  resumePolicy?: "auto" | "positional";
-  checkpointReplies?: Record<string, unknown>;
-  background?: boolean;
-  runId?: string;
-  permissionId?: string;
-  response?: z.infer<typeof permissionResponseSchema>;
-  callIndex?: number;
-  forceOwner?: boolean;
-  lastN?: number;
-  labelGlob?: string;
-  logLines?: number;
-  waitMs?: number;
-  offset?: number;
-  maxBytes?: number;
-}
-
-function hasConfigFields(raw: RawWorkflowToolInput): boolean {
-  return raw.harnesses !== undefined || raw.modelSpecs !== undefined || raw.modelFilter !== undefined || raw.probeTimeoutMs !== undefined;
-}
-
-function hasPermissionFields(raw: RawWorkflowToolInput): boolean {
-  return raw.permissionId !== undefined || raw.response !== undefined;
-}
-
-function hasResultFields(raw: RawWorkflowToolInput): boolean {
-  return raw.offset !== undefined || raw.maxBytes !== undefined;
-}
-
-function hasExecutionFields(raw: RawWorkflowToolInput): boolean {
-  return (
-    raw.script !== undefined ||
-    raw.scriptPath !== undefined ||
-    raw.projectDir !== undefined ||
-    raw.args !== undefined ||
-    raw.maxAgents !== undefined ||
-    raw.concurrency !== undefined ||
-    raw.agentRetries !== undefined ||
-    raw.agentTimeoutMs !== undefined ||
-    raw.agentIdleTimeoutMs !== undefined ||
-    raw.resumeFromRunId !== undefined ||
-    raw.resumePolicy !== undefined ||
-    raw.checkpointReplies !== undefined ||
-    raw.background !== undefined
-  );
+export interface ParseWorkflowToolInputOptions {
+  /** Require projectDir for config/run on the shared multi-project daemon. */
+  requireProjectDir?: boolean;
 }
 
 function invalid(message: string): never {
   throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Invalid workflow tool input: ${message}`);
 }
 
-export interface ParseWorkflowToolInputOptions {
-  /**
-   * Enforce projectDir on run inputs. The shared workflow daemon serves every project from
-   * one process and has no ambient cwd, so a run must name its project; a single-project
-   * (in-process) server leaves this off and defaults to its own project.
-   */
-  requireProjectDir?: boolean;
+function checkpointReplies(
+  value: Record<string, unknown> | undefined,
+): Record<number, unknown> | undefined {
+  return value === undefined
+    ? undefined
+    : Object.fromEntries(Object.entries(value).map(([callIndex, reply]) => [Number(callIndex), reply]));
 }
 
-/** Apply the action discriminator after the MCP SDK has validated primitive fields. */
+/** Normalize compatibility input, validate one canonical branch, and apply runtime defaults. */
 export function parseWorkflowToolInput(
-  raw: RawWorkflowToolInput,
+  supplied: unknown,
   options: ParseWorkflowToolInputOptions = {},
 ): WorkflowToolInput {
-  if (raw.action === "config") {
-    if (
-      raw.script !== undefined ||
-      raw.scriptPath !== undefined ||
-      raw.args !== undefined ||
-      raw.maxAgents !== undefined ||
-      raw.concurrency !== undefined ||
-      raw.agentRetries !== undefined ||
-      raw.agentTimeoutMs !== undefined ||
-      raw.agentIdleTimeoutMs !== undefined ||
-      raw.resumeFromRunId !== undefined ||
-      raw.resumePolicy !== undefined ||
-      raw.checkpointReplies !== undefined ||
-      raw.background !== undefined ||
-      raw.runId !== undefined ||
-      hasPermissionFields(raw) ||
-      raw.callIndex !== undefined ||
-      raw.forceOwner !== undefined ||
-      raw.waitMs !== undefined ||
-      raw.lastN !== undefined ||
-      raw.labelGlob !== undefined ||
-      raw.logLines !== undefined ||
-      hasResultFields(raw)
-    ) {
-      invalid('action="config" accepts only projectDir, harnesses, modelSpecs, modelFilter, and probeTimeoutMs');
-    }
-    if (options.requireProjectDir === true && raw.projectDir === undefined) {
-      invalid(
-        "config requires projectDir (the absolute project directory) on this server so project-sensitive backend options are discovered in the correct cwd",
-      );
-    }
-    return {
-      action: "config",
-      projectDir: raw.projectDir,
-      harnesses: raw.harnesses,
-      modelSpecs: raw.modelSpecs,
-      modelFilter: raw.modelFilter,
-      probeTimeoutMs: raw.probeTimeoutMs,
-    };
+  const parsed = workflowToolInputSchema.safeParse(supplied);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    invalid(first === undefined ? "input does not match a workflow action" : first.message);
   }
-
-  if (raw.action === "result") {
-    if (!raw.runId) invalid('action="result" requires runId');
-    if (
-      hasExecutionFields(raw) ||
-      hasConfigFields(raw) ||
-      hasPermissionFields(raw) ||
-      raw.waitMs !== undefined ||
-      raw.callIndex !== undefined ||
-      raw.forceOwner !== undefined ||
-      raw.lastN !== undefined ||
-      raw.labelGlob !== undefined ||
-      raw.logLines !== undefined
-    ) {
-      invalid('action="result" accepts only runId, offset, and maxBytes');
-    }
-    return {
-      action: "result",
-      runId: raw.runId,
-      offset: raw.offset ?? 0,
-      maxBytes: raw.maxBytes ?? WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT,
-    };
-  }
-
-  if (raw.action === "permissions-response") {
-    if (!raw.runId) invalid('action="permissions-response" requires runId');
-    if (!raw.permissionId || raw.response === undefined) {
-      invalid('action="permissions-response" requires permissionId and response');
-    }
-    if (
-      hasExecutionFields(raw) ||
-      hasConfigFields(raw) ||
-      raw.waitMs !== undefined ||
-      raw.callIndex !== undefined ||
-      raw.forceOwner !== undefined ||
-      raw.lastN !== undefined ||
-      raw.labelGlob !== undefined ||
-      raw.logLines !== undefined ||
-      hasResultFields(raw)
-    ) {
-      invalid('action="permissions-response" accepts only runId, permissionId, and response');
-    }
-    return {
-      action: "permissions-response",
-      runId: raw.runId,
-      permissionId: raw.permissionId,
-      response: raw.response,
-    };
-  }
-
-  if (raw.action === "inspect") {
-    if (!raw.runId) invalid('action="inspect" requires runId');
-    if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || hasResultFields(raw) || raw.waitMs !== undefined || raw.callIndex !== undefined || raw.forceOwner !== undefined) {
-      invalid('action="inspect" cannot include execution fields');
-    }
-    return {
-      action: "inspect",
-      runId: raw.runId,
-      lastN: raw.lastN,
-      labelGlob: raw.labelGlob,
-      logLines: raw.logLines,
-    };
-  }
-
-  if (raw.action === "await") {
-    if (!raw.runId) invalid('action="await" requires runId');
-    if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || hasResultFields(raw) || raw.callIndex !== undefined || raw.forceOwner !== undefined) {
-      invalid('action="await" cannot include execution fields');
-    }
-    return {
-      action: "await",
-      runId: raw.runId,
-      waitMs: raw.waitMs ?? 20_000,
-      lastN: raw.lastN,
-      labelGlob: raw.labelGlob,
-      logLines: raw.logLines,
-    };
-  }
-
-  if (raw.action === "stop") {
-    if (!raw.runId) invalid('action="stop" requires runId');
-    if (hasExecutionFields(raw) || hasConfigFields(raw) || hasPermissionFields(raw) || hasResultFields(raw) || raw.waitMs !== undefined) {
-      invalid('action="stop" cannot include execution fields or waitMs');
-    }
-    if (raw.callIndex !== undefined && raw.forceOwner !== undefined) {
-      invalid('action="stop" forceOwner is forbidden with callIndex');
-    }
-    return {
-      action: "stop",
-      runId: raw.runId,
-      callIndex: raw.callIndex,
-      ...(raw.forceOwner === undefined ? {} : { forceOwner: raw.forceOwner }),
-      lastN: raw.lastN,
-      labelGlob: raw.labelGlob,
-      logLines: raw.logLines,
-    };
-  }
-
+  const input = parsed.data;
   if (
-    raw.runId !== undefined ||
-    hasPermissionFields(raw) ||
-    raw.callIndex !== undefined ||
-    raw.forceOwner !== undefined ||
-    raw.waitMs !== undefined ||
-    raw.lastN !== undefined ||
-    raw.labelGlob !== undefined ||
-    raw.logLines !== undefined ||
-    hasConfigFields(raw) ||
-    hasResultFields(raw)
+    (input.action === "config" || input.action === "run") &&
+    options.requireProjectDir &&
+    input.projectDir === undefined
   ) {
-    invalid("run inputs cannot include inspection fields");
+    invalid(`${input.action} requires projectDir (the absolute project directory) on this shared workflow daemon`);
   }
-  const hasScript = raw.script !== undefined;
-  const hasScriptPath = raw.scriptPath !== undefined;
-  if (hasScript === hasScriptPath) invalid("exactly one of script or scriptPath is required");
-  if (options.requireProjectDir === true && raw.projectDir === undefined) {
-    invalid(
-      "run requires projectDir (the absolute project directory) on this server — it selects the project-scoped run store and default execution cwd",
-    );
-  }
-  if (raw.resumePolicy !== undefined && raw.resumeFromRunId === undefined) {
-    invalid("resumePolicy requires resumeFromRunId");
-  }
-  if (raw.checkpointReplies !== undefined && raw.resumeFromRunId === undefined) {
-    invalid("checkpointReplies requires resumeFromRunId");
-  }
-  const common = {
-    action: raw.action,
-    projectDir: raw.projectDir,
-    args: raw.args,
-    maxAgents: raw.maxAgents,
-    concurrency: raw.concurrency,
-    agentRetries: raw.agentRetries,
-    agentTimeoutMs: raw.agentTimeoutMs,
-    agentIdleTimeoutMs: raw.agentIdleTimeoutMs,
-    resumeFromRunId: raw.resumeFromRunId,
-    resumePolicy: raw.resumePolicy,
-    checkpointReplies: raw.checkpointReplies === undefined
-      ? undefined
-      : Object.fromEntries(
-          Object.entries(raw.checkpointReplies).map(([callIndex, reply]) => [Number(callIndex), reply]),
+  switch (input.action) {
+    case "config":
+      return input;
+    case "run":
+      return {
+        ...input,
+        checkpointReplies: checkpointReplies(
+          "checkpointReplies" in input ? input.checkpointReplies : undefined,
         ),
-    background: raw.background ?? false,
-  };
-  return hasScript
-    ? { ...common, script: raw.script as string }
-    : { ...common, scriptPath: raw.scriptPath as string };
+        background: input.background ?? false,
+      } as WorkflowExecuteToolInput;
+    case "resume":
+      return {
+        ...input,
+        checkpointReplies: checkpointReplies(input.checkpointReplies),
+        background: input.background ?? false,
+      };
+    case "status":
+      return { ...input, waitMs: input.waitMs ?? 0 };
+    case "result":
+      return {
+        ...input,
+        offset: input.offset ?? 0,
+        maxBytes: input.maxBytes ?? WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT,
+      };
+    case "permissions-response":
+    case "stop":
+      return input;
+  }
 }
 
-/** Clamp only execution resource knobs; inspection values are rejected rather than clamped. */
-export function clampWorkflowInput(input: WorkflowExecuteToolInput): WorkflowExecuteToolInput {
+/** Clamp only execution resource knobs; status values are rejected rather than clamped. */
+export function clampWorkflowInput<T extends WorkflowExecuteToolInput | WorkflowResumeToolInput>(input: T): T {
   const clampInt = (value: number | undefined, minimum: number, maximum: number) =>
     value === undefined || !Number.isFinite(value)
       ? undefined
@@ -649,5 +527,5 @@ export function clampWorkflowInput(input: WorkflowExecuteToolInput): WorkflowExe
       input.maxAgents === undefined || !Number.isFinite(input.maxAgents)
         ? undefined
         : Math.max(1, Math.floor(input.maxAgents)),
-  };
+  } as T;
 }

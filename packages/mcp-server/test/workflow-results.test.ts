@@ -48,7 +48,7 @@ async function waitUntil(predicate: () => boolean, message: string): Promise<voi
   assert.fail(message);
 }
 
-test("completed foreground, inspect, and await expose a distinct durable result resource to content-first clients", async () => {
+test("completed foreground and status expose a distinct durable result resource to content-first clients", async () => {
   const authored = { marker: "EXACT-WORKFLOW-RESULT", nested: { answer: 42 } };
   const serialized = JSON.stringify(authored);
   const script = [
@@ -61,25 +61,30 @@ test("completed foreground, inspect, and await expose a distinct durable result 
     const runId = String(structured(completed)?.runId);
     const scriptUri = `workflow://runs/${runId}/script`;
     const resultUri = `workflow://runs/${runId}/result`;
+    const eventsUri = `workflow://runs/${runId}/events`;
 
     assert.equal(structured(completed)?.resultUri, resultUri);
+    assert.equal(structured(completed)?.eventsUri, eventsUri);
     assert.match(allText(completed), /Workflow result \(exact JSON\):/);
     assert.ok(allText(completed).includes(serialized), "content-only clients receive the small exact JSON result");
-    assert.deepEqual(links(completed).map((link) => link.uri), [resultUri, scriptUri]);
+    assert.deepEqual(links(completed).map((link) => link.uri), [resultUri, scriptUri, eventsUri]);
     assert.match(String(links(completed)[0]?.name), /result/);
     assert.match(String(links(completed)[1]?.name), /script/);
+    assert.match(String(links(completed)[2]?.name), /events/);
+    assert.match(String(links(completed)[2]?.description), /event stream/);
     assert.equal(resourceText(await client.readResource({ uri: resultUri })), serialized);
 
     const inspected = await client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(inspected)?.resultUri, resultUri);
-    assert.deepEqual(links(inspected).map((link) => link.uri), [resultUri, scriptUri]);
+    assert.equal(structured(inspected)?.eventsUri, eventsUri);
+    assert.deepEqual(links(inspected).map((link) => link.uri), [resultUri, scriptUri, eventsUri]);
 
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 0 },
+      arguments: { action: "status", runId, waitMs: 0 },
     });
     assert.equal(structured(awaited)?.resultUri, resultUri);
     assert.equal(
@@ -87,7 +92,7 @@ test("completed foreground, inspect, and await expose a distinct durable result 
       resultUri,
     );
     assert.ok(allText(awaited).includes(serialized));
-    assert.deepEqual(links(awaited).map((link) => link.uri), [resultUri, scriptUri]);
+    assert.deepEqual(links(awaited).map((link) => link.uri), [resultUri, scriptUri, eventsUri]);
 
     const events = resourceText(
       await client.readResource({ uri: `workflow://runs/${runId}/events` }),
@@ -168,6 +173,7 @@ test("large exact results stay out of summary text and page losslessly on UTF-8 
     });
     const runId = String(structured(completed)?.runId);
     const resultUri = `workflow://runs/${runId}/result`;
+    const eventsUri = `workflow://runs/${runId}/events`;
     const visible = allText(completed);
     assert.equal(visible.includes(serialized.slice(0, 1_000)), false);
     assert.match(visible, /Exact workflow result: \d+ UTF-8 bytes/);
@@ -186,6 +192,8 @@ test("large exact results stay out of summary text and page losslessly on UTF-8 
       const page = structured(response)!;
       assert.equal(page.action, "result");
       assert.equal(page.resultUri, resultUri);
+      assert.equal(page.eventsUri, eventsUri);
+      assert.equal(links(response).some((link) => link.uri === eventsUri), true);
       assert.equal(page.offset, offset);
       assert.ok(Buffer.byteLength(String(page.chunk), "utf8") <= 16_384);
       assert.deepEqual(JSON.parse(allText(response)), page, "content mirrors the bounded structured page");
@@ -302,7 +310,7 @@ test("exact result retrieval survives restart and fails closed for every unavail
     const runId = String(structured(accepted)?.runId);
     const terminal = await paused.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 1_000 },
+      arguments: { action: "status", runId, waitMs: 1_000 },
     });
     assert.equal(structured(terminal)?.status, "paused");
     const unavailable = await paused.client.callTool({

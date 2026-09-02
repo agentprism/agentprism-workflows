@@ -4,6 +4,10 @@
 
 **Feedback:** issue #131, section 2
 
+> **Current MCP migration:** this historical design introduced separate `inspect` and `await`
+> actions. The implemented model-facing contract now consolidates both under `action:"status"`
+> with optional `waitMs`; see [`workflow-status-action.md`](../workflow-status-action.md).
+
 ## 1. Problem
 
 The MCP `workflow` tool currently keeps one `tools/call` open until the workflow reaches a terminal
@@ -146,8 +150,6 @@ export interface WorkflowExecuteToolInput {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
-  tokenBudget?: number | null;
   resumeFromRunId?: string;
   checkpointReplies?: Record<number, unknown>;
   /** Default false. True acknowledges after admission and executes in this server process. */
@@ -221,8 +223,7 @@ A valid background request is:
   "script": "export const meta = { name: 'review', description: 'review a change' };\nconst report = await agent('Review ' + args.target, { label: 'review' });\nreturn report;",
   "args": { "target": "src/auth.ts" },
   "background": true,
-  "concurrency": 4,
-  "tokenBudget": 200000
+  "concurrency": 4
 }
 ```
 
@@ -314,7 +315,7 @@ three ways:
   semantics.
 
 Every other execution option is identical to foreground, including `maxAgents`, per-run agent
-`concurrency`, retries, timeout, token budget, approved script backends, and checkpoint reply
+`concurrency`, retries, approved script backends, and checkpoint reply
 injection used during resume.
 
 When `background: true` and `resumeFromRunId` are supplied together, the MCP adapter continues its

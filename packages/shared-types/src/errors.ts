@@ -11,9 +11,6 @@
 // class + guards). Provider adapters classify their own structured error surfaces before
 // constructing this shared error; no provider prose classifier lives at the seam.
 export enum WorkflowErrorCode {
-  AGENT_TIMEOUT = "AGENT_TIMEOUT",
-  /** An opt-in per-attempt watchdog observed no backend activity before its idle deadline. */
-  AGENT_IDLE_TIMEOUT = "AGENT_IDLE_TIMEOUT",
   /** A host cancelled one in-flight agent call without aborting the owning workflow run. */
   AGENT_CANCELLED = "AGENT_CANCELLED",
   WORKFLOW_ABORTED = "WORKFLOW_ABORTED",

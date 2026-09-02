@@ -51,7 +51,6 @@ function call(index = 0): WorkflowCallRecord {
     label: `agent-${index}`,
     backendId: "test-backend",
     resolvedCwd: "/workspace",
-    budgetDebit: 0,
     settlementOrdinal: index + 1,
     scope: runId,
   };

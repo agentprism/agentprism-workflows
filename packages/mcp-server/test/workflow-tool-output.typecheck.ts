@@ -1,13 +1,18 @@
-import type { WorkflowReplayEligibility, WorkflowRunStatus } from "@automatalabs/workflows";
+import type {
+  WorkflowCallRecord,
+  WorkflowReplayEligibility,
+  WorkflowResumeCallDecision,
+  WorkflowRunLimits,
+  WorkflowRunStatus,
+} from "@automatalabs/workflows";
 
 import type {
   WorkflowBackgroundAccepted,
   WorkflowExecutionToolResult,
-  WorkflowInspectionToolResult,
   WorkflowResultRetrieval,
-  WorkflowRunAwaitResult,
   WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
+  WorkflowStatusToolResult,
   WorkflowStopPendingResult,
   WorkflowStopResult,
 } from "../src/workflow-tool-output.js";
@@ -16,11 +21,8 @@ declare const status: WorkflowRunStatus;
 const lineage: WorkflowScriptLineageEntry[] = [];
 const limits = {
   maxAgents: 1_000,
-  tokenBudget: null,
   concurrency: 6,
   agentRetries: 0,
-  agentTimeoutMs: null,
-  agentIdleTimeoutMs: null,
 };
 const replayEligibility: WorkflowReplayEligibility = {
   strategy: "identity-v1",
@@ -43,6 +45,7 @@ const execution: WorkflowExecutionToolResult = {
   scriptSource: "inline",
   scriptUri: "workflow://runs/aa-bb/script",
   resultUri: "workflow://runs/aa-bb/result",
+  eventsUri: "workflow://runs/aa-bb/events",
   limits,
   replayEligibility,
 };
@@ -62,28 +65,30 @@ const resultRetrieval: WorkflowResultRetrieval = {
 const background: WorkflowBackgroundAccepted = {
   runId: "aa-bb",
   status: "running",
-  scriptSource: "path",
+  scriptSource: "stored",
   scriptUri: "workflow://runs/aa-bb/script",
+  eventsUri: "workflow://runs/aa-bb/events",
   limits,
   replayEligibility,
 };
-const inspection: WorkflowInspectionToolResult = {
+const statusFields = {
   ...status,
   scriptUri: "workflow://runs/aa-bb/script",
+  eventsUri: "workflow://runs/aa-bb/events",
   lineage,
 };
-const awaited: WorkflowRunAwaitResult = {
-  ...inspection,
+const observed: WorkflowStatusToolResult = {
+  ...statusFields,
   wait: { requestedMs: 0, elapsedMs: 0, returnedBecause: "immediate" },
 };
 const stopped: WorkflowStopResult = {
-  ...inspection,
+  ...statusFields,
   status: "aborted",
   stopped: true,
   alreadyTerminal: false,
 };
 const pendingStop: WorkflowStopPendingResult = {
-  ...inspection,
+  ...statusFields,
   status: "running",
   stopped: false,
   alreadyTerminal: false,
@@ -98,6 +103,32 @@ const resourceFields: WorkflowScriptResourceFields = {
   scriptUri: "workflow://runs/aa-bb/script",
   resultUri: "workflow://runs/aa-bb/result",
   lineage,
+};
+const removedBudgetLimit: WorkflowRunLimits = {
+  maxAgents: 1,
+  concurrency: 1,
+  agentRetries: 0,
+  // @ts-expect-error token budgets are not part of current run limits
+  tokenBudget: null,
+};
+const removedCallDebit: WorkflowCallRecord = {
+  index: 0,
+  kind: "agent",
+  hash: "hash",
+  outcome: "result",
+  origin: "runner",
+  // @ts-expect-error debit metadata is not part of current call records
+  budgetDebit: 0,
+};
+const removedLogicalDebit: WorkflowResumeCallDecision = {
+  index: 0,
+  kind: "agent",
+  action: "replayed",
+  sourceRunId: "source",
+  recordedIndex: 0,
+  match: "index-hash",
+  // @ts-expect-error replay reports do not expose logical debit metadata
+  logicalBudgetDebit: 0,
 };
 
 // @ts-expect-error result retrieval requires the exact chunk
@@ -118,6 +149,7 @@ const executionWithoutSource: WorkflowExecutionToolResult = {
   runId: "aa-bb",
   status: "completed",
   scriptUri: "workflow://runs/aa-bb/script",
+  eventsUri: "workflow://runs/aa-bb/events",
 };
 // @ts-expect-error execution results require resolved limits
 const executionWithoutLimits: WorkflowExecutionToolResult = {
@@ -125,21 +157,32 @@ const executionWithoutLimits: WorkflowExecutionToolResult = {
   status: "completed",
   scriptSource: "inline",
   scriptUri: "workflow://runs/aa-bb/script",
+  eventsUri: "workflow://runs/aa-bb/events",
 };
 // @ts-expect-error background acknowledgements require scriptUri
 const backgroundWithoutUri: WorkflowBackgroundAccepted = {
   runId: "aa-bb",
   status: "running",
   scriptSource: "inline",
+  eventsUri: "workflow://runs/aa-bb/events",
   limits,
 };
-// @ts-expect-error inspections require the complete lineage
-const inspectionWithoutLineage: WorkflowInspectionToolResult = {
+// @ts-expect-error current execution results require durable events discovery
+const executionWithoutEvents: WorkflowExecutionToolResult = {
+  runId: "aa-bb",
+  status: "completed",
+  scriptSource: "inline",
+  scriptUri: "workflow://runs/aa-bb/script",
+  limits,
+};
+// @ts-expect-error status results require the complete lineage
+const statusWithoutLineage: WorkflowStatusToolResult = {
   ...status,
   scriptUri: "workflow://runs/aa-bb/script",
+  wait: { requestedMs: 0, elapsedMs: 0, returnedBecause: "immediate" },
 };
-// @ts-expect-error await results require scriptUri
-const awaitWithoutUri: WorkflowRunAwaitResult = {
+// @ts-expect-error status results require scriptUri
+const statusWithoutUri: WorkflowStatusToolResult = {
   ...status,
   lineage,
   wait: { requestedMs: 0, elapsedMs: 0, returnedBecause: "immediate" },
@@ -162,16 +205,19 @@ void [
   resultRetrieval,
   resultRetrievalWithoutChunk,
   background,
-  inspection,
-  awaited,
+  observed,
   stopped,
   pendingStop,
   resourceFields,
+  removedBudgetLimit,
+  removedCallDebit,
+  removedLogicalDebit,
   executionWithoutSource,
   executionWithoutLimits,
+  executionWithoutEvents,
   backgroundWithoutUri,
-  inspectionWithoutLineage,
-  awaitWithoutUri,
+  statusWithoutLineage,
+  statusWithoutUri,
   stopWithoutTerminalAck,
   fieldsWithoutLineage,
 ];

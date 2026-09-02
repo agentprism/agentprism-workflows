@@ -103,7 +103,6 @@ describe("WorkflowError", () => {
     assert.equal(WorkflowErrorCode.REPLAY_TARGET_INVALID, "REPLAY_TARGET_INVALID");
     assert.equal(WorkflowErrorCode.REPLAY_DIVERGENCE, "REPLAY_DIVERGENCE");
     assert.equal(WorkflowErrorCode.AGENT_CANCELLED, "AGENT_CANCELLED");
-    assert.equal(WorkflowErrorCode.AGENT_IDLE_TIMEOUT, "AGENT_IDLE_TIMEOUT");
   });
 
   it("types each strict-JSON recorded-error projection form", () => {

@@ -281,9 +281,6 @@ export interface WorkflowCallReplayProvenance {
   sourceRunId: string;
   recordedIndex: number;
   match: WorkflowResumeMatch;
-  /** Preserved source cost. Applied to script-visible spent only by identity-v1;
-   *  absent for checkpoints and legacy rows without a source manifest. */
-  logicalBudgetDebit?: number;
   /** Agents only: legacy source-world classification retained as diagnostic
    *  provenance. It never determines whether a call is replayable. */
   sourceResumeSafety?: WorkflowResumeSafety;
@@ -302,7 +299,6 @@ export type WorkflowResumeCallDecision =
       recordedIndex: number;
       match: WorkflowResumeMatch;
       reason?: never;
-      logicalBudgetDebit?: number;
       checkpointInjected?: true;
     }
   | {
@@ -316,7 +312,6 @@ export type WorkflowResumeCallDecision =
       sourceRunId?: never;
       recordedIndex?: never;
       match?: never;
-      logicalBudgetDebit?: never;
       checkpointInjected?: never;
     }
   | {
@@ -327,7 +322,6 @@ export type WorkflowResumeCallDecision =
       sourceRunId?: never;
       recordedIndex?: never;
       match?: never;
-      logicalBudgetDebit?: never;
       checkpointInjected?: never;
     };
 
@@ -366,8 +360,6 @@ export type WorkflowResumeReport = WorkflowResumeReportBase &
   );
 
 export type WorkflowReplayOperationalOption =
-  | "agentTimeoutMs"
-  | "agentIdleTimeoutMs"
   | "agentRetries"
   | "concurrency";
 
@@ -500,9 +492,6 @@ export interface WorkflowCallRecord {
   isolation?: "worktree";
   /** The post-resolution execution directory handed to the runner. */
   resolvedCwd?: string;
-  /** What this logical call added to the run's script-visible spent value. Zero on
-   *  journal-replayed rows; absent on checkpoint rows. */
-  budgetDebit?: number;
   /** Legacy source-world classification retained for diagnostics and old journal
    *  compatibility. Replay eligibility is based on recorded call correspondence,
    *  not this marker. */
@@ -544,10 +533,6 @@ export interface WorkflowRunCallStatus {
   phase?: string;
   model?: string;
   backendId?: string;
-  /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
-  timeoutMs?: number | null;
-  /** Resolved no-backend-activity deadline for each attempt; null means disabled. */
-  idleTimeoutMs?: number | null;
   /** Terminal agent error, including recoverable failures that settled the call to null. */
   errorCode?: WorkflowErrorCode;
   /** Present only while the call is in flight on a live run; settled calls omit it. */
@@ -575,14 +560,8 @@ export interface WorkflowRunStatusTruncation {
 /** Host-resolved execution bounds in force for one run. */
 export interface WorkflowRunLimits {
   maxAgents: number;
-  tokenBudget: number | null;
   concurrency: number;
   agentRetries: number;
-  /** Total-wall-clock ceiling for each attempt; null means the host imposes none. */
-  agentTimeoutMs: number | null;
-  /** No-backend-activity ceiling for each attempt; null means disabled. Absent only on
-   *  persisted limits written before the idle-watchdog contract. New executions always set it. */
-  agentIdleTimeoutMs?: number | null;
 }
 
 /** Safe, bounded, point-in-time status used by every run-inspection/polling host. */

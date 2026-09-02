@@ -34,7 +34,6 @@ test("on() bubbles agent_message_chunk + usage_update + session lifecycle with r
   const opened: string[] = [];
   const closed: string[] = [];
   let usageSeen = false;
-  let activityCount = 0;
 
   runner.on("agent_message_chunk", (e) => {
     assert.equal(e.backendId, "claude");
@@ -57,7 +56,6 @@ test("on() bubbles agent_message_chunk + usage_update + session lifecycle with r
     label: "greet",
     runId: "run-1",
     callIndex: 7,
-    onActivity: () => { activityCount += 1; },
   });
 
   assert.equal(text, "Hello");
@@ -67,7 +65,6 @@ test("on() bubbles agent_message_chunk + usage_update + session lifecycle with r
     wild.includes("agent_message_chunk") && wild.includes("usage_update"),
     "the session_update catch-all saw every kind",
   );
-  assert.equal(activityCount, wild.length, "attempt liveness reports every real session/update exactly once");
   assert.equal(opened.length, 1, "exactly one session opened");
   assert.deepEqual(closed, opened, "the opened session was closed on release");
 });

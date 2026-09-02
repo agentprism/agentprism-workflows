@@ -64,7 +64,6 @@ function agentRow(index = 0, overrides: Partial<WorkflowCallRecord> = {}): Workf
     inputsHash: INPUT_A,
     outcome: "result",
     origin: "runner",
-    budgetDebit: index + 1,
     resumeSafety: "declared-read-only",
     scope: SOURCE_RUN_ID,
     ...overrides,
@@ -151,9 +150,6 @@ function candidate(
     recordedIndex: index,
     entry,
     call,
-    logicalBudgetDebit: call.origin === "journal-replay"
-      ? call.replay?.logicalBudgetDebit
-      : call.budgetDebit,
   };
 }
 
@@ -183,7 +179,6 @@ function blocker(index = 0, overrides: Partial<WorkflowCallRecord> = {}): Persis
         recoverable: true,
       },
       aborted: true,
-      budgetDebit: 0,
       ...overrides,
     }),
   };
@@ -380,7 +375,7 @@ describe("incremental resume admission", () => {
     assert.equal(malformed.strategy, "identity-v1");
   });
 
-  it("replays across every operational-knob change and migrates format 1 positionally", async () => {
+  it("replays across retry/concurrency changes and migrates format 1 positionally", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "resume-knobs-cwd-"));
     const persistenceRoot = mkdtempSync(join(tmpdir(), "resume-knobs-runs-"));
     const script = `export const meta = { name: "resume-knobs", description: "resume knobs" };
@@ -401,7 +396,6 @@ return { first, second };`;
     });
     try {
       const source = await manager.runSync(script, undefined, {
-        agentTimeoutMs: 900,
         agentRetries: 1,
         concurrency: 2,
       });
@@ -411,9 +405,6 @@ return { first, second };`;
       sourceState.runtime.engineVersion = "0.25.0";
       manager.getPersistence().save(sourceState);
       const variants = [
-        { runId: "timeout-dropped", agentTimeoutMs: null },
-        { runId: "timeout-changed", agentTimeoutMs: 450 },
-        { runId: "idle-enabled", agentIdleTimeoutMs: 900 },
         { runId: "retries-changed", agentRetries: 0 },
         { runId: "concurrency-changed", concurrency: 7 },
       ] as const;
@@ -426,14 +417,6 @@ return { first, second };`;
         assert.equal(resumed.resumeReport?.replayed, 2, variant.runId);
         assert.equal(resumed.resumeReport?.live, 0, variant.runId);
         assert.equal(resumed.replayEligibility?.engineVersionComparison, "different", variant.runId);
-        if (variant.runId === "idle-enabled") {
-          assert.equal(
-            resumed.replayEligibility?.operationalChanges.find((change) =>
-              change.option === "agentIdleTimeoutMs"
-            )?.detail,
-            "source recorded agentIdleTimeoutMs=none; this run: 900",
-          );
-        }
       }
       assert.equal(liveCalls, 2, "operational changes never invoke the runner for completed calls");
 
@@ -444,7 +427,6 @@ return { first, second };`;
       const bridged = await manager.runSync(script, undefined, {
         runId: "format-one-bridge",
         resumeFromRunId: source.runId,
-        agentTimeoutMs: null,
         agentRetries: 0,
         concurrency: 9,
       });
@@ -479,8 +461,6 @@ return { first, second };`;
   it("pins the remaining structural, status, metadata, and runtime-format outcomes", () => {
     const cases: Array<[string, PersistedRunState, Partial<Omit<ResumeAdmissionInput, "source">>, string]> = [
       ["unsupported", sourceState(undefined, { resume: { format: "future" } as never }), {}, "unsupported-format"],
-      ["aborted", sourceState(undefined, { status: "aborted" }), {}, "abort-residue"],
-      ["abort signal", sourceState(undefined, { abortSignaled: true }), {}, "abort-residue"],
       ["running", sourceState(undefined, { status: "running" }), {}, "source-not-terminal"],
       ["isolation", sourceState(undefined, { executionMode: { kind: "isolation", baselineRunId: "base" } }), {}, "isolation-recording"],
       ["cwd metadata", sourceState(undefined, { effectiveCwd: undefined }), {}, "resume-metadata-missing"],
@@ -498,6 +478,17 @@ return { first, second };`;
       assert.equal(decision.strategy, "live", name);
       assert.equal(decision.strategy === "live" && decision.disabledReason, reason, name);
     }
+
+    assert.equal(
+      admission(sourceState(undefined, { status: "aborted" })).strategy,
+      "identity-v1",
+      "a terminal aborted source keeps its completed correspondence candidates",
+    );
+    assert.equal(
+      admission(sourceState(undefined, { abortSignaled: true })).strategy,
+      "identity-v1",
+      "an abort marker is diagnostic once the source has terminal persisted call facts",
+    );
 
     const missingTerminal = admission(sourceState(undefined, {
       resume: { format: "identity-v1" },
@@ -547,8 +538,8 @@ return { first, second };`;
     assert.equal(missingPath.strategy === "live" && missingPath.disabledReason, "manifest-invalid");
     const missingInputs = admission(sourceState([agentRow(0, { inputsHash: undefined })]));
     assert.equal(missingInputs.strategy === "live" && missingInputs.disabledReason, "manifest-invalid");
-    const missingDebit = admission(sourceState([agentRow(0, { budgetDebit: undefined })]));
-    assert.equal(missingDebit.strategy === "live" && missingDebit.disabledReason, "manifest-invalid");
+    const withoutHistoricalDebit = admission(sourceState([agentRow()]));
+    assert.equal(withoutHistoricalDebit.strategy, "identity-v1");
 
     const missingPair = sourceState();
     missingPair.journal = [];
@@ -565,7 +556,6 @@ return { first, second };`;
 
     const replayed = agentRow(0, {
       origin: "journal-replay",
-      budgetDebit: 0,
       replay: {
         sourceRunId: "older",
         recordedIndex: 4,
@@ -573,7 +563,7 @@ return { first, second };`;
         sourceResumeSafety: "declared-read-only",
       },
     });
-    assert.equal(admission(sourceState([replayed])).strategy === "live" && admission(sourceState([replayed])).disabledReason, "manifest-invalid");
+    assert.equal(admission(sourceState([replayed])).strategy, "identity-v1");
 
     const unknownSafety = agentRow(0) as WorkflowCallRecord & { resumeSafety: string };
     unknownSafety.resumeSafety = "future-safety";
@@ -591,7 +581,7 @@ return { first, second };`;
     });
     assert.equal(admission(unknownAborted).strategy === "live" && admission(unknownAborted).disabledReason, "unsupported-format");
     const abortedRunning = sourceState(undefined, { status: "running", abortSignaled: true });
-    assert.equal(admission(abortedRunning).strategy === "live" && admission(abortedRunning).disabledReason, "abort-residue");
+    assert.equal(admission(abortedRunning).strategy === "live" && admission(abortedRunning).disabledReason, "source-not-terminal");
     const runningIsolation = sourceState(undefined, {
       status: "running",
       executionMode: { kind: "isolation", baselineRunId: "base" },
@@ -612,23 +602,27 @@ return { first, second };`;
     assert.equal(admission(cwdAndRuntime, { current }).strategy === "live" && admission(cwdAndRuntime, { current }).disabledReason, "cwd-mismatch");
   });
 
-  it("validates retained seeds and normalizes replay-origin logical debits", () => {
+  it("validates retained seeds while stripping legacy debit metadata", () => {
     const replayCall = agentRow(0, {
       origin: "journal-replay",
-      budgetDebit: 0,
       replay: {
         sourceRunId: "older-run",
         recordedIndex: 7,
         match: "unique-hash",
-        logicalBudgetDebit: 13,
         sourceResumeSafety: "declared-read-only",
       },
     });
-    const cloned = cloneResumeCandidate(SOURCE_RUN_ID, entryFor(replayCall), replayCall);
-    assert.equal(cloned?.logicalBudgetDebit, 13);
+    const legacyReplayCall = replayCall as WorkflowCallRecord & {
+      budgetDebit: number;
+      replay: NonNullable<WorkflowCallRecord["replay"]> & { logicalBudgetDebit: number };
+    };
+    legacyReplayCall.budgetDebit = 0;
+    legacyReplayCall.replay.logicalBudgetDebit = 13;
+    const cloned = cloneResumeCandidate(SOURCE_RUN_ID, entryFor(legacyReplayCall), legacyReplayCall);
     assert.notEqual(cloned?.call, replayCall);
-    replayCall.replay!.logicalBudgetDebit = 99;
-    assert.equal(cloned?.logicalBudgetDebit, 13);
+    assert.equal(Object.hasOwn(cloned ?? {}, "logicalBudgetDebit"), false);
+    assert.equal(Object.hasOwn(cloned?.call ?? {}, "budgetDebit"), false);
+    assert.equal(Object.hasOwn(cloned?.call.replay ?? {}, "logicalBudgetDebit"), false);
 
     const validRetained = candidate(2, { sourceRunId: "older-run", call: { hash: HASH_C, inputsHash: INPUT_C } });
     const withSeed = sourceState(undefined, {
@@ -749,14 +743,11 @@ return { first, second };`;
         path: "older-checkpoint",
         inputsHash: INPUT_B,
         origin: "confirm",
-        budgetDebit: undefined,
         resumeSafety: undefined,
       },
       entry: { kind: "checkpoint", hash: HASH_B, result: false },
     });
-    delete retainedCheckpoint.call.budgetDebit;
     delete retainedCheckpoint.call.resumeSafety;
-    delete retainedCheckpoint.logicalBudgetDebit;
     const retainedBlocker = sourceState([prior, pending], {
       status: "paused",
       pauseReason: "checkpoint_required",
@@ -875,7 +866,7 @@ describe("identity candidate indexes and selection", () => {
 
   it("keeps original exact and content multiplicity after consumption", () => {
     const sameExact = candidate(1, {
-      call: { path: "workflow.js:1:1", inputsHash: INPUT_B, budgetDebit: 2 },
+      call: { path: "workflow.js:1:1", inputsHash: INPUT_B },
     });
     const exactIndexes = buildResumeCandidateIndexes(seed([candidate(), sameExact]));
     const consumed = new Set([indexedSourceOccurrence(exactIndexes.exact.get(
@@ -887,7 +878,7 @@ describe("identity candidate indexes and selection", () => {
     });
 
     const movedDuplicate = candidate(1, {
-      call: { path: "workflow.js:2:1", budgetDebit: 2 },
+      call: { path: "workflow.js:2:1" },
     });
     const contentIndexes = buildResumeCandidateIndexes(seed([candidate(), movedDuplicate]));
     assert.deepEqual(selectResumeCandidate(contentIndexes, matchInput({ path: "new-path" })), {
@@ -929,12 +920,10 @@ describe("identity candidate indexes and selection", () => {
         path: "checkpoint-path",
         inputsHash: INPUT_B,
         origin: "confirm",
-        budgetDebit: undefined,
         resumeSafety: undefined,
       },
       entry: { kind: "checkpoint", hash: HASH_B, result: true },
     });
-    delete checkpointCandidate.logicalBudgetDebit;
     const injected = injection(3, { path: "injected-path" });
     const indexes = buildResumeCandidateIndexes(seed([checkpointCandidate], [injected]));
     assert.deepEqual(selectResumeCandidate(indexes, matchInput({
@@ -1027,7 +1016,7 @@ describe("positional resume selection", () => {
 
   it("requires new-format input agreement while ignoring world classifications", () => {
     const first = agentRow(0);
-    const second = agentRow(1, { path: first.path, budgetDebit: 2 });
+    const second = agentRow(1, { path: first.path });
     for (const call of [first, second]) {
       const decision = selectPositionalResume({
         index: call.index,
@@ -1040,7 +1029,7 @@ describe("positional resume selection", () => {
         sourceCall: call,
       });
       assert.equal(decision.action, "replay");
-      assert.equal(decision.action === "replay" && decision.logicalBudgetDebit, call.budgetDebit);
+      assert.equal(Object.hasOwn(decision, "logicalBudgetDebit"), false);
     }
 
     const changedInputs = selectPositionalResume({
@@ -1113,7 +1102,7 @@ describe("incremental resume report construction", () => {
   it("sorts cloned decisions, computes counters, and emits only strategy fields", () => {
     const decisions: WorkflowResumeCallDecision[] = [
       { index: 2, kind: "agent", action: "failed", reason: "resume-fatal-latch" },
-      { index: 0, kind: "agent", action: "replayed", sourceRunId: SOURCE_RUN_ID, recordedIndex: 7, match: "unique-hash", logicalBudgetDebit: 3 },
+      { index: 0, kind: "agent", action: "replayed", sourceRunId: SOURCE_RUN_ID, recordedIndex: 7, match: "unique-hash" },
       { index: 1, kind: "checkpoint", action: "live", reason: "not-recorded" },
     ];
     const report = buildResumeReport({

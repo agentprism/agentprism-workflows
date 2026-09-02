@@ -57,7 +57,7 @@ want to make.
   downstream* run live. That is **propagation mode** — "what does this swap do to the final
   outcome?" — and it works today with no new machinery.
 - The engine's `createReplayRunner` serves recorded results for every call except the live target,
-  with call paths, input fingerprints, environment identity, budget-trajectory replay, and strict
+  with call paths, input fingerprints, environment identity, and strict
   fail-closed divergence checks. The SDK's `runIsolation` executes that composition end to end and
   persists a quarantined artifact plus `ReplayReport`: upstream *and* admissible downstream calls
   are held fixed for a per-step comparison. Scripts outside the proven correspondence envelope use

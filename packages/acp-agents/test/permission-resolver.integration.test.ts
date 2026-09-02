@@ -37,7 +37,6 @@ test("runner-level resolver can approve after a delay and the turn proceeds", as
     turns: [{ toolCall: { title: "Read file", kind: "read" }, text: "done" }],
   });
   const permissionEvents: AcpPermissionEvent[] = [];
-  const interactionStates: string[] = [];
   const resolverContexts: Array<{ label?: string; runId?: string; sessionId: string }> = [];
   const runner = makeRunner({
     onPermissionRequest: async (_params, ctx) => {
@@ -53,7 +52,6 @@ test("runner-level resolver can approve after a delay and the turn proceeds", as
     cwd,
     label: "interactive",
     runId: "run-perm-1",
-    onInteractionStateChange: (state) => interactionStates.push(`${state.kind}:${state.state}`),
   });
 
   assert.equal(out, "done");
@@ -62,7 +60,6 @@ test("runner-level resolver can approve after a delay and the turn proceeds", as
   assert.equal(resolverContexts[0].label, "interactive");
   assert.equal(resolverContexts[0].runId, "run-perm-1");
   assert.deepEqual(permissionEvents.map((event) => event.outcome), [ALLOW]);
-  assert.deepEqual(interactionStates, ["permission:waiting", "permission:running"]);
 });
 
 test("an explicit tool deny settles before the live resolver", async () => {

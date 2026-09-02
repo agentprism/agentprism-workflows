@@ -33,10 +33,6 @@ export interface WorkflowAgentSnapshot {
   tokens?: number;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
-  /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
-  timeoutMs?: number | null;
-  /** Resolved no-backend-activity deadline for each attempt; null means disabled. */
-  idleTimeoutMs?: number | null;
   /** The agent's ACP session re-attach record (live or journal-replayed), when one exists. */
   session?: AgentSessionRecord;
   callIndex?: number;

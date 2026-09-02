@@ -71,7 +71,7 @@ async function exerciseEra(
   mode: "legacy" | "modern",
   daemonUrl: string,
   projectDir: string,
-): Promise<{ tools: string[]; status: unknown }> {
+): Promise<{ tools: string[]; status: unknown; workflowInputSchema: unknown }> {
   const connected = await connectHttp(daemonUrl, {
     protocolMode: mode,
     uiCapability: "matching",
@@ -85,6 +85,8 @@ async function exerciseEra(
     const listed = await connected.client.listTools();
     const tools = listed.tools.map((tool) => tool.name).sort();
     assert.deepEqual(tools, ["docs", "repl", "workflow", "workflow-events"]);
+    const workflow = listed.tools.find((tool) => tool.name === "workflow");
+    assert.ok(workflow);
     const panel = await connected.client.readResource({
       uri: "ui://agentprism-workflow/run-monitor.html",
     });
@@ -92,10 +94,14 @@ async function exerciseEra(
 
     const result = await connected.client.callTool({
       name: "workflow",
-      arguments: { script: SCRIPT, projectDir },
+      arguments: { action: "run", script: SCRIPT, projectDir },
     });
     assert.equal(result.isError, false);
-    return { tools, status: structured(result)?.status };
+    return {
+      tools,
+      status: structured(result)?.status,
+      workflowInputSchema: workflow.inputSchema,
+    };
   } finally {
     await connected.dispose();
   }
@@ -108,6 +114,14 @@ test("one daemon serves legacy sessions and modern 2026-07-28 requests through t
     const legacy = await exerciseEra("legacy", daemon.url, projectDir);
     const modern = await exerciseEra("modern", daemon.url, projectDir);
     assert.deepEqual(modern.tools, legacy.tools);
+    assert.deepEqual(
+      modern.workflowInputSchema,
+      legacy.workflowInputSchema,
+      "legacy and modern discovery publish the same discriminated workflow schema",
+    );
+    const published = modern.workflowInputSchema as { oneOf?: unknown[]; properties?: unknown };
+    assert.equal(published.oneOf?.length, 7);
+    assert.equal(published.properties, undefined, "neither transport regresses to the flat field superset");
     assert.equal(legacy.status, "completed");
     assert.equal(modern.status, "completed");
     assert.equal(daemon.sessions.size, 1, "only the legacy client allocates an MCP session");
@@ -204,15 +218,17 @@ return await agent("work", { label: "worker", model: "codex" });`;
 
     const resolved = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 5_000 },
+      arguments: { action: "status", runId, waitMs: 5_000 },
     });
     assert.equal(resolved.isError, false);
     assert.equal(structured(resolved)?.permissionResponse?.outcome?.optionId, "allow_for_session");
+    assert.equal(structured(resolved)?.wait?.requestedMs, 5_000);
+    assert.equal(structured(resolved)?.wait?.returnedBecause, "permission-resolved");
     assert.equal(connected.elicitations.length, 1);
 
     const terminal = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 5_000 },
+      arguments: { action: "status", runId, waitMs: 5_000 },
     });
     assert.equal(structured(terminal)?.outcome?.result, "allow_for_session");
   } finally {
@@ -293,7 +309,7 @@ return await agent("wait", { label: "wait" });`;
   }
 });
 
-test("modern response-stream cancellation aborts await without cancelling the workflow", async () => {
+test("modern response-stream cancellation aborts status waiting without cancelling the workflow", async () => {
   const controlled = gatedRunner();
   const daemon = await startDaemon(controlled.runner);
   const projectDir = makeProjectDir("dual-era-cancellation");
@@ -313,7 +329,7 @@ return await agent("wait", { label: "wait" });`;
 
     const controller = new AbortController();
     const awaiting = connected.client.callTool(
-      { name: "workflow", arguments: { action: "await", runId, waitMs: 25_000 } },
+      { name: "workflow", arguments: { action: "status", runId, waitMs: 25_000 } },
       { signal: controller.signal },
     );
     setTimeout(() => controller.abort(), 25);
@@ -321,13 +337,13 @@ return await agent("wait", { label: "wait" });`;
 
     const inspection = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "inspect", runId },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(inspection)?.status, "running");
     controlled.release();
     const completed = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "await", runId, waitMs: 10_000 },
+      arguments: { action: "status", runId, waitMs: 10_000 },
     });
     assert.equal(structured(completed)?.status, "completed");
   } finally {

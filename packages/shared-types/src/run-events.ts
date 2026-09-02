@@ -35,10 +35,6 @@ export interface RunAgentStartPayload extends RunEventOrigin {
   prompt: string;
   model?: string;
   configOptions?: Record<string, string | boolean>;
-  /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
-  timeoutMs?: number | null;
-  /** Resolved no-backend-activity deadline for each attempt; null means disabled. */
-  idleTimeoutMs?: number | null;
   callIndex: number;
   /** The structural call-path key (WorkflowCallRecord.path), when captured. */
   path?: string;

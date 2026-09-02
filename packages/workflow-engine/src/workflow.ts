@@ -36,8 +36,6 @@ import {
   resolveAgentType,
 } from "./agent-registry.js";
 import {
-  DEFAULT_AGENT_IDLE_TIMEOUT_MS,
-  DEFAULT_AGENT_TIMEOUT_MS,
   MAX_AGENT_RETRIES,
   MAX_AGENTS_PER_RUN,
   MAX_CONCURRENCY,
@@ -129,7 +127,7 @@ export interface SharedRuntime {
     active: number;
     invalid: boolean;
     retired?: boolean;
-    onActivity?: (active: number) => void;
+    onChange?: (active: number) => void;
   };
 }
 
@@ -175,10 +173,6 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
-  /** Host total-wall-clock ceiling per attempt. null/omitted means the host imposes no ceiling. */
-  agentTimeoutMs?: number | null;
-  /** Host no-backend-activity ceiling per attempt. null/omitted disables the idle watchdog. */
-  agentIdleTimeoutMs?: number | null;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
   /** Absolute workflow persistence root for log persistence; explicit value wins over AGENTPRISM_PERSISTENCE_ROOT. */
@@ -258,10 +252,6 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     prompt: string;
     model?: string;
     configOptions?: Record<string, string | boolean>;
-    /** Resolved total-wall-clock deadline for each attempt; null means uncapped. */
-    timeoutMs?: number | null;
-    /** Resolved no-backend-activity deadline for each attempt; null means disabled. */
-    idleTimeoutMs?: number | null;
     callIndex: number;
     /** The structural call-path key (same value as WorkflowCallRecord.path), when captured. */
     path?: string;
@@ -319,8 +309,6 @@ const AGENT_OPTION_KEYS = [
   "isolation",
   "resume",
   "agentType",
-  "timeoutMs",
-  "idleTimeoutMs",
   "retries",
   "cwd",
   "mcpServers",
@@ -373,10 +361,6 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * and falls back to default tools/model (with the name as a prose hint).
    */
   agentType?: string;
-  /** Per-call total-wall deadline. It may tighten, but cannot disable or raise, a finite host ceiling. */
-  timeoutMs?: number | null;
-  /** Per-call no-backend-activity deadline. It may tighten, but cannot disable or raise, a finite host ceiling. */
-  idleTimeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
   /**
@@ -532,46 +516,17 @@ export interface WorkflowRunLimitOptions {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  agentTimeoutMs?: number | null;
-  agentIdleTimeoutMs?: number | null;
 }
 
-/** Resolve the run limits once so admission, persistence, and execution report the same values.
- *  `tokenBudget` stays in the persisted record, ALWAYS null — the budget is deleted (§7); the
- *  field survives only so old persisted runs and isolation recordings keep their shape. */
+/** Resolve the run limits once so admission, persistence, and execution report the same values. */
 export function resolveWorkflowRunLimits(options: WorkflowRunLimitOptions): WorkflowRunLimits {
   return {
     maxAgents: options.maxAgents ?? MAX_AGENTS_PER_RUN,
-    tokenBudget: null,
     concurrency: normalizeConcurrency(
       options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
     ),
     agentRetries: normalizeAgentRetries(options.agentRetries ?? 0),
-    agentTimeoutMs: options.agentTimeoutMs !== undefined
-      ? options.agentTimeoutMs
-      : DEFAULT_AGENT_TIMEOUT_MS,
-    agentIdleTimeoutMs: options.agentIdleTimeoutMs !== undefined
-      ? options.agentIdleTimeoutMs
-      : DEFAULT_AGENT_IDLE_TIMEOUT_MS,
   };
-}
-
-/** A script may shorten a host deadline, but a finite host deadline is an unbypassable ceiling. */
-export function resolveAgentTimeoutMs(
-  hostTimeoutMs: number | null,
-  callTimeoutMs: number | null | undefined,
-): number | null {
-  if (hostTimeoutMs === null) return callTimeoutMs ?? null;
-  if (callTimeoutMs === null || callTimeoutMs === undefined) return hostTimeoutMs;
-  return Math.min(hostTimeoutMs, callTimeoutMs);
-}
-
-/** A script may shorten the host's idle ceiling, but cannot bypass a finite host watchdog. */
-export function resolveAgentIdleTimeoutMs(
-  hostTimeoutMs: number | null,
-  callTimeoutMs: number | null | undefined,
-): number | null {
-  return resolveAgentTimeoutMs(hostTimeoutMs, callTimeoutMs);
 }
 
 /** Convert a workflow name into the path-free base used for its vm filename. */
@@ -609,9 +564,7 @@ export async function runWorkflow<T = unknown>(
     maxAgents,
     concurrency,
     agentRetries: runAgentRetries,
-    agentTimeoutMs,
   } = effectiveLimits;
-  const agentIdleTimeoutMs = effectiveLimits.agentIdleTimeoutMs ?? null;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const callbackContext: WorkflowCallbackContext = { scope: runId };
   const baseCwd = options.cwd ?? process.cwd();
@@ -668,7 +621,7 @@ export async function runWorkflow<T = unknown>(
   const resumeActivity = shared.resumeActivity ?? {
     active: 0,
     invalid: false,
-    onActivity: options.onResumeActivity,
+    onChange: options.onResumeActivity,
   };
   shared.resumeActivity = resumeActivity;
   const limiter = shared.limiter;
@@ -685,7 +638,7 @@ export async function runWorkflow<T = unknown>(
     }
     resumeActivity.active = next;
     try {
-      resumeActivity.onActivity?.(next);
+      resumeActivity.onChange?.(next);
     } catch {
       resumeActivity.invalid = true;
     }
@@ -724,14 +677,6 @@ export async function runWorkflow<T = unknown>(
     state.logs.push(text);
     logger.log(text);
   };
-
-  if (options.sharedRuntime === undefined) {
-    log(
-      `agent timeout admission: total-wall ceiling ${agentTimeoutMs === null ? "none" : `${agentTimeoutMs}ms`}; ` +
-        `idle ceiling ${agentIdleTimeoutMs === null ? "disabled" : `${agentIdleTimeoutMs}ms without backend activity`}; ` +
-        "each retry re-arms both clocks",
-    );
-  }
 
   const phase = (title: string, ...deletedOptions: unknown[]) => {
     if (deletedOptions.length > 0) {
@@ -1081,8 +1026,6 @@ export async function runWorkflow<T = unknown>(
     assertNoModelConfigOption(agentOptions.configOptions, pendingLabel);
 
     const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
-    const timeout = resolveAgentTimeoutMs(agentTimeoutMs, agentOptions.timeoutMs);
-    const idleTimeout = resolveAgentIdleTimeoutMs(agentIdleTimeoutMs, agentOptions.idleTimeoutMs);
     const retryAttempts =
       agentOptions.retries !== undefined ? normalizeAgentRetries(agentOptions.retries) : runAgentRetries;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
@@ -1113,7 +1056,7 @@ export async function runWorkflow<T = unknown>(
     const legacyCallInputsHash = hashCallInputsV1({
       ...callInputs,
       retries: retryAttempts,
-      timeoutMs: timeout,
+      timeoutMs: null,
     });
 
     // Deterministic resume key: assigned at lexical call time, before the limiter,
@@ -1173,8 +1116,6 @@ export async function runWorkflow<T = unknown>(
         prompt,
         model: displayModel,
         configOptions: agentOptions.configOptions,
-        timeoutMs: timeout,
-        idleTimeoutMs: idleTimeout,
         callIndex,
         path: callPath,
         scope: runId,
@@ -1202,7 +1143,6 @@ export async function runWorkflow<T = unknown>(
         origin: "engine",
         error: errorRecord,
         aborted: true,
-        budgetDebit: 0,
         ...(legacyResumeSafety === "declared-read-only"
           ? { resumeSafety: legacyResumeSafety }
           : {}),
@@ -1232,7 +1172,7 @@ export async function runWorkflow<T = unknown>(
       let worktree = precreatedWorktree;
       let runCwd = preparedRunCwd;
       let attemptsRan = 0;
-      let budgetDebit = 0;
+      let observedTokens = 0;
       const sealedUsage: AgentUsage[] = [];
       const modelFallbacks: string[] = [];
       const continuationCandidate = preparedContinuation?.candidatesByIndex.get(callIndex);
@@ -1257,7 +1197,7 @@ export async function runWorkflow<T = unknown>(
           shared.tokenUsage.cacheWrite += usage.cacheWrite;
         }
         shared.tokenUsage.total += tokens;
-        budgetDebit += tokens;
+        observedTokens += tokens;
         options.onTokenUsage?.({ ...shared.tokenUsage }, callbackContext);
         return tokens;
       };
@@ -1337,7 +1277,6 @@ export async function runWorkflow<T = unknown>(
           ...(modelFallbacks.length ? { modelFallback: true as const } : {}),
           ...(worktree?.isolated ? { worktree: true } : {}),
           ...(runCwd !== undefined && origin === "runner" ? { resolvedCwd: runCwd } : {}),
-          budgetDebit,
           ...(resumeDeclared && resolvedIsolation === undefined
             ? { resumeSafety: "declared-read-only" as const }
             : resumeDeclared &&
@@ -1352,7 +1291,7 @@ export async function runWorkflow<T = unknown>(
           label,
           phase: assignedPhase,
           result: null,
-          tokens: budgetDebit,
+          tokens: observedTokens,
           worktree: runCwd,
           model: slot?.modelResolved ?? displayModel,
           error: workflowError.message,
@@ -1447,13 +1386,8 @@ export async function runWorkflow<T = unknown>(
               }
             }
             let result: unknown;
-            let idleWatchdog: AgentIdleWatchdog | undefined;
             try {
               let rawRunnerPromise: Promise<unknown>;
-              idleWatchdog = createAgentIdleWatchdog(idleTimeout, label, (error) => {
-                sealAttempt(slot);
-                attemptController?.abort(error);
-              });
               beginResumeActivity();
               try {
                 rawRunnerPromise = agentRunner.run(prompt, {
@@ -1526,16 +1460,6 @@ export async function runWorkflow<T = unknown>(
                     const copied = cloneTelemetry(reported);
                     if (copied) slot.provenance = copied;
                   },
-                  ...(idleWatchdog === undefined
-                    ? {}
-                    : {
-                        onActivity: () => idleWatchdog?.activity(),
-                        onInteractionStateChange: (interaction: { kind: "permission"; state: "waiting" | "running" }) => {
-                          if (interaction.kind !== "permission") return;
-                          if (interaction.state === "waiting") idleWatchdog?.pause();
-                          else idleWatchdog?.resume();
-                        },
-                      }),
                   onHistory: (history: AgentHistoryEntry[]) => {
                     if (slot.sealed) return;
                     const copied = cloneTelemetry(history);
@@ -1558,21 +1482,10 @@ export async function runWorkflow<T = unknown>(
                 throw error;
               }
               observeResumeActivity(rawRunnerPromise);
-              const boundedRunnerPromise = withTimeout(
-                rawRunnerPromise,
-                timeout,
-                label,
-                () => {
-                  sealAttempt(slot);
-                  attemptController?.abort();
-                },
-                idleWatchdog?.promise,
-              );
               result = hostAttemptRegistered
-                ? await withAgentCancellation(boundedRunnerPromise, attemptController.signal)
-                : await boundedRunnerPromise;
+                ? await withAgentCancellation(rawRunnerPromise, attemptController.signal)
+                : await rawRunnerPromise;
             } finally {
-              idleWatchdog?.dispose();
               sealAttempt(slot);
               if (continueFromSession !== undefined && !signal.aborted) {
                 const continuation = slot.provenance?.source === "live"
@@ -1616,7 +1529,6 @@ export async function runWorkflow<T = unknown>(
               ...(modelFallbacks.length ? { modelFallback: true as const } : {}),
               ...(worktree?.isolated ? { worktree: true } : {}),
               resolvedCwd: runCwd,
-              budgetDebit,
               ...(resumeDeclared && resolvedIsolation === undefined
                 ? { resumeSafety: "declared-read-only" as const }
                 : resumeDeclared &&
@@ -1655,7 +1567,7 @@ export async function runWorkflow<T = unknown>(
               label,
               phase: assignedPhase,
               result: resultSnapshot,
-              tokens: budgetDebit,
+              tokens: observedTokens,
               worktree: runCwd,
               model: slot.modelResolved ?? displayModel,
               session,
@@ -1732,7 +1644,6 @@ export async function runWorkflow<T = unknown>(
       sourceRunId: string;
       recordedIndex: number;
       match: "path-hash" | "unique-hash" | "index-hash";
-      logicalBudgetDebit?: number;
       sourceResumeSafety?: WorkflowResumeSafety;
       rebindSession: boolean;
       manifestProvenance: boolean;
@@ -1759,7 +1670,6 @@ export async function runWorkflow<T = unknown>(
         outcome: "result",
         origin: "journal-replay",
         ...(cachedUsage ? { usage: cachedUsage } : {}),
-        budgetDebit: 0,
         ...(input.sourceResumeSafety ? { resumeSafety: input.sourceResumeSafety } : {}),
         ...(input.manifestProvenance
           ? {
@@ -1767,9 +1677,6 @@ export async function runWorkflow<T = unknown>(
                 sourceRunId: input.sourceRunId,
                 recordedIndex: input.recordedIndex,
                 match: input.match,
-                ...(input.logicalBudgetDebit !== undefined
-                  ? { logicalBudgetDebit: input.logicalBudgetDebit }
-                  : {}),
                 ...(input.sourceResumeSafety
                   ? { sourceResumeSafety: input.sourceResumeSafety }
                   : {}),
@@ -1846,7 +1753,6 @@ export async function runWorkflow<T = unknown>(
               sourceRunId: source.candidate.sourceRunId,
               recordedIndex: source.candidate.recordedIndex,
               match: match.match,
-              logicalBudgetDebit: source.candidate.logicalBudgetDebit as number,
             });
             gate.release();
             return replayPreparedAgent({
@@ -1855,7 +1761,6 @@ export async function runWorkflow<T = unknown>(
               sourceRunId: source.candidate.sourceRunId,
               recordedIndex: source.candidate.recordedIndex,
               match: match.match,
-              logicalBudgetDebit: source.candidate.logicalBudgetDebit,
               sourceResumeSafety: source.candidate.call.resumeSafety,
               rebindSession: true,
               manifestProvenance: true,
@@ -1900,9 +1805,6 @@ export async function runWorkflow<T = unknown>(
               sourceRunId: preparedResume.sourceRunId,
               recordedIndex: callIndex,
               match: match.match,
-              ...(match.logicalBudgetDebit === undefined
-                ? {}
-                : { logicalBudgetDebit: match.logicalBudgetDebit }),
             });
             gate.release();
             return replayPreparedAgent({
@@ -1911,7 +1813,6 @@ export async function runWorkflow<T = unknown>(
               sourceRunId: preparedResume.sourceRunId,
               recordedIndex: callIndex,
               match: match.match,
-              logicalBudgetDebit: match.logicalBudgetDebit,
               sourceResumeSafety,
               rebindSession: false,
               manifestProvenance: sourceCall !== undefined,
@@ -1979,7 +1880,7 @@ export async function runWorkflow<T = unknown>(
         if (!settled) {
           const errorRecord = projectRecordedError(error);
           const workflowError = wrapError(error, { agentLabel: label });
-          settle({ outcome: "error", origin: "engine", error: errorRecord, budgetDebit: 0 });
+          settle({ outcome: "error", origin: "engine", error: errorRecord });
           if (agentStartEmitted) {
             emitAgentEnd({
               label,
@@ -2013,7 +1914,6 @@ export async function runWorkflow<T = unknown>(
             outcome: "result",
             origin: "journal-replay",
             ...(cachedUsage ? { usage: cachedUsage } : {}),
-            budgetDebit: 0,
           });
           emitAgentEnd({
             label,
@@ -2028,7 +1928,7 @@ export async function runWorkflow<T = unknown>(
         } catch (error) {
           const errorRecord = projectRecordedError(error);
           const workflowError = wrapError(error, { agentLabel: label });
-          settle({ outcome: "error", origin: "engine", error: errorRecord, budgetDebit: 0 });
+          settle({ outcome: "error", origin: "engine", error: errorRecord });
           emitAgentEnd({
             label,
             phase: assignedPhase,
@@ -3551,114 +3451,6 @@ function bestEffortDebug(message: string): void {
     console.debug(`[workflow-engine] ${message}`);
   } catch {
     // Debug reporting never changes execution.
-  }
-}
-
-interface AgentIdleWatchdog {
-  promise: Promise<never>;
-  activity(): void;
-  pause(): void;
-  resume(): void;
-  dispose(): void;
-}
-
-/** Per-attempt no-backend-activity race. Only real runner activity re-arms it. */
-function createAgentIdleWatchdog(
-  ms: number | null,
-  label: string,
-  onTimeout: (error: WorkflowError) => void,
-): AgentIdleWatchdog | undefined {
-  if (ms === null) return undefined;
-
-  let timer: NodeJS.Timeout | undefined;
-  let disposed = false;
-  let paused = false;
-  let rejectTimeout!: (error: WorkflowError) => void;
-  const promise = new Promise<never>((_resolve, reject) => {
-    rejectTimeout = reject;
-  });
-  const arm = () => {
-    if (disposed || paused) return;
-    if (timer !== undefined) clearTimeout(timer);
-    timer = setTimeout(() => {
-      timer = undefined;
-      if (disposed) return;
-      const error = new WorkflowError(
-        `Agent "${label}" received no backend activity for ${ms}ms in this attempt`,
-        WorkflowErrorCode.AGENT_IDLE_TIMEOUT,
-        { recoverable: true, agentLabel: label },
-      );
-      // Latch classification before cancellation: a runner may reject synchronously from abort.
-      rejectTimeout(error);
-      try {
-        onTimeout(error);
-      } catch {
-        // Attempt cancellation is best-effort; idle-timeout classification still wins.
-      }
-    }, ms);
-  };
-  arm();
-
-  return {
-    promise,
-    activity: arm,
-    pause() {
-      if (disposed || paused) return;
-      paused = true;
-      if (timer !== undefined) clearTimeout(timer);
-      timer = undefined;
-    },
-    resume() {
-      if (disposed || !paused) return;
-      paused = false;
-      arm();
-    },
-    dispose() {
-      disposed = true;
-      if (timer !== undefined) clearTimeout(timer);
-      timer = undefined;
-    },
-  };
-}
-
-/**
- * Run a promise with a total-wall timeout.
- */
-async function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number | null,
-  label: string,
-  onTimeout?: () => void,
-  competingDeadline?: Promise<never>,
-): Promise<T> {
-  if (ms === null && competingDeadline === undefined) return promise;
-
-  let timeoutId: NodeJS.Timeout | undefined;
-  const races: Array<Promise<T> | Promise<never>> = [promise];
-  if (competingDeadline !== undefined) races.push(competingDeadline);
-  if (ms !== null) {
-    races.push(new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(() => {
-        const error = new WorkflowError(
-          `Agent "${label}" timed out after ${ms}ms of total wall-clock time in this attempt`,
-          WorkflowErrorCode.AGENT_TIMEOUT,
-          { recoverable: true },
-        );
-        // Latch classification before cancellation: a runner may reject synchronously from abort.
-        reject(error);
-        try {
-          onTimeout?.();
-        } catch {
-          // Attempt cancellation is best-effort; timeout classification still wins.
-        }
-      }, ms);
-    }));
-  }
-
-  try {
-    return await Promise.race(races);
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
   }
 }
 

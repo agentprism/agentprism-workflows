@@ -53,9 +53,15 @@ export interface RunObservabilityAgent {
   status: "queued" | "running" | "done" | "error" | "skipped";
   callIndex?: number;
   scope?: string;
-  timeoutMs?: number | null;
-  idleTimeoutMs?: number | null;
   errorCode?: WorkflowErrorCode;
+}
+
+function projectRunLimits(limits: WorkflowRunLimits): WorkflowRunLimits {
+  return {
+    maxAgents: limits.maxAgents,
+    concurrency: limits.concurrency,
+    agentRetries: limits.agentRetries,
+  };
 }
 
 interface SanitizedText {
@@ -312,8 +318,6 @@ function callStatus(entry: JournalEntry, agent?: RunObservabilityAgent): Workflo
     ...(phase === undefined ? {} : { phase: scalar(phase) }),
     ...(model === undefined ? {} : { model: scalar(model) }),
     ...(backendId === undefined ? {} : { backendId: scalar(backendId) }),
-    ...(agent?.timeoutMs === undefined ? {} : { timeoutMs: agent.timeoutMs }),
-    ...(agent?.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: agent.idleTimeoutMs }),
     ...(agent?.errorCode === undefined ? {} : { errorCode: agent.errorCode }),
     ...resultPreview(entry.result),
   };
@@ -327,8 +331,6 @@ function agentCallStatus(agent: RunObservabilityAgent): WorkflowRunCallStatus {
     label: sanitizeText(agent.label).value,
     ...(agent.phase === undefined ? {} : { phase: scalar(agent.phase) }),
     ...(agent.model === undefined ? {} : { model: scalar(agent.model) }),
-    ...(agent.timeoutMs === undefined ? {} : { timeoutMs: agent.timeoutMs }),
-    ...(agent.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: agent.idleTimeoutMs }),
     ...(agent.errorCode === undefined ? {} : { errorCode: agent.errorCode }),
     ...(agent.status === "queued" || agent.status === "running" ? { status: agent.status } : {}),
     ...resultPreview(null),
@@ -388,7 +390,7 @@ export function projectWorkflowRunStatus(
   const runIsLive = source.status === "pending" || source.status === "running";
   for (const [key, agent] of agentsByCall) {
     // Successful calls already have journal rows. Failed calls intentionally do not, so project
-    // their terminal agent row to keep recoverable failures such as AGENT_TIMEOUT inspectable.
+    // their terminal agent row to keep recoverable failures inspectable.
     // Queued/running calls have no journal row yet either — project them on live runs so
     // inspection reflects the agents actually in flight instead of reporting zero calls.
     if (journalCalls.has(key)) continue;
@@ -407,6 +409,14 @@ export function projectWorkflowRunStatus(
   const logSource = (filter.logLines === 0 ? [] : source.logs.slice(-filter.logLines)).map(sanitizeText);
   let logs = logSource.map((line) => line.value);
   let calls = selectedCalls.map((call) => call.status);
+  const replayEligibility = source.replayEligibility === undefined
+    ? undefined
+    : {
+        ...source.replayEligibility,
+        operationalChanges: source.replayEligibility.operationalChanges.filter(
+          (change) => change.option === "agentRetries" || change.option === "concurrency",
+        ),
+      };
 
   const status: WorkflowRunStatus = {
     runId: sanitizeText(source.runId).value,
@@ -418,10 +428,10 @@ export function projectWorkflowRunStatus(
     ...(source.errorCode === undefined ? {} : { errorCode: source.errorCode }),
     ...(source.limits === undefined
       ? {}
-      : { limits: { ...source.limits, agentIdleTimeoutMs: source.limits.agentIdleTimeoutMs ?? null } }),
-    ...(source.replayEligibility === undefined
+      : { limits: projectRunLimits(source.limits) }),
+    ...(replayEligibility === undefined
       ? {}
-      : { replayEligibility: source.replayEligibility }),
+      : { replayEligibility }),
     logTail: {
       lines: logs,
       totalLines: source.logs.length,
@@ -696,7 +706,6 @@ function projectCallRecord(
     ...(record.worktree === undefined ? {} : { worktree: record.worktree }),
     ...(record.isolation === undefined ? {} : { isolation: record.isolation }),
     ...(record.resolvedCwd === undefined ? {} : { resolvedCwd: projectText(record.resolvedCwd, state) }),
-    ...(record.budgetDebit === undefined ? {} : { budgetDebit: record.budgetDebit }),
     ...(record.settlementOrdinal === undefined ? {} : { settlementOrdinal: record.settlementOrdinal }),
     ...(record.provenance === undefined ? {} : { provenance: projectProvenance(record.provenance, state) }),
     ...(record.scope === undefined ? {} : { scope: projectText(record.scope, state) }),
@@ -737,8 +746,6 @@ export function projectRunEventForPersistence(
         ...(event.configOptions === undefined
           ? {}
           : { configOptions: projectConfigOptions(event.configOptions, state) }),
-        ...(event.timeoutMs === undefined ? {} : { timeoutMs: event.timeoutMs }),
-        ...(event.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: event.idleTimeoutMs }),
         callIndex: event.callIndex,
         // Never truncated: a partial call-path key is worse than none for consumers that
         // join on it, so an oversized capture is dropped instead of projected.

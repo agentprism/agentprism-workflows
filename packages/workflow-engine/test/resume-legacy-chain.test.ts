@@ -25,6 +25,10 @@ test("a markerless 0.23 chained journal accepts persisted ancestors but excludes
   });
   try {
     const source = JSON.parse(readFileSync(FIXTURE, "utf8")) as PersistedRunState;
+    const legacyFixture = readFileSync(FIXTURE, "utf8");
+    assert.match(legacyFixture, /"tokenBudget"/);
+    assert.match(legacyFixture, /"budgetDebit"/);
+    assert.match(legacyFixture, /"logicalBudgetDebit"/);
     const ancestorRunId = source.journal?.[0]?.scope;
     assert.equal(typeof ancestorRunId, "string");
     source.effectiveCwd = cwd;
@@ -66,7 +70,6 @@ test("a markerless 0.23 chained journal accepts persisted ancestors but excludes
     const replayed = await manager.runSync(source.script, source.args, {
       runId: "legacy-chain-target",
       resumeFromRunId: source.runId,
-      agentTimeoutMs: null,
     });
     assert.equal(listCalls, 1, "positional preparation scans persisted run IDs exactly once");
     assert.equal(replayed.status, "completed");
@@ -82,21 +85,25 @@ test("a markerless 0.23 chained journal accepts persisted ancestors but excludes
     assert.equal(replayed.replayEligibility?.engineVersionComparison, "source-unknown");
     assert.equal(replayed.replayEligibility?.sourceInputsFormat, 1);
     assert.equal(replayed.replayEligibility?.currentInputsFormat, 2);
-    assert.equal(
-      replayed.replayEligibility?.operationalChanges.find((change) => change.option === "agentTimeoutMs")?.detail,
-      "source recorded agentTimeoutMs=900000; this run: none",
-    );
+    assert.deepEqual(replayed.replayEligibility?.operationalChanges, []);
     const persisted = persistence.load("legacy-chain-target");
     assert.equal(persisted?.runtime?.inputsFormat, 2);
     assert.ok(persisted?.runtime?.engineVersion);
     assert.ok(persisted?.journal?.every((entry) => entry.scope === "legacy-chain-target"));
+    assert.equal(persisted?.calls?.some((call) => Object.hasOwn(call, "budgetDebit")), false);
+    assert.equal(
+      persisted?.calls?.some((call) => Object.hasOwn(call.replay ?? {}, "logicalBudgetDebit")),
+      false,
+    );
+    assert.equal(Object.hasOwn(persisted?.limits ?? {}, "tokenBudget"), false);
+    const rewritten = readFileSync(join(persistence.getRunsDir(), "legacy-chain-target.json"), "utf8");
+    assert.doesNotMatch(rewritten, /"tokenBudget"|"budgetDebit"|"logicalBudgetDebit"/);
 
     assert.equal(persistence.delete(ancestorRunId), true);
     listCalls = 0;
     const missingAncestor = await manager.runSync(source.script, source.args, {
       runId: "legacy-chain-missing-ancestor",
       resumeFromRunId: source.runId,
-      agentTimeoutMs: null,
     });
     assert.equal(listCalls, 1, "each positional admission performs one persisted-run scan");
     assert.equal(liveCalls, 3, "an absent ancestor remains conservatively ineligible");

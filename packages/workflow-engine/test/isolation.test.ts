@@ -49,7 +49,6 @@ function resultRow(overrides: Partial<WorkflowCallRecord> = {}): WorkflowCallRec
     modelRequested: "baseline/requested",
     modelResolved: "baseline/resolved",
     resolvedCwd: EXECUTION_CWD,
-    budgetDebit: 4,
     settlementOrdinal: 1,
     scope: "baseline-run",
     ...overrides,
@@ -89,11 +88,8 @@ function recording(overrides: Partial<PersistedRunState> = {}): PersistedRunStat
     callsAllocated: 1,
     limits: {
       maxAgents: 10,
-      tokenBudget: null,
       concurrency: 2,
       agentRetries: 0,
-      agentTimeoutMs: null,
-      agentIdleTimeoutMs: null,
     },
     startedAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
@@ -142,7 +138,7 @@ function expectWorkflowError(
 
 describe("isolation preflight", () => {
   it("exports the complete frozen reason and divergence vocabularies", () => {
-    assert.equal(RECORDING_UNUSABLE_REASONS.length, 23);
+    assert.equal(RECORDING_UNUSABLE_REASONS.length, 22);
     assert.equal(REPLAY_DIVERGENCE_KINDS.length, 11);
     assert.equal(new Set(RECORDING_UNUSABLE_REASONS).size, RECORDING_UNUSABLE_REASONS.length);
     assert.equal(new Set(REPLAY_DIVERGENCE_KINDS).size, REPLAY_DIVERGENCE_KINDS.length);
@@ -175,7 +171,6 @@ describe("isolation preflight", () => {
                 attempts: undefined,
                 usage: undefined,
                 error: hardError,
-                budgetDebit: 0,
               }),
             ],
             journal: [],
@@ -214,7 +209,6 @@ describe("isolation preflight", () => {
       ],
       ["no-limits", () => recording({ limits: undefined })],
       ["agent-limit-boundary", () => recording({ limits: { ...recording().limits!, maxAgents: 1 } })],
-      ["no-budget-trajectory", () => recording({ calls: [resultRow({ budgetDebit: undefined })] })],
       ["no-execution-cwd", () => recording({ effectiveCwd: undefined, cwd: undefined })],
       ["no-environment-identity", () => recording({ environment: undefined })],
       ["environment-mismatch", () => recording({ environment: { key: "different" } })],
@@ -288,7 +282,7 @@ describe("isolation preflight", () => {
     expectWorkflowError(
       () =>
         replay(
-          recording({ calls: [resultRow({ origin: "journal-replay", attempts: undefined, resolvedCwd: undefined, budgetDebit: 0 })] }),
+          recording({ calls: [resultRow({ origin: "journal-replay", attempts: undefined, resolvedCwd: undefined })] }),
         ),
       WorkflowErrorCode.REPLAY_TARGET_INVALID,
       "journal-replay-target",
@@ -485,7 +479,6 @@ describe("replay runner", () => {
       modelRequested: undefined,
       modelResolved: undefined,
       resolvedCwd: undefined,
-      budgetDebit: undefined,
       error: realmError,
     });
     const targetRow = resultRow({
@@ -542,7 +535,7 @@ describe("replay runner", () => {
 });
 
 describe("runIsolation harness", () => {
-  it("records, isolates, persists quarantine/provenance/report, and per-call token debits (the deleted budget's recording survives as a metric)", async () => {
+  it("records, isolates, and persists quarantine, provenance, reports, and usage telemetry", async () => {
     const root = mkdtempSync(join(tmpdir(), "isolation-harness-"));
     const cwd = mkdtempSync(join(tmpdir(), "isolation-cwd-"));
     const script = `export const meta = { name: 'harness', description: 'integration' }
@@ -568,7 +561,6 @@ return { first, target }`;
         maxAgents: 10,
         concurrency: 1,
         agentRetries: 0,
-        agentTimeoutMs: null,
         environmentKey: ENVIRONMENT_KEY,
       });
       assert.equal(baseline.status, "completed");
@@ -612,8 +604,8 @@ return { first, target }`;
     }
   });
 
-  it("classifies candidate fallback, target failure, zero-call nested workflow, and timeout cancellation", async () => {
-    const scenarios = ["fallback", "failure", "nested", "timeout"] as const;
+  it("classifies candidate fallback, target failure, and zero-call nested workflow", async () => {
+    const scenarios = ["fallback", "failure", "nested"] as const;
     for (const scenario of scenarios) {
       const root = mkdtempSync(join(tmpdir(), `isolation-${scenario}-`));
       const cwd = mkdtempSync(join(tmpdir(), `isolation-${scenario}-cwd-`));
@@ -637,11 +629,8 @@ return value`
           maxAgents: 10,
           concurrency: 1,
           agentRetries: 0,
-          agentTimeoutMs: scenario === "timeout" ? 10 : null,
-          tokenBudget: null,
           environmentKey: ENVIRONMENT_KEY,
         });
-        let timeoutSignalAborted = false;
         const result = await runIsolation({
           baselineRunId: `baseline-${scenario}`,
           cwd,
@@ -661,19 +650,6 @@ return value`
                   details: { exact: true },
                 });
               }
-              if (scenario === "timeout") {
-                await new Promise<void>((resolve) => {
-                  options?.signal?.addEventListener(
-                    "abort",
-                    () => {
-                      timeoutSignalAborted = true;
-                      resolve();
-                    },
-                    { once: true },
-                  );
-                });
-                return "late";
-              }
               options?.onModelResolved?.("candidate/concrete");
               return "candidate";
             },
@@ -681,7 +657,7 @@ return value`
         });
         assert.equal(
           result.status,
-          scenario === "failure" ? "target-failed" : scenario === "timeout" ? "target-failed" : "diverged",
+          scenario === "failure" ? "target-failed" : "diverged",
           scenario,
         );
         if (scenario === "fallback") assert.equal(result.report.divergence?.kind, "candidate-fallback");
@@ -690,7 +666,6 @@ return value`
           assert.equal(result.error?.code, WorkflowErrorCode.SCHEMA_NONCOMPLIANCE);
           assert.deepEqual(result.error?.details, { exact: true });
         }
-        if (scenario === "timeout") assert.equal(timeoutSignalAborted, true);
       } finally {
         rmSync(root, { recursive: true, force: true });
         rmSync(cwd, { recursive: true, force: true });
@@ -717,8 +692,6 @@ return 'caught'`;
         maxAgents: 10,
         concurrency: 1,
         agentRetries: 0,
-        agentTimeoutMs: null,
-        tokenBudget: null,
         environmentKey: ENVIRONMENT_KEY,
       });
       const controller = new AbortController();

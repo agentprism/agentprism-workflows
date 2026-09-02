@@ -255,11 +255,8 @@ return { count: args.count, answer }`,
       assert.equal(persisted?.callsAllocated, 0);
       assert.deepEqual(persisted?.limits, {
         maxAgents: 1000,
-        tokenBudget: null,
         concurrency: 8,
         agentRetries: 0,
-        agentTimeoutMs: null,
-        agentIdleTimeoutMs: null,
       });
     } finally {
       dirs.cleanup();
