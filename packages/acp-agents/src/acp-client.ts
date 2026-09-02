@@ -109,7 +109,13 @@ import {
   type AgentInteractionState,
   type McpServerConfig,
 } from "@automatalabs/shared-types";
-import type { Backend, BackendId, ProviderErrorMetadata, StructuredSource } from "./backend.js";
+import type {
+  Backend,
+  BackendId,
+  ProviderErrorMetadata,
+  SessionMetaInputs,
+  StructuredSource,
+} from "./backend.js";
 import {
   adaptPromptContent,
   describeAuthProviderAdvertisement,
@@ -1849,14 +1855,17 @@ export class PooledConnection {
   }
 
   private sessionRequestMeta(opts: AcpSessionOptions): Record<string, unknown> | undefined {
+    const inputs: SessionMetaInputs = {
+      baseInstructions: opts.baseInstructions,
+      developerInstructions: opts.developerInstructions,
+      runId: opts.runId,
+      label: opts.label,
+    };
     return stampRunId(
       layerMeta(
-        this.backend.sessionMetaDefaults?.(),
+        this.backend.sessionMetaDefaults?.(inputs),
         opts.meta,
-        this.backend.sessionMeta(opts.schema, {
-          baseInstructions: opts.baseInstructions,
-          developerInstructions: opts.developerInstructions,
-        }),
+        this.backend.sessionMeta(opts.schema, inputs),
       ),
       opts.runId,
     );

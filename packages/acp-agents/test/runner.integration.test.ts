@@ -1296,13 +1296,20 @@ test("(#5) mcpServers defaults to [] at session/new when none is provided", asyn
 
 test("(#5b) RunOptions.runId is stamped onto session/new _meta[runId]", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
-  await makeRunner().run("hi", { model: "claude", cwd, runId: "run-abc123" });
+  await makeRunner().run("hi", {
+    model: "claude",
+    cwd,
+    runId: "run-abc123",
+    label: "phase: implement",
+  });
 
   const entries = readLog();
   const newSession = entries.find((e) => e.method === "newSession");
-  // No schema on this run, so the ONLY _meta is the correlation stamp.
-  assert.deepEqual(newSession?.params?._meta, { runId: "run-abc123" });
-  // It rides session/new, NOT the prompt turn.
+  assert.deepEqual(newSession?.params?._meta, {
+    claudeCode: { options: { title: "AgentPrism: phase: implement" } },
+    runId: "run-abc123",
+  });
+  // Correlation and title ride session/new, never the prompt turn.
   assert.equal(entries.find((e) => e.method === "prompt")?.params?._meta ?? undefined, undefined);
 });
 
@@ -1317,9 +1324,11 @@ test("(#5b) runId coexists with the Claude schema _meta at session/new", async (
     runId: "run-xyz",
   });
   const meta = readLog().find((e) => e.method === "newSession")?.params?._meta as Record<string, unknown>;
-  // Both the vendor schema channel AND the correlation stamp are present.
+  // The vendor schema channel, no-hidden-title default, and correlation stamp are all present.
   assert.equal(meta?.["runId"], "run-xyz");
-  assert.ok(meta?.claudeCode, "the Claude schema _meta channel is preserved");
+  const claudeCode = meta?.claudeCode as { options?: { title?: string; outputFormat?: unknown } };
+  assert.equal(claudeCode?.options?.title, "AgentPrism: run-xyz");
+  assert.ok(claudeCode?.options?.outputFormat, "the Claude schema _meta channel is preserved");
 });
 
 test("(#5b) Codex session/new carries the runId _meta even though the schema rides the turn", async () => {

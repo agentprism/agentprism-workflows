@@ -254,7 +254,10 @@ test("callIndex reaches every session event, survives tombstones and retries, an
     assert.equal("callIndex" in entry.params, false);
     assert.equal(JSON.stringify(entry.params).includes("callIndex"), false);
     assert.equal(JSON.stringify(entry.params).includes("event-fixture"), false);
-    assert.deepEqual(entry.params._meta, { runId: "run-call-index" });
+    assert.deepEqual(entry.params._meta, {
+      claudeCode: { options: { title: "AgentPrism: correlated" } },
+      runId: "run-call-index",
+    });
   }
 });
 

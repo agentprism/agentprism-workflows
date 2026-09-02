@@ -1,4 +1,4 @@
-// ClaudeBackend — drives @agentclientprotocol/claude-agent-acp@0.66.0 (over the Claude
+// ClaudeBackend — drives @agentclientprotocol/claude-agent-acp@0.73.0 (over the Claude
 // Agent SDK). Structured output rides the vendor `_meta.claudeCode` channel at session/new:
 //   options.outputFormat = { type:"json_schema", schema }   // the SDK's native constraint
 //   emitRawSDKMessages = true                                // MANDATORY to READ the result
@@ -12,6 +12,7 @@ import type {
   Backend,
   ProviderErrorClassification,
   ProviderErrorMetadata,
+  SessionMetaInputs,
   SpawnConfig,
   StructuredSource,
 } from "../backend.js";
@@ -21,6 +22,7 @@ import { toAnthropicJsonSchema } from "../schema-strict.js";
 import { defineBuiltinBackend } from "./define.js";
 
 const require = createRequire(import.meta.url);
+const MAX_WORKFLOW_TITLE_LENGTH = 160;
 
 /** Claude auth adaptation: terminal follows host TTY and gateway follows the host resolver. */
 export const claudeAuthProfile: AuthProfile = {
@@ -68,17 +70,27 @@ export class ClaudeBackend implements Backend {
     }
   }
 
-  sessionMeta(schema: TSchema | undefined): Record<string, unknown> | undefined {
-    // Claude has no analog to Codex's base/developer instruction overrides, so it ignores the
-    // optional SessionMetaInputs (the seam still accepts them via the Backend interface).
+  sessionMetaDefaults(inputs?: SessionMetaInputs): Record<string, unknown> | undefined {
+    const title = workflowSessionTitle(inputs);
+    if (!title) return undefined;
+    return { claudeCode: { options: { title } } } satisfies ClaudeCodeSessionMeta;
+  }
+
+  sessionMeta(schema: TSchema | undefined, inputs?: SessionMetaInputs): Record<string, unknown> | undefined {
+    // Claude has no analog to Codex's base/developer instruction overrides. For engine runs, set
+    // the SDK session title up front: claude-agent-acp >=0.71 otherwise launches an unobserved
+    // background small-model title-generation call after the first turn. Interactive sessions
+    // have no runId and retain the adapter's generated-title behavior.
     if (!schema) return undefined;
     // Anthropic structured outputs accept only a JSON-Schema subset (additionalProperties:false
     // required on every object; numeric/string/array constraints rejected). Normalize the wire
     // copy so the native constraint always engages — an incompatible schema would fail the SDK
     // constraint and silently degrade the run to unconstrained text + the repair ladder.
+    const title = workflowSessionTitle(inputs);
     const meta: ClaudeCodeSessionMeta = {
       claudeCode: {
         options: {
+          ...(title ? { title } : {}),
           outputFormat: { type: "json_schema", schema: toAnthropicJsonSchema(schema) },
         },
         emitRawSDKMessages: true,
@@ -95,6 +107,12 @@ export class ClaudeBackend implements Backend {
   nativeStructured(source: StructuredSource): unknown {
     return source.rawStructuredOutput();
   }
+}
+
+function workflowSessionTitle(inputs: SessionMetaInputs | undefined): string | undefined {
+  if (!inputs?.runId) return undefined;
+  const subject = (inputs.label?.trim() || inputs.runId).replace(/\s+/g, " ");
+  return `AgentPrism: ${subject}`.slice(0, MAX_WORKFLOW_TITLE_LENGTH);
 }
 
 export const claudeBackendDefinition = defineBuiltinBackend({

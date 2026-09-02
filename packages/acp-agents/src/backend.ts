@@ -43,6 +43,10 @@ export interface SessionMetaInputs {
   baseInstructions?: string;
   /** CODEX-ONLY: developer-role instructions (`thread/start.developerInstructions`). */
   developerInstructions?: string;
+  /** Engine run correlation id. Backends may use it to suppress autonomous session work. */
+  runId?: string;
+  /** Human-readable occurrence label associated with `runId`; never sent unless a backend uses it. */
+  label?: string;
 }
 
 /** Structured provider metadata accumulated alongside a prompt before its request rejects. */
@@ -104,7 +108,7 @@ export interface Backend {
   /** OPTIONAL backend-level `_meta` DEFAULTS for session/new (e.g. a custom registry entry's
    *  static `sessionMeta`). Lowest precedence: per-call RunOptions.meta merges OVER these,
    *  and sessionMeta()'s protocol-critical keys merge over both. */
-  sessionMetaDefaults?(): Record<string, unknown> | undefined;
+  sessionMetaDefaults?(inputs?: SessionMetaInputs): Record<string, unknown> | undefined;
   /** PROTOCOL-CRITICAL `_meta` for session/new (undefined when this backend carries nothing
    *  there) — e.g. the Claude schema channel. Highest precedence below the runId stamp: these
    *  keys win over the generic user passthrough. `inputs` carries optional per-session extras

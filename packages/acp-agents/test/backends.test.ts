@@ -31,13 +31,27 @@ test("ClaudeBackend.sessionMeta carries outputFormat + emitRawSDKMessages at ses
   assert.deepEqual(schema.required, ["city", "hot"]);
 });
 
-test("ClaudeBackend: no schema => no session _meta; never carries schema on the turn", () => {
+test("ClaudeBackend: no schema => no critical session _meta; never carries schema on the turn", () => {
   // Typed through the Backend seam (the engine only ever sees Backend), so promptMeta takes
   // the schema arg even though Claude deliberately ignores it.
   const backend: Backend = new ClaudeBackend();
   assert.equal(backend.sessionMeta(undefined), undefined);
   assert.equal(backend.promptMeta(SCHEMA), undefined); // Claude schema is session-scoped, not per-turn
   assert.equal(backend.id, "claude");
+});
+
+test("ClaudeBackend gives engine runs a stable title so the adapter spends no hidden title turn", () => {
+  const backend: Backend = new ClaudeBackend();
+  assert.equal(backend.sessionMetaDefaults?.(), undefined, "interactive sessions retain generated titles");
+  assert.deepEqual(backend.sessionMetaDefaults?.({ runId: "run-123", label: "phase: implement" }), {
+    claudeCode: { options: { title: "AgentPrism: phase: implement" } },
+  });
+
+  const meta = backend.sessionMeta(SCHEMA, { runId: "run-123", label: "phase: implement" }) as {
+    claudeCode: { options: { title: string; outputFormat: unknown } };
+  };
+  assert.equal(meta.claudeCode.options.title, "AgentPrism: phase: implement");
+  assert.ok(meta.claudeCode.options.outputFormat, "the title does not displace structured output");
 });
 
 test("ClaudeBackend.nativeStructured reads structured_output off the raw SDK result", () => {
