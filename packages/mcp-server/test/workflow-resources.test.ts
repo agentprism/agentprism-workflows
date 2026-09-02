@@ -1340,6 +1340,20 @@ test("a slow events subscriber holds one promise plus one dirty bit while durabl
     const run = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "events-backpressure"));
     const uri = `workflow://runs/${run.runId}/events`;
     const initial = eventDocument(await client.readResource({ uri }));
+    // Count every watcher delivery so the release below waits for the WHOLE backlog to drain, not
+    // just the first record. Otherwise records still draining after releaseFirst() each re-dirty
+    // the settled subscription and emit their own hint — the very non-coalescing this test forbids —
+    // which made the assertion flake under load.
+    const internals = resources as unknown as {
+      eventSubscriptions: Map<string, { dirty: boolean; inFlight: boolean }>;
+      markEventSubscriptionDirty: (subscription: { dirty: boolean; inFlight: boolean }) => void;
+    };
+    let drainedRecords = 0;
+    const markSubscriptionDirty = internals.markEventSubscriptionDirty.bind(resources);
+    internals.markEventSubscriptionDirty = (subscription) => {
+      drainedRecords += 1;
+      markSubscriptionDirty(subscription);
+    };
     await client.subscribeResource({ uri });
     const persistence = manager.getPersistence();
     const state = persistence.load(run.runId);
@@ -1353,11 +1367,9 @@ test("a slow events subscriber holds one promise plus one dirty bit while durabl
       state.eventSeq = record.seq;
     }
     persistence.save(state);
-    const internals = resources as unknown as {
-      eventSubscriptions: Map<string, { dirty: boolean; inFlight: boolean }>;
-    };
-    await waitUntil(() => notificationCalls === 1 && internals.eventSubscriptions.get(uri)?.dirty === true,
-      "the slow subscriber should coalesce its backlog into one dirty bit");
+    await waitUntil(
+      () => drainedRecords >= 1_005 && notificationCalls === 1 && internals.eventSubscriptions.get(uri)?.dirty === true,
+      "the slow subscriber should coalesce its whole drained backlog into one dirty bit");
     assert.equal(internals.eventSubscriptions.get(uri)?.inFlight, true);
     releaseFirst();
     await waitUntil(() => notificationCalls >= 2, "one coalesced follow-up hint should be sent");

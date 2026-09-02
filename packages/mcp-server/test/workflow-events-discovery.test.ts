@@ -378,3 +378,60 @@ test("legacy persisted rows omit events discovery and latest activity without br
     await cold.dispose();
   }
 });
+
+test("an eventLogIncomplete stream omits events discovery and latest activity without breaking status", async () => {
+  const first = await connect(okRunner());
+  let runId: string | undefined;
+  let runFile: string | undefined;
+  try {
+    const completed = await first.client.callTool({
+      name: "workflow",
+      arguments: { script: NO_AGENT_SCRIPT },
+    });
+    runId = runIdOf(completed);
+    runFile = persistedRunFile(runId);
+    assert.ok(runFile);
+    // Before the fault marker is set, the completed run advertises its durable events stream.
+    assert.equal(typeof structured(completed)?.eventsUri, "string");
+  } finally {
+    await first.dispose();
+  }
+
+  assert.ok(runId && runFile);
+  // A mid-run journal-append fault leaves a valid stream id/watermark but an incomplete log whose
+  // read/watch seam fails closed; the events surfaces must treat it as integrity-unsafe and omit it
+  // rather than advertise a URI/link that would fault (EVENT_LOG_INCOMPLETE) on read.
+  const row = JSON.parse(readFileSync(runFile, "utf8")) as Record<string, unknown>;
+  assert.equal(typeof row.eventStreamId, "string");
+  assert.equal(Number.isSafeInteger(row.eventSeq), true);
+  row.eventLogIncomplete = true;
+  writeFileSync(runFile, `${JSON.stringify(row, null, 2)}\n`, "utf8");
+
+  const cold = await connect(okRunner());
+  try {
+    const status = await cold.client.callTool({
+      name: "workflow",
+      arguments: { action: "status", runId, waitMs: 0 },
+    });
+    assert.equal(status.isError, false);
+    assert.equal(structured(status)?.status, "completed");
+    assert.equal(structured(status)?.eventsUri, undefined);
+    assert.equal(activityOf(status), undefined);
+    assert.equal((structured(status)?.outcome as Record<string, unknown>).eventsUri, undefined);
+    assert.equal(
+      resourceLinks(status).some((link) => String(link.uri).endsWith("/events")),
+      false,
+    );
+
+    // The immutable result stays retrievable even though the events sidecar is unadvertised.
+    const result = await cold.client.callTool({
+      name: "workflow",
+      arguments: { action: "result", runId },
+    });
+    assert.equal(result.isError, false);
+    assert.equal(structured(result)?.status, "completed");
+    assert.equal(structured(result)?.eventsUri, undefined);
+  } finally {
+    await cold.dispose();
+  }
+});

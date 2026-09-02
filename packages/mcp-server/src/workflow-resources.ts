@@ -70,7 +70,12 @@ function hasExactResult(state: PersistedRunState): boolean {
 }
 
 function hasDurableEventStream(state: PersistedRunState): boolean {
-  return typeof state.eventStreamId === "string" && STREAM_ID_PATTERN.test(state.eventStreamId) &&
+  // A run whose journal append faulted mid-run persists eventLogIncomplete and its read/watch
+  // seam fails closed (EVENT_LOG_INCOMPLETE). Such a stream is integrity-unsafe, so it is never
+  // advertised: availableEventsUri, eventsLink, latestActivity, and the events resource listing
+  // must all omit it, matching requireDurableStoppedRun and the legacy/stream-less handling.
+  return state.eventLogIncomplete !== true &&
+    typeof state.eventStreamId === "string" && STREAM_ID_PATTERN.test(state.eventStreamId) &&
     Number.isSafeInteger(state.eventSeq) && (state.eventSeq ?? -1) >= 0;
 }
 
