@@ -258,8 +258,8 @@ await runner.dispose();   // closes pooled backend processes
 
 The `workflow` tool runs in the foreground by default, can acknowledge long work with
 `background:true`, and observes it with immediate `action:"status"` snapshots. Foreground execution streams `notifications/progress` and normally returns
-the terminal structured result; if a live ACP permission needs an answer, it returns the still-running
-run plus `pendingPermissions` so the same run can be continued through another tool call.
+the terminal structured result; form-capable clients answer live ACP permissions within that same
+run/resume call, while other clients receive the still-running run plus `pendingPermissions`.
 
 Register the MCP entry in your host's config (the same command as before — it is now a thin
 stdio shim that auto-starts a shared local **workflow daemon**, so runs survive the host
@@ -385,12 +385,14 @@ Every run is statically checked, mock-executed, and config-probed before admissi
 { "action": "run", "script": "export const meta = { name: 'review', description: 'review' }; return await agent('Review the repo');", "background": true }
 ```
 
-Then take immediate snapshots until `outcome` appears:
+Request an immediate machine-readable snapshot only when one is needed:
 
 ```json
 { "action": "status", "runId": "mabc1234-k9x2pq" }
 ```
 
+Do not repeatedly call status to watch progress: the MCP Apps panel follows app-only event pages and
+pushes milestones without model tool calls, and event-resource consumers can advance their cursor.
 Status returns the freshest bounded state and cumulative token usage; terminal status adds the same
 raw result/log projection a foreground call returns. Every admitted run and subsequent
 status/terminal response for a durable event-log run exposes `eventsUri` plus a labelled events
@@ -401,9 +403,9 @@ point to that resource and bounded `action:"result"` paging (`endOffset` + `hasM
 bounded/redacted events stream is observability, not an exact-result API. Status includes the
 complete ordered exact option ids and a credential-redacted, bounded view of available tool input,
 content, and locations, plus run/phase/agent/backend/tool context and each option's exact scope.
-Private ACP session ids never appear; requests that cannot fit safely fail closed. Elicitation-capable clients present them to
-the user; other clients answer
-through:
+Private ACP session ids never appear; requests that cannot fit safely fail closed. Status never opens
+a form or changes execution. Form-capable foreground run/resume calls present pending choices in
+place; background and form-less clients answer through:
 
 ```json
 {

@@ -105,7 +105,7 @@ test("background acceptance is immediate and status is an immediate cumulative s
       pendingPermissions: [],
       interaction: {
         permissionRequests: "may-block",
-        collectWith: ["status"],
+        collectWith: ["run", "resume"],
         respondWith: "permissions-response",
         elicitation: "unavailable",
       },

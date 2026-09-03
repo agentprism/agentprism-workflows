@@ -1476,11 +1476,12 @@ whole-run and targeted variants, making `forceOwner` and `callIndex` structurall
 
 Mixed/missing branches and invalid run IDs are MCP Invalid Params (`-32602`). There is no omitted
 action default, retired action alias, hidden input alias, or compatibility normalization.
-`background` omission preserves foreground execution behavior for executions that do not block on
-an ACP permission: it streams progress, honors request cancellation and live checkpoint elicitation, and returns
-`WorkflowExecutionToolResult<T>`. If a permission blocks first, foreground returns a running admission with `pendingPermissions` and the run stays live.
-`action:"status"` is always an immediate lifecycle snapshot. When a permission is pending it also
-projects that request and may elicit one exact option from a capable client.
+`background` omission preserves foreground execution behavior: it streams progress, honors request
+cancellation, presents live checkpoint and ACP-permission forms to capable clients, and returns
+`WorkflowExecutionToolResult<T>` after the same run settles. If a client cannot elicit and a
+permission blocks, foreground returns a running admission with `pendingPermissions` and the run
+stays live. `action:"status"` is always an immediate observation-only lifecycle snapshot. It safely
+projects pending permission details but never elicits or changes execution.
 
 After preflight succeeds, `background:true` reserves one of four process-local active-or-starting slots, performs lease acquisition and the durable initial save, then returns:
 
@@ -1496,7 +1497,7 @@ interface WorkflowBackgroundAccepted {
   pendingPermissions?: WorkflowPendingPermission[];
   interaction: {
     permissionRequests: "may-block";
-    collectWith: ["status"];
+    collectWith: ["run", "resume"];
     respondWith: "permissions-response";
     elicitation: "available" | "unavailable";
   };
@@ -1583,11 +1584,11 @@ interface WorkflowStopPendingResult extends WorkflowRunStatus {
 }
 ```
 
-Status is an immediate snapshot. Elicitation-capable clients receive a pending permission's exact
-options; accepting maps to the selected option id, while decline/cancel maps to ACP cancelled.
-Without elicitation, status returns the request for a later `permissions-response` call. Selected
+Status is an immediate observation-only snapshot. It returns a pending permission's exact safe
+options but never opens an elicitation form. Form-capable foreground run/resume calls collect the
+choice in place; background and form-less clients use a later `permissions-response` call. Selected
 ids are validated against the still-pending request and each permission settles once. Status does
-not poll, await a lifecycle transition, or emit wait metadata.
+not change execution, poll, await a lifecycle transition, or emit wait metadata.
 
 A live permission retains the agent call's concurrency slot and ACP session. Permission
 inspection/response follows the lease owner over the

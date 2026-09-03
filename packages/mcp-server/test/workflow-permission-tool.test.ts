@@ -147,7 +147,7 @@ test("status exposes a live permission and permissions-response resumes the work
   }
 });
 
-test("elicitation-capable status presents the exact options and resumes the agent", async () => {
+test("elicitation-capable status stays observation-only and requires permissions-response", async () => {
   const broker = new WorkflowPermissionBroker();
   const runner = makeRunner(async (_prompt, options) => {
     const outcome = await broker.resolver(
@@ -164,13 +164,14 @@ test("elicitation-capable status presents the exact options and resumes the agen
     return outcome.outcome.outcome === "selected" ? outcome.outcome.optionId : "cancelled";
   });
   const connected = await connect(runner, { permissionBroker: broker, elicitation: true });
+  let permissionForms = 0;
   connected.client.setRequestHandler("elicitation/create", async (request) => {
     const schema = request.params.requestedSchema as {
       required?: string[];
       properties?: Record<string, { enum?: string[]; oneOf?: Array<{ const: string }> }>;
     };
     if (schema.properties?.optionId) {
-      assert.deepEqual(schema.properties.optionId.enum, ["allow_once", "allow_for_session"]);
+      permissionForms++;
       return { action: "accept" as const, content: { optionId: "allow_for_session" } };
     }
     const content = Object.fromEntries((schema.required ?? []).map((field) => {
@@ -192,9 +193,21 @@ test("elicitation-capable status presents the exact options and resumes the agen
       name: "workflow",
       arguments: { action: "status", runId },
     }));
-    assert.equal((inspected.permissionResponse as Record<string, unknown>).runId, runId);
-    assert.deepEqual(inspected.pendingPermissions, []);
+    assert.equal(permissionForms, 0);
+    assert.equal((inspected.pendingPermissions as unknown[]).length, 1);
+    assert.deepEqual((inspected.interaction as Record<string, unknown>).collectWith, ["run", "resume"]);
+    assert.equal(inspected.permissionResponse, undefined);
 
+    const [permission] = inspected.pendingPermissions as Array<{ permissionId: string }>;
+    await connected.client.callTool({
+      name: "workflow",
+      arguments: {
+        action: "permissions-response",
+        runId,
+        permissionId: permission!.permissionId,
+        response: { outcome: { outcome: "selected", optionId: "allow_for_session" } },
+      },
+    });
     const awaited = await waitForStatus(
       connected.client,
       runId,

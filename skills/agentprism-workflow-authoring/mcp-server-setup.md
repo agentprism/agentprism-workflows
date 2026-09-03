@@ -29,15 +29,15 @@ defaults, wait controls, or hidden cross-action inputs.
   decisions without re-elicitation. It never creates a child run or accepts edited inputs. Old
   records without required canonical metadata remain inspectable but require a fresh Run.
 - **Status** (`{ action:"status", runId, lastN?, labelGlob?, logLines? }`) returns one immediate,
-  bounded snapshot. Request another snapshot later; status never polls or waits. It may expose a
+  bounded on-demand snapshot. It never waits, elicits, or changes execution, and may expose a
   sanitized pending ACP permission request.
 - **Result** (`{ action:"result", runId, offset?, maxBytes? }`) pages the exact JSON result of a
   completed run in at most 16,384 UTF-8 bytes without splitting code points.
 - **Permission response** (`{ action:"permissions-response", runId, permissionId, response }`)
-  selects one exact advertised option ID or cancels the live request. Capable clients instead get a
-  form showing run ID, phase, label, backend, tool title/kind, bounded redacted raw input/content/
-  locations, and the exact meaning/scope of every option. Private session IDs and secrets are never
-  shown.
+  selects one exact advertised option ID or cancels the live request. Capable foreground run/resume
+  calls instead get a form showing run ID, phase, label, backend, tool title/kind, bounded redacted
+  raw input/content/locations, and the exact meaning/scope of every option. Private session IDs and
+  secrets are never shown.
 - **Stop** aborts the whole run, or includes `callIndex` to cancel one live agent call. A targeted
   call settles to `null` with `AGENT_CANCELLED`; siblings continue.
 
@@ -57,7 +57,8 @@ are ignored in favor of the first answer.
 }
 ```
 
-Retain the returned run ID, then take snapshots:
+Retain the returned run ID. The MCP Apps monitor or durable events resource follows progress
+without model tool calls; request status only when one on-demand model-readable sample is needed:
 
 ```json
 { "action": "status", "runId": "RUN_ID" }

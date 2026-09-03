@@ -63,7 +63,7 @@ const pendingPermissionSchema = z.object({
 
 const permissionInteractionSchema = z.object({
   permissionRequests: z.literal("may-block"),
-  collectWith: z.array(z.literal("status")),
+  collectWith: z.tuple([z.literal("run"), z.literal("resume")]),
   respondWith: z.literal("permissions-response"),
   elicitation: z.enum(["available", "unavailable"]),
 });
@@ -712,7 +712,7 @@ export type WorkflowExecutionToolResult<T = unknown> = WorkflowExecutionOutcome<
 
 export interface WorkflowPermissionInteraction {
   permissionRequests: "may-block";
-  collectWith: ["status"];
+  collectWith: ["run", "resume"];
   respondWith: "permissions-response";
   elicitation: "available" | "unavailable";
 }

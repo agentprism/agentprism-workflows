@@ -295,7 +295,7 @@ interface WorkflowBackgroundAccepted {
   eventsUri: string;
   limits: WorkflowRunLimits;
   pendingPermissions?: WorkflowPendingPermission[];
-  interaction: { permissionRequests: "may-block"; collectWith: ["status"]; respondWith: "permissions-response"; elicitation: "available" | "unavailable" };
+  interaction: { permissionRequests: "may-block"; collectWith: ["run", "resume"]; respondWith: "permissions-response"; elicitation: "available" | "unavailable" };
 }
 
 interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {

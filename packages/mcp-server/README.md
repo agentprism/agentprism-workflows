@@ -31,8 +31,8 @@ This package is a **thin MCP adapter**. The `workflow` tool's real work — pars
 ```
 
 For `workflow`, foreground is the default; `background:true` durably admits work and returns its run
-ID without awaiting agent completion, and repeated `action:"status"` calls collect immediate bounded snapshots (see
-[Run model](#run-model)). The `repl` tool holds a persistent QuickJS VM **per `projectDir`** — the
+ID without awaiting agent completion. Use `action:"status"` only for an on-demand bounded snapshot;
+the events resource and app-only monitor provide continuous progress (see [Run model](#run-model)). The `repl` tool holds a persistent QuickJS VM **per `projectDir`** — the
 same per-project context model — whose state persists across tool calls and daemon restarts through
 the per-project `repl/` store, and whose subagent `agent()` calls use the same ACP path shown above
 (see [The `repl` tool](#the-repl-tool)). `stdout` is reserved for JSON-RPC framing — every diagnostic
@@ -393,7 +393,7 @@ interface WorkflowBackgroundAccepted {
   eventsUri: string;
   limits: WorkflowRunLimits;
   pendingPermissions?: WorkflowPendingPermission[];
-  interaction: { permissionRequests: "may-block"; collectWith: ["status"]; respondWith: "permissions-response"; elicitation: "available" | "unavailable" };
+  interaction: { permissionRequests: "may-block"; collectWith: ["run", "resume"]; respondWith: "permissions-response"; elicitation: "available" | "unavailable" };
 }
 
 interface WorkflowResultRetrieval {
@@ -533,11 +533,12 @@ No workflow run found for runId "<runId>" in this server's project-scoped run st
 Reading an existing failed/aborted run with status is still successful (`isError: false`); branch on
 the payload `status`.
 
-Status uses that safe projection and returns early with `action-required` when a live ACP
-permission is pending. Status attaches the request's exact ordered option ids with bounded,
-redacted presentation metadata. Elicitation-capable clients present one choice; other clients answer
-with `permissions-response`. The response accepts only the selected exact optionId or cancellation—
-caller-supplied response `_meta` is forbidden—and routes to the daemon generation holding the run lease. The workflow remains running
+Status uses that safe projection and reports `action-required` when a live ACP permission is
+pending. It attaches the request's exact ordered option ids with bounded, redacted presentation
+metadata, but never elicits or changes execution. Form-capable foreground run/resume calls present
+the choice in place; background and form-less clients answer with `permissions-response`. The
+response accepts only the selected exact optionId or cancellation—caller-supplied response `_meta`
+is forbidden—and routes to the daemon generation holding the run lease. The workflow remains running
 and keeps its ACP session/concurrency slot. This state is execution-affine, not a durable pause, and cannot be reconstructed after
 owner loss.
 
@@ -645,8 +646,9 @@ client `resources` capability to gate these server-offered primitives.
 ## Run model
 
 - **Foreground by default.** Omitted/false `background` preserves the synchronous behavior,
-  request cancellation, progress notifications, live checkpoint elicitation, terminal `isError`,
-  and result shape.
+  request cancellation, progress notifications, live checkpoint and ACP-permission elicitation,
+  terminal `isError`, and result shape. Each accepted form response continues the same run inside
+  the original run/resume call.
 - **Detached admission.** `background:true` returns a running acknowledgement with `runId`,
   `status`, `scriptSource`, `scriptUri`, `eventsUri`, resolved `limits`, and separately labelled
   script/events resource links
@@ -657,16 +659,16 @@ client `resources` capability to gate these server-offered primitives.
   There is no queue. Foreground and status consume no slot; a durably stopped background
   run frees its slot immediately even if backend session wind-down is still pending.
 - **Canonical bounded status.** `action:"status"` reads the manager's freshest in-memory snapshot,
-  then its project-scoped persisted store and returns immediately. Request another snapshot or read
-  the event resource for later progress.
-  Status never parses/runs a script, invokes an agent, asks for backend approval, or leases a live
+  then its project-scoped persisted store and returns immediately. It is an on-demand read, not a
+  waiting or interaction channel; use the event resource or app-only monitor for continuous progress.
+  Status never parses/runs a script, invokes an agent, elicits permission, asks for backend approval, or leases a live
   owner. A cold persisted `pending`/`running` row may take a short reconciliation lease and become
   `paused` / `interrupted` when its owner is dead; live or permission-protected owners and every
   other status remain unchanged. Run ID possession is the capability; UI `sessionId` listing
   filters do not apply.
 - **Progress notifications.** When the host includes a `progressToken` with the call, the server streams `notifications/progress` as agents settle (it reports `settled / total` agents plus the current phase). With no `progressToken`, progress is a no-op.
-  Background runs deliberately have no initiating progress channel; repeated immediate status
-  snapshots and the app-only run monitor are their progress surfaces.
+  Background runs deliberately have no initiating progress channel; the durable events resource and
+  app-only run monitor are their continuous progress surfaces, with status reserved for on-demand snapshots.
 - **Terminal status, not exceptions.** An ordinary pause/fail/abort does **not** throw — the run resolves to a `WorkflowRunResult` with `status` already stamped (`completed | paused | failed | aborted`) plus an optional `reason`/`resetHint`. Only a malformed script (which fails before a run exists) surfaces as an MCP tool error.
 - **Immediate terminal diagnostics.** Paused, failed, and aborted execution results contain a
   redacted final-20 `logTail` even when empty. The text response renders `recent run log (last X of

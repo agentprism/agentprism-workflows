@@ -193,72 +193,133 @@ return await checkpoint("Pick one", { kind: "select", choices: ["alpha", "beta"]
   }
 });
 
-test("modern input_required resolves a live workflow permission with the exact optionId", async () => {
-  const broker = new WorkflowPermissionBroker();
-  const runner = makeRunner(async (_prompt, options) => {
-    const response = await broker.resolver(
-      {
-        sessionId: "modern-permission-session",
-        toolCall: { toolCallId: "modern-permission-tool", title: "Run tests", kind: "execute" },
-        options: [
-          { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
-          { optionId: "allow_for_session", name: "Allow for session", kind: "allow_always" },
-        ],
+for (const protocolMode of ["legacy", "modern"] as const) {
+  test(`${protocolMode} foreground permission elicitation continues the original run call`, async () => {
+    const broker = new WorkflowPermissionBroker();
+    const runner = makeRunner(async (_prompt, options) => {
+      const outcomes: string[] = [];
+      for (const suffix of ["first", "second"]) {
+        const response = await broker.resolver(
+          {
+            sessionId: `${protocolMode}-permission-session`,
+            toolCall: {
+              toolCallId: `${protocolMode}-permission-tool-${suffix}`,
+              title: `Run ${suffix} command`,
+              kind: "execute",
+            },
+            options: [
+              { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+              { optionId: "allow_for_session", name: "Allow for session", kind: "allow_always" },
+            ],
+          },
+          {
+            sessionId: `${protocolMode}-permission-session`,
+            backendId: "codex",
+            runId: options.runId,
+            callIndex: options.callIndex,
+          },
+        );
+        outcomes.push(response.outcome.outcome === "selected" ? response.outcome.optionId : "cancelled");
+      }
+      return outcomes.join(",");
+    });
+    const daemon = await startDaemon(runner, broker);
+    const projectDir = makeProjectDir(`dual-era-permission-${protocolMode}`);
+    const connected = await connectHttp(daemon.url, {
+      protocolMode,
+      uiCapability: "absent",
+      elicit: (request) => {
+        const configuration = acceptAgentConfiguration(request);
+        return configuration
+          ? { action: "accept", content: configuration }
+          : { action: "accept", content: { optionId: "allow_for_session" } };
       },
-      {
-        sessionId: "modern-permission-session",
-        backendId: "codex",
-        runId: options.runId,
-        callIndex: options.callIndex,
-      },
-    );
-    return response.outcome.outcome === "selected" ? response.outcome.optionId : "cancelled";
-  });
-  const daemon = await startDaemon(runner, broker);
-  const projectDir = makeProjectDir("dual-era-permission");
-  const connected = await connectHttp(daemon.url, {
-    protocolMode: "modern",
-    uiCapability: "absent",
-    elicit: (request) => {
-      const configuration = acceptAgentConfiguration(request);
-      return configuration
-        ? { action: "accept", content: configuration }
-        : { action: "accept", content: { optionId: "allow_for_session" } };
-    },
-  });
-  try {
-    const script = `export const meta = { name: "modern-permission", description: "modern permission" };
+    });
+    try {
+      const script = `export const meta = { name: "${protocolMode}-permission", description: "permission" };
 return await agent("work", { label: "worker", model: "codex" });`;
-    const accepted = await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "run", script, projectDir, background: true },
-    });
-    const runId = structured(accepted)?.runId;
-    assert.equal(typeof runId, "string");
-    await waitUntil(() => broker.has(runId as string), "modern permission request");
+      const terminal = await connected.client.callTool({
+        name: "workflow",
+        arguments: { action: "run", script, projectDir },
+      });
+      assert.equal(terminal.isError, false, JSON.stringify(terminal.content));
+      assert.equal(structured(terminal)?.status, "completed");
+      assert.equal(structured(terminal)?.result, "allow_for_session,allow_for_session");
+      assert.equal(connected.elicitations.length, 3, "agent configuration plus two live permissions");
+      assert.deepEqual(broker.list(structured(terminal)?.runId as string), []);
+    } finally {
+      await connected.dispose();
+      await daemon.close();
+    }
+  });
+}
 
-    const resolved = await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId },
+for (const protocolMode of ["legacy", "modern"] as const) {
+  test(`${protocolMode} status observes but never elicits a background permission`, async () => {
+    const broker = new WorkflowPermissionBroker();
+    const runner = makeRunner(async (_prompt, options) => {
+      const response = await broker.resolver(
+        {
+          sessionId: `${protocolMode}-background-permission-session`,
+          toolCall: { toolCallId: `${protocolMode}-background-permission-tool`, title: "Run tests", kind: "execute" },
+          options: [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }],
+        },
+        {
+          sessionId: `${protocolMode}-background-permission-session`,
+          backendId: "codex",
+          runId: options.runId,
+          callIndex: options.callIndex,
+        },
+      );
+      return response.outcome.outcome === "selected" ? response.outcome.optionId : "cancelled";
     });
-    assert.equal(resolved.isError, false);
-    assert.equal(structured(resolved)?.permissionResponse?.outcome?.optionId, "allow_for_session");
-    assert.equal(connected.elicitations.length, 2);
+    const daemon = await startDaemon(runner, broker);
+    const projectDir = makeProjectDir(`dual-era-status-permission-${protocolMode}`);
+    let permissionForms = 0;
+    const connected = await connectHttp(daemon.url, {
+      protocolMode,
+      uiCapability: "absent",
+      elicit: (request) => {
+        const configuration = acceptAgentConfiguration(request);
+        if (configuration) return { action: "accept", content: configuration };
+        permissionForms++;
+        return { action: "accept", content: { optionId: "allow_once" } };
+      },
+    });
+    try {
+      const script = `export const meta = { name: "${protocolMode}-status-permission", description: "permission" };
+return await agent("work", { label: "worker", model: "codex" });`;
+      const accepted = await connected.client.callTool({
+        name: "workflow",
+        arguments: { action: "run", script, projectDir, background: true },
+      });
+      const runId = structured(accepted)?.runId as string;
+      await waitUntil(() => broker.has(runId), `${protocolMode} background permission request`);
 
-    await waitUntil(async () => structured(await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId },
-    }))?.status === "completed", "modern permission workflow completion");
-    const terminal = await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId },
-    });
-    assert.equal(structured(terminal)?.outcome?.result, "allow_for_session");
-  } finally {
-    await connected.dispose();
-    await daemon.close();
-  }
-});
+      const observed = await connected.client.callTool({
+        name: "workflow",
+        arguments: { action: "status", runId },
+      });
+      assert.equal(observed.isError, false);
+      assert.equal(permissionForms, 0);
+      assert.equal(structured(observed)?.pendingPermissions?.length, 1);
+      const permissionId = structured(observed)?.pendingPermissions?.[0]?.permissionId;
+      assert.equal(typeof permissionId, "string");
+      await connected.client.callTool({
+        name: "workflow",
+        arguments: {
+          action: "permissions-response",
+          runId,
+          permissionId,
+          response: { outcome: { outcome: "selected", optionId: "allow_once" } },
+        },
+      });
+    } finally {
+      await connected.dispose();
+      await daemon.close();
+    }
+  });
+}
 
 test("modern input_required enforces script-backend approval before admission", async () => {
   let capturedBackends: unknown;
