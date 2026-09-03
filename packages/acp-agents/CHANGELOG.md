@@ -1,5 +1,13 @@
 # @automatalabs/acp-agents
 
+## 1.0.1
+
+### Patch Changes
+
+- 620c9ca: Refresh the wrapped Claude Agent SDK runtime override from 0.3.258 to 0.3.259. The update adds batched user-message correlation, an opt-in no-prompt permission policy, and Claude Code parity without changing AgentPrism's host-brokered permission, terminal-result, or usage integration surfaces.
+- Updated dependencies [620c9ca]
+  - @automatalabs/shared-types@1.1.0
+
 ## 1.0.0
 
 ### Major Changes

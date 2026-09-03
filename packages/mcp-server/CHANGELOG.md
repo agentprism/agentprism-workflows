@@ -1,5 +1,23 @@
 # @automatalabs/mcp-server
 
+## 2.0.0
+
+### Major Changes
+
+- 620c9ca: Continue MCP workflows in place under their existing run ID with durable canonical agent configuration, cumulative usage and events, and first-answer-wins checkpoint decisions. Make the MCP lifecycle strict by removing replay/fork inputs, action aliases, and status waiting, improve bounded redacted configuration and permission elicitation, and add an app-only multi-run monitor dashboard shared by the supported legacy and modern protocol eras.
+
+### Minor Changes
+
+- 620c9ca: Add pre-execution MCP agent configuration elicitation. Form-capable legacy and modern clients can choose each dry-run-observed call's provider, model, mode, and advertised config in one structured request before workflow admission. Effective host selections now replace provider-specific authored settings and enter engine dispatch and replay identity by deterministic occurrence ordinal, with strict coverage for control-flow paths missed by preflight.
+
+### Patch Changes
+
+- Updated dependencies [620c9ca]
+- Updated dependencies [620c9ca]
+  - @automatalabs/workflows@1.1.0
+  - @automatalabs/shared-types@1.1.0
+  - @automatalabs/repl-engine@0.4.15
+
 ## 1.1.0
 
 ### Minor Changes
