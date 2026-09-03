@@ -250,9 +250,8 @@ return await parallel([
 ]);
 ```
 
-The worktree edits are discarded. Both completed calls use the same journal correspondence rule.
-See the [incremental resume API](../../docs/api.md#content-addressed-incremental-resume) for
-admission, reports, and legacy fallback.
+The worktree edits are discarded. Both completed calls use deterministic journal identity, and an
+MCP continuation reuses the same run's persisted journal and configuration.
 
 The same run delivered from disk:
 

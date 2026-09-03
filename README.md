@@ -309,7 +309,7 @@ metadata and app-only surface. Supporting hosts (Claude, Claude Desktop, VS Code
 Goose, …) show a live multi-run dashboard: a phase/agent graph with per-node log drill-in, live
 token/cost totals, a Stop control, and active/recent run navigation. The initiating tool's run is
 selected by default. The panel derives that anchor runId from the call's arguments
-(status/result/permissions-response/stop) or the newly-created runId from a run/resume result
+(resume/status/result/permissions-response/stop) or the newly-created runId from a fresh run result
 (immediately for `background: true` admissions), then keeps itself
 current by polling the app-only `workflow-events` tool and obtains one bounded project-local run
 list through app-only `workflow-runs` (both `visibility:["app"]`, outside the model's tool loop).
