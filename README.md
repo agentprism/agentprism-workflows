@@ -190,8 +190,9 @@ Our independently published ACP servers are available as an [ACP-format registry
 https://agentprism.github.io/agentprism-workflows/acp-registry/v1/latest/registry.json
 ```
 
-It currently contains the `@automatalabs/codex-acp` fork and the from-scratch
-`@automatalabs/pi-acp` server. Each npx distribution is pinned to the npm `latest` version that CI
+It currently contains the extension-aware `@automatalabs/acp-server` router, the
+`@automatalabs/codex-acp` fork, and the from-scratch `@automatalabs/pi-acp` server. Each npx
+distribution is pinned to the npm `latest` version that CI
 has verified is actually published; the GitHub Pages data workflow refreshes the registry after
 successful releases and on its regular schedule.
 
