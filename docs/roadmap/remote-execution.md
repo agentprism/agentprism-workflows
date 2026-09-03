@@ -66,9 +66,10 @@ positioned to provide:
   reconnect. This generalizes the existing `resumeInBackground` behavior from deliberate
   detach to involuntary disconnect.
 
-Backend selection happens by name at the runner (`wss://runner/acp?backend=claude` or
-path-based): the client knows names, the runner holds the name→command registry, and spawn
-commands/env secrets never reach the client.
+The serving-side aggregation and backend-selection contract is defined in
+[`acp-server.md`](acp-server.md): clients negotiate the AgentPrism routing extension on a discovery
+connection, then pin each operational ACP connection to one allowlisted backend during `initialize`.
+Spawn commands and environment secrets never reach the client.
 
 **Packaging:** the runner ships as its own package, `@automatalabs/acp-server` — named by the
 protocol surface it exposes, mirroring `@automatalabs/mcp-server` (the adapters it fronts are

@@ -9,6 +9,7 @@ Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 | `@automatalabs/workflows` | Facade re-exporting the supported orchestration surface (`runDynamicWorkflow`, `createAcpRunner`, `WorkflowManager`, auth/session types) | You want the SDK. **Start here.** |
 | `@automatalabs/workflow-engine` | The deterministic script engine + `WorkflowManager` (no agent construction — the runner is injected) | You bring your own `AgentRunner` and don't want ACP deps |
 | `@automatalabs/acp-agents` | The ACP runner: pooled Claude/Codex/OpenCode/pi ACP processes, model routing, structured output, events, interactive sessions | You want agent execution without the workflow engine |
+| `@automatalabs/acp-server` | ACP V1 stdio proxy with negotiated backend discovery and one backend pinned per operational connection | You want one extension-aware ACP endpoint for all configured backends |
 | `@automatalabs/shared-types` | The seam contracts: `AgentRunner`, `RunOptions`, `WorkflowError` (+ codes), workflow result/meta types | You implement a custom runner or need `instanceof WorkflowError` across packages |
 | `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, bounded status, resume, live permission response, stop) and the `repl` tool (a persistent per-project JavaScript REPL for live subagent orchestration) | You drive workflows from Claude Code / an MCP client |
 | `@automatalabs/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` traces and metrics | Your host owns an OTel SDK and wants run/agent/tool observability |
@@ -1309,6 +1310,28 @@ Two gates run before any prompt tokens are spent:
 Installed backend status verified from the packaged dists: `@agentclientprotocol/claude-agent-acp@0.73.0` advertises `http`/`sse` MCP support but no `acp`, `@automatalabs/codex-acp` (workspace) advertises `mcpCapabilities: { acp: false, http: true, sse: false }` and rejects ACP MCP config internally, OpenCode advertises HTTP/SSE MCP support, and `@automatalabs/pi-acp` serves stdio, Streamable HTTP, and SSE while advertising `{ http:true, sse:true }`. Pi also consumes the stable MCP base protocol plus sampling, roots, and form/URL elicitation; client-hosted `acp` remains runner-owned.
 
 ---
+
+## ACP aggregation server
+
+`@automatalabs/acp-server` exports `serveAcpServer(options?)` and the
+`agentprism-acp-server` ACP V1 stdio executable. Every client advertises router version 1 under
+`clientCapabilities._meta["@automatalabs/agentprism"].acpRouter` and selects either a discovery or
+backend connection in the initialize request's top-level `_meta`.
+
+A discovery connection exposes `_automatalabs/agentprism/backends/probe`; its `{ cwd,
+additionalDirectories?, mcpServers, _meta? }` input opens one temporary no-prompt session per
+configured backend and returns each initialize capability set, session mode catalog, and config
+option catalog. A backend connection selects one backend during `initialize`, forwards that request,
+and returns the backend response with the router confirmation merged into
+`agentCapabilities._meta`. Every `session/new` repeats the same backend assertion. After that check,
+all ACP and non-AgentPrism extension traffic passes through unchanged, including native session IDs
+and `_meta`; the server keeps no session-routing table.
+
+Library options are `{ stream?, backends?, targets?, version?, signal? }`. `backends` uses the same
+custom backend schema and `AGENTPRISM_BACKENDS` merge as `acp-agents`; `targets` supplies exact
+embedded/test targets instead. The package exports `BackendTarget`, discovery result types, extension
+constants, parsers, and initialize-response helpers. `acp-agents` exports
+`openRawBackendConnection(backend)`, the uninitialized process/stream primitive used by this proxy.
 
 ## Backends & process resolution
 

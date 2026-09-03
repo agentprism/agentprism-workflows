@@ -191,6 +191,7 @@ test("root agent entrypoints preserve planning freedom and monorepo delivery rul
   const agents = readRepoFile("AGENTS.md");
   const claude = readRepoFile("CLAUDE.md");
   const contributing = readRepoFile("CONTRIBUTING.md");
+  const dependencyGate = readRepoFile("scripts/check-acp-deps.mjs");
   const codexAgents = readRepoFile("packages/codex-acp/AGENTS.md");
 
   assert.equal(claude.trim(), "@AGENTS.md", "CLAUDE.md must import the canonical root AGENTS.md");
@@ -205,6 +206,20 @@ test("root agent entrypoints preserve planning freedom and monorepo delivery rul
   assert.ok(
     contributing.includes("Planning versus implemented specifications"),
     "CONTRIBUTING.md must retain the authoritative planning/implementation distinction",
+  );
+  assert.match(
+    agents,
+    /Any stale package or dependency[\s\S]*immediate maintenance work[\s\S]*separate update PR/,
+    "root agent policy must make every gated update an immediate separate maintenance lane",
+  );
+  assert.match(
+    contributing,
+    /every dependency, runtime, adapter, source upstream, or workspace package checked for currency/,
+    "the dependency runbook must apply immediate ownership to every gated update",
+  );
+  assert.ok(
+    dependencyGate.includes("every stale package or dependency is immediate maintenance work"),
+    "the executable gate must print the immediate-maintenance policy",
   );
   assert.ok(
     codexAgents.includes("Root monorepo, delivery, attribution, and release rules always win"),
@@ -231,7 +246,7 @@ test("public package inventories cover every workspace package", () => {
       manifest: JSON.parse(readRepoFile(`packages/${entry.name}/package.json`)) as { name: string },
     }));
 
-  assert.equal(manifests.length, 9, "update the documented package-count contract when the workspace changes");
+  assert.equal(manifests.length, 10, "update the documented package-count contract when the workspace changes");
   for (const path of ["README.md", "docs/api.md", "docs/design-notes.md"]) {
     const text = readRepoFile(path);
     for (const { manifest } of manifests) {
@@ -252,8 +267,8 @@ test("public package inventories cover every workspace package", () => {
   for (const { dir } of manifests) {
     assert.ok(contributing.includes(`packages/${dir}`), `CONTRIBUTING.md must inventory packages/${dir}`);
   }
-  assert.match(contributing, /\(monorepo\) of nine packages/);
-  assert.match(readRepoFile("docs/design-notes.md"), /monorepo of \*\*nine\*\* published packages/);
+  assert.match(contributing, /\(monorepo\) of ten packages/);
+  assert.match(readRepoFile("docs/design-notes.md"), /monorepo of \*\*ten\*\* published packages/);
 });
 
 test("auth, MCP, and authoring docs retain the implemented contracts", () => {
