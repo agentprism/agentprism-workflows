@@ -3,8 +3,10 @@
 // published AgentPrism npm packages, plus a transparent per-package breakdown.
 //
 // npm's bulk download endpoint does not support scoped packages, so every
-// package is queried separately. All responses must describe the same period;
-// nothing is written unless every response is valid.
+// package is queried separately. All responses must describe the same period.
+// A range 404 is accepted only when registry metadata proves the package was
+// created after the requested window, in which case its exact contribution is
+// zero; nothing is written unless every other response is valid.
 //
 // npm's named `last-month` alias can lag behind its explicit-date data even
 // when cache-busting and no-cache headers are used. Build an exact 30-day UTC
@@ -22,6 +24,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packagesDir = join(repoRoot, "packages");
 
 const DOWNLOADS_API = process.env.AGENTPRISM_NPM_DOWNLOADS_API ?? "https://api.npmjs.org";
+const NPM_REGISTRY = process.env.AGENTPRISM_NPM_REGISTRY ?? "https://registry.npmjs.org";
 const WINDOW_DAYS = 30;
 const REPORTING_LAG_DAYS = 2;
 const EXTERNAL_PACKAGES = Object.freeze(["@automatalabs/codex-acp"]);
@@ -64,7 +67,7 @@ const details = {
   },
   packageCount: rows.length,
   totalDownloads: total,
-  method: "Sum of validated daily rows from separate npm range requests for each published package.",
+  method: "Sum of validated daily rows from separate npm range requests; registry-confirmed packages created after the window contribute zero.",
   note: "Counts are per package and are not deduplicated across dependency installs.",
   packages: rows.map((row) => ({
     name: row.package,
@@ -142,7 +145,15 @@ async function fetchPackageDownloads(packageName, period) {
   // Explicit periods change daily, but retain cache busting for repeated same-day runs and
   // intermediaries that ignore request cache directives.
   url.searchParams.set("t", `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`);
-  const response = await fetchWithRetry(url);
+  let response;
+  try {
+    response = await fetchWithRetry(url);
+  } catch (error) {
+    if (error?.status === 404) {
+      return zeroDownloadsForPackageCreatedAfterPeriod(packageName, period);
+    }
+    throw error;
+  }
 
   let payload;
   try {
@@ -209,6 +220,50 @@ async function fetchPackageDownloads(packageName, period) {
   };
 }
 
+async function zeroDownloadsForPackageCreatedAfterPeriod(packageName, period) {
+  const url = new URL(encodeURIComponent(packageName), ensureTrailingSlash(NPM_REGISTRY));
+  url.searchParams.set("t", `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`);
+  const response = await fetchWithRetry(url);
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    throw new Error(`invalid registry JSON for ${packageName}: ${errorMessage(error)}`);
+  }
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error(`invalid registry response for ${packageName}: expected an object`);
+  }
+  if (payload.name !== packageName) {
+    throw new Error(
+      `invalid registry response for ${packageName}: name was ${JSON.stringify(payload.name)}`,
+    );
+  }
+
+  const created = payload.time?.created;
+  const createdAt = typeof created === "string" ? Date.parse(created) : Number.NaN;
+  if (!Number.isFinite(createdAt)) {
+    throw new Error(
+      `invalid registry response for ${packageName}: time.created was ${JSON.stringify(created)}`,
+    );
+  }
+  const firstDayAfterPeriod = Date.parse(`${shiftIsoDate(period.end, 1)}T00:00:00.000Z`);
+  if (createdAt < firstDayAfterPeriod) {
+    throw new Error(
+      `npm downloads API returned 404 for ${packageName}, but registry metadata says it was ` +
+        `created during or before the requested period (${created})`,
+    );
+  }
+
+  return {
+    package: packageName,
+    downloads: 0,
+    daily: period.days.map((day) => ({ day, downloads: 0 })),
+    start: period.start,
+    end: period.end,
+  };
+}
+
 async function fetchWithRetry(url) {
   let lastError;
 
@@ -221,6 +276,7 @@ async function fetchWithRetry(url) {
       if (response.ok) return response;
 
       const error = new Error(`HTTP ${response.status} from ${url}`);
+      error.status = response.status;
       if (response.status >= 400 && response.status < 500 && response.status !== 429) {
         throw error;
       }

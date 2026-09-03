@@ -45,10 +45,60 @@ test("download badge uses a complete explicit 30-day UTC window", async () => {
       description: "Explicit 30-day UTC window ending two full days before generation; start and end are inclusive.",
     });
     assert.equal(details.packageCount, api.requests.length);
-    assert.equal(details.method, "Sum of validated daily rows from separate npm range requests for each published package.");
+    assert.equal(details.method, "Sum of validated daily rows from separate npm range requests; registry-confirmed packages created after the window contribute zero.");
     assert.equal(details.totalDownloads, perPackage * details.packageCount);
     assert.equal(badge.message, `${formatCompact(details.totalDownloads)}/month`);
     assert.match(result.stdout, new RegExp(`\\(${expectedStart}\\.\\.${expectedEnd}\\)`));
+  } finally {
+    await api.close();
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test("download badge counts a registry-confirmed post-window package as zero when npm has no range yet", async () => {
+  const outputDir = await mkdtemp(join(tmpdir(), "agentprism-npm-downloads-new-package-"));
+  const newPackage = "@automatalabs/acp-server";
+  const api = await startDownloadsApi(
+    ({ packageName }) => packageName === newPackage
+      ? { httpStatus: 404, body: { error: "package has no download data" } }
+      : responseFor(packageName),
+    ({ packageName }) => packageName === newPackage
+      ? { name: newPackage, time: { created: "2026-09-03T19:13:00.000Z" } }
+      : null,
+  );
+
+  try {
+    const result = await runGenerator(outputDir, api.url);
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(api.registryRequests, [newPackage]);
+
+    const details = JSON.parse(await readFile(join(outputDir, "npm-downloads-details.json"), "utf8"));
+    const row = details.packages.find((entry) => entry.name === newPackage);
+    assert.deepEqual(row, { name: newPackage, downloads: 0 });
+    assert.match(result.stdout, /@automatalabs\/acp-server 0/);
+  } finally {
+    await api.close();
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test("download badge rejects a range 404 for a package that existed within the window", async () => {
+  const outputDir = await mkdtemp(join(tmpdir(), "agentprism-npm-downloads-missing-existing-"));
+  const missingPackage = "@automatalabs/acp-server";
+  const api = await startDownloadsApi(
+    ({ packageName }) => packageName === missingPackage
+      ? { httpStatus: 404, body: { error: "missing" } }
+      : responseFor(packageName),
+    ({ packageName }) => packageName === missingPackage
+      ? { name: missingPackage, time: { created: "2026-08-20T12:00:00.000Z" } }
+      : null,
+  );
+
+  try {
+    const result = await runGenerator(outputDir, api.url);
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /downloads API returned 404.*created during or before the requested period/s);
+    await assertNotPublished(outputDir);
   } finally {
     await api.close();
     await rm(outputDir, { recursive: true, force: true });
@@ -145,28 +195,39 @@ async function assertNotPublished(outputDir) {
   }
 }
 
-async function startDownloadsApi(payloadFor) {
+async function startDownloadsApi(payloadFor, registryPayloadFor = () => null) {
   const requests = [];
+  const registryRequests = [];
   const server = createServer((request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
     const match = url.pathname.match(/^\/downloads\/range\/([^/]+)\/(.+)$/);
-    if (!match) {
-      response.writeHead(404, { "content-type": "application/json" });
-      response.end(JSON.stringify({ error: "not found" }));
+    if (match) {
+      const period = decodeURIComponent(match[1]);
+      const packageName = decodeURIComponent(match[2]);
+      requests.push({
+        period,
+        packageName,
+        cacheBust: url.searchParams.get("t") ?? "",
+        cacheControl: request.headers["cache-control"],
+        pragma: request.headers.pragma,
+      });
+      const payload = payloadFor({ period, packageName });
+      const status = payload?.httpStatus ?? 200;
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify(payload?.httpStatus ? payload.body : payload));
       return;
     }
 
-    const period = decodeURIComponent(match[1]);
-    const packageName = decodeURIComponent(match[2]);
-    requests.push({
-      period,
-      packageName,
-      cacheBust: url.searchParams.get("t") ?? "",
-      cacheControl: request.headers["cache-control"],
-      pragma: request.headers.pragma,
-    });
-    response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify(payloadFor({ period, packageName })));
+    const packageName = decodeURIComponent(url.pathname.slice(1));
+    const payload = registryPayloadFor({ packageName });
+    if (payload !== null) {
+      registryRequests.push(packageName);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(payload));
+      return;
+    }
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "not found" }));
   });
   await new Promise((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
@@ -178,6 +239,7 @@ async function startDownloadsApi(payloadFor) {
   return {
     url: `http://127.0.0.1:${address.port}`,
     requests,
+    registryRequests,
     close: () => new Promise((resolveClose, rejectClose) => {
       server.close((error) => (error ? rejectClose(error) : resolveClose()));
     }),
@@ -191,6 +253,7 @@ function runGenerator(outputDir, apiUrl) {
       env: {
         ...process.env,
         AGENTPRISM_NPM_DOWNLOADS_API: apiUrl,
+        AGENTPRISM_NPM_REGISTRY: apiUrl,
         AGENTPRISM_NPM_DOWNLOADS_NOW: now,
       },
       stdio: ["ignore", "pipe", "pipe"],
