@@ -54,6 +54,12 @@ test("generator publishes the official ACP top-level shape with pinned npm versi
       assert.match(icon, /height="16"/);
       assert.match(icon, /currentColor/);
     }
+
+    const [routerIcon, defaultIcon] = await Promise.all([
+      readFile(join(publishedDir, "agentprism-acp-server.svg"), "utf8"),
+      readFile(join(publishedDir, "agentprism-codex-acp.svg"), "utf8"),
+    ]);
+    assert.notEqual(routerIcon, defaultIcon);
   } finally {
     await registry.close();
     await rm(outputDir, { recursive: true, force: true });
