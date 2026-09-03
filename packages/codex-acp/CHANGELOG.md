@@ -1,5 +1,11 @@
 # @automatalabs/codex-acp
 
+## 2.3.2
+
+### Patch Changes
+
+- 81b2209: Sync with upstream agentclientprotocol/codex-acp main (non-squashed subtree merge of `5552cef`). Refresh and merge complete Codex rate-limit snapshots for the status command, report individual spend limits, retain the latest turn usage for status-only prompts, and report context-window percentage used consistently.
+
 ## 2.3.1
 
 ### Patch Changes
