@@ -1,13 +1,19 @@
 # `@automatalabs/acp-server`
 
 Connection-pinned ACP V1 proxy for the backends configured through
-`@automatalabs/acp-agents`. The package exposes the `agentprism-acp-server` stdio executable and a
-programmatic `serveAcpServer()` entry point.
+`@automatalabs/acp-agents`. The `agentprism-acp-server` executable defaults to stdio and can also
+listen for Streamable HTTP and WebSocket clients on one endpoint.
 
 ```bash
-npx @automatalabs/acp-server
+npx @automatalabs/acp-server                    # stdio
+npx @automatalabs/acp-server --http             # http://127.0.0.1:7331/acp + ws://…
+npx @automatalabs/acp-server --http --host 127.0.0.1 --port 8080 --path /acp
 agentprism-acp-server --version
 ```
+
+`--host`, `--port`, and `--path` apply only with `--http`; their defaults are `127.0.0.1`, `7331`,
+and `/acp`. Each accepted HTTP or WebSocket connection has an independent discovery/backend mode
+and pinned downstream connection.
 
 The server accepts only clients that negotiate AgentPrism router extension version 1 under
 `clientCapabilities._meta["@automatalabs/agentprism"].acpRouter`.
@@ -77,15 +83,15 @@ Built-in backend IDs are `claude`, `codex`, `opencode`, and `pi`. Custom backend
 Install the router, the official ACP TypeScript SDK, and a TypeScript runner:
 
 ```bash
-pnpm add @automatalabs/acp-server @agentclientprotocol/sdk
-pnpm add --save-dev tsx @types/node
+pnpm add @automatalabs/acp-server @agentclientprotocol/sdk ws
+pnpm add --save-dev tsx @types/node @types/ws
 ```
 
 The following examples are consecutive sections of one `router-client.ts` file. They follow the
 official SDK's [current client example](https://github.com/agentclientprotocol/typescript-sdk/blob/main/src/examples/client.ts):
 `client(...).onRequest(...).connectWith(...)`, `ctx.request(...)`, and the
-`buildSession(...).withSession(...)` active-session API. The helper starts a fresh
-`agentprism-acp-server` stdio process for each connection. The example permission handler rejects
+`buildSession(...).withSession(...)` active-session API. The stdio helper starts a fresh
+`agentprism-acp-server` process for each connection. The example permission handler rejects
 safely; replace it with the application's actual user-confirmation UI.
 
 ### Shared client and stdio setup
@@ -94,6 +100,9 @@ safely; replace it with the application's actual user-confirmation UI.
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
+import { createHttpStream } from "@agentclientprotocol/sdk/experimental/http-client";
+import { createWebSocketStream } from "@agentclientprotocol/sdk/experimental/ws-client";
+import { WebSocket } from "ws";
 
 const ROUTER_NAMESPACE = "@automatalabs/agentprism";
 const PROBE_METHOD = "_automatalabs/agentprism/backends/probe";
@@ -194,17 +203,54 @@ async function withRouter<T>(
   );
 
   try {
-    return await acp
-      .client({ name: "agentprism-router-example" })
-      .onRequest(acp.methods.client.session.requestPermission, (ctx) =>
-        client.requestPermission(ctx.params),
-      )
-      .connectWith(stream, operation);
+    return await connectRouter(stream, operation);
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
   }
 }
+
+function connectRouter<T>(
+  stream: acp.Stream,
+  operation: (ctx: acp.ClientContext) => Promise<T>,
+): Promise<T> {
+  return acp
+    .client({ name: "agentprism-router-example" })
+    .onRequest(acp.methods.client.session.requestPermission, (ctx) =>
+      client.requestPermission(ctx.params),
+    )
+    .connectWith(stream, operation);
+}
+
+async function withNetworkRouter<T>(
+  transport: "http" | "websocket",
+  operation: (ctx: acp.ClientContext) => Promise<T>,
+): Promise<T> {
+  const stream =
+    transport === "http"
+      ? createHttpStream("http://127.0.0.1:7331/acp")
+      : createWebSocketStream("ws://127.0.0.1:7331/acp", { WebSocket });
+  try {
+    return await connectRouter(stream, operation);
+  } finally {
+    await stream.writable.close().catch(() => undefined);
+  }
+}
+
+function withConfiguredRouter<T>(
+  operation: (ctx: acp.ClientContext) => Promise<T>,
+): Promise<T> {
+  const transport = process.env.ACP_TRANSPORT ?? "stdio";
+  if (transport === "stdio") return withRouter(operation);
+  if (transport === "http" || transport === "websocket") {
+    return withNetworkRouter(transport, operation);
+  }
+  throw new Error(`ACP_TRANSPORT must be stdio, http, or websocket; got ${transport}`);
+}
 ```
+
+The network adapters are the same official experimental transport APIs used by the SDK's current
+HTTP server, HTTP client, and WebSocket client examples; the messages negotiated through them
+remain ACP V1.
 
 ### Discover configured backends
 
@@ -214,7 +260,7 @@ Discovery uses one initialized connection and the router-owned probe extension. 
 ```ts
 const cwd = process.cwd();
 
-const { backends } = await withRouter(async (ctx) => {
+const { backends } = await withConfiguredRouter(async (ctx) => {
   await ctx.request(
     acp.methods.agent.initialize,
     initializeRequest("discovery"),
@@ -245,7 +291,7 @@ router metadata. `session.sessionId` is the selected backend's native session ID
 const selected = process.argv[2] ?? backends.find((backend) => backend.available)?.id;
 if (!selected) throw new Error("No configured backend is available");
 
-await withRouter(async (ctx) => {
+await withConfiguredRouter(async (ctx) => {
   const initialized = await ctx.request(
     acp.methods.agent.initialize,
     initializeRequest("backend", selected),
@@ -279,23 +325,36 @@ await withRouter(async (ctx) => {
 });
 ```
 
-Run the file with an available backend ID from the discovery output:
+Run the file over stdio, or start `agentprism-acp-server --http` and select a network transport:
 
 ```bash
 pnpm exec tsx router-client.ts codex
+ACP_TRANSPORT=http pnpm exec tsx router-client.ts codex
+ACP_TRANSPORT=websocket pnpm exec tsx router-client.ts codex
 ```
 
 ## Library API
 
 ```ts
-import { serveAcpServer } from "@automatalabs/acp-server";
+import {
+  listenAcpHttpServer,
+  serveAcpServer,
+} from "@automatalabs/acp-server";
 
-await serveAcpServer();
+await serveAcpServer(); // one stdio connection
+
+const server = await listenAcpHttpServer({
+  host: "127.0.0.1",
+  port: 7331,
+  path: "/acp",
+});
+console.log(server.url, server.webSocketUrl);
+await server.close();
 ```
 
 Embedding hosts can pass a custom ACP `stream`, custom backend registrations, exact `targets`, a
-version string, and an abort signal through `ServeAcpServerOptions`. The package also exports the
-router constants, request parsers, response helpers, probe types, and backend-target resolver.
-
-Authentication, authorization, workspace policy, HTTP, WebSocket, and ACP V2 are outside this
-package.
+version string, and an abort signal through `ServeAcpServerOptions`. `ListenAcpHttpServerOptions`
+adds `host`, `port`, `path`, and `maxRequestBodyBytes`; the returned handle exposes the bound URLs,
+a `closed` promise, and idempotent `close()`. The package also exports the default network listener
+constants, router constants, request parsers, response helpers, probe types, and backend-target
+resolver.

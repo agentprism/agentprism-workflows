@@ -9,7 +9,7 @@ Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 | `@automatalabs/workflows` | Facade re-exporting the supported orchestration surface (`runDynamicWorkflow`, `createAcpRunner`, `WorkflowManager`, auth/session types) | You want the SDK. **Start here.** |
 | `@automatalabs/workflow-engine` | The deterministic script engine + `WorkflowManager` (no agent construction — the runner is injected) | You bring your own `AgentRunner` and don't want ACP deps |
 | `@automatalabs/acp-agents` | The ACP runner: pooled Claude/Codex/OpenCode/pi ACP processes, model routing, structured output, events, interactive sessions | You want agent execution without the workflow engine |
-| `@automatalabs/acp-server` | ACP V1 stdio proxy with negotiated backend discovery and one backend pinned per operational connection | You want one extension-aware ACP endpoint for all configured backends |
+| `@automatalabs/acp-server` | ACP V1 proxy over stdio, Streamable HTTP, or WebSocket, with negotiated backend discovery and one backend pinned per operational connection | You want one extension-aware ACP endpoint for all configured backends |
 | `@automatalabs/shared-types` | The seam contracts: `AgentRunner`, `RunOptions`, `WorkflowError` (+ codes), workflow result/meta types | You implement a custom runner or need `instanceof WorkflowError` across packages |
 | `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, bounded status, resume, live permission response, stop) and the `repl` tool (a persistent per-project JavaScript REPL for live subagent orchestration) | You drive workflows from Claude Code / an MCP client |
 | `@automatalabs/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` traces and metrics | Your host owns an OTel SDK and wants run/agent/tool observability |
@@ -1313,8 +1313,10 @@ Installed backend status verified from the packaged dists: `@agentclientprotocol
 
 ## ACP aggregation server
 
-`@automatalabs/acp-server` exports `serveAcpServer(options?)` and the
-`agentprism-acp-server` ACP V1 stdio executable. Every client advertises router version 1 under
+`@automatalabs/acp-server` exports `serveAcpServer(options?)`,
+`listenAcpHttpServer(options?)`, and the `agentprism-acp-server` ACP V1 executable. The executable
+uses stdio by default; `--http` serves Streamable HTTP and WebSocket connections on the same path.
+Every client advertises router version 1 under
 `clientCapabilities._meta["@automatalabs/agentprism"].acpRouter` and selects either a discovery or
 backend connection in the initialize request's top-level `_meta`.
 
@@ -1327,10 +1329,14 @@ and returns the backend response with the router confirmation merged into
 all ACP and non-AgentPrism extension traffic passes through unchanged, including native session IDs
 and `_meta`; the server keeps no session-routing table.
 
-Library options are `{ stream?, backends?, targets?, version?, signal? }`. `backends` uses the same
-custom backend schema and `AGENTPRISM_BACKENDS` merge as `acp-agents`; `targets` supplies exact
-embedded/test targets instead. The package exports `BackendTarget`, discovery result types, extension
-constants, parsers, and initialize-response helpers. `acp-agents` exports
+`ServeAcpServerOptions` is `{ stream?, backends?, targets?, version?, signal? }`.
+`ListenAcpHttpServerOptions` adds `{ host?, port?, path?, maxRequestBodyBytes? }` and returns a handle
+with the bound HTTP and WebSocket URLs, a `closed` promise, and idempotent `close()`. The network
+listener defaults to `127.0.0.1:7331/acp`; the official SDK transport owns its required
+`Acp-Connection-Id` and SSE route correlation, while AgentPrism still keeps no session-routing table.
+`backends` uses the same custom backend schema and `AGENTPRISM_BACKENDS` merge as `acp-agents`;
+`targets` supplies exact embedded/test targets instead. The package exports `BackendTarget`,
+discovery result types, extension constants, parsers, and initialize-response helpers. `acp-agents` exports
 `openRawBackendConnection(backend)`, the uninitialized process/stream primitive used by this proxy.
 
 ## Backends & process resolution

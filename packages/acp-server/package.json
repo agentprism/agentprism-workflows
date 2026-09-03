@@ -49,6 +49,10 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.4.0",
-    "@automatalabs/acp-agents": "workspace:*"
+    "@automatalabs/acp-agents": "workspace:*",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
   }
 }

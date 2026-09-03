@@ -37,15 +37,37 @@
 > “I think this makes sense, although I don't understand why this is in the doc "Probe results do not expose commands, environment variables, credentials, or registry spawn configuration. Discovery connections reject session and prompt methods."
 >
 > Also, please add a mermaid diagram of the initialization and session setup process”
+>
+> “Okay the next task is to add an http/websocket mode to our acp-server so that clients that support websockets can connect. This may or may not involve experimental acp v2 support. If the examples use it, then we should too. The docs may incorrectly state that websocket/http or v2 support is not in scope, but they are incorrect and those lines should be omitted (not replaced).”
 
 ## Implementation
 
-`@automatalabs/acp-server` is an ACP V1 stdio proxy exposed by the `agentprism-acp-server` executable. Each client connection operates in exactly one of two modes:
+`@automatalabs/acp-server` is an ACP V1 proxy exposed by the `agentprism-acp-server` executable over stdio, Streamable HTTP, or WebSocket. Each client connection operates in exactly one of two modes:
 
 - **Discovery mode** probes the configured backends and returns their capabilities and session configuration.
 - **Backend mode** pins the connection to one configured backend and transparently proxies ACP traffic to it.
 
 The server does not run workflows, fan prompts out, combine model catalogs, rewrite session IDs, or maintain a session routing table.
+
+## Transports
+
+With no transport flag, `agentprism-acp-server` serves one ACP connection over newline-delimited
+stdio. With `--http`, it listens on one endpoint for both Streamable HTTP and WebSocket clients:
+
+```bash
+agentprism-acp-server --http --host 127.0.0.1 --port 7331 --path /acp
+```
+
+The host, port, and path default to the values shown. Each accepted HTTP or WebSocket connection
+constructs an independent router with its own discovery or backend mode and downstream process
+connection. The network listener uses the official TypeScript SDK's `AcpServer`, Node HTTP adapter,
+and WebSocket upgrade adapter. Streamable HTTP's `Acp-Connection-Id`, session-specific SSE routes,
+and WebSocket framing remain transport-owned correlation; they do not create an AgentPrism session
+routing table or alter backend-native session IDs.
+
+All three transports carry ACP protocol version 1. The official SDK's HTTP/WebSocket examples also
+initialize ACP version 1; its experimental module labels describe the transport API surface rather
+than changing the negotiated message protocol.
 
 ## Initialization and session setup
 
@@ -262,5 +284,3 @@ The proxy terminates the outer and downstream JSON-RPC connections, so each conn
 ## Package boundary
 
 `@automatalabs/acp-server` is a composition-root package with the `agentprism-acp-server` bin. It depends on `@automatalabs/acp-agents` and the ACP SDK and remains independent of the workflow engine and MCP server. `acp-agents` exposes a raw downstream ACP connection factory that provides backend resolution, process lifecycle, and bidirectional protocol access without passing through `AcpAgentRunner.run()` or its observational event bus.
-
-The executable supports ACP V1 over stdio. Authentication, authorization, workspace policy, HTTP, WebSocket, and ACP V2 are outside the implementation.
