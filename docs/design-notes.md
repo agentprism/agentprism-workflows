@@ -249,14 +249,15 @@ All versions below were re-verified from the installed workspace dependency grap
 
 - **`@agentclientprotocol/claude-agent-acp@0.73.0`** — ACP server wrapping Claude.
   Bin: `claude-agent-acp` (`npx @agentclientprotocol/claude-agent-acp`). Author: Zed Industries.
-  Resolves **`@anthropic-ai/claude-agent-sdk@0.3.258`** through the workspace override — the
+  Resolves **`@anthropic-ai/claude-agent-sdk@0.3.259`** through the workspace override — the
   adapter itself exact-pins `0.3.257`, so the override lifts the runtime to npm `latest`.
   Adapter 0.71–0.73 adds model-aware modes, per-model usage metadata, native subagent/task
   reporting, message-specific forks, and session titles. AgentPrism gives engine-owned Claude
   sessions a stable label-derived SDK title so the adapter does not launch its otherwise-unobserved
   background title-generation model call; interactive sessions retain generated titles. SDK
-  0.3.258 is a Claude Code parity update over 0.3.257's thinking-token and MCP resource-link
-  additions. The structured-output option/result declarations integrated below remain compatible.
+  0.3.259 adds batched user-message correlation and an opt-in no-prompt permission policy, plus
+  Claude Code parity. AgentPrism's host permission broker retains the default `host` policy, and
+  the structured-output, terminal-result, and usage surfaces integrated below remain compatible.
   Drop the override once the adapter catches up (CONTRIBUTING "When the dependency gate blocks").
   Ref: https://github.com/agentclientprotocol/claude-agent-acp
   > Naming note: the canonical package is **`claude-agent-acp`**, not "claude-acp".
@@ -631,14 +632,14 @@ export type PromptRequest = {
 // :213   ToolCallContent = Content | Diff | Terminal      — no structuredContent
 ```
 
-### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.73.0` → `@anthropic-ai/claude-agent-sdk@0.3.258`
+### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.73.0` → `@anthropic-ai/claude-agent-sdk@0.3.259`
 
 **Supported, session-scoped, via the `_meta.claudeCode` vendor extension.**
 
 **(a) Set the schema — IN.** The SDK's `Options.outputFormat` is the native lever:
 
 ```ts
-// claude-agent-sdk 0.3.258  sdk.d.ts:1820
+// claude-agent-sdk 0.3.259  sdk.d.ts:1820
 /** Output format configuration for structured responses.
  *  When specified, the agent will return structured data matching the schema. */
 outputFormat?: OutputFormat;
@@ -686,7 +687,7 @@ Client `session/new` payload:
 and retries; on exhaustion it ends with a terminal subtype:
 
 ```ts
-// claude-agent-sdk 0.3.258  sdk.d.ts:4877  (SDKResultError.subtype)
+// claude-agent-sdk 0.3.259  sdk.d.ts:4894  (SDKResultError.subtype)
 'error_during_execution' | 'error_max_turns' | 'error_max_budget_usd'
   | 'error_max_structured_output_retries'
 ```
@@ -697,7 +698,7 @@ error / `max_turn_requests` stop reason).
 **(c) Read the result — OUT (the one rough edge).** The parsed object lands in:
 
 ```ts
-// claude-agent-sdk 0.3.258  sdk.d.ts:4955  (SDKResultSuccess)
+// claude-agent-sdk 0.3.259  sdk.d.ts:4977  (SDKResultSuccess)
 structured_output?: unknown;
 ```
 
@@ -1070,7 +1071,7 @@ resurrect a snapshot or sidecar after the run was removed.
 **Packages (verified versions, 2026-09-02):**
 - `@modelcontextprotocol/{client,server,node}@2.0.0` (dual-era MCP shell); `@modelcontextprotocol/sdk@1.30.0` remains on separate ACP embedded-client boundaries — https://github.com/modelcontextprotocol/typescript-sdk
 - `@agentclientprotocol/sdk@1.4.0` — https://github.com/agentclientprotocol
-- `@agentclientprotocol/claude-agent-acp@0.73.0` (workspace override resolves `@anthropic-ai/claude-agent-sdk@0.3.258`; adapter pin `0.3.257`) — https://github.com/agentclientprotocol/claude-agent-acp
+- `@agentclientprotocol/claude-agent-acp@0.73.0` (workspace override resolves `@anthropic-ai/claude-agent-sdk@0.3.259`; adapter pin `0.3.257`) — https://github.com/agentclientprotocol/claude-agent-acp
 - `@automatalabs/codex-acp` (workspace fork of `@agentclientprotocol/codex-acp` at `packages/codex-acp`, patch baked into dist) — upstream: https://github.com/agentclientprotocol/codex-acp
 - `@automatalabs/pi-acp` (Pi ACP server; workspace-lockstep built-in dependency, exact version stamped at publish) — `packages/pi-acp`
 - OpenCode (`opencode acp`) — https://opencode.ai
