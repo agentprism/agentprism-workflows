@@ -619,6 +619,10 @@ if (blockers.length > 0) {
 const stale = outdated.length > 0 || upstreamIssues.length > 0 || wrappedIssues.length > 0;
 if (stale) {
   console.error("");
+  console.error("acp-deps: policy: every stale package or dependency is immediate maintenance work.");
+  console.error("  Pause the original delivery; open and land a separate update PR from current origin/main,");
+  console.error("  following the named gate's update and merge mechanics; then update and revalidate the original branch.");
+  console.error("");
   console.error("acp-deps: a pin bump alone is only the right fix when upstream changed NOTHING we");
   console.error("  integrate against. For EACH stale item above: read the upstream release notes /");
   console.error("  changelog (and for substantial jumps the source diff of the surfaces we consume),");

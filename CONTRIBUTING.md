@@ -1,6 +1,6 @@
 # Contributing
 
-This is a **pnpm workspace** (monorepo) of nine packages under the `@automatalabs` scope. The user-facing overview is in [`README.md`](README.md); the protocol-level design is in [`docs/design-notes.md`](docs/design-notes.md).
+This is a **pnpm workspace** (monorepo) of ten packages under the `@automatalabs` scope. The user-facing overview is in [`README.md`](README.md); the protocol-level design is in [`docs/design-notes.md`](docs/design-notes.md).
 
 ## Prerequisites
 
@@ -29,6 +29,7 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 | `packages/shared-types` | The `AgentRunner` seam + shared types. |
 | `packages/workflow-engine` | The deterministic engine (realm, parallel/pipeline, journal/resume, budget, worktree). |
 | `packages/acp-agents` | ACP client + Claude/Codex/OpenCode/pi/custom backends (the `AgentRunner` implementation, pooling, auth/session lifecycle). |
+| `packages/acp-server` | Connection-pinned ACP V1 stdio proxy and extension-negotiated backend discovery (bin `agentprism-acp-server`). |
 | `packages/mcp-server` | The stdio MCP server / composition root (bin `agentprism-workflow`; the `workflow` and `repl` tools — no auth tools). |
 | `packages/workflows` | The importable SDK facade. |
 | `packages/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` events. |
@@ -36,13 +37,13 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 | `packages/pi-acp` | Standalone in-process ACP server and library adapter for the pi coding agent. |
 | `packages/codex-acp` | Our codex-acp fork (full upstream history, non-squashed subtree): the ACP server the Codex backend spawns. |
 
-`workflow-engine` and `acp-agents` are **siblings** — neither imports the other; they meet only at the `AgentRunner` seam in `shared-types`. `workflows` is the single facade that composes them; `mcp-server` builds on `workflows`. So the primary dependency direction is `mcp-server → workflows → { workflow-engine, acp-agents, shared-types }`. `agentprism-otel` is an independent leaf with an `@opentelemetry/api` peer dependency; it observes the manager structurally and is not in that runtime chain. `repl-engine` is **not** a leaf: it composes the `quickjs-wasi` shim with `workflows`, `acp-agents`, and `shared-types`, and its `repl` MCP tool is registered in `mcp-server` (which depends on `repl-engine`) — the `repl-orchestrator` roadmap phase is implemented (`docs/roadmap/repl-orchestrator.md`) and the package is published independently.
+`workflow-engine` and `acp-agents` are **siblings** — neither imports the other; they meet only at the `AgentRunner` seam in `shared-types`. `workflows` is the single facade that composes them; `mcp-server` builds on `workflows`, while `acp-server` builds directly on `acp-agents`. So the primary dependency direction is `mcp-server → workflows → { workflow-engine, acp-agents, shared-types }` and `acp-server → acp-agents`. `agentprism-otel` is an independent leaf with an `@opentelemetry/api` peer dependency; it observes the manager structurally and is not in that runtime chain. `repl-engine` is **not** a leaf: it composes the `quickjs-wasi` shim with `workflows`, `acp-agents`, and `shared-types`, and its `repl` MCP tool is registered in `mcp-server` (which depends on `repl-engine`) — the `repl-orchestrator` roadmap phase is implemented (`docs/roadmap/repl-orchestrator.md`) and the package is published independently.
 
 ### Conventions
 
 - TypeScript source resolution in-repo: each package's `exports.types` points at `./src/index.ts` for the dev build; the published manifest is overridden to `./dist` via `publishConfig` (see below). Don't repoint the top-level fields to `dist`.
 - Tests use `node:test` via `tsx` (`tsx --test`). Keep the default suite deterministic and credential-free.
-- The `AGENTPRISM_*` env vars, the `.agentprism/` runtime dirs, and the `agentprism-workflow` bin are a **wire/CLI contract** — they are intentionally *not* renamed with the npm scope. The ACP `_meta` extension keys are **bare** (un-namespaced): `outputSchema`, `runId`, `baseInstructions`, `developerInstructions` — exported as `META_KEYS` / `CODEX_META_KEYS` from `shared-types`. Beyond the reserved keys, workflows can send **arbitrary** `_meta` via `agent({ meta, promptMeta })` (session/new / session/prompt scoped), and **custom ACP backends** register via `AGENTPRISM_BACKENDS` or `createAcpRunner({ backends })` — see `acp-agents/src/registry.ts` and design-notes §5.9.
+- The `AGENTPRISM_*` env vars, the `.agentprism/` runtime dirs, and the `agentprism-workflow` bin are a **wire/CLI contract** — they are intentionally *not* renamed with the npm scope. The workflow ACP dialect's protocol-critical `_meta` keys are **bare** (un-namespaced): `outputSchema`, `runId`, `baseInstructions`, `developerInstructions` — exported as `META_KEYS` / `CODEX_META_KEYS` from `shared-types`. The ACP proxy's negotiated routing extension instead lives under `_meta["@automatalabs/agentprism"].acpRouter`. Beyond the reserved keys, workflows can send **arbitrary** `_meta` via `agent({ meta, promptMeta })` (session/new / session/prompt scoped), and **custom ACP backends** register via `AGENTPRISM_BACKENDS` or `createAcpRunner({ backends })` — see `acp-agents/src/registry.ts` and design-notes §5.9.
 
 ### Planning versus implemented specifications
 
@@ -89,7 +90,7 @@ CI pushes are exempt from the *hook* automatically (`CI` env guard) because CI e
 
 ### When the dependency gate blocks
 
-The gate failing anywhere — pre-push, a PR's required check, or the release workflow — means the same thing: a tracked upstream moved (or freshness could not be verified), so **all merges and releases are blocked; merging the maintenance PR into `main` unblocks them**. Triage in this order:
+The gate failing anywhere — local verification, pre-push, a PR's required check, or the release workflow — means the same thing: a tracked upstream moved (or freshness could not be verified), so **all merges and releases are blocked; merging the maintenance PR into `main` unblocks them**. The task that discovers any stale package or dependency owns resolving it immediately; do not report it as unrelated work and finish delivery. This applies to every dependency, runtime, adapter, source upstream, or workspace package checked for currency. Pause the original change, create a separate maintenance branch from current `origin/main` in another worktree when necessary, follow the named gate's update and merge mechanics, land its PR, then update and revalidate the original branch. Triage in this order:
 
 The authored backend registry generates the preinstall-safe snapshot at
 `scripts/acp-backends.manifest.json`. After changing a built-in definition, regenerate and check

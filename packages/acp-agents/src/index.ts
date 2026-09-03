@@ -201,6 +201,10 @@ export type { NegotiatedCapabilities } from "./capabilities.js";
 export { AcpAgentPool, resolvePoolSize } from "./pool.js";
 export type { AcpPoolOptions, AcpPoolDeps } from "./pool.js";
 
+// Uninitialized process/stream primitive for transparent ACP composition roots.
+export { openRawBackendConnection } from "./raw-connection.js";
+export type { RawBackendConnection } from "./raw-connection.js";
+
 // Consumer-provided client-side ACP handlers: fs/terminal routing plus truthful initialize
 // clientCapabilities derived from the registered handler set.
 export { clientCapabilitiesFor } from "./client-handlers.js";

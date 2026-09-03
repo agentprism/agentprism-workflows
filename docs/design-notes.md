@@ -6,7 +6,7 @@ package-specific API references (field/method names, file:line, versions). For i
 usage, start with the README; read this when you need the protocol-level mechanics (ACP lifecycle,
 the structured-output crux, model/permission/usage wiring, and execution-engine internals).
 
-> Reference/design doc, not a roadmap or a tutorial. The implementation now lives in nine
+> Reference/design doc, not a roadmap or a tutorial. The implementation now lives in ten
 > `@automatalabs/*` packages — see [§2](#2-codebase--module-structure). The Pi `src/…` citations
 > throughout are provenance for the lifted engine, not paths in this repo.
 
@@ -69,7 +69,7 @@ extension. We **lift** the specific pieces of `pi-dynamic-workflows` we need (co
 source) and write the rest fresh. The engine imports no Pi code; `acp-agents` reaches Pi only by
 spawning the exact-pinned `@automatalabs/pi-acp` package as an ACP server.
 
-The code is organized as **nine packages**, all released to npm, with a one-way dependency
+The code is organized as **ten packages**, all released to npm, with a one-way dependency
 direction. The lower
 layers remain independently usable — in particular, the ACP agent logic and workflow engine both
 work **with no MCP server at all** — while the facade and integration leaves stay thin.
@@ -117,6 +117,11 @@ The REPL engine (roadmap `repl-orchestrator`) is **not** a leaf outside that cha
                                 MCP tool is registered in mcp-server (phase E —
                                 implemented; the package is published independently).
 ```
+
+`@automatalabs/acp-server` is a separate composition root over `acp-agents`. Its stdio process
+acts as an ACP agent toward one extension-aware client connection and as an ACP client toward the
+selected backend. A discovery connection probes all configured backends; an operational connection
+pins one backend during `initialize` and then forwards ACP traffic without rewriting session IDs.
 
 `workflow-engine` and `acp-agents` are **siblings**: neither imports the other. They meet only at
 the `AgentRunner` interface (`run(prompt, opts) → result`), injected at composition time. The
@@ -192,9 +197,9 @@ Attaches structurally to a `WorkflowManager` and maps workflow/agent/tool events
 spans plus token, cost, count, and duration metrics. It peer-depends on `@opentelemetry/api` and is
 outside the engine/runner dependency chain.
 
-> Packaging (as implemented): a pnpm monorepo of **nine** published packages —
+> Packaging (as implemented): a pnpm monorepo of **ten** published packages —
 > `@automatalabs/shared-types` (the seam), `@automatalabs/workflow-engine`, `@automatalabs/acp-agents`,
-> `@automatalabs/mcp-server` (the bin), `@automatalabs/workflows` (the importable SDK facade),
+> `@automatalabs/acp-server` (the connection-pinned ACP proxy), `@automatalabs/mcp-server` (the bin), `@automatalabs/workflows` (the importable SDK facade),
 > `@automatalabs/agentprism-otel` (the optional telemetry bridge), `@automatalabs/pi-acp`
 > (the standalone in-process pi ACP server), `@automatalabs/codex-acp` (the Codex ACP fork adding
 > turn-level `outputSchema` forwarding, pulled in by `acp-agents`), and `@automatalabs/repl-engine`
@@ -219,6 +224,7 @@ outside the engine/runner dependency chain.
 | Module | Piece | Replaces (Pi) | New |
 |---|---|---|---|
 | `acp-agents` | **Leaf** — run one subagent | `WorkflowAgent` in [`src/agent.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts) (`createAgentSession`, `ModelRegistry`, `createCodingTools`) | `AcpAgentRunner.run()` (via `createAcpRunner()`) — drives Claude, Codex, OpenCode, pi, or custom ACP agents |
+| `acp-server` | **ACP composition root** — aggregate backend servers | no Pi equivalent | negotiated discovery connections plus connection-pinned transparent ACP V1 proxying |
 | `workflows` | **Facade** — compose + validate | no Pi equivalent | public SDK, one-shot helper, workflow folders/validator, manager ACP-event bridge |
 | `mcp-server` | **Shell** — expose tools | [`extensions/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/extensions/workflow.ts) + `createWorkflowTool` `defineTool` + TUI ([`display.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/display.ts), [`task-panel.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/task-panel.ts), [`workflow-ui.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-ui.ts)) | stdio MCP server registering the `workflow` and `repl` tools (no auth tools); progress via MCP notifications |
 | `agentprism-otel` | **Observability** | no Pi equivalent | OTel trace/metric mapping over manager events |

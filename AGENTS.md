@@ -36,11 +36,12 @@ Do not add temporary compatibility layers unless the user explicitly requests on
 
 ## Architecture and package boundaries
 
-This is a pnpm monorepo of nine `@automatalabs/*` packages:
+This is a pnpm monorepo of ten `@automatalabs/*` packages:
 
 - `shared-types`: shared seams and wire/result types.
 - `workflow-engine`: deterministic workflow execution, journaling, resume, checkpoints, and isolation.
 - `acp-agents`: ACP client and backend integration for Claude, Codex, OpenCode, pi, and custom agents.
+- `acp-server`: connection-pinned ACP proxy and backend-discovery server.
 - `workflows`: the public SDK facade composing the engine and ACP runner.
 - `repl-engine`: persistent QuickJS REPL orchestration over the same backend stack.
 - `mcp-server`: MCP composition root exposing `workflow`, `repl`, and selective authoring docs.
@@ -48,7 +49,7 @@ This is a pnpm monorepo of nine `@automatalabs/*` packages:
 - `codex-acp`: published fork maintained as a non-squashed upstream subtree.
 - `agentprism-otel`: optional observability bridge.
 
-Keep `workflow-engine` backend-agnostic and `acp-agents` engine-agnostic; they meet through `shared-types`. The primary runtime direction is `mcp-server → {workflows, repl-engine, shared-types}`, `workflows → {workflow-engine, acp-agents, shared-types}`, `repl-engine → {workflows, acp-agents, shared-types}`, and `acp-agents → {codex-acp, pi-acp, shared-types}`.
+Keep `workflow-engine` backend-agnostic and `acp-agents` engine-agnostic; they meet through `shared-types`. The primary runtime direction is `mcp-server → {workflows, repl-engine, shared-types}`, `acp-server → acp-agents`, `workflows → {workflow-engine, acp-agents, shared-types}`, `repl-engine → {workflows, acp-agents, shared-types}`, and `acp-agents → {codex-acp, pi-acp, shared-types}`.
 
 For MCP server work, preserve the deliberate SDK boundary: production server code uses the split MCP SDK v2 packages, legacy 2025 and modern `2026-07-28` traffic share one implementation through era-specific transport seams, and no v1 SDK object may be passed into a v2 API. `@modelcontextprotocol/ext-apps` remains browser-build/test-side; production server code must not import its v1 server helpers.
 
@@ -69,6 +70,7 @@ For MCP server work, preserve the deliberate SDK boundary: production server cod
   ```
 
 - The pre-push hook additionally runs attribution, dependency freshness, and real Claude/Codex/OpenCode/pi plus steering gates. It has no bypass; fix authentication or dependency failures.
+- Any stale package or dependency reported by a repository update gate during any task is immediate maintenance work, not an “unrelated” caveat to leave for delivery. This applies to every dependency, runtime, adapter, source upstream, or workspace package the repository gates for currency. Pause the original delivery, open a separate update PR from current `origin/main`, follow that gate’s prescribed update and merge mechanics, land it, then update and revalidate the original branch.
 - Never weaken a guard or assertion merely to make a change pass. Fix the implementation or the documented contract that the guard protects.
 
 ## Generated and coupled artifacts

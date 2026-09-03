@@ -17,7 +17,7 @@ Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipe
 - **As a TypeScript SDK** — `@automatalabs/workflows` — embed the runner in your own program.
 - **As a stdio MCP server** — `@automatalabs/mcp-server`, built on the SDK — expose `workflow` and `repl` tools to any MCP host (Claude Code, Zed, …).
 
-> All nine `@automatalabs/*` packages are **published on npm** — see [Install](#install). Two are primary user-facing entry points: the `@automatalabs/workflows` SDK and the `@automatalabs/mcp-server` stdio server.
+> All ten `@automatalabs/*` packages are **published on npm** — see [Install](#install). Two are primary workflow entry points: the `@automatalabs/workflows` SDK and the `@automatalabs/mcp-server` stdio server. `@automatalabs/acp-server` is the extension-aware ACP aggregation entry point.
 
 ---
 
@@ -138,8 +138,8 @@ You only need auth for the backend(s) you actually call.
 
 ```bash
 pnpm add @automatalabs/workflows        # the SDK
-# or, to run the MCP server:
-pnpm add @automatalabs/mcp-server
+pnpm add @automatalabs/mcp-server       # the MCP server
+pnpm add @automatalabs/acp-server       # the ACP aggregation server
 ```
 
 ### From source (for development)
@@ -155,12 +155,13 @@ pnpm build        # tsc -b across all packages
 
 ## Packages
 
-These are the packages you interact with directly. The first two are the primary **user-facing entry points** — start with one of them; the third is a standalone backend server:
+These are the packages you interact with directly. The first two are the primary workflow entry points; the latter two expose ACP servers:
 
 | Package | What it is |
 |---|---|
 | **`@automatalabs/workflows`** | The canonical public **SDK** — a thin facade that runs workflow scripts programmatically over the default ACP backend, and re-exports the supported engine + backend integration surface. Start here. |
 | **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, bounded status, resume, permission response, stop) and the `repl` tool (a persistent JavaScript REPL for live subagent orchestration) — built on `@automatalabs/workflows` and `@automatalabs/repl-engine`. |
+| **`@automatalabs/acp-server`** | The extension-aware stdio **ACP proxy** (bin: `agentprism-acp-server`): probe every configured backend on a discovery connection, then pin each operational connection to Claude, Codex, OpenCode, pi, or a custom ACP server. |
 | **`@automatalabs/pi-acp`** | The standalone stdio **ACP server** (bin: `pi-acp`) embedding the pi coding agent in-process; exact-pinned and spawned by the first-class `pi` backend. |
 
 One optional integration package attaches to the SDK's manager surface:
@@ -179,7 +180,7 @@ The five packages below are **internal building blocks**. Most are composed by t
 | **`@automatalabs/codex-acp`** | The workspace fork of `agentclientprotocol/codex-acp` (imported with full history) — the ACP server the Codex backend spawns, baking turn-level `outputSchema` forwarding into its shipped dist. Consumed by `@automatalabs/acp-agents` as `workspace:*`; you never depend on it directly. |
 | **`@automatalabs/shared-types`** | The `AgentRunner` seam + shared types the others compose against. Internal — public entry is `@automatalabs/workflows`. |
 
-Dependency direction: `mcp-server` → `{ workflows, repl-engine, shared-types }`; `workflows` → `{ workflow-engine, acp-agents, shared-types }`; `acp-agents` → `{ codex-acp, pi-acp, shared-types }`; `repl-engine` → `{ workflows, acp-agents, shared-types }`. The SDK (`workflows`) is the single facade that composes the deterministic engine and the ACP backend, which meet only at the `AgentRunner` seam in `shared-types`. The engine never names a backend; the agents never know they're inside a workflow. `acp-agents` spawns the bundled `codex-acp` / `pi-acp` ACP servers as its Codex and pi backends. `repl-engine` composes the QuickJS-in-WASM shim with `workflows` (for the shared per-project key) and `acp-agents` (the REPL's subagents are ACP sessions against the same backends the SDK drives), and ships its `repl` tool in `mcp-server`.
+Dependency direction: `mcp-server` → `{ workflows, repl-engine, shared-types }`; `acp-server` → `acp-agents`; `workflows` → `{ workflow-engine, acp-agents, shared-types }`; `acp-agents` → `{ codex-acp, pi-acp, shared-types }`; `repl-engine` → `{ workflows, acp-agents, shared-types }`. The SDK (`workflows`) is the single facade that composes the deterministic engine and the ACP backend, which meet only at the `AgentRunner` seam in `shared-types`. The engine never names a backend; the agents never know they're inside a workflow. `acp-agents` spawns the bundled `codex-acp` / `pi-acp` ACP servers as its Codex and pi backends. `repl-engine` composes the QuickJS-in-WASM shim with `workflows` (for the shared per-project key) and `acp-agents` (the REPL's subagents are ACP sessions against the same backends the SDK drives), and ships its `repl` tool in `mcp-server`.
 
 ### Published ACP registry
 
