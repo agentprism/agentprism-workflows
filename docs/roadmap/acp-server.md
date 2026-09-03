@@ -1,6 +1,6 @@
 # AgentPrism ACP server implementation contract
 
-**Status:** approved · unimplemented
+**Status:** implemented · released as `@automatalabs/acp-server@0.1.0`
 
 ## Source request (verbatim)
 
