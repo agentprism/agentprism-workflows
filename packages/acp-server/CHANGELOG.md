@@ -1,5 +1,11 @@
 # @automatalabs/acp-server
 
+## 0.2.0
+
+### Minor Changes
+
+- 59c3888: Add an HTTP mode that serves ACP V1 over Streamable HTTP and WebSocket, backed by the official TypeScript SDK transport adapters, while retaining stdio as the default.
+
 ## 0.1.0
 
 ### Minor Changes
