@@ -2807,7 +2807,6 @@ export class CodexAcpServer {
         let promptWasCancelled = false;
         let recoverableSessionFailure = sessionState.sessionFailure;
         sessionState.currentTurnId = null;
-        sessionState.lastTokenUsage = null;
         const activePrompt = this.trackActivePrompt(params.sessionId);
         let pendingTurnStart: PendingTurnStart | null = null;
         const ensurePendingTurnStart = (): PendingTurnStart => {
@@ -2902,6 +2901,7 @@ export class CodexAcpServer {
 
             const commandPromise = this.availableCommands.tryHandleCommand(params.prompt, sessionState, {
                 onTurnStartPending: () => {
+                    sessionState.lastTokenUsage = null;
                     ensurePendingTurnStart();
                 },
                 onTurnStarted: (turnId, threadId) => {
@@ -3007,6 +3007,7 @@ export class CodexAcpServer {
                 sessionState.fastModeEnabled,
                 sessionState.currentModelSupportsFast,
             );
+            sessionState.lastTokenUsage = null;
             ensurePendingTurnStart();
             const sendPromptPromise = this.runWithProcessCheck(
                 () => this.codexAcpClient.sendPrompt(

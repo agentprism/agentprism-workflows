@@ -1709,6 +1709,48 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         await expect(mockFixture.getAcpConnectionDump([])).toMatchFileSnapshot("data/command-status.json");
     });
 
+    it('preserves the latest context usage while handling /status locally', async () => {
+        const {mockFixture, sessionState} = setupPromptFixture({
+            lastTokenUsage: {
+                totalTokens: 41_500,
+                inputTokens: 40_000,
+                cachedInputTokens: 1_000,
+                outputTokens: 500,
+                reasoningOutputTokens: 100,
+            },
+            modelContextWindow: 258_400,
+        });
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: sessionState.sessionId,
+            prompt: [{type: "text", text: "/status"}],
+        });
+
+        expect(sessionState.lastTokenUsage?.totalTokens).toBe(41_500);
+        expect(mockFixture.getAcpConnectionDump([])).toContain(
+            "**Context window:** 16% used (41.5K used / 258.4K)",
+        );
+    });
+
+    it('resets the previous context usage before a model turn', async () => {
+        const {mockFixture, sessionState} = setupPromptFixture({
+            lastTokenUsage: {
+                totalTokens: 41_500,
+                inputTokens: 40_000,
+                cachedInputTokens: 1_000,
+                outputTokens: 500,
+                reasoningOutputTokens: 100,
+            },
+        });
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: sessionState.sessionId,
+            prompt: [{type: "text", text: "start a model turn"}],
+        });
+
+        expect(sessionState.lastTokenUsage).toBeNull();
+    });
+
     it('passes skill slash commands through to Codex', async () => {
         const { mockFixture, turnStartSpy } = setupPromptFixture();
 
@@ -3949,6 +3991,45 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         await expect(mockFixture.getAcpConnectionDump([])).toMatchFileSnapshot("data/command-status-with-rate-limits.json");
     });
 
+    it ('should refresh the complete rate-limit snapshot for status', async () => {
+        const {mockFixture, sessionState} = setupPromptFixture();
+        vi.spyOn(mockFixture.getCodexAcpClient(), "getRateLimits").mockResolvedValue({
+            rateLimits: {
+                limitId: "codex",
+                limitName: "Codex",
+                primary: {usedPercent: 15, resetsAt: null, windowDurationMins: 300},
+                secondary: {usedPercent: 25, resetsAt: null, windowDurationMins: 10080},
+                credits: {hasCredits: false, unlimited: false, balance: "0"},
+                individualLimit: {
+                    limit: "25000",
+                    used: "8000",
+                    remainingPercent: 72,
+                    resetsAt: Date.UTC(2026, 8, 30, 12) / 1000,
+                },
+                spendControlReached: null,
+                planType: null,
+                rateLimitReachedType: null,
+            },
+            rateLimitsByLimitId: null,
+            rateLimitResetCredits: null,
+            accountId: null,
+            rateLimitUpsell: null,
+        });
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: sessionState.sessionId,
+            prompt: [{type: "text", text: "/status"}],
+        });
+
+        const dump = mockFixture.getAcpConnectionDump([]);
+        expect(dump).toContain("**Codex 5h limit:** 85% left");
+        expect(dump).toContain("**Codex Weekly limit:** 75% left");
+        expect(dump).toContain("**Codex Credits:** 0");
+        expect(dump).toContain(
+            "**Codex individual spend limit:** 72% left (8,000 of 25,000 credits used; resets Sep 30)",
+        );
+    });
+
     it ('should surface thread/compacted as user-visible message', async () => {
         const sessionId = "test-session-id";
         const { mockFixture } = setupPromptFixture({ sessionId });
@@ -4116,6 +4197,73 @@ describe('ACP server test', { timeout: 40_000 }, () => {
                 planType: null,
                 rateLimitReachedType: null,
             }
+        });
+    });
+
+    it ('should apply a missing-id rate-limit update to the codex bucket', async () => {
+        const sessionId = "test-session-id";
+        const rateLimits: RateLimitsMap = new Map([
+            ["codex", {
+                limitId: "codex",
+                limitName: "Codex",
+                snapshot: {
+                    limitId: "codex",
+                    limitName: "Codex",
+                    primary: {usedPercent: 10, resetsAt: null, windowDurationMins: 300},
+                    secondary: {usedPercent: 20, resetsAt: null, windowDurationMins: 10080},
+                    credits: {hasCredits: true, unlimited: false, balance: "25"},
+                    individualLimit: null,
+                    spendControlReached: null,
+                    planType: null,
+                    rateLimitReachedType: null,
+                },
+            }],
+            ["codex_other", {
+                limitId: "codex_other",
+                limitName: "Other",
+                snapshot: {
+                    limitId: "codex_other",
+                    limitName: "Other",
+                    primary: {usedPercent: 30, resetsAt: null, windowDurationMins: 60},
+                    secondary: null,
+                    credits: null,
+                    individualLimit: null,
+                    spendControlReached: null,
+                    planType: null,
+                    rateLimitReachedType: null,
+                },
+            }],
+        ]);
+        const {mockFixture, sessionState} = setupPromptFixture({sessionId, rateLimits});
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId,
+            prompt: [{type: "text", text: "test"}],
+        });
+        mockFixture.sendServerNotification({
+            method: "account/rateLimits/updated",
+            params: {
+                rateLimits: {
+                    limitId: null,
+                    limitName: null,
+                    primary: null,
+                    secondary: {usedPercent: 40, resetsAt: null, windowDurationMins: 10080},
+                    credits: null,
+                    individualLimit: null,
+                    spendControlReached: null,
+                    planType: null,
+                    rateLimitReachedType: null,
+                },
+            },
+        });
+        await mockFixture.getCodexAcpClient().waitForSessionNotifications(sessionId);
+
+        expect([...sessionState.rateLimits!.keys()]).toEqual(["codex", "codex_other"]);
+        expect(sessionState.rateLimits!.get("codex")!.snapshot).toMatchObject({
+            limitId: "codex",
+            primary: null,
+            secondary: {usedPercent: 40, resetsAt: null, windowDurationMins: 10080},
+            credits: {hasCredits: true, unlimited: false, balance: "25"},
         });
     });
 });

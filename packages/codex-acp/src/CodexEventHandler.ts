@@ -83,6 +83,7 @@ import {
 } from "./AirExtension";
 import {CodexSubagentEventRouter} from "./subagents/CodexSubagentEventRouter";
 import type {SubagentState} from "./subagents/AcpSubagents";
+import {mergeRateLimitSnapshot} from "./RateLimitsMap";
 
 export { stripShellPrefix };
 
@@ -1350,11 +1351,15 @@ export class CodexEventHandler {
         if (!this.sessionState.rateLimits) {
             this.sessionState.rateLimits = new Map();
         }
-        const limitId = params.rateLimits.limitId ?? params.rateLimits.limitName ?? "unknown";
+        const limitId = params.rateLimits.limitId ?? "codex";
+        const existingEntry = this.sessionState.rateLimits.get(limitId);
+        const snapshot = existingEntry
+            ? mergeRateLimitSnapshot(existingEntry.snapshot, params.rateLimits)
+            : {...params.rateLimits, limitId};
         this.sessionState.rateLimits.set(limitId, {
             limitId: limitId,
-            limitName: params.rateLimits.limitName ?? limitId,
-            snapshot: params.rateLimits,
+            limitName: snapshot.limitName ?? existingEntry?.limitName ?? limitId,
+            snapshot,
         });
     }
 
