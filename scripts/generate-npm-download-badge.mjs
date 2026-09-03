@@ -6,13 +6,13 @@
 // package is queried separately. All responses must describe the same period;
 // nothing is written unless every response is valid.
 //
-// The named `last-month` period keeps the request URL identical from day to
-// day, and npm's edge has served GitHub-hosted runners a days-old cached
-// window for that URL while other vantage points saw fresh data. Two guards:
-// every request carries a unique cache-busting query param plus no-cache
-// headers, and a response whose period ends more than MAX_END_LAG_DAYS ago
-// fails the run outright — a failed run publishes nothing (the previous data
-// stays live) instead of laundering a stale window under a fresh generatedAt.
+// npm's named `last-month` alias can lag behind its explicit-date data even
+// when cache-busting and no-cache headers are used. Build an exact 30-day UTC
+// range instead, ending two full days ago so npm's daily aggregation has time
+// to settle. Range responses must contain every requested day in order, and
+// the aggregate final day must be non-zero. A failed completeness check writes
+// nothing, preserving the previously published badge rather than presenting
+// incomplete counts as fresh.
 
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -22,21 +22,22 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packagesDir = join(repoRoot, "packages");
 
 const DOWNLOADS_API = process.env.AGENTPRISM_NPM_DOWNLOADS_API ?? "https://api.npmjs.org";
-const PERIOD = "last-month";
+const WINDOW_DAYS = 30;
+const REPORTING_LAG_DAYS = 2;
 const EXTERNAL_PACKAGES = Object.freeze(["@automatalabs/codex-acp"]);
 const FETCH_ATTEMPTS = 3;
 const FETCH_TIMEOUT_MS = 10_000;
 const RETRY_DELAY_MS = 1_000;
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-// npm normally reports through yesterday or the day before; anything older
-// means npm (or a cache in front of it) is serving a stale window.
-const MAX_END_LAG_DAYS = 4;
 
+const generatedAt = reportingNow();
+const period = reportingPeriod(generatedAt);
 const outputDir = parseOutputDir(process.argv.slice(2));
 const packageNames = await discoverPublishedPackages();
-const rows = await Promise.all(packageNames.map(fetchPackageDownloads));
-const { start, end } = requireMatchingPeriod(rows);
-requireFreshPeriod(end);
+const rows = await Promise.all(
+  packageNames.map((packageName) => fetchPackageDownloads(packageName, period)),
+);
+const { start, end } = requireMatchingPeriod(rows, period);
+requireCompleteFinalDay(rows, end);
 const total = rows.reduce((sum, row) => sum + row.downloads, 0);
 
 if (!Number.isSafeInteger(total)) {
@@ -53,16 +54,17 @@ const endpoint = {
 
 const details = {
   schemaVersion: 1,
-  generatedAt: new Date().toISOString(),
+  generatedAt: generatedAt.toISOString(),
   period: {
-    parameter: PERIOD,
+    parameter: period.parameter,
     start,
     end,
-    description: "Last 30 available days reported by npm; start and end are inclusive.",
+    reportingLagDays: REPORTING_LAG_DAYS,
+    description: "Explicit 30-day UTC window ending two full days before generation; start and end are inclusive.",
   },
   packageCount: rows.length,
   totalDownloads: total,
-  method: "Sum of separate npm point-download requests for each published package.",
+  method: "Sum of validated daily rows from separate npm range requests for each published package.",
   note: "Counts are per package and are not deduplicated across dependency installs.",
   packages: rows.map((row) => ({
     name: row.package,
@@ -132,12 +134,13 @@ async function discoverPublishedPackages() {
   return names;
 }
 
-async function fetchPackageDownloads(packageName) {
+async function fetchPackageDownloads(packageName, period) {
   const url = new URL(
-    `/downloads/point/${PERIOD}/${encodeURIComponent(packageName)}`,
+    `/downloads/range/${period.parameter}/${encodeURIComponent(packageName)}`,
     ensureTrailingSlash(DOWNLOADS_API),
   );
-  // The path is identical every day, so bust any cache between us and npm.
+  // Explicit periods change daily, but retain cache busting for repeated same-day runs and
+  // intermediaries that ignore request cache directives.
   url.searchParams.set("t", `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`);
   const response = await fetchWithRetry(url);
 
@@ -156,20 +159,51 @@ async function fetchPackageDownloads(packageName) {
       `invalid response for ${packageName}: package was ${JSON.stringify(payload.package)}`,
     );
   }
-  if (!Number.isSafeInteger(payload.downloads) || payload.downloads < 0) {
+  if (payload.start !== period.start || payload.end !== period.end) {
     throw new Error(
-      `invalid response for ${packageName}: downloads was ${JSON.stringify(payload.downloads)}`,
+      `npm returned the wrong explicit period for ${packageName}: ` +
+        `${JSON.stringify(payload.start)}..${JSON.stringify(payload.end)} ` +
+        `(expected ${period.start}..${period.end})`,
     );
   }
-  if (!validIsoDate(payload.start) || !validIsoDate(payload.end) || payload.start > payload.end) {
+  if (!Array.isArray(payload.downloads)) {
+    throw new Error(`invalid response for ${packageName}: downloads was not an array`);
+  }
+  if (payload.downloads.length !== period.days.length) {
     throw new Error(
-      `invalid response period for ${packageName}: ${JSON.stringify(payload.start)}..${JSON.stringify(payload.end)}`,
+      `incomplete response for ${packageName}: received ${payload.downloads.length} daily rows ` +
+        `(expected ${period.days.length})`,
     );
   }
 
+  let downloads = 0;
+  const daily = payload.downloads.map((entry, index) => {
+    const expectedDay = period.days[index];
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`invalid daily response for ${packageName} on ${expectedDay}: expected an object`);
+    }
+    if (entry.day !== expectedDay) {
+      throw new Error(
+        `incomplete response for ${packageName}: daily row ${index} was ${JSON.stringify(entry.day)} ` +
+          `(expected ${expectedDay})`,
+      );
+    }
+    if (!Number.isSafeInteger(entry.downloads) || entry.downloads < 0) {
+      throw new Error(
+        `invalid daily downloads for ${packageName} on ${expectedDay}: ${JSON.stringify(entry.downloads)}`,
+      );
+    }
+    downloads += entry.downloads;
+    if (!Number.isSafeInteger(downloads)) {
+      throw new Error(`download total for ${packageName} is not a safe integer`);
+    }
+    return { day: entry.day, downloads: entry.downloads };
+  });
+
   return {
     package: packageName,
-    downloads: payload.downloads,
+    downloads,
+    daily,
     start: payload.start,
     end: payload.end,
   };
@@ -210,7 +244,30 @@ async function fetchWithRetry(url) {
   );
 }
 
-function requireMatchingPeriod(results) {
+function reportingNow() {
+  const override = process.env.AGENTPRISM_NPM_DOWNLOADS_NOW;
+  const now = override === undefined ? new Date() : new Date(override);
+  if (!Number.isFinite(now.getTime())) {
+    throw new Error(`AGENTPRISM_NPM_DOWNLOADS_NOW must be an ISO timestamp, got ${JSON.stringify(override)}`);
+  }
+  return now;
+}
+
+function reportingPeriod(now) {
+  const today = now.toISOString().slice(0, 10);
+  const end = shiftIsoDate(today, -REPORTING_LAG_DAYS);
+  const start = shiftIsoDate(end, -(WINDOW_DAYS - 1));
+  const days = Array.from({ length: WINDOW_DAYS }, (_, index) => shiftIsoDate(start, index));
+  return { parameter: `${start}:${end}`, start, end, days };
+}
+
+function shiftIsoDate(date, days) {
+  const value = new Date(`${date}T00:00:00.000Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
+}
+
+function requireMatchingPeriod(results, expected) {
   const first = results[0];
   if (!first) throw new Error("npm returned no package results");
 
@@ -222,25 +279,35 @@ function requireMatchingPeriod(results) {
       );
     }
   }
+  if (first.start !== expected.start || first.end !== expected.end) {
+    throw new Error(
+      `npm returned ${first.start}..${first.end}, expected explicit period ${expected.start}..${expected.end}`,
+    );
+  }
   return { start: first.start, end: first.end };
 }
 
-/** Refuse to publish a window npm should long since have moved past. A thrown
- *  error fails the workflow's build job, so the deploy step never runs and the
- *  previously published data stays live — loud staleness instead of silent. */
-function requireFreshPeriod(endDate) {
-  const lagDays = Math.floor((Date.now() - Date.parse(`${endDate}T00:00:00.000Z`)) / 86_400_000);
-  if (lagDays > MAX_END_LAG_DAYS) {
+/** Explicit date endpoints represent not-yet-ingested days as zero rather than reporting that
+ *  the day is unavailable. Across the complete published package set a zero aggregate is a
+ *  reliable fail-closed signal that the requested final day has not settled yet. */
+function requireCompleteFinalDay(results, endDate) {
+  let downloads = 0;
+  for (const row of results) {
+    const finalDay = row.daily.at(-1);
+    if (finalDay?.day !== endDate) {
+      throw new Error(`incomplete response for ${row.package}: missing final day ${endDate}`);
+    }
+    downloads += finalDay.downloads;
+    if (!Number.isSafeInteger(downloads)) {
+      throw new Error(`aggregate downloads for final day ${endDate} is not a safe integer`);
+    }
+  }
+  if (downloads === 0) {
     throw new Error(
-      `npm reported a stale download window: period end ${endDate} is ${lagDays} days old ` +
-        `(max ${MAX_END_LAG_DAYS}) — refusing to republish stale counts`,
+      `npm reported zero downloads across all ${results.length} packages for ${endDate}; ` +
+        "the explicit reporting window has not settled — refusing to publish incomplete counts",
     );
   }
-}
-
-function validIsoDate(value) {
-  if (typeof value !== "string" || !ISO_DATE.test(value)) return false;
-  return new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
 }
 
 function ensureTrailingSlash(value) {
