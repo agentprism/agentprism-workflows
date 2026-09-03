@@ -48,7 +48,7 @@ reach the host; keep evidence concise and never put credentials or other secrets
 | `headless` | `"default" \| "abort" \| "pause"` | No live channel: `"default"` takes `default ?? true`, `"abort"` aborts, and `"pause"` creates a persisted `checkpoint_required` pause. Default `"default"`. |
 | `timeoutMs` | `number` | Deadline for the interactive prompt. |
 
-The host supplies the live human channel (elicitation in the MCP server; `ExecOptions.confirm` in the SDK), and that channel wins even when `headless: "pause"` is declared. A durable pause carries non-secret `checkpointContext`; resume with `ExecOptions.checkpointReplies: { [context.callIndex]: decision }` or attach a live channel. On a new `resumeFromRunId` execution, reply keys always name indexes in the **source** recording; identity matching may inject that decision at a shifted current index. Completed host and headless checkpoint results both replay when identity and the checkpoint-options fingerprint over `default`, `headless`, and `timeoutMs` match. A changed option or ambiguous match runs fresh. Detached runs never pause for a checkpoint unless the author opts into `"pause"`.
+The host supplies the live human channel (elicitation in the MCP server; `ExecOptions.confirm` in the SDK), and that channel wins even when `headless:"pause"` is declared. A durable pause carries non-secret `checkpointContext`; MCP continues the same run with `checkpointReplies:{ [context.callIndex]: decision }`. The first strict-JSON decision stored under the run lease is authoritative forever: repeats are idempotent and conflicts are ignored. Detached runs never pause for a checkpoint unless the author opts into `"pause"`.
 
 ## Error codes (`WorkflowError.code`)
 

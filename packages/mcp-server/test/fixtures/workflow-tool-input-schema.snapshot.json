@@ -4,74 +4,153 @@
   "branches": [
     {
       "action": "config",
-      "properties": ["action", "projectDir", "harnesses", "modelSpecs", "modelFilter"],
-      "required": ["action"],
+      "properties": [
+        "action",
+        "projectDir",
+        "harnesses",
+        "modelSpecs",
+        "modelFilter"
+      ],
+      "required": [
+        "action"
+      ],
       "additionalProperties": false
     },
     {
       "variants": [
         {
           "action": "run",
-          "properties": ["action", "script", "projectDir", "args", "maxAgents", "concurrency", "agentRetries", "background"],
-          "required": ["action", "script"],
+          "properties": [
+            "action",
+            "script",
+            "projectDir",
+            "args",
+            "maxAgents",
+            "concurrency",
+            "agentRetries",
+            "background"
+          ],
+          "required": [
+            "action",
+            "script"
+          ],
           "additionalProperties": false
         },
         {
           "action": "run",
-          "properties": ["action", "scriptPath", "projectDir", "args", "maxAgents", "concurrency", "agentRetries", "background"],
-          "required": ["action", "scriptPath"],
-          "additionalProperties": false
-        },
-        {
-          "action": "run",
-          "properties": ["action", "script", "projectDir", "args", "maxAgents", "concurrency", "agentRetries", "background", "resumeFromRunId", "resumePolicy", "checkpointReplies"],
-          "required": ["action", "script", "resumeFromRunId"],
-          "additionalProperties": false
-        },
-        {
-          "action": "run",
-          "properties": ["action", "scriptPath", "projectDir", "args", "maxAgents", "concurrency", "agentRetries", "background", "resumeFromRunId", "resumePolicy", "checkpointReplies"],
-          "required": ["action", "scriptPath", "resumeFromRunId"],
+          "properties": [
+            "action",
+            "scriptPath",
+            "projectDir",
+            "args",
+            "maxAgents",
+            "concurrency",
+            "agentRetries",
+            "background"
+          ],
+          "required": [
+            "action",
+            "scriptPath"
+          ],
           "additionalProperties": false
         }
       ]
     },
     {
       "action": "resume",
-      "properties": ["action", "runId", "args", "maxAgents", "concurrency", "agentRetries", "resumePolicy", "checkpointReplies", "background"],
-      "required": ["action", "runId"],
+      "properties": [
+        "action",
+        "runId",
+        "maxAgents",
+        "concurrency",
+        "agentRetries",
+        "checkpointReplies",
+        "background"
+      ],
+      "required": [
+        "action",
+        "runId"
+      ],
       "additionalProperties": false
     },
     {
       "action": "status",
-      "properties": ["action", "runId", "lastN", "labelGlob", "logLines", "waitMs"],
-      "required": ["action", "runId"],
+      "properties": [
+        "action",
+        "runId",
+        "lastN",
+        "labelGlob",
+        "logLines"
+      ],
+      "required": [
+        "action",
+        "runId"
+      ],
       "additionalProperties": false
     },
     {
       "action": "result",
-      "properties": ["action", "runId", "offset", "maxBytes"],
-      "required": ["action", "runId"],
+      "properties": [
+        "action",
+        "runId",
+        "offset",
+        "maxBytes"
+      ],
+      "required": [
+        "action",
+        "runId"
+      ],
       "additionalProperties": false
     },
     {
       "action": "permissions-response",
-      "properties": ["action", "runId", "permissionId", "response"],
-      "required": ["action", "runId", "permissionId", "response"],
+      "properties": [
+        "action",
+        "runId",
+        "permissionId",
+        "response"
+      ],
+      "required": [
+        "action",
+        "runId",
+        "permissionId",
+        "response"
+      ],
       "additionalProperties": false
     },
     {
       "variants": [
         {
           "action": "stop",
-          "properties": ["action", "runId", "lastN", "labelGlob", "logLines", "forceOwner"],
-          "required": ["action", "runId"],
+          "properties": [
+            "action",
+            "runId",
+            "lastN",
+            "labelGlob",
+            "logLines",
+            "forceOwner"
+          ],
+          "required": [
+            "action",
+            "runId"
+          ],
           "additionalProperties": false
         },
         {
           "action": "stop",
-          "properties": ["action", "runId", "lastN", "labelGlob", "logLines", "callIndex"],
-          "required": ["action", "runId", "callIndex"],
+          "properties": [
+            "action",
+            "runId",
+            "lastN",
+            "labelGlob",
+            "logLines",
+            "callIndex"
+          ],
+          "required": [
+            "action",
+            "runId",
+            "callIndex"
+          ],
           "additionalProperties": false
         }
       ]

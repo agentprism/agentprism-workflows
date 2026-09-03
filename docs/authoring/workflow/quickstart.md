@@ -54,13 +54,13 @@ const results = (await parallel([
 
 ## Model selection
 
-Omit `model` for the server default, or use a backend-only value such as `"codex"` to retain that backend's configured default model. When `AGENTPRISM_DEFAULT_BACKEND` is truly unset, the MCP server probes backend readiness without prompting, pins one project default before validation/execution, and keeps that backend for the run and resume; an explicit environment default always wins. Before pinning a model id, `mode`, or `configOptions`, call `workflow` with `action:"config"`. After choosing a model, use `modelSpecs` to read that exact model's option domain. Config preserves each advertised mode's id, name, description, and `_meta`, plus `defaultModeId`. When mode is omitted, AgentPrism applies Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode. Pin only exact advertised ids and never guess model or option ids.
+Omit `model` for the server default, or use a backend-only value such as `"codex"` to retain that backend's configured default model. When `AGENTPRISM_DEFAULT_BACKEND` is truly unset, the MCP server probes backend readiness without prompting and pins one project default at admission; an explicit environment default wins. Before pinning a model id, `mode`, or `configOptions`, call `workflow` with `action:"config"` and use `modelSpecs` for that model's exact domain. For trusted implementation/review work, select Claude `bypassPermissions` or Codex `agent` when advertised. Claude `auto` is classifier-driven and may request permission; do not treat it as full-access autonomy. Pin only exact advertised ids and never guess model or option ids. The effective choices are persisted canonically for the run and reused unchanged by continuation.
 
 ## Validation and execution
 
 Every `{ action:"run", ... }` request is statically parsed, mock-executed, and checked against no-prompt backend configuration before admission. A rejection creates no run ID, reserves no background slot, and spends no tokens. Read the diagnostic, correct the script, and submit it again.
 
-Use foreground execution for short work. Use `background:true` for work that may outlive one tool request; retain the returned `runId`, then use bounded `status` or `stop` calls.
+Use foreground execution for short work. Use `background:true` for work that may outlive one tool request; retain the returned `runId`, then use immediate `status` snapshots or `stop` calls.
 
 The input is a strict action union: send only fields belonging to the selected action. In particular, `projectDir` belongs to `config` and `run`, not `status`, `result`, `resume`, or `stop`. Some MCP clients report every rejected union branch; when that happens, first check the branch matching your `action` and remove cross-action fields.
 
@@ -78,10 +78,10 @@ This is the complete long-running loop. First admit a background run and retain 
 }
 ```
 
-Observe without imposing an execution deadline. A `waitMs` timeout returns current progress and never cancels the run:
+Observe the current state. Status is always an immediate snapshot; issue it again for a later sample:
 
 ```json
-{ "action": "status", "runId": "RUN_ID", "waitMs": 25000 }
+{ "action": "status", "runId": "RUN_ID" }
 ```
 
 After completion, retrieve the exact result. If `hasMore` is true, repeat with `offset` set to the previous `endOffset`:
@@ -90,13 +90,15 @@ After completion, retrieve the exact result. If `hasMore` is true, repeat with `
 { "action": "result", "runId": "RUN_ID", "offset": 0, "maxBytes": 16384 }
 ```
 
-To retry an incomplete source from its stored immutable script and args, create a new run; do not resend `script`:
+Continue an incomplete run in place; do not resend `script` or `args`:
 
 ```json
 { "action": "resume", "runId": "RUN_ID", "background": true }
 ```
 
-The new admission reports a predicted replayable prefix. Use `status` on the new `runId` for observed replayed/live/failed counts, then use `result` after completion.
+The response keeps the same `runId` without exposing an execution-attempt identity. It reuses the
+admitted script, args, effective agent configuration, journal, event stream, cumulative usage, and
+durable checkpoint decisions. Use `status` on that same ID, then `result` after completion.
 
 ## What to read next
 

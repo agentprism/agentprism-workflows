@@ -21,6 +21,8 @@ export const meta = {
 //   8. Read-only lenses fan out; run-things lenses are serialized (two builds in one
 //      checkout collide), and base-freshness uses git ls-remote — never fetch — in the
 //      shared worktree.
+//   9. This trusted implementation/review train uses the backends' real autonomous modes:
+//      Codex "agent" and Claude "bypassPermissions" (Claude "auto" may still ask).
 
 // ---- args hardening (hosts may hand args through as a JSON string) ----
 const input =
@@ -196,7 +198,7 @@ const outcome = await gate(
         (feedback
           ? `\nA review board rejected attempt ${attempt}. Their combined feedback (self-contained — do not assume any file exists unless named here):\n${feedback}\nAddress every point, re-verify, and commit before reporting.\n`
           : ""),
-      { label: `implement:r${attempt + 1}`, phase: "Implement", model: "codex/gpt-5.6-sol", configOptions: { reasoning_effort: "xhigh" }, cwd: W, retries: 1, schema: IMPL_REPORT },
+      { label: `implement:r${attempt + 1}`, phase: "Implement", model: "codex/gpt-5.6-sol", mode: "agent", configOptions: { reasoning_effort: "xhigh" }, cwd: W, retries: 1, schema: IMPL_REPORT },
     ),
   async (report) => {
     round += 1;
@@ -217,7 +219,7 @@ const outcome = await gate(
     }
     // Read-only lenses fan out; run-things lenses execute one at a time — two builds in
     // one checkout collide on outputs and caches.
-    const lensOpts = (lens) => ({ label: `review:${lens.key}:r${round}`, phase: "Gate", model: "claude/opus[1m]", cwd: W, retries: 1, schema: VERDICT });
+    const lensOpts = (lens) => ({ label: `review:${lens.key}:r${round}`, phase: "Gate", model: "claude/opus[1m]", mode: "bypassPermissions", cwd: W, retries: 1, schema: VERDICT });
     const readOnly = LENSES.filter((l) => !l.runs);
     const runsThings = LENSES.filter((l) => l.runs);
     const readVerdicts = await parallel(readOnly.map((lens) => () => agent(lensPrompt(lens, report, round), lensOpts(lens))));
@@ -258,7 +260,7 @@ const adjudication = await agent(
     `against the code, spot-check surprising lens verdicts in BOTH directions (lens verdicts are inputs, not votes). ` +
     `Write your full report to ${D}/final-adjudication.md. ` +
     `Your findings are a CLOSED list — the fix round applies exactly this list and nothing else.`,
-  { label: "adjudicate", phase: "Adjudicate", model: "claude/opus[1m]", cwd: W, retries: 1, schema: ADJUDICATION },
+  { label: "adjudicate", phase: "Adjudicate", model: "claude/opus[1m]", mode: "bypassPermissions", cwd: W, retries: 1, schema: ADJUDICATION },
 );
 if (!adjudication) throw new Error("terminal adjudication produced no result — inspect the run before delivery");
 if (adjudication.reviewedHeadSha !== outcome.value.headSha) {
@@ -281,7 +283,7 @@ const fixOutcome = await gate(
         `touch, run the full verification bar, commit on ${BRANCH}, and report status "implemented" with headSha equal ` +
         `to the branch tip.` +
         (feedback ? `\nThe adjudicator rejected your previous fix attempt:\n${feedback}\nAddress every residual.` : ""),
-      { label: `fix:r${attempt + 1}`, phase: "Fix", model: "codex/gpt-5.6-sol", configOptions: { reasoning_effort: "xhigh" }, cwd: W, retries: 1, schema: IMPL_REPORT },
+      { label: `fix:r${attempt + 1}`, phase: "Fix", model: "codex/gpt-5.6-sol", mode: "agent", configOptions: { reasoning_effort: "xhigh" }, cwd: W, retries: 1, schema: IMPL_REPORT },
     ),
   async (fixReport) => {
     if (!fixReport || fixReport.status !== "implemented" || !fixReport.commitShas.length || !SHA.test(fixReport.headSha)) {
@@ -293,7 +295,7 @@ const fixOutcome = await gate(
         `finding from your ${D}/final-adjudication.md against the committed branch (fix report: ` +
         `${JSON.stringify(fixReport)}), hunt regressions the fixes introduced, and write ${D}/final-adjudication-fix.md. ` +
         `approved=true means shippable as-is.`,
-      { label: "adjudicate:fix", phase: "Fix", model: "claude/opus[1m]", cwd: W, retries: 1, schema: ADJUDICATION },
+      { label: "adjudicate:fix", phase: "Fix", model: "claude/opus[1m]", mode: "bypassPermissions", cwd: W, retries: 1, schema: ADJUDICATION },
     );
     if (!verdict) return { ok: false, feedback: "Adjudicator returned no verdict — re-verify your own fixes against the closed list and recommit." };
     if (verdict.reviewedHeadSha !== fixReport.headSha) {

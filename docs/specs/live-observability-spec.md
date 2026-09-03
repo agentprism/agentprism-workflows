@@ -621,10 +621,10 @@ Thus a subsequent lifecycle callback does not replay stale content, while every 
 sequence and remains visible. Settled/total counts are unchanged. There is no manager-wide
 listener, run-ID filter, pre-assignment slot, or listener cleanup lifecycle.
 
-Background `await` handles the persisted `agentProgress` member inside the existing
-`createAwaitProgressReporter.record` switch and uses the same safe message while preserving its
-start/end/phase counters [L13]. That switch explicitly ignores `agentTranscript`: transcript rows
-neither change counters nor emit `notifications/progress`; the following `agentProgress` record is
+MCP `status` is an immediate snapshot and emits no `notifications/progress` for persisted
+`agentProgress` rows; only a foreground `run`/`resume` request reports live progress, using the same
+safe message [L13]. Persisted `agentTranscript` rows never drive progress: they neither change
+counters nor emit `notifications/progress`; the following `agentProgress` record is
 the one progress-reporting surface. Both paths keep existing request-correlated
 `notifications/progress` behavior; absent progress tokens remain a no-op and notification promises
 are never awaited. These messages are a convenience only; transcript reconstruction always uses
@@ -744,7 +744,7 @@ an error, it revalidates and re-arms one at the new `endCursor` before returning
 subscription is rejected.
 
 For unsubscribe, **known** means the canonical URI is currently subscribed, its run snapshot or
-lineage tombstone exists, or this server instance observed that run's deletion. A well-formed URI
+deletion tombstone exists, or this server instance observed that run's deletion. A well-formed URI
 for an existing but never-subscribed run is therefore known and unsubscribe returns `{}`. A
 malformed/query URI or syntactically valid run ID that satisfies none of those conditions is
 never-known and returns **-32602**. Successful unsubscribe removes the URI, closes its pump, clears
@@ -792,9 +792,9 @@ does not send a final resource-updated notification for a resource that can no l
 
 ### 7.3 Tool discovery and compact status activity
 
-Script resource URI/read/subscription/lineage behavior remains unchanged. Canonical `status` uses
-the same event log and terminal detection, and its progress reporter adds the `agentProgress`
-content message from §6.3 while ignoring `agentTranscript` records. Every admitted durable-log run
+Script resource URI/read/subscription behavior remains unchanged. Canonical `status` reads one
+immediate snapshot and folds `agentProgress` records while ignoring `agentTranscript` records. It
+does not tail, poll, or wait for a lifecycle transition. Every admitted durable-log run
 and later status/terminal response exposes the canonical `eventsUri` and a clearly labelled events
 `resource_link` alongside existing script/result links. Result retrieval repeats the URI/link when
 the stream exists. Legacy rows without valid event-generation metadata omit them.

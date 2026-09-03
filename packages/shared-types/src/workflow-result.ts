@@ -153,6 +153,24 @@ export interface WorkflowCheckpointTaken {
   source: WorkflowCheckpointSource;
 }
 
+/** Durable classification of one checkpoint reply presented while continuing a run. */
+export interface WorkflowCheckpointResolution {
+  callIndex: number;
+  /** accepted = first durable answer; same = idempotent repeat; different = ignored conflict. */
+  outcome: "accepted" | "same" | "different";
+  /** The first durable decision. */
+  decision: unknown;
+  /** A conflicting supplied value, retained only in the immediate host response. */
+  ignored?: unknown;
+}
+
+/** Same-run continuation telemetry. This is intentionally not a replay/fork report. */
+export interface WorkflowContinuationResult {
+  generation: number;
+  replayedPrefix: number;
+  resolvedCheckpoints?: WorkflowCheckpointResolution[];
+}
+
 /** One cached agent()/checkpoint() result, keyed by its deterministic call index
  *  (PersistedRunState.journal, run-persistence.ts). The frozen AgentResult MUST
  *  round-trip through this JSON unchanged for resume. */
@@ -600,7 +618,7 @@ export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed
  * So hosts get a complete, resumable result without widening the engine's return.
  */
 export interface WorkflowRunResult<T = unknown> {
-  /** Stable id; pass back as `resumeFromRunId` to continue a paused run from its journal. */
+  /** Stable id; MCP continuation keeps this exact identity. */
   runId: string;
   /** Terminal status. "paused" => resumable (usage limit / auth / durable checkpoint). */
   status: RunStatus;
@@ -641,6 +659,8 @@ export interface WorkflowRunResult<T = unknown> {
   fallbacks?: WorkflowRunFallback[];
   /** Checkpoint calls resolved in this execution. Absent when none resolved. */
   checkpointsTaken?: WorkflowCheckpointTaken[];
+  /** Present after an in-place continuation of this run. */
+  continuation?: WorkflowContinuationResult;
   /** The engine-owned authoritative manifest: one frozen record per terminated call. */
   calls?: WorkflowCallRecord[];
   /** Manager-owned correspondence report for a resumeFromRunId execution. */

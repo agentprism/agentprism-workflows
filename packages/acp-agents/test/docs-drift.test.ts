@@ -267,9 +267,14 @@ test("auth, MCP, and authoring docs retain the implemented contracts", () => {
   assert.ok(authSpec.includes("### 4.7 Completed PR sequencing (historical)"));
 
   const mcpReadme = readRepoFile("packages/mcp-server/README.md");
-  for (const contract of ["OpenCode", "`AGENTPRISM_PERSISTENCE_ROOT`", "resumeFromRunId", "`author-workflow`"]) {
+  for (const contract of ["OpenCode", "`AGENTPRISM_PERSISTENCE_ROOT`", 'action:"resume"', "`author-workflow`"]) {
     assert.ok(mcpReadme.includes(contract), `MCP README must document ${contract}`);
   }
+  assert.ok(
+    mcpReadme.includes("config/run/resume/status/result/permissions-response/stop"),
+    "MCP README must name the complete strict workflow action lifecycle",
+  );
+  assert.match(mcpReadme, /continue(?:s| that) the exact run ID/i);
   // The MCP server's whole tool surface is the single `workflow` tool: backend auth belongs to
   // the agents' own CLI credential stores (auth/provider management lives in the SDK runner
   // APIs). Retired MCP tool names must not resurface in the current-state docs.
@@ -291,6 +296,40 @@ test("auth, MCP, and authoring docs retain the implemented contracts", () => {
   const reference = readRepoFile("skills/agentprism-workflow-authoring/reference.md");
   assert.ok(reference.includes("| `keepSession` |"), "the exhaustive agent option table must include keepSession");
   assert.ok(reference.includes('reason: "auth_required"'), "authoring reference must explain auth pauses");
+});
+
+test("trusted autonomous examples pin explicit modes and describe Claude auto accurately", () => {
+  const trustedExamples = [
+    "docs/authoring/workflow/checkpoints-and-quality.md",
+    "docs/authoring/workflow/examples.md",
+    "skills/agentprism-workflow-authoring/gates-and-lenses.md",
+    "skills/agentprism-workflow-authoring/examples-and-validation.md",
+  ];
+  for (const path of trustedExamples) {
+    const text = readRepoFile(path);
+    assert.ok(text.includes('mode: "agent"'), `${path} must pin Codex agent for trusted work`);
+    assert.ok(
+      text.includes('mode: "bypassPermissions"'),
+      `${path} must pin Claude bypassPermissions for trusted work`,
+    );
+  }
+
+  const modeGuidance = [
+    "README.md",
+    "packages/mcp-server/README.md",
+    "docs/authoring/workflow/models-and-config.md",
+    "skills/agentprism-workflow-authoring/SKILL.md",
+    "skills/agentprism-workflow-authoring/models-and-output.md",
+  ];
+  for (const path of modeGuidance) {
+    const text = readRepoFile(path);
+    assert.match(text, /Claude `auto`[^\n]*(?:classifier|model classifier)/i, `${path} must describe Claude auto as classifier-driven`);
+    assert.match(
+      text,
+      /Claude `auto`[^\n]*may (?:still )?(?:(?:ask|request) permission|ask the user)/i,
+      `${path} must not describe Claude auto as permission-free`,
+    );
+  }
 });
 
 test("maintained examples do not reintroduce invalid agent/model contracts", () => {

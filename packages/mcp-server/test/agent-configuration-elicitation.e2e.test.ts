@@ -153,7 +153,7 @@ for (const protocolMode of ["legacy", "modern"] as const) {
         name: "workflow",
         arguments: { action: "run", projectDir, script: SCRIPT },
       });
-      assert.equal(result.isError, false);
+      assert.equal(result.isError, false, JSON.stringify(result.content));
       assert.equal(structured(result)?.status, "completed");
       assert.equal(connected.elicitations.length, 1);
       assert.deepEqual(seen, [

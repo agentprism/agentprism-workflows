@@ -5,8 +5,7 @@ import { z } from "zod";
 
 // The published schema is an action-discriminated oneOf. Every object variant is strict, so
 // cross-action fields fail at the MCP validation boundary instead of being stripped and rejected
-// later by a prose-maintained discriminator. Compatibility aliases are normalized before this
-// canonical schema (see normalizeCompatibilityInput), never published as competing actions.
+// later by a prose-maintained discriminator. There are no action aliases or hidden preprocessors.
 
 const permissionResponseSchema = z
   .object({
@@ -53,7 +52,7 @@ const modelFilterSchema = z
   .min(1)
   .max(128)
   .describe("Config only: case-insensitive model-id substring or /regular expression/ filter.");
-const argsSchema = z.unknown().describe("Run/resume JSON value exposed to the script as `args`.");
+const argsSchema = z.unknown().describe("Run only: JSON value exposed to the script as `args`.");
 const maxAgentsSchema = z.number().int().positive().describe("Maximum agents for the new run; default 1000.");
 const concurrencySchema = z
   .number()
@@ -65,13 +64,6 @@ const agentRetriesSchema = z
   .int()
   .min(0)
   .describe("Recoverable retries per agent; values above 3 are clamped.");
-const resumeFromRunIdSchema = z
-  .string()
-  .min(1)
-  .describe("Run only: source run for edited-script replay. Use resume for stored-script replay.");
-const resumePolicySchema = z
-  .enum(["auto", "positional"])
-  .describe("Replay matching policy; default auto.");
 const checkpointRepliesSchema = z
   .record(
     z.string().refine(
@@ -83,7 +75,7 @@ const checkpointRepliesSchema = z
     ),
     z.unknown(),
   )
-  .describe("Checkpoint decisions keyed by the source checkpoint call index.");
+  .describe("Resume only: checkpoint decisions keyed by this run's checkpoint call index.");
 const backgroundSchema = z
   .boolean()
   .describe("Run/resume only: acknowledge after durable admission; default false.");
@@ -123,12 +115,6 @@ const logLinesSchema = z
   .min(0)
   .max(50)
   .describe("Status/stop latest log lines; default 20, range 0..50.");
-const waitMsSchema = z
-  .number()
-  .int()
-  .min(0)
-  .max(25_000)
-  .describe("Status request bound in milliseconds, 0..25000; it never cancels workflow work.");
 const offsetSchema = z
   .number()
   .int()
@@ -158,8 +144,6 @@ export const workflowToolInputShape = {
   maxAgents: maxAgentsSchema,
   concurrency: concurrencySchema,
   agentRetries: agentRetriesSchema,
-  resumeFromRunId: resumeFromRunIdSchema,
-  resumePolicy: resumePolicySchema,
   checkpointReplies: checkpointRepliesSchema,
   background: backgroundSchema,
   runId: runIdSchema,
@@ -170,7 +154,6 @@ export const workflowToolInputShape = {
   lastN: lastNSchema,
   labelGlob: labelGlobSchema,
   logLines: logLinesSchema,
-  waitMs: waitMsSchema,
   offset: offsetSchema,
   maxBytes: maxBytesSchema,
 } as const;
@@ -194,12 +177,6 @@ const executionOptionsShape = {
   background: backgroundSchema.optional(),
 } as const;
 
-const editedReplayShape = {
-  resumeFromRunId: resumeFromRunIdSchema,
-  resumePolicy: resumePolicySchema.optional(),
-  checkpointReplies: checkpointRepliesSchema.optional(),
-} as const;
-
 const runInlineInputSchema = z
   .object({
     action: z.literal("run").describe("Validate and execute explicit workflow content."),
@@ -214,38 +191,18 @@ const runPathInputSchema = z
     ...executionOptionsShape,
   })
   .strict();
-const replayInlineInputSchema = z
-  .object({
-    action: z.literal("run").describe("Execute edited content with replay from a source run."),
-    script: scriptSchema,
-    ...executionOptionsShape,
-    ...editedReplayShape,
-  })
-  .strict();
-const replayPathInputSchema = z
-  .object({
-    action: z.literal("run").describe("Execute edited content with replay from a source run."),
-    scriptPath: scriptPathSchema,
-    ...executionOptionsShape,
-    ...editedReplayShape,
-  })
-  .strict();
 const runInputSchema = z.xor([
   runInlineInputSchema,
   runPathInputSchema,
-  replayInlineInputSchema,
-  replayPathInputSchema,
 ]);
 
 const resumeInputSchema = z
   .object({
-    action: z.literal("resume").describe("Create a new run from a source's stored script and args."),
+    action: z.literal("resume").describe("Continue this exact run using its durable inputs and configuration."),
     runId: runIdSchema,
-    args: argsSchema.optional(),
     maxAgents: maxAgentsSchema.optional(),
     concurrency: concurrencySchema.optional(),
     agentRetries: agentRetriesSchema.optional(),
-    resumePolicy: resumePolicySchema.optional(),
     checkpointReplies: checkpointRepliesSchema.optional(),
     background: backgroundSchema.optional(),
   })
@@ -260,9 +217,8 @@ const inspectionShape = {
 
 const statusInputSchema = z
   .object({
-    action: z.literal("status").describe("Read status immediately or wait for a milestone."),
+    action: z.literal("status").describe("Read an immediate point-in-time status snapshot."),
     ...inspectionShape,
-    waitMs: waitMsSchema.optional(),
   })
   .strict();
 
@@ -321,32 +277,8 @@ export const workflowToolCanonicalInputSchema = z.xor([
   workflowToolInputBranches.stop,
 ]).meta({ type: "object" });
 
-function normalizeCompatibilityInput(value: unknown): unknown {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
-  const raw = value as Record<string, unknown>;
-  if (raw.action === "inspect") {
-    // inspect never accepted a request wait. Leaving the alias untouched makes the canonical
-    // schema reject this invalid hybrid instead of silently changing its meaning.
-    if (raw.waitMs !== undefined) return value;
-    return { ...raw, action: "status", waitMs: 0 };
-  }
-  if (raw.action === "await") {
-    return { ...raw, action: "status", waitMs: raw.waitMs ?? 20_000 };
-  }
-  if (raw.action === undefined) {
-    return { ...raw, action: "run" };
-  }
-  return value;
-}
-
-/**
- * Runtime wire schema. Discovery publishes only the canonical oneOf, while the preprocess keeps
- * pre-status inspect/await and omitted-action run clients working during their migration window.
- */
-export const workflowToolInputSchema = z.preprocess(
-  normalizeCompatibilityInput,
-  workflowToolCanonicalInputSchema,
-);
+/** Runtime and discovery use the same strict canonical schema. */
+export const workflowToolInputSchema = workflowToolCanonicalInputSchema;
 
 interface WorkflowExecuteToolInputBase {
   action: "run";
@@ -365,26 +297,16 @@ type WorkflowExplicitContent =
   | { script?: never; scriptPath: string };
 
 export type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase &
-  WorkflowExplicitContent &
-  (
-    | { resumeFromRunId?: never; resumePolicy?: never; checkpointReplies?: never }
-    | {
-        resumeFromRunId: string;
-        resumePolicy?: "auto" | "positional";
-        checkpointReplies?: Record<number, unknown>;
-      }
-  );
+  WorkflowExplicitContent;
 
-/** Simple stored-content replay that creates and durably links a fresh target run. */
+/** Same-ID continuation of one durably admitted run. */
 export interface WorkflowResumeToolInput {
   action: "resume";
-  /** Persisted source run whose immutable script and, by default, strict-JSON args are reused. */
+  /** The exact persisted run to continue. */
   runId: string;
-  args?: unknown;
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
   background?: boolean;
 }
@@ -400,21 +322,7 @@ export interface WorkflowConfigToolInput {
 export interface WorkflowStatusToolInput extends WorkflowRunInspectionOptions {
   action: "status";
   runId: string;
-  /** Omit or use zero for an immediate observation; positive values wait at most this long. */
-  waitMs?: number;
 }
-
-/** @deprecated Runtime migration input only. Use WorkflowStatusToolInput with omitted waitMs. */
-export type WorkflowInspectToolInput = Omit<WorkflowStatusToolInput, "action" | "waitMs"> & {
-  action: "inspect";
-  waitMs?: never;
-};
-
-/** @deprecated Runtime migration input only. Use WorkflowStatusToolInput with a positive waitMs. */
-export type WorkflowAwaitToolInput = Omit<WorkflowStatusToolInput, "action"> & {
-  action: "await";
-  waitMs?: number;
-};
 
 export interface WorkflowResultToolInput {
   action: "result";
@@ -464,7 +372,7 @@ function checkpointReplies(
     : Object.fromEntries(Object.entries(value).map(([callIndex, reply]) => [Number(callIndex), reply]));
 }
 
-/** Normalize compatibility input, validate one canonical branch, and apply runtime defaults. */
+/** Validate one canonical branch and apply runtime defaults. */
 export function parseWorkflowToolInput(
   supplied: unknown,
   options: ParseWorkflowToolInputOptions = {},
@@ -488,9 +396,6 @@ export function parseWorkflowToolInput(
     case "run":
       return {
         ...input,
-        checkpointReplies: checkpointReplies(
-          "checkpointReplies" in input ? input.checkpointReplies : undefined,
-        ),
         background: input.background ?? false,
       } as WorkflowExecuteToolInput;
     case "resume":
@@ -500,7 +405,7 @@ export function parseWorkflowToolInput(
         background: input.background ?? false,
       };
     case "status":
-      return { ...input, waitMs: input.waitMs ?? 0 };
+      return input;
     case "result":
       return {
         ...input,

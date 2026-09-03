@@ -64,7 +64,7 @@ test("run scripts are listed and readable as resources over HTTP", async () => {
     const session = await connectHttp(daemon.url);
     const result = await session.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT, projectDir },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir },
     });
     const runId = structured(result)?.runId as string;
     assert.ok(runId);
@@ -92,7 +92,7 @@ test("events subscription delivers resources/updated over the standalone GET str
     const session = await connectHttp(daemon.url);
     const started = await session.client.callTool({
       name: "workflow",
-      arguments: { script: ONE_AGENT_SCRIPT, background: true, projectDir },
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT, background: true, projectDir },
     });
     const runId = structured(started)?.runId as string;
     assert.ok(runId, textOf(started));
@@ -107,7 +107,7 @@ test("events subscription delivers resources/updated over the standalone GET str
 
     const awaited = await session.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 15_000 },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(awaited)?.status, "completed", textOf(awaited));
     await session.dispose();
@@ -125,7 +125,7 @@ test("checkpoint elicitation rides the HTTP POST stream and returns the answered
     });
     const result = await session.client.callTool({
       name: "workflow",
-      arguments: { script: CHECKPOINT_SCRIPT, projectDir },
+      arguments: { action: "run", script: CHECKPOINT_SCRIPT, projectDir },
     });
     assert.equal(result.isError ?? false, false, textOf(result));
     assert.equal(structured(result)?.result, "alpha", "the elicited choice should be the run result");
@@ -145,7 +145,7 @@ test("a non-eliciting client's checkpoint degrades to the declared default over 
     const session = await connectHttp(daemon.url); // no elicitation capability
     const result = await session.client.callTool({
       name: "workflow",
-      arguments: { script: CHECKPOINT_SCRIPT, projectDir },
+      arguments: { action: "run", script: CHECKPOINT_SCRIPT, projectDir },
     });
     assert.equal(result.isError ?? false, false, textOf(result));
     assert.equal(structured(result)?.result, "beta", "headless checkpoint should take the default");

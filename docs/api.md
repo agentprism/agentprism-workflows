@@ -108,7 +108,7 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `maxAgents` | Cap on total agent calls for the run. |
 | `concurrency`, `agentRetries` | Per-run overrides of the manager defaults. |
 | `defaultModel` | Host-pinned backend/model for calls with no authored model, agent-definition model, tier, or phase/meta route. It is persisted, passed as the resolved model, and enters call identity. Primarily used by the MCP composition root's automatic default selection. |
-| `agentConfigurations` | Host-selected `{ model, mode?, configOptions? }` values keyed by the zero-based root-execution-wide agent occurrence ordinal. A selection replaces the call's provider-specific authored model/mode/config before hashing and dispatch, so changing providers cannot leak stale option ids and omission clears authored mode/config. The map itself is not persisted; effective values are recorded in call identity, and a new resume request supplies fresh selections. |
+| `agentConfigurations` | Host-selected `{ model, mode?, configOptions? }` values keyed by the zero-based root-execution-wide agent occurrence ordinal. A selection replaces the call's provider-specific authored model/mode/config before hashing and dispatch, so changing providers cannot leak stale option ids and omission clears authored mode/config. Canonical strict-host admissions persist a versioned, host-owned snapshot atomically with the run; same-ID continuation reuses it without re-elicitation. Raw form values are never persisted. |
 | `requireAgentConfiguration` | When true, fail before runner dispatch if a live occurrence has no `agentConfigurations` entry. This lets a preflight-driven host fail closed when live control flow reaches a call the mock pass did not observe. |
 | `confirm` | `(promptText, options) => Promise<reply>` — live human channel for `checkpoint()`. When present it wins over every headless mode, including `"pause"`. |
 | `resumeFromRunId` | Persisted source ID for a **new** managed execution. Requires journaling, must differ from a caller-supplied new `runId`, and is mutually exclusive with `resumeJournal`. Missing sources fail with `PERSISTENCE_ERROR`. |
@@ -137,9 +137,11 @@ sets the live prompt deadline. `headless` has three modes:
   non-secret `checkpointContext` (`callIndex`, hash, prompt, kind, choices/default). Resume with
   `checkpointReplies: { [context.callIndex]: decision }`, or attach a live `confirm` callback.
 
-The injected decision is persisted as the checkpoint's journal entry and replayed on future cold
-resumes. A detached run therefore never hangs or pauses at a checkpoint unless the workflow author
-explicitly selects `headless: "pause"`.
+For same-ID continuation, the first strict-JSON answer is persisted under the run lease before any
+script continues. Repeating that answer is idempotent; a conflicting later answer is ignored in
+favor of the durable first answer. Reconstruction replays the persisted decision forever. A
+detached run therefore never hangs or pauses at a checkpoint unless the workflow author explicitly
+selects `headless: "pause"`.
 
 ### Lifecycle
 
@@ -154,6 +156,7 @@ explicitly selects `headless: "pause"`.
 | `stop(runId)` | `boolean` | Whole-run terminal abort. The same run ID cannot resume in place, but its retained journal can be the source of a new `resumeFromRunId` execution. |
 | `resume(runId, exec?)` | `Promise<boolean>` | Same-ID recovery of a paused/failed run using historical positional replay. Reloads the persisted script/args/cwd, rejects `resumeFromRunId`/`resumePolicy`, emits no resume report, and permanently marks the artifact legacy. Requires journaling. |
 | `resumeInBackground(runId, exec?)` | `Promise<{ accepted, promise? }>` | Same-ID `resume()` plus the settlement handle: when accepted, `promise` is the resumed execution's completion promise (same contract as `startInBackground`'s — rejects on failure/pause, side-channel catch attached). The facade manager holds a per-execution `exec.agent` event bridge until it settles. |
+| `continueRun(runId, exec?)` | `Promise<WorkflowContinuationStart>` | Strict same-ID continuation used by MCP. Requires a valid versioned canonical admission snapshot, inherits all semantic inputs, accepts runtime controls/checkpoint replies only, and returns a bounded refusal reason instead of guessing missing metadata. |
 | `getRun(runId)` | `ManagedRun \| undefined` | Live in-memory state incl. `status`, `snapshot`, `error`. |
 | `listRuns()` / `listAllRuns()` | `PersistedRunState[]` | Persisted runs (session-filtered / all); their existing scan lease-reconciles candidate dead-owner rows without a second directory scan. |
 | `getPersistedAgentSessions(runId)` | `AgentSessionRecord[] \| undefined` | Cold-restart counterpart of `WorkflowRunResult.agentSessions`: the re-attach records recovered from persisted state (`undefined` = no such run, `[]` = none recorded), ready for `runner.loadSession()`/`resumeSession()` on a fresh manager. |
@@ -191,11 +194,11 @@ next.resumeReport;      // per-call correspondence; absent on ordinary/same-ID r
 ```
 
 `runDynamicWorkflow(currentScript, { args: currentArgs, exec: { resumeFromRunId } })` exposes the
-same manager path. MCP execution accepts the same `resumeFromRunId`, optional `resumePolicy`, and
-`checkpointReplies`. `resumeFromRunId` must be a non-empty string; `resumePolicy` must be exactly
-`"auto" | "positional"`; `checkpointReplies` on a new-run API requires the source ID; journaling
-must be enabled; and a caller-minted target `runId` must differ from the source. Invalid
-combinations fail before target creation. The manager holds the source's cross-process lease
+same manager path for SDK embedding hosts. These fork/replay controls are SDK-only: the MCP tool
+neither advertises nor accepts them. On the SDK surface, `resumeFromRunId` must be a non-empty
+string; `resumePolicy` must be exactly `"auto" | "positional"`; `checkpointReplies` on a new-run API
+requires the source ID; journaling must be enabled; and a caller-minted target `runId` must differ
+from the source. Invalid combinations fail before target creation. The manager holds the source's cross-process lease
 through validation/cloning and the target's critical initial seed save, then releases it before
 execution or background acknowledgement. Every candidate removal/selection is likewise durably
 committed before the script can observe a replayed result or live delegation.
@@ -1374,7 +1377,8 @@ interface WorkflowConfigToolInput {
 
 interface WorkflowExecuteToolInput {
   action: "run";
-  script: string;
+  script?: string;
+  scriptPath?: string; // exactly one of script/scriptPath
   projectDir?: string; // absolute project directory: selects the project-scoped run store and
                        // default execution cwd. REQUIRED on the shared workflow daemon; optional
                        // on a single-project (--in-process) server, defaulting to its own project.
@@ -1382,20 +1386,15 @@ interface WorkflowExecuteToolInput {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  resumeFromRunId?: string;
-  resumePolicy?: "auto" | "positional";
-  checkpointReplies?: Record<number, unknown>;
   background?: boolean; // default false
 }
 
 interface WorkflowResumeToolInput {
   action: "resume";
-  runId: string; // persisted source; the result receives a fresh linked runId
-  args?: unknown; // explicit replacement; omission reuses stored strict-JSON args
+  runId: string; // exact persisted run identity; continuation never creates a child run
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
   background?: boolean;
 }
@@ -1403,7 +1402,6 @@ interface WorkflowResumeToolInput {
 interface WorkflowStatusToolInput extends WorkflowRunInspectionOptions {
   action: "status";
   runId: string;
-  waitMs?: number; // default 0 (immediate); integer 0..25_000
 }
 
 interface WorkflowResultToolInput {
@@ -1449,8 +1447,16 @@ interface WorkflowExecutionToolResult<T = unknown> {
   checkpointContext?: CheckpointContext;
   fallbacks?: WorkflowRunFallback[];
   checkpointsTaken?: WorkflowCheckpointTaken[];
-  resumeReport?: WorkflowResumeReport;   // resumeFromRunId executions only
-  replayEligibility?: WorkflowReplayEligibility;
+  continuation?: {
+    generation: number;
+    replayedPrefix: number;
+    resolvedCheckpoints?: Array<{
+      callIndex: number;
+      outcome: "accepted" | "same" | "different";
+      decision: unknown;
+      ignored?: unknown;
+    }>;
+  };
   scriptSource: "inline" | "path" | "stored";
   scriptUri: string;
   eventsUri: string;
@@ -1458,24 +1464,23 @@ interface WorkflowExecutionToolResult<T = unknown> {
 }
 ```
 
-`action:"config"` reuses the server's runner to open bounded no-prompt sessions and returns live model/mode/config catalogs without creating a manager run. Mode names, descriptions, and `_meta` are preserved verbatim in structured and human-readable output, alongside `defaultModeId` (`auto` / `agent` / `build` for the three mode-capable first-class backends). `action:"resume"` first locates the source project from `runId`, rejects missing/unreadable persisted content or unreplayable stored args directly, then submits the immutable stored script and stored-or-explicit args through the same new-run validation/admission path with `resumeFromRunId` set internally. It works from supported paused and terminal sources, never mutates the source, never inherits its operational limits, and returns a fresh linked run ID; `scriptSource:"stored"` identifies this admission. Ordinary `action:"run"` with explicit script content plus `resumeFromRunId` remains the edited replay path. Every execution request is statically parsed and mock-executed before run admission. If the client advertises MCP form elicitation and the mock run observes agent calls, the server probes provider catalogs and sends one structured pre-execution request covering every occurrence. Each call has one required provider/model choice plus optional provider-scoped advertised mode/config fields, with its resolved label, phase title, and phase description. Decline/cancel creates no run. Accepted values are checked against the probed form and injected before a second complete routed preflight, call hashing, and dispatch; an uncovered live occurrence fails closed. Legacy elicitation is fulfilled through the SDK shim, while modern `2026-07-28` clients retry `input_required` with signed request state. Clients without form elicitation keep explicit/automatic default-backend routing. An invalid preflight returns `{ action:"run", status:"rejected", validation }` with no run ID, persistence record, background reservation, or live `AgentRunner.run()` call.
+`action:"config"` reuses the server's runner to open bounded no-prompt sessions and returns live model/mode/config catalogs without creating a manager run. Mode names, descriptions, and `_meta` are preserved verbatim in structured and human-readable output, alongside `defaultModeId` (`auto` / `agent` / `build` for the three mode-capable first-class backends). `action:"resume"` locates the persisted run from `runId` and continues that exact identity under its run lease. It uses the immutable stored script, args, cwd, approved script backends, canonical agent-configuration admission, journal, event stream, cumulative usage, and checkpoint history. It never accepts replacement script or args and never creates a child run. Missing canonical continuation metadata fails clearly and requires a fresh `run`.
+
+Every new `run` request is statically parsed and mock-executed before admission. If the client advertises MCP form elicitation and the mock run observes agent calls, the server probes provider catalogs and sends one structured pre-execution request covering every occurrence. Each call has one required provider/model choice plus optional provider-scoped advertised mode/config fields, with its resolved label, phase title/detail, and a bounded credential-redacted task/prompt preview so the user can understand what the selected model will do. Decline/cancel creates no run. Accepted values are checked against the probed form, converted to a canonical host-owned effective configuration snapshot, and atomically persisted with the initial run state before execution. Raw form fields are not persisted. The server repeats the complete routed preflight with the selected values before call hashing and dispatch; an uncovered live occurrence fails closed. Same-ID continuation reuses the durable snapshot without another form. Legacy elicitation is fulfilled through the SDK shim, while modern `2026-07-28` clients retry `input_required` with signed request state. Clients without form elicitation keep explicit/automatic default-backend routing. An invalid preflight returns `{ action:"run", status:"rejected", validation }` with no run ID, persistence record, background reservation, or live `AgentRunner.run()` call.
 
 The published input is a strict draft-2020-12 `oneOf` with seven top-level branches in this order:
 config, run, resume, status, result, permissions-response, and stop. Every object variant requires
 its literal `action` and has `additionalProperties:false`. Run has structural sub-variants for
-inline/path content and fresh/edited replay, so exactly one content source is required and
-`resumePolicy`/`checkpointReplies` can appear only with required `resumeFromRunId`. Stop has separate
+inline/path content, so exactly one content source is required. Stop has separate
 whole-run and targeted variants, making `forceOwner` and `callIndex` structurally exclusive.
 
-Mixed/missing branches, invalid run IDs, invalid status bounds, and `waitMs` outside 0–25,000
-are MCP Invalid Params (`-32602`). `background` omission preserves foreground execution byte for
-byte for executions that do not block on an ACP permission: it streams progress, honors request cancellation and live checkpoint elicitation, and returns
-`WorkflowExecutionToolResult<T>`. If a permission blocks first, foreground returns a running admission with `pendingPermissions` and the run stays live. `action:"status"` with omitted or zero `waitMs` observes lifecycle state immediately; when a permission is pending it also projects that request and may elicit one exact option from a capable client.
-Compatibility normalization runs before canonical validation but is absent from discovery: an
-omitted action becomes `run`, legacy `inspect` becomes immediate `status`, and legacy `await`
-becomes `status` while preserving explicit `waitMs` or using its historical 20-second default.
-Deprecated inspect/await TypeScript aliases remain migration input types only; neither belongs to
-`WorkflowToolInput`, and new callers must use the seven published actions.
+Mixed/missing branches and invalid run IDs are MCP Invalid Params (`-32602`). There is no omitted
+action default, retired action alias, hidden input alias, or compatibility normalization.
+`background` omission preserves foreground execution behavior for executions that do not block on
+an ACP permission: it streams progress, honors request cancellation and live checkpoint elicitation, and returns
+`WorkflowExecutionToolResult<T>`. If a permission blocks first, foreground returns a running admission with `pendingPermissions` and the run stays live.
+`action:"status"` is always an immediate lifecycle snapshot. When a permission is pending it also
+projects that request and may elicit one exact option from a capable client.
 
 After preflight succeeds, `background:true` reserves one of four process-local active-or-starting slots, performs lease acquisition and the durable initial save, then returns:
 
@@ -1487,7 +1492,7 @@ interface WorkflowBackgroundAccepted {
   scriptUri: string;
   eventsUri: string;
   limits: WorkflowRunLimits;
-  replayEligibility?: WorkflowReplayEligibility;
+  continuation?: WorkflowExecutionToolResult["continuation"];
   pendingPermissions?: WorkflowPendingPermission[];
   interaction: {
     permissionRequests: "may-block";
@@ -1503,10 +1508,9 @@ channel, or live checkpoint `confirm`; checkpoints use authored headless behavio
 start request supplied a progress token, it emits no background progress after returning.
 Cancelling the accepted call cannot abort the run. A fifth run fails with
 `Background workflow limit reached (4 active or starting runs). Check an existing run with status and retry.`
-Foreground, status, and result retrieval do not consume slots. A background simple resume or run carrying `resumeFromRunId` creates a new run
-ID and copies the complete inherited journal plus any synthetic checkpoint answer into that new
-run's initial durable record, preserving multi-hop resume safety. Its acknowledgement includes the
-admission-time `replayEligibility` prediction before the script body is allowed to execute.
+Foreground, status, and result retrieval do not consume slots. A background resume continues the
+input run ID under the same lease and reports the continuation generation. It does not allocate a
+new run or copy state into an execution child.
 
 Every newly admitted response reports its resolved `limits`. The same object appears on foreground
 results, background acknowledgements, status, and terminal status `outcome`; legacy
@@ -1516,7 +1520,7 @@ persisted records that predate limit storage may omit it. Failed call rows inclu
 ```ts
 interface WorkflowPermissionRequestProjection {
   toolCall: RequestPermissionRequest["toolCall"]; // safe projection; ACP sessionId is omitted
-  options: PermissionOption[]; // complete ordered exact optionIds; presentation is redacted/bounded
+  options: PermissionOption[]; // complete ordered exact optionIds plus exact meaning/scope
   _meta?: Record<string, unknown> | null; // redacted/bounded when retained
 }
 
@@ -1533,14 +1537,7 @@ interface WorkflowPendingPermission {
   requestRedacted: boolean;
 }
 
-interface WorkflowStatusWaitMetadata {
-  requestedMs: number;
-  elapsedMs: number;
-  returnedBecause: "terminal" | "timeout" | "immediate" | "action-required" | "permission-resolved";
-}
-
 interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
-  wait: WorkflowStatusWaitMetadata;
   tokenUsage?: TokenUsage;
   pendingPermissions?: WorkflowPendingPermission[];
   outcome?: Omit<WorkflowExecutionToolResult<T>, "eventsUri"> & { eventsUri?: string }; // terminal; legacy streams may omit URI
@@ -1586,28 +1583,18 @@ interface WorkflowStopPendingResult extends WorkflowRunStatus {
 }
 ```
 
-Status returns immediately for terminal runs, is a non-blocking read when `waitMs` is omitted or zero, and otherwise
-waits for terminal lifecycle state **or a live ACP permission** for at most the requested duration.
-A permission returns `action-required` before the bound. Elicitation-capable clients receive the
-backend's exact options; accepting maps to the selected option id, while decline/cancel maps to ACP
-cancelled. Without elicitation, status returns the request for a later `permissions-response`
-call. Selected ids are validated against the still-pending request and each permission settles once. For new-format runs it
-tails the generation-pinned event sidecar. When the **status request** carries a progress token, the
-server emits the existing coarse notification shape after each phase, distinct agent start, and
-first terminal agent end for `(scope, callIndex)`: `progress` is the number of distinct ended calls,
-`total` is distinct started calls (omitted while zero), and `message` is the latest phase title
-(omitted until known). Snapshot agent rows/current phase seed those sets, and the tail begins after
-the snapshot watermark, so a late status request neither scans the unbounded history for progress state nor
-double-counts the known prefix.
+Status is an immediate snapshot. Elicitation-capable clients receive a pending permission's exact
+options; accepting maps to the selected option id, while decline/cancel maps to ACP cancelled.
+Without elicitation, status returns the request for a later `permissions-response` call. Selected
+ids are validated against the still-pending request and each permission settles once. Status does
+not poll, await a lifecycle transition, or emit wait metadata.
 
-The local settlement promise may still win the terminal race without disabling tail progress. A live
-permission wait retains the agent call's concurrency slot and ACP session. Permission
+A live permission retains the agent call's concurrency slot and ACP session. Permission
 inspection/response follows the lease owner over the
 signed daemon control plane. It is not a durable engine pause: owner loss invalidates the original
 ACP request and no successor reconstructs it cold. For
-legacy, incomplete, corrupt, mismatched, or otherwise unsafe event logs, status explicitly falls back
-to 250-ms `inspectRun()` terminal polling and emits no progress notifications even if that status request has
-a token. Status cancellation closes its watcher/poller, ends only that request, and returns
+legacy, incomplete, corrupt, mismatched, or otherwise unsafe event logs do not change the immediate
+status contract. Cancelling status ends only that request and returns
 `Workflow status request for runId "<runId>" was cancelled; the workflow was not cancelled.` with no
 structured content. Status is a successful read even for failed/aborted lifecycle status. Partial
 `tokenUsage` is cumulative live work in this execution only; cached replay adds zero. At terminal,
@@ -1633,14 +1620,14 @@ Retrieval has no TTL and remains available until SDK/manual deletion, corruption
 inherited status portion retains its 24,576-byte/redaction bound and status text its 8,192-byte cap;
 raw terminal `outcome` intentionally has no new envelope cap.
 
-Runs execute in the shared per-user workflow daemon (the default stdio entry is a thin shim that proxies to it and auto-starts it), so a client disconnect, shim kill, or session eviction does not stop in-flight work. During version succession the current daemon is the front door while a predecessor may retain execution ownership under the run lease. Whole-run stop writes an idempotent durable intent and signed internal control forwards stop/cancel to that predecessor. A final stop response still requires a durable aborted snapshot plus its stopped event; a control wait that expires returns a successful nonterminal stop acknowledgement with `control.state:"pending"` and an operation ID. `forceOwner:true` on whole-run stop explicitly authorizes terminating a superseded owner daemon after identity revalidation and may interrupt sibling runs; it is forbidden with `callIndex`. Owner exit (signals, forced stop, crash, machine shutdown) — or, under `--in-process`, the single client-owned process exiting — can interrupt work; there is no cross-machine handoff. If an owner exits with a pending whole-stop intent, the next lease holder cold-stops it; otherwise cold preflights reconcile orphaned `pending`/`running` state to `paused` / `interrupted` for explicit `resumeFromRunId`. A live lease is never stolen because of a timeout.
+Runs execute in the shared per-user workflow daemon (the default stdio entry is a thin shim that proxies to it and auto-starts it), so a client disconnect, shim kill, or session eviction does not stop in-flight work. During version succession the current daemon is the front door while a predecessor may retain execution ownership under the run lease. Whole-run stop writes an idempotent durable intent and signed internal control forwards stop/cancel to that predecessor. A final stop response still requires a durable aborted snapshot plus its stopped event; a control wait that expires returns a successful nonterminal stop acknowledgement with `control.state:"pending"` and an operation ID. `forceOwner:true` on whole-run stop explicitly authorizes terminating a superseded owner daemon after identity revalidation and may interrupt sibling runs; it is forbidden with `callIndex`. Owner exit (signals, forced stop, crash, machine shutdown) — or, under `--in-process`, the single client-owned process exiting — can interrupt work; there is no cross-machine handoff. If an owner exits with a pending whole-stop intent, the next lease holder cold-stops it; otherwise cold preflights reconcile orphaned `pending`/`running` state to `paused` / `interrupted` for same-ID `resume`. A live lease is never stolen because of a timeout.
 The MCP input does not resolve saved workflow names; name resolution is an SDK/`openWorkflowDir`
 feature. The server honors the SDK environment variables plus `AGENTPRISM_ALLOW_SCRIPT_BACKENDS`.
 
-Status returns `WorkflowRunStatus` plus wait metadata, durable `latestActivity`, live `pendingPermissions`, and interaction guidance when applicable. Durable-log runs expose `eventsUri` and a labelled events resource link; completed runs with an authored JSON value also expose `resultUri` and a labelled result resource link without adding either detailed event content or that value to the bounded status projection. Permission diagnostics are credential-redacted and scalar-bounded, omit the private ACP session id, and preserve the complete ordered exact option-id list inside a separate 64 KiB envelope; an option set that cannot be represented safely is cancelled instead of partially exposed. Permission responses accept only cancellation or an exact selected optionId and forbid caller-supplied response `_meta`. Its JSON structured content is capped at 24,576 bytes
+Status returns `WorkflowRunStatus` plus durable `latestActivity`, live `pendingPermissions`, and interaction guidance when applicable. Durable-log runs expose `eventsUri` and a labelled events resource link; completed runs with an authored JSON value also expose `resultUri` and a labelled result resource link without adding either detailed event content or that value to the bounded status projection. Permission diagnostics are credential-redacted and scalar-bounded, omit the private ACP session id, and preserve the complete ordered exact option-id list inside a separate 64 KiB envelope; an option set that cannot be represented safely is cancelled instead of partially exposed. The elicitation form identifies the run ID, phase, agent label, backend, tool title/kind, and renders the available sanitized `rawInput`, `content`, and `locations` fields within strict per-field and total bounds. Each option states its exact meaning and scope. Permission responses accept only cancellation or an exact selected optionId and forbid caller-supplied response `_meta`. Its JSON structured content is capped at 24,576 bytes
 and its formatted text at 8,192 bytes. An existing failed or aborted run is still a successful read.
 An unknown/corrupt/unreadable run is `isError:true`, has no structured content, and returns exactly
-`No workflow run found for runId "<runId>" in this server's project-scoped run store.` Simple resume also fails directly when its source content is unreadable or its stored args cannot be replayed as strict JSON. Execution keeps current error semantics: failed/aborted are tool errors, paused is a successful resumable call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped at 12,288 bytes; rejected preflight scripts instead carry bounded structured validation diagnostics and have no run ID or tail.
+`No workflow run found for runId "<runId>" in this server's project-scoped run store.` Resume fails directly when the exact run lacks required canonical admission data, readable stored content, or replayable strict-JSON args; the caller must start a fresh run. Execution keeps current error semantics: failed/aborted are tool errors, paused is a successful resumable call. Non-completed execution text includes the manager's final-20 redacted `logTail` and is capped at 12,288 bytes; rejected preflight scripts instead carry bounded structured validation diagnostics and have no run ID or tail.
 
 **The `author-workflow` prompt.** Prompt-capable hosts additionally get one compact user-controlled MCP prompt, `author-workflow` (optional `task` argument). It frames the task and directs the assistant to `docs` topic `workflow/quickstart` plus only the related topics needed; it does not inject the optional skill or the complete reference. Prompts never enter the model's tool-selection loop.
 

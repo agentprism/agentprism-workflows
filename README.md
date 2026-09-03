@@ -49,13 +49,20 @@ A representative ask:
 
 From an ask like that, the agent picks the primitives — `gate()` fix-loops with the reviewer's feedback threaded into fresh attempts, structured-output verdicts, self-contained prompts, per-call model routing and effort via `configOptions` — and the validator (static parse → mock dry run → per-harness config probe) proves the script's structure and its model/config choices for zero tokens before any real run.
 
-### Durable runs — resume without re-spending tokens
+### Durable runs — same-ID continuation
 
-Scripts run in a deterministic realm and every `agent()` call is journaled under an identity hash. A new `resumeFromRunId` execution replays unchanged completed calls even after insertions or reordering; ambiguous or mismatched calls run live. Filesystem/environment drift is reported as provenance instead of vetoing replay. Provider quota and authentication walls don't fail the run either: the run **pauses**, keeps the interrupted ACP session reopenable, and on resume reattaches to continue that exact turn when its call index, identity, execution inputs, backend, cwd, and reopen capability still match. Any correspondence uncertainty fails to a fresh live call, while completed calls retain ordinary journal replay.
+Scripts run in a deterministic realm and every `agent()` and `checkpoint()` result is journaled.
+MCP `{ action:"resume", runId }` continues that exact run ID with its persisted script, args,
+canonical host-selected agent configuration, journal, event stream, cumulative usage, and durable
+checkpoint decisions. It never creates a child execution or accepts edited script/args replay.
+Exact journal hits rebuild state without current provider usage. Provider quota and authentication
+walls pause the run; an eligible interrupted ACP call can reattach to the recorded session and
+charge only new usage.
 
-> **Resume rule:** replay is content-addressed and fail-to-live on correspondence: a completed call replays when its identity and input fingerprint match uniquely. Filesystem or world state never gates replay.
->
-> `args` is not itself part of an `agent()` identity. New args can raise an orchestration-only loop cap while earlier calls keep replaying; when args change a prompt or another hashed/runner-visible input, only corresponding calls miss. New-format reuse requires exact cwd, compatible format/metadata/manifest admission, and unambiguous identity/input correspondence—not a purity annotation. Identity hits spend zero current provider tokens. See the [incremental resume API](docs/api.md#content-addressed-incremental-resume) for matching, reports, legacy fallback, and checkpoints.
+The host atomically persists a versioned effective agent-configuration snapshot at admission and
+reuses it without re-elicitation. Uncovered occurrences fail closed and stay uncovered. Checkpoint
+answers are first-writer-wins under the run lease: identical repeats are idempotent and conflicts
+cannot replace the durable first answer.
 
 Compact reader/experiment fan-out:
 
@@ -250,8 +257,7 @@ await runner.dispose();   // closes pooled backend processes
 ## Quickstart — MCP server
 
 The `workflow` tool runs in the foreground by default, can acknowledge long work with
-`background: true`, and observes it with bounded `action: "status"` calls. Omitted or zero `waitMs`
-returns immediately; a positive value waits for a milestone without cancelling work. Foreground execution streams `notifications/progress` and normally returns
+`background:true`, and observes it with immediate `action:"status"` snapshots. Foreground execution streams `notifications/progress` and normally returns
 the terminal structured result; if a live ACP permission needs an answer, it returns the still-running
 run plus `pendingPermissions` so the same run can be continued through another tool call.
 
@@ -274,10 +280,11 @@ The server is bundled in the `@automatalabs/workflows` tarball, so this needs no
 server installation. The independently published `@automatalabs/mcp-server` package and its
 `agentprism-workflow` bin remain available as an alternative. When the MCP client advertises form
 elicitation, every run with dry-run-observed `agent()` calls first presents one structured user
-request: choose each call's provider/model and optional advertised mode/config, with its phase title
-and description shown. The selected values are fully preflighted before execution. Clients without
+request: choose each call's provider/model and optional advertised mode/config, with its phase title,
+description, and bounded credential-redacted task preview shown. The canonical effective choices
+are fully preflighted and persisted before execution. Clients without
 form elicitation retain automatic default routing: with no `AGENTPRISM_DEFAULT_BACKEND`, a
-model-less call triggers zero-token readiness probes and pins one backend for that project/run. Set
+model-less call triggers zero-token readiness probes and pins one backend for that run. Set
 the environment variable only when you want an explicit operator default for those headless clients.
 
 From a source checkout, point at the built entry instead:
@@ -299,13 +306,15 @@ The server advertises `io.modelcontextprotocol/ui`; on the current legacy MCP wi
 in through `capabilities.extensions["io.modelcontextprotocol/ui"]` with
 `mimeTypes: ["text/html;profile=mcp-app"]`. Only that exact, well-formed declaration adds the UI
 metadata and app-only surface. Supporting hosts (Claude, Claude Desktop, VS Code Copilot,
-Goose, …) show a live run-monitor panel
-for `workflow` calls: a phase/agent graph with per-node log drill-in, live token/cost totals,
-and a Stop control. The panel derives the observed runId from the call's arguments
+Goose, …) show a live multi-run dashboard: a phase/agent graph with per-node log drill-in, live
+token/cost totals, a Stop control, and active/recent run navigation. The initiating tool's run is
+selected by default. The panel derives that anchor runId from the call's arguments
 (status/result/permissions-response/stop) or the newly-created runId from a run/resume result
 (immediately for `background: true` admissions), then keeps itself
-current by polling the app-only `workflow-events` tool (`visibility: ["app"]`, outside the
-model's tool loop) — no model tokens are spent while it is visible. The panel also mirrors
+current by polling the app-only `workflow-events` tool and obtains one bounded project-local run
+list through app-only `workflow-runs` (both `visibility:["app"]`, outside the model's tool loop).
+One authoritative project manager answers the listing; incapable clients cannot discover either
+tool. No model tokens are spent while the panel is visible. The panel also mirrors
 run status into the host's model context (`ui/update-model-context`, last push wins) at
 **milestones only** — an agent call going terminal (done or error), a phase start, and the
 run reaching a paused or terminal state — so the agent learns how a run is doing without
@@ -320,12 +329,8 @@ locally against the ext-apps reference host, run
 `node packages/mcp-server/scripts/dev-app-host.mjs`; its header shows the Apps capability the
 reference host's generic core client must advertise.
 
-> **Known limitation (upstream):** MCP Apps currently renders a **new** panel instance for
-> every model-initiated `workflow` call — the spec has no way to re-attach a call to an
-> already-rendered view yet. Reusable views (`viewSessionId`) are tracked upstream in
-> [ext-apps#430](https://github.com/modelcontextprotocol/ext-apps/issues/430); until that
-> lands, the mitigations above (context pushes + tool-description guidance) keep the agent
-> from re-calling the tool just to check status.
+> MCP Apps hosts may replace an existing panel when a new tool call renders. Every surviving panel
+> therefore provides the bounded multi-run selector instead of assuming one panel per run.
 
 <p align="center">
   <img src="docs/assets/run-monitor-graph.png" alt="Run monitor: live phase/agent graph of a workflow run" />
@@ -334,34 +339,30 @@ reference host's generic core client must advertise.
 
 **Tool: `workflow`** — input parameters:
 
-Tool discovery publishes a strict seven-action `oneOf`: `action` is required, each branch lists
-only its valid fields, and cross-action fields are rejected as MCP Invalid Params. During migration,
-the runtime still maps an omitted action to `run`, legacy `inspect` to immediate `status`, and legacy
-`await` to `status` with its historical 20-second omitted wait. New callers should use only the
-published canonical forms.
+Tool discovery and runtime use the same strict seven-action `oneOf`: `action` is required, each
+branch lists only its valid fields, and cross-action or removed fields are rejected as MCP Invalid
+Params. There are no hidden aliases, omitted-action defaults, wait controls, or MCP replay/fork
+inputs.
 
 | Param | Type | Notes |
 |---|---|---|
-| `action` | `"config" \| "run" \| "resume" \| "status" \| "result" \| "permissions-response" \| "stop"` | Required canonical discriminator. `"config"` performs zero-token live backend discovery. `"run"` validates and executes explicit content. `"resume"` creates a new run from stored script and args. `"status"` is the one run-observation action. `"result"` pages completed exact JSON. `permissions-response` resolves one live ACP request using an exact advertised option. |
+| `action` | `"config" \| "run" \| "resume" \| "status" \| "result" \| "permissions-response" \| "stop"` | Required canonical discriminator. `resume` continues the exact run ID; `status` is an immediate observation. |
 | `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for resume/status/result/permissions-response/stop. |
 | `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for resume/status/result/permissions-response/stop. |
 | `projectDir` | absolute path string | Config/run: project-sensitive discovery cwd and the run's project store/default cwd. Required for both on the shared daemon; defaults to the server's project under `--in-process`. Resume locates the project from its source `runId`. |
 | `harnesses` | string[] | Config only: optional backend names to probe; omission discovers every registered backend. |
 | `modelSpecs` | string[] | Config only: select exact routed models before reading their model-specific options. |
 | `modelFilter` | string | Config only: bounded model-id substring or `/regex/` filter. |
-| `background` | boolean | Run/resume; default `false`. `true` acknowledges after durable admission and executes in the daemon (returns the new `{ runId, status: "running" }`). |
-| `args` | any | Exposed to the script as the global `args`. Resume defaults to the source's stored strict-JSON args; an explicit value replaces them. |
+| `background` | boolean | Run/resume; default `false`. `true` acknowledges after durable admission and executes in the daemon. Resume keeps the same run ID. |
+| `args` | any | Run only: JSON value exposed to the script as global `args`; immutable after admission. |
 | `maxAgents` | number | Default 1000. |
 | `concurrency` | number | **Clamped** to 16 (not rejected). |
 | `agentRetries` | number | **Clamped** to 3. |
-| `resumeFromRunId` | string | Run only: advanced edited replay using the explicitly supplied `script`/`scriptPath` and current `args`. Simple stored-content replay uses `action:"resume"` plus `runId`. |
-| `resumePolicy` | `"auto" \| "positional"` | Resume/run-with-`resumeFromRunId`; default `"auto"`. Positional requests index/prefix matching but cannot bypass new-format format, metadata, manifest, or input checks. |
-| `checkpointReplies` | object | With resume or `resumeFromRunId`, map the **source** `checkpointContext.callIndex` to its decision. Keys must be canonical non-negative integer strings on the JSON wire. |
-| `runId` | string | Required for resume/status/result/permissions-response/stop. For resume it names the immutable source; the response carries a new run ID. |
+| `checkpointReplies` | object | Resume only: map this run's `checkpointContext.callIndex` to a strict-JSON decision. The durable first answer wins. |
+| `runId` | string | Required for resume/status/result/permissions-response/stop. Resume input and output use this same ID. |
 | `permissionId` | UUID string | Permissions-response only: opaque pending request id returned by status. |
 | `response` | ACP permission response | Permissions-response only: `{ outcome:{ outcome:"selected", optionId } }` using an exact advertised option, or `{ outcome:{ outcome:"cancelled" } }`. |
 | `callIndex` | integer | Stop only: cancel exactly that one in-flight agent call (its slot settles to `null` with `AGENT_CANCELLED`) without aborting the run. Forbidden for every other action. |
-| `waitMs` | integer | Status only: omit or use zero for an immediate read; positive values wait up to 25,000 ms. This bounds only the MCP request and never cancels workflow work. |
 | `offset` | integer | Result only: UTF-8 byte offset, default zero; continue at the prior `endOffset`. |
 | `maxBytes` | integer | Result only: exact chunk size bound, 4–16,384 bytes; default 16,384. |
 | `lastN` | integer | Status/stop: latest matching calls, default 20, range 1–50. |
@@ -374,33 +375,33 @@ When pinning a model, mode, or `configOptions`, discover exact live values first
 { "action": "config", "projectDir": "/absolute/project", "harnesses": ["codex"], "modelFilter": "gpt" }
 ```
 
-The config response preserves each harness's raw mode id, name, description, and `_meta`, and reports
-AgentPrism's explicit omitted-mode defaults: Claude `auto`, Codex `agent`, OpenCode `build`, and no Pi
-mode. These defaults are applied at session start instead of inheriting ambient harness settings.
+The config response preserves each harness's raw mode id, name, description, and `_meta`. For trusted
+implementation/review workflows select Claude `bypassPermissions` or Codex `agent` when advertised.
+Claude `auto` uses a model classifier and may request permission; it is not full-access autonomy.
 
-Every run is statically checked, mock-executed, and config-probed before admission. Invalid scripts return `status:"rejected"` diagnostics without a run ID, background reservation, or token spend. Foreground remains the default. For long work, start it and retain the new run ID:
+Every run is statically checked, mock-executed, and config-probed before admission. Invalid scripts return `status:"rejected"` diagnostics without a run ID, background reservation, or token spend. Foreground remains the default. For long work, start it and retain the returned run ID:
 
 ```json
 { "action": "run", "script": "export const meta = { name: 'review', description: 'review' }; return await agent('Review the repo');", "background": true }
 ```
 
-Then long-poll in ordinary bounded tool calls until `outcome` appears:
+Then take immediate snapshots until `outcome` appears:
 
 ```json
-{ "action": "status", "runId": "mabc1234-k9x2pq", "waitMs": 20000 }
+{ "action": "status", "runId": "mabc1234-k9x2pq" }
 ```
 
-A timeout returns the freshest bounded status and partial cumulative token usage; terminal status
-adds the same raw result/log projection a foreground call returns. Every admitted run and subsequent
+Status returns the freshest bounded state and cumulative token usage; terminal status adds the same
+raw result/log projection a foreground call returns. Every admitted run and subsequent
 status/terminal response for a durable event-log run exposes `eventsUri` plus a labelled events
 resource link. Completed foreground/status responses expose `workflow://runs/{runId}/result`
 separately from the script resource. Exact JSON up
 to 4,096 UTF-8 bytes is copied into foreground/status text for content-first hosts; larger results
 point to that resource and bounded `action:"result"` paging (`endOffset` + `hasMore`). The
-bounded/redacted events stream is observability, not an exact-result API. Status returns early with
-`wait.returnedBecause:"action-required"` when an ACP permission is pending. Status includes
-the complete ordered exact option ids with credential-redacted, bounded diagnostics and no private ACP
-session id; requests that cannot fit safely fail closed. Elicitation-capable clients present them to
+bounded/redacted events stream is observability, not an exact-result API. Status includes the
+complete ordered exact option ids and a credential-redacted, bounded view of available tool input,
+content, and locations, plus run/phase/agent/backend/tool context and each option's exact scope.
+Private ACP session ids never appear; requests that cannot fit safely fail closed. Elicitation-capable clients present them to
 the user; other clients answer
 through:
 
@@ -422,12 +423,11 @@ it and use status or stop. Across a version upgrade, the successor routes signed
 to the predecessor holding the run lease; whole-stop intent is durable and can report a nonterminal
 `control.state:"pending"` before final settlement. Owner daemon exit (signals, forced owner stop,
 crash, machine loss) — or, under `--in-process`, the client-owned process exiting — can interrupt
-in-flight work, while the durable journal prefix remains resumable. Background runs send no request progress and use authored headless
-checkpoint behavior. Resume a paused, failed, completed, or aborted source with
-`{ "action":"resume", "runId":"…" }`; the server reuses its immutable persisted script and stored
-strict-JSON args, creates a new linked run, and durably records any replay prefix before a background
-acknowledgement. Supply `args` to replace the stored value. Operational limits come only from the new
-request. Use explicit `script` or `scriptPath` plus `resumeFromRunId` when replaying edited content.
+in-flight work, while durable state remains available. Background runs send no request progress and use authored headless
+checkpoint behavior. Resume a paused or failed continuable run with
+`{ "action":"resume", "runId":"…" }`; the server continues that same ID with immutable persisted
+script, args, canonical agent configuration, journal, events, cumulative usage, and checkpoint
+decisions. Old records without valid admission metadata require a fresh Run.
 
 #### Follow a background run live
 
@@ -466,37 +466,42 @@ what makes reconnects gap-free. See the
 [`@automatalabs/mcp-server` run-resource contract](packages/mcp-server/README.md#run-resources) for
 event shapes, redaction limits, and stream-replacement errors.
 
-#### Raise a loop cap without paying for completed rounds twice
+#### Continue the exact paused run
 
-This script intentionally halts after six expensive reviews when called with `{ "maxRounds": 6 }`, although eight are required:
+This script pauses durably before implementation when no live checkpoint channel is available:
 
 ```js
 export const meta = {
-  name: "resume-loop-cap",
-  description: "Run expensive review rounds up to an args-controlled cap",
-  phases: [{ title: "Review" }],
+  name: "review-then-implement",
+  description: "Review a change and require a durable implementation decision",
+  phases: [{ title: "Review" }, { title: "Implement" }],
 };
 
-const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
-const numericCap = Number(input.maxRounds);
-const maxRounds = Number.isInteger(numericCap) && numericCap > 0 ? numericCap : 8;
-
 phase("Review");
-const rounds = [];
-for (let i = 0; i < maxRounds; i += 1) {
-  rounds.push(
-    await agent(
-      `Review round ${i + 1}: inspect the repository and report unresolved release blockers.`,
-      { label: `review:${i + 1}`, phase: "Review" },
-    ),
-  );
-}
-
-if (maxRounds < 8) throw new Error(`review cap ${maxRounds} reached before 8 rounds`);
-return { rounds };
+const review = await agent(`Review ${args.target} and propose a safe implementation.`, {
+  label: "review",
+  model: "codex",
+  mode: "agent",
+});
+const approved = await checkpoint("Apply the reviewed implementation?", {
+  kind: "confirm",
+  headless: "pause",
+});
+if (!approved) return { applied: false, review };
+phase("Implement");
+const implementation = await agent(`Implement this reviewed plan:\n${review}`, {
+  label: "implement",
+  model: "codex",
+  mode: "agent",
+});
+return { applied: true, implementation };
 ```
 
-Call `workflow` once with that script and `args: { "maxRounds": 6 }`. Copy the returned `runId`, then call `{ "action":"resume", "runId":"…", "args":{ "maxRounds":8 } }`. The stored immutable script is reused, rounds 1–6 rebuild the same identities and replay with zero current provider tokens, and only rounds 7 and 8 run live. Keep the cap out of the round prompt: interpolating `maxRounds` into every prompt would change all eight identities and make all eight calls live.
+After the pause, send `{ "action":"resume", "runId":"…", "checkpointReplies":{ "1":true } }`
+using the exact call index from `checkpointContext`. The response retains the same run ID. Its
+script, args, canonical agent configuration, journal, event stream, and cumulative usage remain
+attached to that identity. The first strict-JSON checkpoint answer is durable before continuation;
+identical repeats are idempotent and later conflicts cannot replace it.
 
 Retain every returned `runId`. Before guessing why a run paused or failed, read its safe status,
 log, and call tail:
@@ -526,7 +531,7 @@ A script is plain JavaScript whose **first statement** is the `meta` literal. In
 - `gate(produce, validate, opts?)` — returns `{ ok, value, verdict, attempts }`: `value` is the final producer result and `verdict` is the exact last validator return.
 - `checkpoint()`, `verify()`, `judgePanel()`, `loopUntilDry()`, `completenessCheck()`, `retry()`, `workflow()`, `args`.
 
-Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in the realm) so replay identities and input fingerprints are reproducible. Eligible new-format calls match by exact path/hash or unique content; uncertain correspondence runs live.
+Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in the realm) so same-run journal identities and input fingerprints are reproducible. A matching exact occurrence replays; an interrupted or mismatched occurrence runs live.
 
 > **Writing scripts with an AI agent?** The MCP `workflow` tool is self-contained: its description teaches the compact DSL, `action:"config"` exposes live choices, and `run` validates automatically. This repo also publishes an optional exhaustive backend-agnostic authoring skill —
 > [`skills/agentprism-workflow-authoring`](skills/agentprism-workflow-authoring/SKILL.md) — in the standard
@@ -669,7 +674,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 
 - [`packages/workflows/examples/`](packages/workflows/examples/) — **runnable examples**, from a single gated script to a complete standalone project (`repo-triage`) that mixes three selected backends in one autonomous multi-stage run.
 - [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events (incl. auth pauses and the `agentEvent` token-level stream), `ExecOptions`, the runner surface (`run()`, auth controller, session hand-off, model routing, event bus, interactive sessions, capabilities), backend resolution + environment variables, the SDK auth/provider APIs, and the full `WorkflowError` code table.
-- [`docs/design-notes.md`](docs/design-notes.md) — the deep protocol-level design: ACP lifecycle, the structured-output crux, model/permission/usage/cancellation mechanics, and the engine lineage.
+- [`docs/design-notes.md`](docs/design-notes.md) — the deep protocol-level design: ACP lifecycle, the structured-output crux, model/permission/usage/cancellation mechanics, and execution-engine internals.
 - [`skills/agentprism-workflow-authoring/`](skills/agentprism-workflow-authoring/SKILL.md) — the **agent skill for authoring workflow scripts** (install with `npx skills add agentprism/agentprism-workflows`): the DSL, per-call backend routing, structured output, and a full option reference, written for AI agents that write workflows.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — local development, testing (including the gated live-backend e2e), and releasing.
 - [Agent Client Protocol](https://agentclientprotocol.com) · [Model Context Protocol](https://modelcontextprotocol.io)

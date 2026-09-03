@@ -2,62 +2,39 @@
 
 Status: **implemented MCP contract**.
 
-## Canonical discovery contract
+## Canonical discovery and runtime contract
 
-The `workflow` tool publishes one draft-2020-12 `oneOf` with seven top-level branches, in this
-order: `config`, `run`, `resume`, `status`, `result`, `permissions-response`, and `stop`. Every
-object variant requires its literal `action`, lists only fields valid for that variant, and sets
-`additionalProperties: false`. There is no root optional-field superset and no prose-only manual
-discriminator after primitive validation.
-
-The branch field sets are:
+The `workflow` tool publishes one draft-2020-12 `oneOf` with seven branches, in this order:
+`config`, `run`, `resume`, `status`, `result`, `permissions-response`, and `stop`. Every object
+requires its literal `action`, lists only fields valid for that action, and sets
+`additionalProperties:false`. Discovery and runtime use the same Zod union.
 
 | Action | Required fields | Optional fields |
 | --- | --- | --- |
 | `config` | `action` | `projectDir`, `harnesses`, `modelSpecs`, `modelFilter` |
-| `run` | `action`, exactly one of `script`/`scriptPath` | `projectDir`, `args`, `maxAgents`, `concurrency`, `agentRetries`, `background`; edited replay additionally requires `resumeFromRunId` before allowing `resumePolicy` or `checkpointReplies` |
-| `resume` | `action`, `runId` | `args`, `maxAgents`, `concurrency`, `agentRetries`, `resumePolicy`, `checkpointReplies`, `background` |
-| `status` | `action`, `runId` | `lastN`, `labelGlob`, `logLines`, `waitMs` |
+| `run` | `action`, exactly one of `script`/`scriptPath` | `projectDir`, `args`, `maxAgents`, `concurrency`, `agentRetries`, `background` |
+| `resume` | `action`, `runId` | `maxAgents`, `concurrency`, `agentRetries`, `checkpointReplies`, `background` |
+| `status` | `action`, `runId` | `lastN`, `labelGlob`, `logLines` |
 | `result` | `action`, `runId` | `offset`, `maxBytes` |
 | `permissions-response` | `action`, `runId`, `permissionId`, `response` | none |
 | `stop` | `action`, `runId` | `lastN`, `labelGlob`, `logLines`, and either targeted `callIndex` or whole-run `forceOwner` |
 
-Run uses four nested `oneOf` variants: fresh inline, fresh path, edited-replay inline, and
-edited-replay path. This structurally enforces both content XOR and the dependency of replay policy
-and checkpoint replies on a source run. Stop uses two nested variants so `callIndex` and
-`forceOwner` cannot coexist. The permission response is itself discriminated between selected and
-cancelled outcomes.
+Run has inline and path variants. Stop has whole-run and targeted-call variants. The permission
+response discriminates selected and cancelled outcomes. `projectDir` is required for config/run by
+the shared multi-project daemon and optional in a single-project server; this deployment condition
+is checked after canonical validation so both protocol transports advertise the same schema.
 
-`projectDir` remains conditionally required for config/run by the shared daemon and optional on a
-single-project in-process server; that deployment distinction is enforced after canonical schema
-validation because both transports intentionally publish the same tool schema.
-
-## Runtime and migration
-
-The published and runtime canonical contracts are the same Zod union. Runtime defaults such as
-status `waitMs: 0`, result paging defaults, background false, and execution clamps are applied only
-after the union accepts one exact branch.
-
-A narrow pre-validation compatibility normalizer preserves installed callers without advertising
-competing choices:
-
-- omitted `action` becomes `run`;
-- legacy `inspect` becomes `status` with `waitMs: 0` and rejects an inspect request that supplied
-  `waitMs`;
-- legacy `await` becomes `status`, preserving explicit `waitMs` or using the historical omitted
-  default of 20,000 ms.
-
-Deprecated inspect/await TypeScript aliases remain migration input types only. They are not members
-of `WorkflowToolInput`, not branches in JSON Schema, and not mentioned by the model-facing tool
-description. There is one status handler and one status output contract.
+There is no input normalizer. `action` is mandatory, the seven names above are exhaustive, and
+every branch rejects unknown or cross-action fields. Runtime defaults such as result paging and
+`background:false` are applied only after an exact branch is accepted. Status is always an
+immediate snapshot.
 
 ## Protocol and verification
 
-The production registration continues through the split MCP SDK v2 boundary. The stateful legacy
-transport and stateless `2026-07-28` transport receive the same registered Standard Schema and
-publish byte-equivalent input JSON Schema; no v1 SDK server object crosses into production.
+Production registration uses the split MCP SDK v2 boundary. The stateful legacy 2025 transport and
+stateless `2026-07-28` transport register the same Standard Schema and publish byte-equivalent input
+JSON Schema; neither transport adds action aliases.
 
-The committed schema snapshot pins action order, branch-local properties, required sets, nested
-run/stop variants, and `additionalProperties:false`. Runtime-versus-Ajv parity tests accept a
-representative request for every canonical action and reject cross-action fields in both validators.
-The dual-era HTTP test proves both transports publish the same seven-branch schema.
+The committed schema snapshot pins action order, branch-local properties, required sets, structural
+run/stop variants, and `additionalProperties:false`. Runtime/Ajv parity tests cover all canonical
+actions and reject removed and cross-action fields.

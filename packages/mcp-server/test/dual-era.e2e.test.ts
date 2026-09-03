@@ -100,7 +100,7 @@ async function exerciseEra(
     }
     const listed = await connected.client.listTools();
     const tools = listed.tools.map((tool) => tool.name).sort();
-    assert.deepEqual(tools, ["docs", "repl", "workflow", "workflow-events"]);
+    assert.deepEqual(tools, ["docs", "repl", "workflow", "workflow-events", "workflow-runs"]);
     const workflow = listed.tools.find((tool) => tool.name === "workflow");
     assert.ok(workflow);
     const panel = await connected.client.readResource({
@@ -153,7 +153,7 @@ test("modern envelope classification wins over a stale legacy session header", a
     const response = await rawModernToolCall(
       daemon.url,
       1,
-      { script: SCRIPT, projectDir },
+      { action: "run", script: SCRIPT, projectDir },
       undefined,
       { "mcp-session-id": "stale-legacy-session" },
     );
@@ -178,7 +178,7 @@ test("modern input_required resumes a durable workflow checkpoint while legacy b
 return await checkpoint("Pick one", { kind: "select", choices: ["alpha", "beta"], default: "beta" });`;
     const result = await connected.client.callTool({
       name: "workflow",
-      arguments: { script, projectDir },
+      arguments: { action: "run", script, projectDir },
     });
     assert.equal(result.isError, false);
     assert.equal(structured(result)?.status, "completed");
@@ -231,7 +231,7 @@ test("modern input_required resolves a live workflow permission with the exact o
 return await agent("work", { label: "worker", model: "codex" });`;
     const accepted = await connected.client.callTool({
       name: "workflow",
-      arguments: { script, projectDir, background: true },
+      arguments: { action: "run", script, projectDir, background: true },
     });
     const runId = structured(accepted)?.runId;
     assert.equal(typeof runId, "string");
@@ -239,17 +239,19 @@ return await agent("work", { label: "worker", model: "codex" });`;
 
     const resolved = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 5_000 },
+      arguments: { action: "status", runId },
     });
     assert.equal(resolved.isError, false);
     assert.equal(structured(resolved)?.permissionResponse?.outcome?.optionId, "allow_for_session");
-    assert.equal(structured(resolved)?.wait?.requestedMs, 5_000);
-    assert.equal(structured(resolved)?.wait?.returnedBecause, "permission-resolved");
     assert.equal(connected.elicitations.length, 2);
 
+    await waitUntil(async () => structured(await connected.client.callTool({
+      name: "workflow",
+      arguments: { action: "status", runId },
+    }))?.status === "completed", "modern permission workflow completion");
     const terminal = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 5_000 },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(terminal)?.outcome?.result, "allow_for_session");
   } finally {
@@ -280,7 +282,7 @@ test("modern input_required enforces script-backend approval before admission", 
 return await agent("approved backend", { model: "browser" });`;
     const result = await connected.client.callTool({
       name: "workflow",
-      arguments: { script, projectDir },
+      arguments: { action: "run", script, projectDir },
     });
     assert.equal(result.isError, false);
     assert.equal(structured(result)?.status, "completed");
@@ -311,7 +313,7 @@ test("modern subscriptions/listen receives list and durable run-event updates", 
 return await agent("wait", { label: "wait" });`;
     const accepted = await connected.client.callTool({
       name: "workflow",
-      arguments: { script, projectDir, background: true },
+      arguments: { action: "run", script, projectDir, background: true },
     });
     const runId = structured(accepted)?.runId;
     assert.equal(typeof runId, "string");
@@ -335,56 +337,12 @@ return await agent("wait", { label: "wait" });`;
   }
 });
 
-test("modern response-stream cancellation aborts status waiting without cancelling the workflow", async () => {
-  const controlled = gatedRunner();
-  const daemon = await startDaemon(controlled.runner);
-  const projectDir = makeProjectDir("dual-era-cancellation");
-  const connected = await connectHttp(daemon.url, {
-    protocolMode: "modern",
-    uiCapability: "absent",
-  });
-  try {
-    const script = `export const meta = { name: "modern-cancel", description: "modern cancel" };
-return await agent("wait", { label: "wait" });`;
-    const accepted = await connected.client.callTool({
-      name: "workflow",
-      arguments: { script, projectDir, background: true },
-    });
-    const runId = structured(accepted)?.runId;
-    assert.equal(typeof runId, "string");
-
-    const controller = new AbortController();
-    const awaiting = connected.client.callTool(
-      { name: "workflow", arguments: { action: "status", runId, waitMs: 25_000 } },
-      { signal: controller.signal },
-    );
-    setTimeout(() => controller.abort(), 25);
-    await assert.rejects(awaiting, /abort|cancel|closed/i);
-
-    const inspection = await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId },
-    });
-    assert.equal(structured(inspection)?.status, "running");
-    controlled.release();
-    const completed = await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 10_000 },
-    });
-    assert.equal(structured(completed)?.status, "completed");
-  } finally {
-    controlled.release();
-    await connected.dispose();
-    await daemon.close();
-  }
-});
-
 test("modern checkpoint requestState applies the authored default after its deadline", async () => {
   const daemon = await startDaemon(okRunner());
   const projectDir = makeProjectDir("dual-era-checkpoint-timeout");
   const script = `export const meta = { name: "modern-timeout", description: "modern timeout" };
 return await checkpoint("Continue?", { kind: "confirm", default: false, timeoutMs: 5 });`;
-  const args = { script, projectDir };
+  const args = { action: "run", script, projectDir };
   try {
     const first = await rawModernToolCall(daemon.url, 1, args);
     assert.equal(first.result?.resultType, "input_required");
@@ -401,25 +359,32 @@ return await checkpoint("Continue?", { kind: "confirm", default: false, timeoutM
   }
 });
 
-test("modern multi-round-trip state rejects scriptPath content drift", async () => {
+test("modern checkpoint continuation uses the admitted script when scriptPath later changes", async () => {
   const daemon = await startDaemon(okRunner());
   const projectDir = makeProjectDir("dual-era-script-path-drift");
   const scriptPath = join(projectDir, "checkpoint.workflow.js");
   const original = `export const meta = { name: "path-checkpoint", description: "path checkpoint" };
 return await checkpoint("Continue?", { kind: "confirm" });`;
   writeFileSync(scriptPath, original, "utf8");
-  const args = { scriptPath, projectDir };
+  const args = { action: "run", scriptPath, projectDir };
   try {
     const first = await rawModernToolCall(daemon.url, 1, args);
     const requestState = first.result?.requestState;
     assert.equal(typeof requestState, "string");
-    writeFileSync(scriptPath, `${original}\n// changed while prompting`, "utf8");
-    const rejected = await rawModernToolCall(daemon.url, 2, args, {
+    writeFileSync(
+      scriptPath,
+      `export const meta = { name: "mutated", description: "must not execute" }; return "mutated";`,
+      "utf8",
+    );
+    const completed = await rawModernToolCall(daemon.url, 2, args, {
       requestState: requestState as string,
       inputResponses: { checkpoint: { action: "accept", content: { approve: true } } },
     });
-    assert.equal(rejected.result?.isError, true);
-    assert.match(JSON.stringify(rejected.result?.content), /scriptPath content changed/);
+    assert.equal(completed.error, undefined);
+    const result = completed.result?.structuredContent as Record<string, unknown> | undefined;
+    assert.equal(result?.status, "completed");
+    assert.equal(result?.result, true);
+    assert.equal(result?.scriptSource, "stored");
   } finally {
     await daemon.close();
   }
@@ -429,7 +394,7 @@ test("modern requestState survives daemon replacement and rejects tampering", as
   const projectDir = makeProjectDir("dual-era-request-state");
   const script = `export const meta = { name: "restart-checkpoint", description: "restart checkpoint" };
 return await checkpoint("Continue?", { kind: "confirm", default: false });`;
-  const args = { script, projectDir };
+  const args = { action: "run", script, projectDir };
   const firstDaemon = await startDaemon(okRunner());
   const first = await rawModernToolCall(firstDaemon.url, 1, args);
   const requestState = first.result?.requestState;

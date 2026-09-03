@@ -83,7 +83,7 @@ function phaseText(meta: WorkflowMeta, call: ValidatedAgentCall): { title: strin
 function fieldDescription(meta: WorkflowMeta, call: ValidatedAgentCall, suffix?: string): string {
   const phase = phaseText(meta, call);
   const detail = phase.detail ? ` ${phase.detail}` : "";
-  return `${phase.title}: ${call.label}.${detail}${suffix ? ` ${suffix}` : ""}`.trim();
+  return `${phase.title}: ${call.label}.${detail} Task: ${call.promptPreview}${suffix ? ` ${suffix}` : ""}`.trim();
 }
 
 type SelectConfigOption = Extract<SessionConfigOption, { type: "select" }>;
@@ -247,7 +247,9 @@ export function buildWorkflowAgentConfigurationPlan(
   for (const call of configurableCalls) {
     const phase = phaseText(meta, call);
     callLines.push(
-      `${call.index + 1}. ${phase.title} — ${call.label}${phase.detail ? `\n   ${phase.detail}` : ""}`,
+      `${call.index + 1}. ${phase.title} — ${call.label}` +
+        `${phase.detail ? `\n   ${phase.detail}` : ""}` +
+        `\n   Task: ${call.promptPreview}`,
     );
     const routeField = `agent_${call.index}_model`;
     required.push(routeField);

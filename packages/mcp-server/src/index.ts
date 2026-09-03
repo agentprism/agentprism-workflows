@@ -30,7 +30,6 @@ export type {
 } from "./workflow-permissions.js";
 export type {
   CreateWorkflowServerOptions,
-  WorkflowConfirmCallback,
   WorkflowCheckpointOptions,
   WorkflowServer,
 } from "./server.js";
@@ -46,10 +45,8 @@ export {
   WORKFLOW_RESULT_CHUNK_BYTES_MIN,
 } from "./workflow-tool-input.js";
 export type {
-  WorkflowAwaitToolInput,
   WorkflowConfigToolInput,
   WorkflowExecuteToolInput,
-  WorkflowInspectToolInput,
   WorkflowPermissionResponseToolInput,
   WorkflowResumeToolInput,
   WorkflowResultToolInput,
@@ -63,7 +60,6 @@ export {
   workflowToolOutputShape,
 } from "./workflow-tool-output.js";
 export type {
-  WorkflowAwaitMetadata,
   WorkflowBackgroundAccepted,
   WorkflowConfigToolResult,
   WorkflowExecutionOutcome,
@@ -73,13 +69,10 @@ export type {
   WorkflowPermissionInteraction,
   WorkflowPermissionResponseResult,
   WorkflowResultRetrieval,
-  WorkflowRunAwaitResult,
   WorkflowRunLatestActivity,
-  WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
   WorkflowScriptSource,
   WorkflowStatusToolResult,
-  WorkflowStatusWaitMetadata,
   WorkflowStopPendingResult,
   WorkflowStopResult,
   WorkflowToolResult,
@@ -118,9 +111,10 @@ export { ReplPresenceLedger } from "./repl-presence.js";
 export {
   RUN_MONITOR_RESOURCE_URI,
   WORKFLOW_EVENTS_TOOL_NAME,
+  WORKFLOW_RUNS_TOOL_NAME,
   registerWorkflowAppUi,
 } from "./app-ui.js";
-export type { WorkflowAppUiDeps } from "./app-ui.js";
+export type { WorkflowAppUiDeps, WorkflowRunListItem } from "./app-ui.js";
 export {
   EXTENSION_ID,
   RESOURCE_MIME_TYPE,
@@ -155,7 +149,7 @@ export type {
  * Bootstrap the MCP `workflow` server over stdio. Composition root: build the ACP-backed
  * AgentRunner, inject it into the workflow-engine via the server shell, and serve on
  * stdin/stdout. Backend auth stays with the agents' own CLI credential stores; a run that
- * hits AUTH_REQUIRED pauses and resumes through a fresh linked run after an out-of-band CLI login.
+ * hits AUTH_REQUIRED pauses and continues under the same run ID after an out-of-band CLI login.
  * The stdio transport is the RELAY transport (phase-F review round 3): its stdin reader
  * lives on a worker thread that fires the server's out-of-band eval-break relay for
  * `repl` interrupt calls, so the documented no-id interrupt works for a synchronously

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import type { AcpPermissionEvent, RequestPermissionRequest } from "@automatalabs/workflows";
 import { WorkflowPermissionBroker } from "../src/workflow-permissions.js";
+import { createPermissionElicitation } from "../src/server.js";
 
 function request(options = [
   { optionId: "allow_once", name: "Allow once", kind: "allow_once" as const },
@@ -105,6 +106,8 @@ test("the public request stays redacted and below 64 KiB without losing ordered 
   assert.equal(pending.requestRedacted, true);
   assert.equal("sessionId" in pending.request, false);
   assert.doesNotMatch(serialized, /do-not-expose|sk-proj-abcdefgh12345678/);
+  assert.match(serialized, /rawInput/);
+  assert.match(serialized, /deploy/);
   assert.deepEqual(
     pending.request.options.map((option) => option.optionId),
     options.map((option) => option.optionId),
@@ -114,6 +117,35 @@ test("the public request stays redacted and below 64 KiB without losing ordered 
     outcome: { outcome: "selected", optionId: "choice_15" },
   });
   assert.deepEqual(await response, { outcome: { outcome: "selected", optionId: "choice_15" } });
+});
+
+test("permission form shows sanitized commands and file targets with explicit option scope", async () => {
+  const broker = new WorkflowPermissionBroker();
+  const sensitive = request();
+  sensitive.toolCall.rawInput = {
+    command: "pnpm test --filter workflow-engine --token=sk-proj-abcdefgh12345678",
+  };
+  sensitive.toolCall.content = [{ type: "content", content: { type: "text", text: "Edit packages/workflow-engine/src/workflow.ts" } }];
+  sensitive.toolCall.locations = [{ path: "/workspace/packages/workflow-engine/src/workflow.ts", line: 42 }];
+  const response = Promise.resolve(broker.resolver(sensitive, context));
+  const pending = broker.list(context.runId)[0]!;
+  const form = createPermissionElicitation(pending, "Implementation");
+
+  assert.match(form.message, new RegExp(`Run: ${context.runId}`));
+  assert.match(form.message, /Phase: Implementation/);
+  assert.match(form.message, /Agent: test-runner/);
+  assert.match(form.message, /Backend: codex/);
+  assert.match(form.message, /Tool: Run pnpm test/);
+  assert.match(form.message, /Kind: execute/);
+  assert.match(form.message, /pnpm test --filter workflow-engine/);
+  assert.match(form.message, /packages\/workflow-engine\/src\/workflow\.ts/);
+  assert.match(form.message, /Allow this exact tool request once/);
+  assert.match(form.message, /remainder of this agent session/);
+  assert.doesNotMatch(form.message, /sk-proj-abcdefgh12345678|session-1/);
+  assert.ok(Buffer.byteLength(form.message, "utf8") < 16 * 1024);
+
+  broker.respond(context.runId, pending.permissionId, { outcome: { outcome: "cancelled" } });
+  assert.deepEqual(await response, { outcome: { outcome: "cancelled" } });
 });
 
 test("requests that cannot preserve a safe complete option set are cancelled instead of parked", async () => {

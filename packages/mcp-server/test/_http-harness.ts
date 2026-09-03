@@ -96,9 +96,9 @@ export async function connectHttp(
   };
 }
 
-export async function waitUntil(predicate: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+export async function waitUntil(predicate: () => boolean | Promise<boolean>, what: string, timeoutMs = 10_000): Promise<void> {
   const start = Date.now();
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() - start > timeoutMs) throw new Error(`Timed out waiting for ${what}`);
     await new Promise((resolve) => setTimeout(resolve, 25));
   }

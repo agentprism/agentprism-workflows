@@ -17,6 +17,7 @@ const RUN_ID = /^[a-z0-9]+-[a-z0-9]+$/;
 const PERMISSION_ID = /^[0-9a-f-]{36}$/i;
 const MAX_PUBLIC_REQUEST_BYTES = 64 * 1024;
 const MAX_PUBLIC_SCALAR_BYTES = 512;
+const MAX_PUBLIC_DETAIL_BYTES = 8 * 1024;
 const MAX_PERMISSION_OPTIONS = 16;
 const MAX_OPTION_ID_CODE_UNITS = 512;
 const MAX_OPTION_ID_BYTES = 2_048;
@@ -160,6 +161,15 @@ function sanitizeValue(
   return output;
 }
 
+function boundProjectedDetail(value: unknown, state: ProjectionState): unknown {
+  const rendered = JSON.stringify(value);
+  if (rendered === undefined || Buffer.byteLength(rendered, "utf8") <= MAX_PUBLIC_DETAIL_BYTES) {
+    return value;
+  }
+  state.truncated = true;
+  return truncateUtf8(rendered, MAX_PUBLIC_DETAIL_BYTES, "…[detail truncated]");
+}
+
 function validMeta(value: unknown): value is Record<string, unknown> | null | undefined {
   return value === undefined || value === null || (typeof value === "object" && !Array.isArray(value));
 }
@@ -192,10 +202,23 @@ function safeToolCall(
   if (typeof toolCall.toolCallId !== "string" || toolCall.toolCallId.length === 0) return undefined;
   const sanitized = sanitizeValue(toolCall, state);
   if (sanitized === null || typeof sanitized !== "object" || Array.isArray(sanitized)) return undefined;
+  const projected = sanitized as RequestPermissionRequest["toolCall"];
   return {
-    ...(sanitized as RequestPermissionRequest["toolCall"]),
     toolCallId: sanitizeString(toolCall.toolCallId, state),
-  };
+    ...(projected.title === undefined ? {} : { title: projected.title }),
+    ...(projected.name === undefined ? {} : { name: projected.name }),
+    ...(projected.kind === undefined ? {} : { kind: projected.kind }),
+    ...(projected.status === undefined ? {} : { status: projected.status }),
+    ...(projected.rawInput === undefined
+      ? {}
+      : { rawInput: boundProjectedDetail(projected.rawInput, state) }),
+    ...(projected.content === undefined
+      ? {}
+      : { content: boundProjectedDetail(projected.content, state) }),
+    ...(projected.locations === undefined
+      ? {}
+      : { locations: boundProjectedDetail(projected.locations, state) }),
+  } as RequestPermissionRequest["toolCall"];
 }
 
 function publicRequest(request: RequestPermissionRequest): PublicRequestProjection | undefined {
@@ -232,7 +255,10 @@ function publicRequest(request: RequestPermissionRequest): PublicRequestProjecti
       ...(projected.toolCall.name === undefined ? {} : { name: projected.toolCall.name }),
       ...(projected.toolCall.kind === undefined ? {} : { kind: projected.toolCall.kind }),
       ...(projected.toolCall.status === undefined ? {} : { status: projected.toolCall.status }),
-    },
+      ...(projected.toolCall.rawInput === undefined ? {} : { rawInput: projected.toolCall.rawInput }),
+      ...(projected.toolCall.content === undefined ? {} : { content: projected.toolCall.content }),
+      ...(projected.toolCall.locations === undefined ? {} : { locations: projected.toolCall.locations }),
+    } as RequestPermissionRequest["toolCall"],
     options: projected.options.map(({ optionId, name, kind }) => ({ optionId, name, kind })),
   };
   if (Buffer.byteLength(JSON.stringify(minimal), "utf8") > MAX_PUBLIC_REQUEST_BYTES) return undefined;

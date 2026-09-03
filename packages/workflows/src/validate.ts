@@ -125,6 +125,8 @@ export interface ValidatedAgentCall {
   /** Zero-based occurrence ordinal shared with WorkflowAgentConfiguration selection. */
   index: number;
   label: string;
+  /** Credential-redacted, UTF-8-bounded task preview for host configuration UI. */
+  promptPreview: string;
   phase?: string;
   /** The verbatim model spec the call requested (undefined = the run/session default). */
   model?: string;
@@ -138,6 +140,19 @@ export interface ValidatedAgentCall {
   /** True when the call requested structured output. */
   schema: boolean;
   mockAnswer?: ValidatedMockAnswerUse;
+}
+
+const AGENT_TASK_PREVIEW_BYTES = 384;
+
+function boundedPromptPreview(prompt: string): string {
+  const redacted = redactText(prompt).value.replace(/\s+/g, " ").trim();
+  if (Buffer.byteLength(redacted, "utf8") <= AGENT_TASK_PREVIEW_BYTES) return redacted;
+  let preview = "";
+  for (const character of redacted) {
+    if (Buffer.byteLength(preview + character + "…", "utf8") > AGENT_TASK_PREVIEW_BYTES) break;
+    preview += character;
+  }
+  return `${preview}…`;
 }
 
 export interface ValidateHarnessOptions {
@@ -1652,12 +1667,14 @@ export async function validateWorkflowScript(
   manager.on("agentStart", (event: {
     label: string;
     phase?: string;
+    prompt: string;
     model?: string;
     configOptions?: Record<string, string | boolean>;
   }) => {
     const call: ValidatedAgentCall = {
       index: agentCalls.length,
       label: event.label,
+      promptPreview: boundedPromptPreview(event.prompt),
       phase: event.phase,
       model: event.model,
       configOptions: event.configOptions,

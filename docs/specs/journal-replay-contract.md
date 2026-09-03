@@ -6,6 +6,9 @@ This contract supersedes the filesystem-safety and purity rules in
 [`incremental-resume-spec.md`](incremental-resume-spec.md). The engine replays recorded workflow
 calls; it does not decide whether the surrounding filesystem or world is safe to reuse.
 
+This document specifies the lower-level SDK fork/replay API. MCP does not expose these inputs; its
+separate [`resume` contract](workflow-resume-action.md) continues one exact run ID.
+
 ## Core rule
 
 For `resumeFromRunId`, every root call is handled independently:

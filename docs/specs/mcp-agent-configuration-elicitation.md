@@ -11,7 +11,7 @@
 This is an MCP composition-root policy; the workflow script DSL and the ACP runner's standalone
 default routing remain unchanged.
 
-For `run` and `resume`, the server performs these token-free steps before run admission:
+For `run`, the server performs these token-free steps before run admission:
 
 1. parse/static validation;
 2. trust approval for script-declared backends;
@@ -22,9 +22,10 @@ For `run` and `resume`, the server performs these token-free steps before run ad
    selections; and
 7. only then run-ID allocation, persistence, background-slot reservation, or live dispatch.
 
-A client must advertise form elicitation. Clients without it retain authored routing and the
-implemented automatic default-backend compatibility policy. Agent-less workflows do not elicit.
-Decline or cancel returns a tool error and creates no run.
+A form-capable client receives the configuration request. Clients without form elicitation use the
+host's authored/automatic routing policy. In both cases the host materializes a complete canonical
+effective occurrence map and enables strict coverage before admission. Agent-less workflows do not
+elicit. Decline or cancel returns a tool error and creates no run.
 
 ## Form contract
 
@@ -36,8 +37,9 @@ uses deterministic occurrence-prefixed fields:
 - optional select/boolean fields for every non-model ACP session option advertised by that provider.
 
 Each field identifies the call ordinal and provider. Its description includes the call's resolved
-label, phase title, and the phase's optional `detail`; the request message also lists those phases and
-details. Provider-specific fields are applied only when their provider is the selected route, so a
+label, phase title, the phase's optional `detail`, and a credential-redacted, strictly bounded task
+prompt preview; the request message lists the same useful preview for every call. Provider-specific
+fields are applied only when their provider is the selected route, so a
 client that returns defaults for other provider groups cannot leak configuration across backends.
 
 Provider/model values are exact routed specs. Mode, select, and boolean responses are checked against
@@ -58,9 +60,14 @@ When MCP selections are active, strict occurrence coverage is enabled. If live c
 an agent occurrence the mocked discovery path did not observe, that occurrence fails before opening
 an ACP session instead of silently using an ambient provider. Earlier observed calls may already have
 run; this is the unavoidable boundary of execution-based discovery for data-dependent control flow.
-The selection map itself is host input and is not persisted. A new resume execution performs fresh
-discovery/elicitation; identical effective choices retain replay identity, while changed choices run
-live.
+That first uncovered occurrence is recorded durably; later continuation fails closed rather than
+shifting an ordinal onto a different call.
+
+At admission the host atomically persists a versioned canonical effective configuration snapshot:
+the occurrence map, host-pinned default model, approved script-backend map, stable selection hash,
+source, and timestamp. Raw MCP form field names and returned form content are never persisted.
+`action:"resume"` continues the same run with this exact snapshot and performs no new routing
+discovery or configuration elicitation. A missing, invalid, or uncovered admission cannot continue.
 
 ## Dual-era transport
 
@@ -79,8 +86,8 @@ a changed catalog reissues the current form rather than accepting a stale respon
 
 Credential-free coverage pins:
 
-- flat-schema generation, phase context, provider scoping, and catalog rejection;
+- flat-schema generation, phase context, bounded/redacted task previews, provider scoping, and catalog rejection;
 - effective model/mode/config dispatch and call-record identity;
-- strict rejection of an uncovered occurrence;
+- atomic canonical admission, inherited same-ID continuation, and durable strict rejection of an uncovered occurrence;
 - one request containing multiple calls; and
 - equivalent legacy and modern HTTP behavior through the shared server implementation.

@@ -1,10 +1,4 @@
-import type { TokenUsage, WorkflowReplayEligibility, WorkflowRunLimits } from "@automatalabs/shared-types";
-import {
-  RESUME_CALL_FAILED_REASONS,
-  RESUME_CALL_LIVE_REASONS,
-  RESUME_DISABLED_REASONS,
-  RESUME_FALLBACK_REASONS,
-} from "@automatalabs/workflows";
+import type { TokenUsage, WorkflowRunLimits } from "@automatalabs/shared-types";
 import type { WorkflowRunResult, WorkflowRunStatus } from "@automatalabs/workflows";
 import { z } from "zod";
 
@@ -132,154 +126,7 @@ const checkpointTakenSchema = z.object({
   source: z.enum(["live", "headless-default", "journal-replay", "injected"]),
 });
 
-const checkpointReplyNotAppliedSchema = z.object({
-  recordedIndex: z.number().int().nonnegative(),
-  status: z.literal("not-applied"),
-  reason: z.enum([
-    "checkpoint-identity-mismatch",
-    "checkpoint-not-reached-at-recorded-call-site",
-  ]),
-  message: z.string(),
-  callIndex: z.number().int().nonnegative().optional(),
-});
-
-const checkpointReplyReportSchema = z.discriminatedUnion("status", [
-  z.object({
-    recordedIndex: z.number().int().nonnegative(),
-    status: z.literal("applied"),
-    callIndex: z.number().int().nonnegative(),
-  }),
-  checkpointReplyNotAppliedSchema,
-]);
-
-const resumeCallDecisionSchema = z.discriminatedUnion("action", [
-  z.object({
-    index: z.number().int().nonnegative(),
-    kind: z.enum(["agent", "checkpoint"]),
-    action: z.literal("replayed"),
-    sourceRunId: z.string(),
-    recordedIndex: z.number().int().nonnegative(),
-    match: z.enum(["path-hash", "unique-hash", "index-hash"]),
-    checkpointInjected: z.literal(true).optional(),
-  }),
-  z.object({
-    index: z.number().int().nonnegative(),
-    kind: z.enum(["agent", "checkpoint"]),
-    action: z.literal("live"),
-    reason: z.enum(RESUME_CALL_LIVE_REASONS),
-    checkpointReply: checkpointReplyNotAppliedSchema.optional(),
-  }),
-  z.object({
-    index: z.number().int().nonnegative(),
-    kind: z.enum(["agent", "checkpoint"]),
-    action: z.literal("failed"),
-    reason: z.enum(RESUME_CALL_FAILED_REASONS),
-  }),
-]);
-
-const resumeReportBaseShape = {
-  sourceRunId: z.string(),
-  requestedPolicy: z.enum(["auto", "positional"]),
-  replayed: z.number().int().nonnegative(),
-  live: z.number().int().nonnegative(),
-  failed: z.number().int().nonnegative(),
-  calls: z.array(resumeCallDecisionSchema),
-  checkpointReply: checkpointReplyReportSchema.optional(),
-} as const;
-
-const resumeReportSchema = z.discriminatedUnion("strategy", [
-  z.object({
-    ...resumeReportBaseShape,
-    strategy: z.literal("identity-v1"),
-  }),
-  z.object({
-    ...resumeReportBaseShape,
-    strategy: z.literal("positional-v1"),
-    fallbackReason: z.enum(RESUME_FALLBACK_REASONS),
-    eligibility: z.enum(["legacy", "safe-prefix", "all-live"]),
-  }),
-  z.object({
-    ...resumeReportBaseShape,
-    strategy: z.literal("live"),
-    disabledReason: z.enum(RESUME_DISABLED_REASONS),
-  }),
-]);
-
-const replayOperationalChangeSchema = z.object({
-  option: z.enum(["agentRetries", "concurrency"]),
-  source: z.number().nullable(),
-  current: z.number().nullable(),
-  detail: z.string(),
-});
-
-const replayProvenanceChangeSchema = z.object({
-  field: z.enum([
-    "runtime.node",
-    "runtime.v8",
-    "environment.identity",
-    "environment.git.head",
-    "environment.git.dirtyDigest",
-    "environment.key",
-  ]),
-  source: z.string().nullable(),
-  current: z.string().nullable(),
-  detail: z.string(),
-});
-
-const replayFirstNonReplaySchema = z.object({
-  index: z.number().int().nonnegative(),
-  action: z.enum(["live", "failed"]),
-  reason: z.enum([
-    ...RESUME_CALL_LIVE_REASONS,
-    ...RESUME_CALL_FAILED_REASONS,
-    ...RESUME_DISABLED_REASONS,
-    ...RESUME_FALLBACK_REASONS,
-  ]),
-  detail: z.string().optional(),
-});
-
-const replayEligibilityBaseShape = {
-  sourceRunId: z.string(),
-  predictedReplayablePrefix: z.number().int().nonnegative(),
-  replayedPrefix: z.number().int().nonnegative(),
-  replayed: z.number().int().nonnegative(),
-  live: z.number().int().nonnegative(),
-  failed: z.number().int().nonnegative(),
-  firstNonReplay: replayFirstNonReplaySchema.optional(),
-  sourceEngineVersion: z.string().optional(),
-  currentEngineVersion: z.string(),
-  engineVersionComparison: z.enum(["same", "different", "source-unknown"]),
-  sourceInputsFormat: z.number().int().nonnegative().optional(),
-  currentInputsFormat: z.number().int().nonnegative(),
-  provenanceChanges: z.array(replayProvenanceChangeSchema).optional(),
-  operationalChanges: z.array(replayOperationalChangeSchema),
-} as const;
-
-const replayEligibilitySchema = z.discriminatedUnion("strategy", [
-  z.object({
-    ...replayEligibilityBaseShape,
-    strategy: z.literal("identity-v1"),
-  }),
-  z.object({
-    ...replayEligibilityBaseShape,
-    strategy: z.literal("positional-v1"),
-    fallbackReason: z.enum(RESUME_FALLBACK_REASONS),
-    eligibility: z.enum(["legacy", "safe-prefix", "all-live"]),
-  }),
-  z.object({
-    ...replayEligibilityBaseShape,
-    strategy: z.literal("live"),
-    disabledReason: z.enum(RESUME_DISABLED_REASONS),
-  }),
-]);
-
 const scriptSourceSchema = z.enum(["inline", "path", "stored"]);
-
-const scriptLineageEntrySchema = z.object({
-  runId: z.string(),
-  uri: z.string(),
-  available: z.boolean(),
-});
 
 const latestActivitySchema = z.object({
   scope: z.string(),
@@ -308,7 +155,6 @@ const inspectionScriptResourceShape = {
   scriptUri: z.string(),
   resultUri: z.string().optional(),
   eventsUri: z.string().optional(),
-  lineage: z.array(scriptLineageEntrySchema),
 } as const;
 
 const runStatusShape = {
@@ -320,7 +166,6 @@ const runStatusShape = {
   reason: z.string().optional(),
   errorCode: z.string().optional(),
   limits: workflowRunLimitsSchema.optional(),
-  replayEligibility: replayEligibilitySchema.optional(),
   latestActivity: z.array(latestActivitySchema).optional(),
   logTail: logTailSchema,
   calls: z.array(
@@ -361,7 +206,6 @@ const runStatusShape = {
 
 const executionDetailsShape = {
   limits: workflowRunLimitsSchema.optional(),
-  replayEligibility: replayEligibilitySchema.optional(),
   result: z.unknown().optional(),
   tokenUsage: tokenUsageSchema.optional(),
   logs: z.array(z.string()).optional(),
@@ -370,7 +214,6 @@ const executionDetailsShape = {
   checkpointContext: checkpointContextSchema.optional(),
   fallbacks: z.array(fallbackSchema).optional(),
   checkpointsTaken: z.array(checkpointTakenSchema).optional(),
-  resumeReport: resumeReportSchema.optional(),
 } as const;
 
 const executionResultSchema = z
@@ -400,12 +243,6 @@ const executionResultSchema = z
       },
     ],
   });
-
-const waitSchema = z.object({
-  requestedMs: z.number().int().nonnegative(),
-  elapsedMs: z.number().int().nonnegative(),
-  returnedBecause: z.enum(["terminal", "timeout", "immediate", "action-required", "permission-resolved"]),
-});
 
 const diagnosticRecordSchema = z.record(z.string(), z.unknown());
 const sessionModeStateSchema = z.object({
@@ -481,12 +318,11 @@ const inspectionRequired = [
   "calls",
   "filter",
   "truncation",
-  "lineage",
 ] as const;
 
 const terminalStatuses = ["paused", "completed", "failed", "aborted"] as const;
 const nonterminalStatuses = ["pending", "running"] as const;
-const commonOutputFields = ["runId", "status", "scriptUri", "resultUri", "eventsUri", "limits", "replayEligibility"] as const;
+const commonOutputFields = ["runId", "status", "scriptUri", "resultUri", "eventsUri", "limits"] as const;
 const runOutputRequired = ["runId", "status", "scriptUri"] as const;
 const executionDetailFields = [
   "result",
@@ -497,7 +333,6 @@ const executionDetailFields = [
   "checkpointContext",
   "fallbacks",
   "checkpointsTaken",
-  "resumeReport",
 ] as const;
 const inspectionFields = [
   ...inspectionRequired,
@@ -541,7 +376,6 @@ const variantOutputFields = [
   ...executionDetailFields,
   "scriptSource",
   ...inspectionFields,
-  "wait",
   "outcome",
   "stopped",
   "alreadyTerminal",
@@ -595,7 +429,6 @@ export const workflowToolOutputShape = z
     scriptUri: z.string().optional(),
     resultUri: z.string().optional(),
     eventsUri: z.string().optional(),
-    lineage: inspectionScriptResourceShape.lineage.optional(),
     workflowName: runStatusShape.workflowName.optional(),
     phases: runStatusShape.phases.optional(),
     currentPhase: runStatusShape.currentPhase,
@@ -605,7 +438,6 @@ export const workflowToolOutputShape = z
     calls: runStatusShape.calls.optional(),
     filter: runStatusShape.filter.optional(),
     truncation: runStatusShape.truncation.optional(),
-    wait: waitSchema.optional(),
     outcome: executionResultSchema.optional(),
     stopped: z.boolean().optional(),
     alreadyTerminal: z.boolean().optional(),
@@ -650,7 +482,7 @@ export const workflowToolOutputShape = z
       valid = runCommonComplete && has("eventsUri") && has("limits") && (value.status === "running"
         ? hasOnlyFields(value, ["scriptSource", "pendingPermissions", "interaction"])
         : terminal && hasOnlyFields(value, ["scriptSource", ...executionDetailFields]));
-    } else if (has("permissionResponse") && !has("wait")) {
+    } else if (has("permissionResponse")) {
       valid =
         runCommonComplete &&
         inspectionComplete &&
@@ -671,14 +503,12 @@ export const workflowToolOutputShape = z
         has("alreadyTerminal") &&
         (value.status === "completed" || value.status === "failed" || value.status === "aborted") &&
         hasOnlyFields(value, [...inspectionFields, "stopped", "alreadyTerminal"]);
-    } else if (has("wait")) {
+    } else {
       valid =
         runCommonComplete &&
         inspectionComplete &&
-        hasOnlyFields(value, [...inspectionFields, "wait", "tokenUsage", "outcome", "pendingPermissions", "interaction", "permissionResponse"]) &&
+        hasOnlyFields(value, [...inspectionFields, "tokenUsage", "outcome", "pendingPermissions", "interaction"]) &&
         (terminal ? has("outcome") : !has("outcome"));
-    } else {
-      valid = runCommonComplete && inspectionComplete && hasOnlyFields(value, inspectionFields);
     }
     if (has("resultUri") && value.status !== "completed") valid = false;
     if (!valid) {
@@ -706,11 +536,8 @@ export const workflowToolOutputShape = z
           "scriptUri",
           "scriptSource",
           "limits",
-          "replayEligibility",
           ...executionDetailFields,
           ...inspectionFields,
-          "lineage",
-          "wait",
           "outcome",
           "stopped",
           "alreadyTerminal",
@@ -733,7 +560,6 @@ export const workflowToolOutputShape = z
           "scriptSource",
           ...executionDetailFields,
           ...inspectionFields,
-          "wait",
           "outcome",
           "stopped",
           "alreadyTerminal",
@@ -755,7 +581,6 @@ export const workflowToolOutputShape = z
           "scriptSource",
           ...executionDetailFields,
           ...inspectionFields,
-          "wait",
           "outcome",
           "stopped",
           "alreadyTerminal",
@@ -776,8 +601,8 @@ export const workflowToolOutputShape = z
       },
       {
         title: "Workflow status",
-        required: [...runOutputRequired, ...inspectionRequired, "wait"],
-        ...forbidsOutside([...inspectionFields, "wait", "tokenUsage", "outcome", "pendingPermissions", "interaction", "permissionResponse"]),
+        required: [...runOutputRequired, ...inspectionRequired],
+        ...forbidsOutside([...inspectionFields, "tokenUsage", "outcome", "pendingPermissions", "interaction"]),
         anyOf: [
           {
             required: ["outcome"],
@@ -788,11 +613,6 @@ export const workflowToolOutputShape = z
             ...forbidsRequired("outcome"),
           },
         ],
-      },
-      {
-        title: "Workflow targeted agent cancellation",
-        required: [...runOutputRequired, ...inspectionRequired],
-        ...forbidsOutside(inspectionFields),
       },
       {
         title: "Workflow permission response acknowledgement",
@@ -838,12 +658,6 @@ export const workflowEventsOutputShape = {
 
 export type WorkflowScriptSource = z.infer<typeof scriptSourceSchema>;
 
-export interface WorkflowScriptLineageEntry {
-  runId: string;
-  uri: string;
-  available: boolean;
-}
-
 /** One bounded, durable activity summary per logical agent call. */
 export interface WorkflowRunLatestActivity {
   scope: string;
@@ -867,7 +681,6 @@ export interface WorkflowScriptResourceFields {
   scriptUri: string;
   resultUri?: string;
   eventsUri?: string;
-  lineage: WorkflowScriptLineageEntry[];
 }
 
 export interface WorkflowExecutionScriptResourceFields {
@@ -884,7 +697,6 @@ export interface WorkflowExecutionOutcome<T = unknown> {
   resultUri?: string;
   eventsUri?: string;
   limits?: WorkflowRunLimits;
-  replayEligibility?: WorkflowReplayEligibility;
   result?: T;
   tokenUsage?: WorkflowRunResult["tokenUsage"];
   logs?: string[];
@@ -893,7 +705,6 @@ export interface WorkflowExecutionOutcome<T = unknown> {
   checkpointContext?: WorkflowRunResult["checkpointContext"];
   fallbacks?: WorkflowRunResult["fallbacks"];
   checkpointsTaken?: WorkflowRunResult["checkpointsTaken"];
-  resumeReport?: WorkflowRunResult["resumeReport"];
 }
 
 export type WorkflowExecutionToolResult<T = unknown> = WorkflowExecutionOutcome<T> &
@@ -910,15 +721,8 @@ export interface WorkflowBackgroundAccepted extends WorkflowExecutionScriptResou
   runId: string;
   status: "running";
   limits: WorkflowRunLimits;
-  replayEligibility?: WorkflowReplayEligibility;
   pendingPermissions?: z.infer<typeof pendingPermissionSchema>[];
   interaction?: WorkflowPermissionInteraction;
-}
-
-export interface WorkflowStatusWaitMetadata {
-  requestedMs: number;
-  elapsedMs: number;
-  returnedBecause: "terminal" | "timeout" | "immediate" | "action-required" | "permission-resolved";
 }
 
 export interface WorkflowRunObservation extends WorkflowRunStatus, WorkflowScriptResourceFields {
@@ -929,7 +733,6 @@ export interface WorkflowRunObservation extends WorkflowRunStatus, WorkflowScrip
 }
 
 export interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunObservation {
-  wait: WorkflowStatusWaitMetadata;
   /** Cumulative usage observed for live calls in this execution; absent before any is known. */
   tokenUsage?: TokenUsage;
   pendingPermissions?: z.infer<typeof pendingPermissionSchema>[];
@@ -938,14 +741,7 @@ export interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunObserv
   outcome?: WorkflowExecutionOutcome<T>;
 }
 
-/** @deprecated Use WorkflowStatusWaitMetadata. */
-export type WorkflowAwaitMetadata = WorkflowStatusWaitMetadata;
-
-/** @deprecated Use WorkflowRunObservation for non-status observation payloads. */
 export type WorkflowInspectionToolResult = WorkflowRunObservation;
-
-/** @deprecated Use WorkflowStatusToolResult. */
-export type WorkflowRunAwaitResult<T = unknown> = WorkflowStatusToolResult<T>;
 
 export interface WorkflowResultRetrieval {
   action: "result";
@@ -1024,7 +820,6 @@ export function toWorkflowExecutionOutcome<T>(
     runId: run.runId,
     status: run.status,
     ...(run.effectiveLimits === undefined ? {} : { limits: run.effectiveLimits }),
-    ...(run.replayEligibility === undefined ? {} : { replayEligibility: run.replayEligibility }),
     result: run.result,
     tokenUsage: run.tokenUsage,
     logs: run.logs,
@@ -1033,7 +828,6 @@ export function toWorkflowExecutionOutcome<T>(
     checkpointContext: run.checkpointContext,
     ...(run.fallbacks === undefined ? {} : { fallbacks: run.fallbacks }),
     ...(run.checkpointsTaken === undefined ? {} : { checkpointsTaken: run.checkpointsTaken }),
-    ...(run.resumeReport === undefined ? {} : { resumeReport: run.resumeReport }),
     scriptUri: resources.scriptUri,
     ...(resources.eventsUri === undefined ? {} : { eventsUri: resources.eventsUri }),
     ...(run.status === "completed" && resources.resultUri !== undefined

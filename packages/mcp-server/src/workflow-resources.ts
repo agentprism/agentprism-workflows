@@ -18,10 +18,7 @@ import {
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
 import { singleStoreRouter, type RunStoreRouter } from "./project-registry.js";
 
-import type {
-  WorkflowRunLatestActivity,
-  WorkflowScriptLineageEntry,
-} from "./workflow-tool-output.js";
+import type { WorkflowRunLatestActivity } from "./workflow-tool-output.js";
 
 export const SCRIPT_RESOURCE_MIME_TYPE = "text/javascript";
 export const RESULT_RESOURCE_MIME_TYPE = "application/json";
@@ -175,21 +172,14 @@ function startedAtMillis(state: PersistedRunState): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function lineageSourceRunId(state: PersistedRunState): string | undefined {
-  const sourceRunId = state.resumeSourceRunId;
-  return sourceRunId === state.runId ? undefined : sourceRunId;
-}
-
 /**
- * Persistence-backed MCP script resources. Run content and lineage are read directly from the
- * engine store for every request; the only process-local state is protocol bookkeeping and a
- * transient controller for a live foreground checkpoint elicitation.
+ * Persistence-backed MCP script resources. Run content is read directly from the
+ * engine store for every request; the only process-local state is protocol bookkeeping.
  */
 export class WorkflowScriptResources {
   private readonly router: RunStoreRouter;
   private readonly detachRunDeleted: () => void;
   private readonly detachRunEventPersisted: () => void;
-  private readonly detachRunStopped: () => void;
   private readonly subscriptions = new Set<string>();
   private readonly externalReaders = new Map<
     string,
@@ -201,13 +191,11 @@ export class WorkflowScriptResources {
   private readonly eventSubscriptions = new Map<string, EventSubscription>();
   private readonly deletedRunIds = new Set<string>();
   private readonly silentDeletionRunIds = new Set<string>();
-  private readonly elicitationControllers = new Map<string, AbortController>();
 
   private readonly onRunDeleted = ({ runId }: { runId: string }): void => {
     this.subscriptions.delete(workflowScriptUri(runId));
     this.subscriptions.delete(workflowResultUri(runId));
     this.closeEventSubscription(workflowRunEventsUri(runId));
-    this.cancelPendingElicitation(runId);
     this.deletedRunIds.add(runId);
     const notify = !this.silentDeletionRunIds.delete(runId);
     if (notify && !this.modernNotifier) void this.mcp.sendResourceListChanged();
@@ -238,13 +226,9 @@ export class WorkflowScriptResources {
             }
           });
         });
-    this.detachRunStopped = this.router.onRunStopped(({ runId }) => this.cancelPendingElicitation(runId));
     const previousOnClose = this.mcp.server.onclose;
     this.mcp.server.onclose = () => {
-      for (const controller of this.elicitationControllers.values()) controller.abort();
-      this.elicitationControllers.clear();
       for (const uri of [...this.eventSubscriptions.keys()]) this.closeEventSubscription(uri);
-      this.detachRunStopped();
       this.detachRunEventPersisted();
       this.detachRunDeleted();
       previousOnClose?.();
@@ -258,7 +242,7 @@ export class WorkflowScriptResources {
   }
 
   /**
-   * Reconcile a run orphaned by a dead owner before reading its events. `await`/`stop` already do
+   * Reconcile a run orphaned by a dead owner before reading its events. `status`/`stop` already do
    * this (server.ts), but the events read path did not: a run left "running" with a frozen journal
    * by a daemon that exited stayed status "running", so buildEventsDocument reported finalized:false
    * forever and the run-monitor panel polled it without end. Mirror the tool paths — only reconcile
@@ -280,7 +264,7 @@ export class WorkflowScriptResources {
     return this.persistenceFor(runId)?.load(runId) ?? null;
   }
 
-  /** Tombstones outlive their run file, so consult every live store. */
+  /** Tombstones keep deleted-resource subscriptions recognizable until unsubscribe. */
   private loadTombstone(runId: string): PersistedRunLineageTombstone | null | undefined {
     for (const context of this.router.stores()) {
       const tombstone = context.manager.getPersistence().loadLineageTombstone?.(runId);
@@ -308,16 +292,6 @@ export class WorkflowScriptResources {
     else void this.mcp.sendResourceListChanged();
   }
 
-  /** Bind the only request-lifetime admission state after the manager reveals the run ID. */
-  trackPendingElicitation(runId: string, controller: AbortController | undefined): void {
-    if (controller) this.elicitationControllers.set(runId, controller);
-  }
-
-  cancelPendingElicitation(runId: string): void {
-    this.elicitationControllers.get(runId)?.abort();
-    this.elicitationControllers.delete(runId);
-  }
-
   /**
    * Delete through the composition boundary so subscription state and list notifications stay in
    * sync. Failed-admission cleanup passes notify=false because that resource was never announced.
@@ -327,31 +301,6 @@ export class WorkflowScriptResources {
     const deleted = this.router.storeFor(runId)?.manager.deleteRun(runId) ?? false;
     if (!deleted) this.silentDeletionRunIds.delete(runId);
     return deleted;
-  }
-
-  /** Pure projection over the engine-owned durable ancestry pointers. */
-  lineage(runId: string): WorkflowScriptLineageEntry[] {
-    const newestToOldest: WorkflowScriptLineageEntry[] = [];
-    const visited = new Set<string>();
-    let currentRunId: string | undefined = runId;
-
-    while (currentRunId && !visited.has(currentRunId)) {
-      visited.add(currentRunId);
-      const state = this.loadState(currentRunId);
-      newestToOldest.push({
-        runId: currentRunId,
-        uri: workflowScriptUri(currentRunId),
-        available: state !== null,
-      });
-      if (!state) {
-        const tombstone = this.loadTombstone(currentRunId);
-        currentRunId = tombstone?.sourceRunId;
-        continue;
-      }
-      currentRunId = lineageSourceRunId(state);
-    }
-
-    return newestToOldest.reverse();
   }
 
   /** Exact persisted result metadata, available only for completed runs with a JSON value. */
@@ -508,21 +457,16 @@ export class WorkflowScriptResources {
     return [...latest.values()].sort((left, right) => left.cursor - right.cursor);
   }
 
-  links(lineage: WorkflowScriptLineageEntry[]): ResourceLink[] {
-    const links: ResourceLink[] = [];
-    for (const entry of lineage) {
-      if (!entry.available) continue;
-      const state = this.loadState(entry.runId);
-      if (!state) continue;
-      links.push({
-        type: "resource_link",
-        uri: entry.uri,
-        name: `${state.workflowName} script (${state.runId})`,
-        description: `workflow script · ${state.status} · started ${state.startedAt}`,
-        mimeType: SCRIPT_RESOURCE_MIME_TYPE,
-      });
-    }
-    return links;
+  scriptLink(runId: string): ResourceLink | undefined {
+    const state = this.loadState(runId);
+    if (!state) return undefined;
+    return {
+      type: "resource_link",
+      uri: workflowScriptUri(runId),
+      name: `${state.workflowName} script (${runId})`,
+      description: `workflow script · ${state.status} · started ${state.startedAt}`,
+      mimeType: SCRIPT_RESOURCE_MIME_TYPE,
+    };
   }
 
   private recentRuns(): PersistedRunState[] {

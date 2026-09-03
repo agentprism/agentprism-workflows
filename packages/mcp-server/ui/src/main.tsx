@@ -4,14 +4,13 @@ import type { CallToolResult } from "@modelcontextprotocol/client";
 
 // Rendered by MCP Apps hosts for `workflow` tool calls (the tool carries
 // _meta.ui.resourceUri). The panel derives the runId from whichever arrives first:
-//   - tool ARGUMENTS for status/result/permissions-response/stop (runId is the observed run), or
-//   - the tool RESULT's structuredContent.runId for run/resume calls (background admission
-//     returns it immediately; foreground returns it with the terminal result). Resume input names
-//     the source run, so it must never win over the newly-created result runId.
+//   - tool ARGUMENTS for resume/status/result/permissions-response/stop, or
+//   - the tool RESULT's structuredContent.runId for fresh run calls.
 // Before a new runId is known, inline run input (or a resume source resource) supplies the static
 // plan. Once known, the panel keeps itself live with the MCP Apps Interactive Updates pattern: it
 // polls the app-only `workflow-events` tool (~2s while live, adaptive backoff when idle or faulted)
-// and folds structured event pages into the render model. Server-side capability
+// and folds structured event pages into the render model. A second app-only bounded query
+// supplies active/recent project runs so a surviving host panel remains navigable. Server-side capability
 // negotiation gates access to that tool and this panel. Polling itself carries no model-notification
 // machinery; selected folded events use ui/message. Hosts that narrate app-originated tool calls
 // diverge from the official design; that compatibility issue is tracked at
@@ -44,6 +43,7 @@ import {
 import type { RunModel, RunStatus } from "./state.js";
 import { readWorkflowEventsPage } from "./workflow-events-poll.js";
 import type { EventsDoc } from "./workflow-events-poll.js";
+import { readRecentRuns, type RunListItem } from "./workflow-runs.js";
 import "./style.css";
 
 function runIdFromResult(result: CallToolResult | null): string | undefined {
@@ -72,7 +72,12 @@ interface MonitorState {
  * carry it explicitly. Idle polls back off (2s→4s→8s→cap) and reset on new events; a bounded run of
  * call faults gives up for good rather than retrying a dead run forever.
  */
-function useRunModel(app: App | null, runId: string | undefined, tornDown: boolean): MonitorState {
+function useRunModel(
+  app: App | null,
+  runId: string | undefined,
+  tornDown: boolean,
+  narrateToModel: boolean,
+): MonitorState {
   const modelRef = useRef<RunModel | null>(null);
   const [, setVersion] = useState(0);
   const [connectionLost, setConnectionLost] = useState(false);
@@ -177,7 +182,9 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
       model.status = doc.status;
       model.finalized = doc.finalized;
       if (model.name === undefined && doc.workflowName) model.name = doc.workflowName;
-      sendModelMessagesForFold(app, runId, doc.after, doc.events, modelMessages);
+      // Only the run this tool call belongs to narrates to the model; runs the user browses
+      // through the navigator are app-local observation and must stay silent.
+      if (narrateToModel) sendModelMessagesForFold(app, runId, doc.after, doc.events, modelMessages);
       bump();
 
       if (doc.hasMore) {
@@ -200,14 +207,38 @@ function useRunModel(app: App | null, runId: string | undefined, tornDown: boole
       cancelled = true;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [app, runId, tornDown]);
+  }, [app, runId, tornDown, narrateToModel]);
 
   return {
-    model: runId === undefined ? null : modelRef.current,
+    model: runId === undefined || modelRef.current?.runId !== runId ? null : modelRef.current,
     connectionLost,
     disconnected,
     fatal,
   };
+}
+
+function useRecentRuns(app: App | null, anchorRunId: string | undefined, tornDown: boolean): RunListItem[] {
+  const [runs, setRuns] = useState<RunListItem[]>([]);
+  useEffect(() => {
+    if (!app || !anchorRunId || tornDown) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const refresh = async () => {
+      try {
+        const next = await readRecentRuns(app, anchorRunId);
+        if (!cancelled) setRuns(next);
+      } catch {
+        // Run event polling remains authoritative for the selected run; stale navigation is safe.
+      }
+      if (!cancelled) timer = setTimeout(() => void refresh(), 5_000);
+    };
+    void refresh();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [app, anchorRunId, tornDown]);
+  return runs;
 }
 
 /**
@@ -326,6 +357,8 @@ function MonitorBody({
   connectionLost,
   disconnected,
   fatal,
+  runs,
+  onSelectRun,
 }: {
   app: App;
   model: RunModel;
@@ -333,6 +366,8 @@ function MonitorBody({
   connectionLost: boolean;
   disconnected: boolean;
   fatal: string | undefined;
+  runs: RunListItem[];
+  onSelectRun: (runId: string) => void;
 }) {
   const [view, setView] = useState<{ kind: "graph" } | { kind: "detail"; target: NodeSelection }>({
     kind: "graph",
@@ -348,9 +383,47 @@ function MonitorBody({
     fatal !== undefined || model.status === "failed" || model.status === "aborted";
   const usage = model.usage;
 
+  // The viewed run always stays selectable even when a bounded listing no longer includes it.
+  const listedRuns: RunListItem[] = runs.some((run) => run.runId === model.runId)
+    ? runs
+    : [
+        {
+          runId: model.runId,
+          workflowName: model.name ?? "workflow",
+          status: model.status,
+          startedAt: "",
+          updatedAt: "",
+        },
+        ...runs,
+      ];
+  const activeRuns = listedRuns.filter((run) => run.status === "pending" || run.status === "running" || run.status === "paused");
+  const recentRuns = listedRuns.filter((run) => run.status === "completed" || run.status === "failed" || run.status === "aborted");
   return (
     <>
       <header className="bar top">
+        {listedRuns.length > 1 && (
+          <select
+            className="run-switch"
+            value={model.runId}
+            aria-label="Navigate active and recent workflow runs"
+            onChange={(event) => onSelectRun(event.target.value)}
+          >
+            {activeRuns.length > 0 && (
+              <optgroup label="Active">
+                {activeRuns.map((run) => (
+                  <option key={run.runId} value={run.runId}>{run.workflowName} · {run.status}</option>
+                ))}
+              </optgroup>
+            )}
+            {recentRuns.length > 0 && (
+              <optgroup label="Recent">
+                {recentRuns.map((run) => (
+                  <option key={run.runId} value={run.runId}>{run.workflowName} · {run.status}</option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+        )}
         <span className="wf-name">{model.name ?? "workflow"}</span>
         <span className="run-id">run {shortRunId(model.runId)}</span>
         <span className="run-id">{agentCount(model)} agents</span>
@@ -458,6 +531,7 @@ function RunMonitor() {
   // The host tears the panel down when its session completes or the user dismisses it. Latch
   // it so event polling (and therefore new model messages) stops permanently.
   const [tornDown, setTornDown] = useState(false);
+  const [selectedRunId, setSelectedRunId] = useState<string | undefined>(undefined);
 
   const { app, error } = useApp({
     appInfo: { name: "AgentPrism Run Monitor", version: "1.0.0" },
@@ -477,10 +551,21 @@ function RunMonitor() {
   useHostStyleVariables(app, app?.getHostContext());
   useHostFonts(app, app?.getHostContext());
 
-  const runId = observedRunIdFromArgs(toolArgs) ?? runIdFromResult(toolResult);
+  const defaultRunId = observedRunIdFromArgs(toolArgs) ?? runIdFromResult(toolResult);
+  useEffect(() => {
+    if (defaultRunId) setSelectedRunId(defaultRunId);
+  }, [defaultRunId]);
+  const runId = selectedRunId ?? defaultRunId;
+  // Anchor the bounded listing on the viewed run so the server keeps it listed.
+  const runs = useRecentRuns(app, runId, tornDown);
   const inlineSkeleton = useMemo(() => inlineSkeletonFromArgs(toolArgs), [toolArgs]);
   const skeletonRunId = runId ?? skeletonSourceRunIdFromArgs(toolArgs);
-  const { model, connectionLost, disconnected, fatal } = useRunModel(app, runId, tornDown);
+  const { model, connectionLost, disconnected, fatal } = useRunModel(
+    app,
+    runId,
+    tornDown,
+    runId !== undefined && runId === defaultRunId,
+  );
   const skeleton = useSkeleton(app, skeletonRunId, inlineSkeleton);
 
   if (error) return <div className="log-empty">Failed to connect to host: {error.message}</div>;
@@ -507,6 +592,8 @@ function RunMonitor() {
       connectionLost={connectionLost}
       disconnected={disconnected}
       fatal={fatal}
+      runs={runs}
+      onSelectRun={setSelectedRunId}
     />
   );
 }

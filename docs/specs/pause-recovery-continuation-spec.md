@@ -6,6 +6,10 @@
 > calls replay independently, while the interrupted call runs at the live boundary and may reattach
 > through the continuation channel described here. See the current
 > [journal replay contract](journal-replay-contract.md).
+>
+> **MCP lifecycle update (2026-09-02):** MCP no longer exposes the new-run replay entry point.
+> `action:"resume"` continues one exact run ID using the same live-call reattachment channel. The
+> SDK new-run replay entry point remains supported for embedding hosts.
 
 **Date:** 2026-07-15
 
@@ -161,11 +165,8 @@ The implementation preserves these named invariants. Each has a test in §7.
    verbatim across replay and event projection, §2.10) and a transient provenance report.
 
 6. **Default-on, zero configuration.** Continuation is the live-path behavior on every resume of a
-   `usage_limit`/`auth_required`-paused run, on both the new-run `resumeFromRunId` API and the
-   same-ID `resume()`/`resumeInBackground()` recovery API (§2.7). There is no opt-in flag, no
-   per-call toggle, and no resource cap. `@automatalabs/workflows` takes no new inputs;
-   `@automatalabs/mcp-server` takes no new inputs and only widens its result **output** schema (§2.10,
-   §6). Both pick the behavior up transitively.
+   `usage_limit`/`auth_required`-paused run, on both the SDK new-run replay API and same-ID recovery.
+   MCP uses the strict same-ID path. There is no opt-in flag, per-call toggle, or resource cap.
 
 ### 2.2 The continuation candidate (data model)
 
@@ -1229,12 +1230,9 @@ no fresh session, records no notice, §2.6). Consolidated:
     permit unclaimed multi-consumer reopen, and correctness never depends on exclusivity because every
     gate fails safe at the reopen RPC (§2.6).
 
-13. **Restrict continuation to the lease-exclusive same-ID recovery path only (no fan-out sharing).**
-    Rejected: gating continuation on the same-ID `resume()`/`resumeInBackground()` API would add zero
-    machinery but would silently disable continuation on the new-run `resumeFromRunId` / MCP entry
-    point, contradicting default-on on **both** entry points (Invariant §2.1.6). The adopted contract
-    permits fan-out and documents per-execution consumption (§2.11); the same-ID API still remains
-    available as the exclusive recovery path for callers who want no sharing.
+13. **Restrict all SDK continuation to the lease-exclusive same-ID path.** Rejected for the SDK:
+    its explicitly supported new-run replay API retains per-execution consumption (§2.11). MCP is
+    intentionally stricter and uses only lease-exclusive same-ID continuation.
 
 ---
 

@@ -5,7 +5,11 @@ import test from "node:test";
 
 import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "../src/mcp-apps.js";
 
-import { RUN_MONITOR_RESOURCE_URI, WORKFLOW_EVENTS_TOOL_NAME } from "../src/index.js";
+import {
+  RUN_MONITOR_RESOURCE_URI,
+  WORKFLOW_EVENTS_TOOL_NAME,
+  WORKFLOW_RUNS_TOOL_NAME,
+} from "../src/index.js";
 import { ONE_AGENT_SCRIPT, connect, okRunner, structured, textOf } from "./_harness.js";
 
 function runIdOf(res: Awaited<ReturnType<Awaited<ReturnType<typeof connect>>["client"]["callTool"]>>): string {
@@ -30,7 +34,7 @@ test("workflow carries the panel resource in _meta.ui; workflow-events is app-on
     const { tools } = await client.listTools();
     assert.deepEqual(
       tools.map((tool) => tool.name).sort(),
-      ["docs", "repl", "workflow", WORKFLOW_EVENTS_TOOL_NAME],
+      ["docs", "repl", "workflow", WORKFLOW_EVENTS_TOOL_NAME, WORKFLOW_RUNS_TOOL_NAME].sort(),
     );
 
     const workflow = tools.find((tool) => tool.name === "workflow");
@@ -47,6 +51,11 @@ test("workflow carries the panel resource in _meta.ui; workflow-events is app-on
     const eventsUi = (events?._meta as { ui?: { resourceUri?: string; visibility?: string[] } })?.ui;
     assert.equal(eventsUi?.resourceUri, RUN_MONITOR_RESOURCE_URI);
     assert.deepEqual(eventsUi?.visibility, ["app"]);
+    const runs = tools.find((tool) => tool.name === WORKFLOW_RUNS_TOOL_NAME);
+    assert.deepEqual(
+      (runs?._meta as { ui?: { visibility?: string[] } } | undefined)?.ui?.visibility,
+      ["app"],
+    );
 
     const resource = await client.readResource({ uri: RUN_MONITOR_RESOURCE_URI });
     const content = resource.contents[0] as { mimeType?: string; text?: string };
@@ -69,6 +78,7 @@ test("only the exact well-formed extensions capability receives the MCP Apps sur
     const matchingWorkflow = matchingTools.find((tool) => tool.name === "workflow");
     assert.ok(matchingWorkflow);
     assert.ok(matchingTools.some((tool) => tool.name === WORKFLOW_EVENTS_TOOL_NAME));
+    assert.ok(matchingTools.some((tool) => tool.name === WORKFLOW_RUNS_TOOL_NAME));
 
     const sharedFields = (tool: typeof matchingWorkflow) => ({
       title: tool.title,
@@ -119,6 +129,11 @@ test("workflow-events is annotated read-only (metadata for hosts that gate on th
       (events?.annotations as { readOnlyHint?: boolean } | undefined)?.readOnlyHint,
       true,
     );
+    assert.equal(
+      (tools.find((tool) => tool.name === WORKFLOW_RUNS_TOOL_NAME)?.annotations as
+        { readOnlyHint?: boolean } | undefined)?.readOnlyHint,
+      true,
+    );
   } finally {
     await dispose();
   }
@@ -129,16 +144,10 @@ test("workflow-events pages a background run's event log to terminal state", asy
   try {
     const accepted = await client.callTool({
       name: "workflow",
-      arguments: { script: ONE_AGENT_SCRIPT, background: true },
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT, background: true },
     });
     assert.equal(accepted.isError ?? false, false);
     const runId = runIdOf(accepted);
-
-    const awaited = await client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 10_000 },
-    });
-    assert.equal(structured(awaited)?.status, "completed");
 
     // Page the event log from 0 like the panel does: agentStart/agentEnd/complete all appear.
     const seenTypes = new Set<string>();
@@ -165,7 +174,8 @@ test("workflow-events pages a background run's event log to terminal state", asy
       workflowName = doc.workflowName;
       after = doc.cursor;
       finalized = doc.finalized;
-      if (!doc.hasMore) break;
+      if (doc.finalized && !doc.hasMore) break;
+      if (!doc.hasMore) await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.ok(seenTypes.has("agentStart"), `saw ${[...seenTypes].join(",")}`);
     assert.ok(seenTypes.has("agentEnd"));
@@ -181,6 +191,56 @@ test("workflow-events pages a background run's event log to terminal state", asy
     const emptyDoc = structured(emptyRes) as { events: unknown[]; hasMore: boolean };
     assert.deepEqual(emptyDoc.events, []);
     assert.equal(emptyDoc.hasMore, false);
+  } finally {
+    await dispose();
+  }
+});
+
+test("workflow-runs returns one bounded active/recent project dashboard", async () => {
+  const { client, dispose } = await connect(okRunner(), { listTools: true });
+  try {
+    const first = await client.callTool({
+      name: "workflow",
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT },
+    });
+    const firstRunId = runIdOf(first);
+    const second = await client.callTool({
+      name: "workflow",
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT },
+    });
+    const secondRunId = runIdOf(second);
+    const listed = await client.callTool({
+      name: WORKFLOW_RUNS_TOOL_NAME,
+      arguments: { anchorRunId: secondRunId, limit: 2 },
+    });
+    assert.equal(listed.isError ?? false, false, textOf(listed));
+    const runs = structured(listed)?.runs as Array<{ runId: string; status: string }>;
+    assert.equal(runs.length, 2);
+    assert.deepEqual(new Set(runs.map((run) => run.runId)), new Set([firstRunId, secondRunId]));
+    assert.ok(runs.every((run) => run.status === "completed"));
+  } finally {
+    await dispose();
+  }
+});
+
+test("workflow-runs keeps the panel's anchor run in a bounded listing", async () => {
+  const { client, dispose } = await connect(okRunner(), { listTools: true });
+  try {
+    const first = await client.callTool({
+      name: "workflow",
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT },
+    });
+    const firstRunId = runIdOf(first);
+    await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
+    await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
+
+    const listed = await client.callTool({
+      name: WORKFLOW_RUNS_TOOL_NAME,
+      arguments: { anchorRunId: firstRunId, limit: 1 },
+    });
+    assert.equal(listed.isError ?? false, false, textOf(listed));
+    const runs = structured(listed)?.runs as Array<{ runId: string }>;
+    assert.deepEqual(runs.map((run) => run.runId), [firstRunId]);
   } finally {
     await dispose();
   }

@@ -24,10 +24,10 @@ test("released SDK v1 client retains the sessionful legacy end-to-end path", asy
   try {
     await client.connect(transport);
     const tools = await client.listTools();
-    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["docs", "repl", "workflow", "workflow-events"]);
+    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["docs", "repl", "workflow", "workflow-events", "workflow-runs"]);
     const result = await client.callTool({
       name: "workflow",
-      arguments: { script: SCRIPT, projectDir: makeProjectDir("released-v1-client") },
+      arguments: { action: "run", script: SCRIPT, projectDir: makeProjectDir("released-v1-client") },
     });
     assert.equal((result.structuredContent as Record<string, unknown> | undefined)?.status, "completed");
     assert.equal(typeof transport.sessionId, "string");

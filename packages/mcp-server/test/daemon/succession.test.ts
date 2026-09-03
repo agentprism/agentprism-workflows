@@ -103,7 +103,7 @@ test("succession: a divergent shim never adopts the old daemon (even busy) — i
     const oldSession = await connectHttp(oldDaemon.url, { listTools: true });
     const firstCall = await oldSession.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT, projectDir },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir },
     });
     assert.equal(structured(firstCall)?.status, "completed", textOf(firstCall));
     assert.ok(oldDaemon.sessions.size >= 1, "the old daemon has an active session (busy)");
@@ -142,14 +142,14 @@ test("succession: a divergent shim never adopts the old daemon (even busy) — i
     const newSession = await connectHttp(info.url, { listTools: true });
     const newCall = await newSession.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT, projectDir },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir },
     });
     assert.equal(structured(newCall)?.status, "completed", textOf(newCall));
 
     // The old daemon KEEPS SERVING its pre-existing session (drain-to-completion, not killed).
     const oldStillWorks = await oldSession.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT, projectDir },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir },
     });
     assert.equal(structured(oldStillWorks)?.status, "completed", textOf(oldStillWorks));
 
@@ -241,7 +241,7 @@ test("lame-duck admission: a superseded daemon (daemon.json names a different pi
     const existing = await connectHttp(daemon.url, { listTools: true });
     const before = await existing.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT, projectDir },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir },
     });
     assert.equal(structured(before)?.status, "completed", textOf(before));
 
@@ -260,7 +260,7 @@ test("lame-duck admission: a superseded daemon (daemon.json names a different pi
     // The EXISTING session keeps working.
     const during = await existing.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT, projectDir },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir },
     });
     assert.equal(structured(during)?.status, "completed", textOf(during));
 
@@ -287,7 +287,7 @@ test("lame-duck admission: a superseded daemon (daemon.json names a different pi
     const resumed = await connectHttp(daemon.url, { listTools: true });
     const after = await resumed.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT, projectDir },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir },
     });
     assert.equal(structured(after)?.status, "completed", textOf(after));
 
@@ -336,7 +336,7 @@ test("lame-duck migration: a superseded daemon closes its idle sessions (their c
     const projectDir = makeProjectDir("lame-duck-migration");
     // A live session (standalone GET stream open, nothing in flight) on the daemon.
     const session = await connectHttp(daemon.url, { listTools: true });
-    const before = await session.client.callTool({ name: "workflow", arguments: { script: NO_AGENT_SCRIPT, projectDir } });
+    const before = await session.client.callTool({ name: "workflow", arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir } });
     assert.equal(structured(before)?.status, "completed", textOf(before));
     assert.equal(daemon.sessions.size, 1);
     assert.equal(daemon.inflightRequestCount(), 0, "no request in flight between calls");
@@ -366,7 +366,7 @@ test("lame-duck migration: a superseded daemon closes its idle sessions (their c
     // The client's session is gone — its next request gets the spec's 404 (the shim's cue to
     // re-initialize on the successor). Here the raw HTTP client sees the rejection.
     await assert.rejects(
-      session.client.callTool({ name: "workflow", arguments: { script: NO_AGENT_SCRIPT, projectDir } }),
+      session.client.callTool({ name: "workflow", arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir } }),
       "the migrated session no longer exists on the lame duck",
     );
     await session.dispose().catch(() => undefined);

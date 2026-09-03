@@ -119,7 +119,7 @@ async function connectShim(opts: { elicit?: () => ElicitResult; protocolMode?: "
 
 async function callWorkflow(client: Client): Promise<Record<string, unknown> | undefined> {
   const result = await client.callTool(
-    { name: "workflow", arguments: { script: NO_AGENT_SCRIPT, projectDir: e2eHome } },
+    { name: "workflow", arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir: e2eHome } },
     { timeout: 60_000 },
   );
   assert.equal(result.isError ?? false, false, JSON.stringify(result.content));
@@ -231,7 +231,7 @@ test("the full MCP feature surface works through the shim: prompts, resources, e
     'return await checkpoint("Pick one", { kind: "select", choices: ["alpha", "beta"], default: "beta" });',
   ].join("\n");
   const answered = await session.client.callTool(
-    { name: "workflow", arguments: { script: checkpointScript, projectDir: e2eHome } },
+    { name: "workflow", arguments: { action: "run", script: checkpointScript, projectDir: e2eHome } },
     { timeout: 60_000 },
   );
   assert.equal(answered.isError ?? false, false, JSON.stringify(answered.content));
@@ -256,7 +256,7 @@ test("the full MCP feature surface works through the shim: prompts, resources, e
     'return await checkpoint("gate", { headless: "pause" });',
   ].join("\n");
   const startedBg = await session.client.callTool(
-    { name: "workflow", arguments: { script: pausingScript, background: true, projectDir: e2eHome } },
+    { name: "workflow", arguments: { action: "run", script: pausingScript, background: true, projectDir: e2eHome } },
     { timeout: 60_000 },
   );
   assert.equal(startedBg.isError ?? false, false, JSON.stringify(startedBg.content));
@@ -282,7 +282,7 @@ test("subscriptions survive daemon death: the shim re-subscribes on session reco
       'return await checkpoint("gate", { headless: "pause" });',
     ].join("\n");
     const started = await session.client.callTool(
-      { name: "workflow", arguments: { script: pausingScript, background: true, projectDir: e2eHome } },
+      { name: "workflow", arguments: { action: "run", script: pausingScript, background: true, projectDir: e2eHome } },
       { timeout: 60_000 },
     );
     const runId = (started.structuredContent as { runId: string }).runId;
@@ -315,7 +315,7 @@ test("subscriptions survive daemon death: the shim re-subscribes on session reco
       'return await checkpoint("gate", { headless: "pause" });',
     ].join("\n");
     const second = await session.client.callTool(
-      { name: "workflow", arguments: { script: secondScript, background: true, projectDir: e2eHome } },
+      { name: "workflow", arguments: { action: "run", script: secondScript, background: true, projectDir: e2eHome } },
       { timeout: 60_000 },
     );
     const secondRunId = (second.structuredContent as { runId: string }).runId;

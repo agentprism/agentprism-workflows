@@ -1372,11 +1372,14 @@ if (run.status === "paused" && run.reason === "auth_required" && run.authContext
   lines.push(`This run needs authentication for backend "${run.authContext.backendId ?? "?"}".`);
   for (const m of run.authContext.methods) lines.push(`  - ${m.id} (${m.type})${m.name ? `: ${m.name}` : ""}`);
   lines.push(
-    `Call workflow_authenticate { backend: "${run.authContext.backendId}", methodId: <one above>, ... }, ` +
-    `then re-call workflow with resumeFromRunId="${run.runId}".`);
+    `Configure credentials for "${run.authContext.backendId}" out of band, then re-call ` +
+    `workflow with { action: "resume", runId: "${run.runId}" }.`);
 }
 ```
-The resume path already exists (`server.ts:449-456`): the second `workflow` call re-hydrates the journal and, because the `AuthStore` now holds the credential and the pool recycled to a fresh generation (§2.6), the re-run acquires an authenticated connection. Terminal-type methods degrade to a text instruction ("run `claude /login` in a terminal") — MCP has no TTY.
+The resume path continues that exact run ID with its durable journal and canonical admission. Because
+the backend credential store now holds the credential and the pool recycled to a fresh generation
+(§2.6), the continued run acquires an authenticated connection. Terminal-type methods degrade to a
+text instruction ("run `claude /login` in a terminal") — MCP has no TTY.
 
 **Optional inline elicitation bridge** — opt-in, default OFF, matching the env-opt-in discipline of `AGENTPRISM_ALLOW_SCRIPT_BACKENDS` (`server.ts:232`). When `AGENTPRISM_MCP_INLINE_AUTH=1`, the composition root builds a **deferred** resolver (new `packages/mcp-server/src/auth-resolver.ts`) that closes over a server-ref box filled after the server is constructed — this breaks the runner⇄server construction cycle cleanly:
 
@@ -1389,7 +1392,7 @@ export function createDeferredMcpAuthResolver(): { resolver: AuthResolver; bind(
 //   const server = createWorkflowServer(runner);
 //   bridge.bind(server.server);
 ```
-The resolver mirrors `createConfirm` (`server.ts:204-217`): if `getClientCapabilities()?.elicitation` is set it collects `env_var` values through masked `server.elicitInput` forms (one per `vars[]`, respecting `secret`/`optional`) and gateway `{baseUrl, headers}` through a form, returning `{outcome:"env"|"meta"}`; a declined/failed elicitation returns `{outcome:"cancelled"}`; `terminal` methods return `{outcome:"cancelled"}` with a one-shot text-instruction elicitation. When elicitation is unadvertised, the resolver returns `{outcome:"cancelled"}` and the run falls back to the pause-and-resume path above. The default (env unset) is pure pause-and-resume — the clean, spec-faithful headless behavior.
+The resolver mirrors the server's capability-gated elicitation pattern (historically the removed `createConfirm` helper; the MCP server now uses the SDK `inputRequired` lifecycle for checkpoints): if `getClientCapabilities()?.elicitation` is set it collects `env_var` values through masked `server.elicitInput` forms (one per `vars[]`, respecting `secret`/`optional`) and gateway `{baseUrl, headers}` through a form, returning `{outcome:"env"|"meta"}`; a declined/failed elicitation returns `{outcome:"cancelled"}`; `terminal` methods return `{outcome:"cancelled"}` with a one-shot text-instruction elicitation. When elicitation is unadvertised, the resolver returns `{outcome:"cancelled"}` and the run falls back to the pause-and-resume path above. The default (env unset) is pure pause-and-resume — the clean, spec-faithful headless behavior.
 
 ---
 
@@ -1428,7 +1431,9 @@ New **`packages/acp-agents/test/auth.integration.test.ts`** drives it over the r
 
 Extend **`packages/acp-agents/test/auth-providers.integration.test.ts`** (currently asserts single-`newSession`, non-retry at `:130-152`) so the retry-once + recycle behavior is regression-locked against the change.
 
-*(Historical — never created; the §4.3 MCP auth tools were never registered, and the shipped server's model-facing tools are `workflow` and `repl`.)* The planned **`packages/mcp-server/test/auth-tools.test.ts`** — against a stub `AuthCapableRunner`: `workflow_auth_status` projection; `workflow_authenticate` env/meta/completed → `AuthResolution` mapping and `{status,methodId,recycled}` output; `formatTerminalSummary` `auth_required` branch reads `authContext` (never the message); the pause → `workflow_authenticate` → `workflow(resumeFromRunId)` loop; and that a plain `AgentRunner` stub registers only the `workflow` tool (detection contract, §4.3).
+*(Historical — never created; the §4.3 MCP auth tools were never registered.)* Current MCP tests
+assert that `auth_required` summaries read structured `authContext` rather than message text and
+direct the caller to configure credentials out of band before same-ID `action:"resume"`.
 
 #### 4.6.3 Live-e2e per first-class backend — all three equally
 

@@ -47,9 +47,9 @@ function eventDocument(result: Awaited<ReturnType<Client["readResource"]>>): Eve
   return JSON.parse(resourceText(result)) as EventDocument;
 }
 
-async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
+async function waitUntil(predicate: () => boolean | Promise<boolean>, message: string): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt++) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.fail(message);
@@ -121,7 +121,7 @@ test("initialize advertises full resources capabilities and scriptPath snapshots
     const unreadablePath = join(dir, "missing.workflow.js");
     const unreadable = await client.callTool({
       name: "workflow",
-      arguments: { scriptPath: unreadablePath },
+      arguments: { action: "run", scriptPath: unreadablePath },
     });
     assert.equal(unreadable.isError, true);
     assert.match(
@@ -135,7 +135,7 @@ test("initialize advertises full resources capabilities and scriptPath snapshots
     );
     const result = await client.callTool({
       name: "workflow",
-      arguments: { scriptPath },
+      arguments: { action: "run", scriptPath },
     });
     const runId = String(structured(result)?.runId);
     const uri = `workflow://runs/${runId}/script`;
@@ -169,7 +169,7 @@ test("admission readback preserves authored args and the original persisted scri
   try {
     const result = await client.callTool({
       name: "workflow",
-      arguments: { script, args },
+      arguments: { action: "run", script, args },
     });
     assert.deepEqual(structured(result)?.result, args);
     const runId = String(structured(result)?.runId);
@@ -206,6 +206,7 @@ test("readback rejects a transient initial save failure before execution can res
     const result = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "failed-admission", description: "must not execute" };',
           'return await agent("must not start");',
@@ -219,7 +220,7 @@ test("readback rejects a transient initial save failure before execution can res
     const runId = fault.acquiredRunIds[0];
     assert.ok(runId);
     const uri = `workflow://runs/${runId}/script`;
-    assert.ok(fault.attempts() > 1);
+    assert.equal(fault.attempts(), 1, "canonical admission is one critical atomic save");
     assert.equal(runnerCalls, 0);
     assert.equal(manager.getRun(runId), undefined);
     assert.equal(fault.durable.load(runId), null);
@@ -250,7 +251,7 @@ test("a failed terminal snapshot save never advertises exact-result availability
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
 
   try {
-    const completed = await client.callTool({ name: "workflow", arguments: { script: NO_AGENT_SCRIPT } });
+    const completed = await client.callTool({ name: "workflow", arguments: { action: "run", script: NO_AGENT_SCRIPT } });
     const runId = String(structured(completed)?.runId);
     assert.equal(structured(completed)?.status, "completed");
     assert.equal(structured(completed)?.resultUri, undefined);
@@ -312,13 +313,13 @@ test("failed foreground admission cannot enter the VM or abandon a checkpoint el
     'return await checkpoint("Ship?", { kind: "confirm" });',
   ].join("\n");
   try {
-    const primed = await client.callTool({ name: "workflow", arguments: { script: checkpointScript } });
+    const primed = await client.callTool({ name: "workflow", arguments: { action: "run", script: checkpointScript } });
     assert.equal(primed.isError, false);
     assert.equal(elicitationRequests, 1);
 
     priming = false;
     failSaves = true;
-    const failed = await client.callTool({ name: "workflow", arguments: { script: checkpointScript } });
+    const failed = await client.callTool({ name: "workflow", arguments: { action: "run", script: checkpointScript } });
     assert.equal(failed.isError, true);
     assert.equal(failed.structuredContent, undefined);
     assert.equal(resourceLinks(failed).length, 0);
@@ -360,6 +361,7 @@ test("persistent foreground admission failure never starts the runner and leaves
     const result = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "failed-admission", description: "must not execute" };',
           'return await agent("must not start");',
@@ -411,14 +413,14 @@ test("persistent admission save failure returns no URI and cleans the run, resou
     await client.listTools();
     const result = await client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT, background: true },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT, background: true },
     });
     assert.equal(result.isError, true);
     assert.equal(result.structuredContent, undefined);
     assert.equal(resourceLinks(result).length, 0);
     assert.match(
       String((result.content as Array<{ text?: string }>)[0]?.text),
-      /persisted run record was unreadable; the run was not acknowledged/i,
+      /failed to persist resume state/i,
     );
 
     const runId = fault.acquiredRunIds[0];
@@ -444,64 +446,6 @@ test("persistent admission save failure returns no URI and cleans the run, resou
   }
 });
 
-test("path and inline delivery share journal identity and changed path content resumes at the first changed call", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "agentprism-mcp-path-resume-"));
-  const scriptPath = join(dir, "resume.workflow.js");
-  writeFileSync(scriptPath, TWO_AGENT_SCRIPT, "utf8");
-  const { runner, calls } = countingRunner();
-  const { client, dispose } = await connect(runner);
-  try {
-    const first = await client.callTool({ name: "workflow", arguments: { scriptPath } });
-    const firstRunId = String(structured(first)?.runId);
-    assert.equal(calls(), 2);
-
-    const inlineResume = await client.callTool({
-      name: "workflow",
-      arguments: { script: TWO_AGENT_SCRIPT, resumeFromRunId: firstRunId },
-    });
-    const secondRunId = String(structured(inlineResume)?.runId);
-    assert.equal(calls(), 2, "identical inline content replays a path-delivered journal byte-for-byte");
-
-    const changed = TWO_AGENT_SCRIPT.replace('agent("beta",', 'agent("beta changed",');
-    writeFileSync(scriptPath, changed, "utf8");
-    const changedResume = await client.callTool({
-      name: "workflow",
-      arguments: { scriptPath, resumeFromRunId: secondRunId },
-    });
-    assert.equal(changedResume.isError, false, JSON.stringify(structured(changedResume)));
-    assert.equal(structured(changedResume)?.status, "completed", JSON.stringify(structured(changedResume)));
-    const thirdRunId = String(structured(changedResume)?.runId);
-    assert.equal(calls(), 3, "the unchanged first call replays and the changed second call runs live");
-    assert.equal(
-      resourceText(await client.readResource({ uri: `workflow://runs/${thirdRunId}/script` })),
-      changed,
-    );
-
-    const inspected = await client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId: thirdRunId },
-    });
-    assert.deepEqual(
-      (structured(inspected)?.lineage as Array<Record<string, unknown>>).map((entry) => ({
-        runId: entry.runId,
-        available: entry.available,
-      })),
-      [firstRunId, secondRunId, thirdRunId].map((runId) => ({ runId, available: true })),
-    );
-    assert.deepEqual(
-      resourceLinks(inspected).map((link) => link.uri),
-      [
-        `workflow://runs/${thirdRunId}/result`,
-        ...[firstRunId, secondRunId, thirdRunId].map((runId) => `workflow://runs/${runId}/script`),
-        `workflow://runs/${thirdRunId}/events`,
-      ],
-    );
-  } finally {
-    await dispose();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 test("concurrent inline and path results report source without persisting it into status", async () => {
   const dir = mkdtempSync(join(tmpdir(), "agentprism-mcp-concurrent-source-"));
   const scriptPath = join(dir, "same.workflow.js");
@@ -517,11 +461,11 @@ test("concurrent inline and path results report source without persisting it int
   try {
     const inlinePromise = client.callTool({
       name: "workflow",
-      arguments: { script: TWO_AGENT_SCRIPT },
+      arguments: { action: "run", script: TWO_AGENT_SCRIPT },
     });
     const pathPromise = client.callTool({
       name: "workflow",
-      arguments: { scriptPath },
+      arguments: { action: "run", scriptPath },
     });
     await waitUntil(() => pending.length === 2, "both identical admissions should execute concurrently");
     pending.splice(0).forEach((resolve) => resolve());
@@ -535,11 +479,11 @@ test("concurrent inline and path results report source without persisting it int
     const pathRunId = String(structured(pathResult)?.runId);
     const inlineAwait = await client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId: inlineRunId, waitMs: 0 },
+      arguments: { action: "status", runId: inlineRunId },
     });
     const pathAwait = await client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId: pathRunId, waitMs: 0 },
+      arguments: { action: "status", runId: pathRunId },
     });
     assert.equal((structured(inlineAwait)?.outcome as Record<string, unknown>).scriptSource, undefined);
     assert.equal((structured(pathAwait)?.outcome as Record<string, unknown>).scriptSource, undefined);
@@ -710,51 +654,7 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
   }
 });
 
-test("actual manager-owned resume lineage retains its root after the middle record is deleted", async () => {
-  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-store-"));
-  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
-  try {
-    const first = await manager.runSync(TWO_AGENT_SCRIPT);
-    const second = await manager.runSync(TWO_AGENT_SCRIPT, undefined, { resumeFromRunId: first.runId });
-    const third = await manager.runSync(TWO_AGENT_SCRIPT, undefined, { resumeFromRunId: second.runId });
-    const ids = [first.runId, second.runId, third.runId];
-    assert.equal(second.resumeReport?.sourceRunId, first.runId);
-    assert.equal(third.resumeReport?.sourceRunId, second.runId);
-    assert.equal(manager.getPersistence().load(second.runId)?.resumeSourceRunId, first.runId);
-    assert.equal(manager.getPersistence().load(third.runId)?.resumeSourceRunId, second.runId);
-    assert.equal(manager.deleteRun(second.runId), true);
-    assert.equal(manager.getPersistence().load(second.runId), null);
-
-    const tombstone = manager.getPersistence().loadLineageTombstone?.(second.runId);
-    assert.equal(tombstone?.sourceRunId, first.runId);
-    assert.deepEqual(Object.keys(tombstone ?? {}).sort(), ["deletedAt", "runId", "sourceRunId"]);
-
-    const coldManager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
-    const mcp = new McpServer({ name: "lineage-test", version: "0.0.0" }, { capabilities: {} });
-    mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
-    const resources = new WorkflowScriptResources(mcp, coldManager);
-    try {
-      assert.deepEqual(
-        resources.lineage(third.runId),
-        ids.map((runId, index) => ({
-          runId,
-          uri: `workflow://runs/${runId}/script`,
-          available: index !== 1,
-        })),
-      );
-      assert.deepEqual(
-        resources.links(resources.lineage(third.runId)).map((link) => link.uri),
-        [first.runId, third.runId].map((runId) => `workflow://runs/${runId}/script`),
-      );
-    } finally {
-      await mcp.close();
-    }
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("createWorkflowServer observes injected-manager deletion exactly once and keeps unsubscribe idempotent", async () => {
+ test("createWorkflowServer observes injected-manager deletion exactly once and keeps unsubscribe idempotent", async () => {
   const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-manager-delete-"));
   const runner = okRunner();
   const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: runner });
@@ -769,7 +669,7 @@ test("createWorkflowServer observes injected-manager deletion exactly once and k
   try {
     const admitted = await client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     const runId = String(structured(admitted)?.runId);
     const uri = `workflow://runs/${runId}/script`;
@@ -794,327 +694,7 @@ test("createWorkflowServer observes injected-manager deletion exactly once and k
   }
 });
 
-test("lineage normalizes engine ancestry pointer cycles and missing ancestors", async () => {
-  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-normalization-"));
-  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
-  const first = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "cycle-first"));
-  const second = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "cycle-second"));
-  const flattened = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "flattened"));
-  const persistence = manager.getPersistence();
-  const firstState = persistence.load(first.runId);
-  const secondState = persistence.load(second.runId);
-  const flattenedState = persistence.load(flattened.runId);
-  assert.ok(firstState && secondState && flattenedState);
-  persistence.save({
-    ...firstState,
-    resumeSourceRunId: second.runId,
-  });
-  persistence.save({
-    ...secondState,
-    resumeSourceRunId: first.runId,
-  });
-  const missingRunId = "missing-ancestor";
-  persistence.save({
-    ...flattenedState,
-    resumeSourceRunId: missingRunId,
-  });
-
-  const mcp = new McpServer({ name: "lineage-normalization", version: "0.0.0" }, { capabilities: {} });
-  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
-  const resources = new WorkflowScriptResources(mcp, manager);
-  try {
-    assert.deepEqual(
-      resources.lineage(first.runId).map((entry) => entry.runId),
-      [second.runId, first.runId],
-      "a pointer cycle terminates with the requested run exactly once",
-    );
-    assert.deepEqual(resources.lineage(flattened.runId), [
-      { runId: missingRunId, uri: `workflow://runs/${missingRunId}/script`, available: false },
-      {
-        runId: flattened.runId,
-        uri: `workflow://runs/${flattened.runId}/script`,
-        available: true,
-      },
-    ]);
-  } finally {
-    await mcp.close();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("resume reports, matcher seeds, and replay provenance never override engine ancestry", async () => {
-  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-precedence-"));
-  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
-  const authoritativeParent = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "authoritative-parent"));
-  const seedParent = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "seed-parent"));
-  const reportParent = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "report-parent"));
-  const provenanceParent = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "provenance-parent"));
-  const child = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "lineage-child"));
-  const persistence = manager.getPersistence();
-  const childState = persistence.load(child.runId);
-  assert.ok(childState);
-  persistence.save({
-    ...childState,
-    resumeSourceRunId: authoritativeParent.runId,
-    resumeSeed: {
-      format: "identity-v1",
-      sourceRunId: seedParent.runId,
-      candidates: [],
-      checkpointInjections: [{
-        sourceRunId: provenanceParent.runId,
-        recordedIndex: 0,
-        hash: "provenance-hash",
-        path: "checkpoint:0",
-        inputsHash: "provenance-inputs",
-        decision: true,
-      }],
-    },
-    resumeReport: {
-      strategy: "identity-v1",
-      sourceRunId: reportParent.runId,
-      requestedPolicy: "auto",
-      replayed: 0,
-      live: 0,
-      failed: 0,
-      calls: [],
-    },
-  });
-
-  const mcp = new McpServer({ name: "lineage-precedence", version: "0.0.0" }, { capabilities: {} });
-  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
-  const resources = new WorkflowScriptResources(mcp, manager);
-  try {
-    assert.deepEqual(
-      resources.lineage(child.runId).map((entry) => entry.runId),
-      [authoritativeParent.runId, child.runId],
-    );
-    assert.equal(manager.deleteRun(child.runId), true);
-    assert.equal(persistence.loadLineageTombstone?.(child.runId)?.sourceRunId, authoritativeParent.runId);
-    assert.deepEqual(
-      resources.lineage(child.runId).map((entry) => entry.runId),
-      [authoritativeParent.runId, child.runId],
-    );
-  } finally {
-    await mcp.close();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("lineage walks every engine ancestry pointer oldest to newest", async () => {
-  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-mixed-"));
-  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: okRunner() });
-  const runs = await Promise.all(
-    ["root", "cached", "pointer-one", "pointer-two"].map((name) =>
-      manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", `mixed-${name}`)),
-    ),
-  );
-  const ids = runs.map((run) => run.runId);
-  const persistence = manager.getPersistence();
-  const states = ids.map((runId) => persistence.load(runId));
-  assert.ok(states.every((state) => state !== null));
-  persistence.save({
-    ...states[1]!,
-    resumeSourceRunId: ids[0]!,
-  });
-  persistence.save({
-    ...states[2]!,
-    resumeSourceRunId: ids[1]!,
-  });
-  persistence.save({
-    ...states[3]!,
-    resumeSourceRunId: ids[2]!,
-  });
-
-  const mcp = new McpServer({ name: "lineage-mixed", version: "0.0.0" }, { capabilities: {} });
-  mcp.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
-  const resources = new WorkflowScriptResources(mcp, manager);
-  try {
-    assert.deepEqual(
-      resources.lineage(ids[3]!).map((entry) => entry.runId),
-      ids,
-    );
-  } finally {
-    await mcp.close();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("public status lineage compaction retains newest diagnostics and recomputes every counter", async () => {
-  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-lineage-compaction-"));
-  const runner = okRunner();
-  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: runner });
-  const run = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "lineage-compaction"));
-  const persistence = manager.getPersistence();
-  const state = persistence.load(run.runId);
-  assert.ok(state);
-
-  const phases = Array.from({ length: 50 }, (_, index) =>
-    `phase-${String(index).padStart(2, "0")} ${"phase detail ".repeat(70)}`,
-  );
-  const logs = Array.from({ length: 50 }, (_, index) =>
-    `log-${String(index).padStart(2, "0")} token=sk-1234567890abcdef ${"l".repeat(700)}`,
-  );
-  const journal = Array.from({ length: 50 }, (_, index) => ({
-    index,
-    hash: `hash-${index}`,
-    result: { token: `secret-${index}`, payload: "r".repeat(1_000) },
-    kind: "agent" as const,
-    call: {
-      kind: "agent" as const,
-      label: `call-${String(index).padStart(2, "0")}`,
-      phase: `phase-${String(index).padStart(2, "0")}`,
-    },
-  }));
-  const ancestors = Array.from(
-    { length: 100 },
-    (_, index) => `ancestor${String(index).padStart(3, "0")}-revision${"x".repeat(20)}`,
-  );
-  for (let index = 0; index < ancestors.length; index++) {
-    persistence.save({
-      ...state,
-      runId: ancestors[index]!,
-      workflowName: `lineage-ancestor-${index}`,
-      ...(index === 0
-        ? { resumeSourceRunId: undefined }
-        : {
-            resumeSourceRunId: ancestors[index - 1]!,
-          }),
-    });
-  }
-  persistence.save({
-    ...state,
-    phases,
-    logs,
-    journal,
-    resumeSourceRunId: ancestors.at(-1)!,
-  });
-
-  const inspectionManager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: runner });
-  assert.equal(inspectionManager.getPersistence().load(run.runId)?.phases?.[0], phases[0]);
-  const server = createWorkflowServer(runner, { manager: inspectionManager });
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: "lineage-compaction-client", version: "0.0.0" }, { capabilities: {} });
-  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-  try {
-    const inspected = await client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId: run.runId, lastN: 50, logLines: 50 },
-    });
-    const payload = structured(inspected)!;
-    const returnedPhases = payload.phases as string[];
-    const returnedLogs = (payload.logTail as Record<string, unknown>).lines as string[];
-    const returnedCalls = payload.calls as Array<Record<string, unknown>>;
-    const truncation = payload.truncation as {
-      maxStructuredBytes: number;
-      byteCapApplied: boolean;
-      phases: { total: number; returned: number; shortened: number };
-      logs: { total: number; returned: number; shortened: number; redacted: number };
-      calls: { total: number; matched: number; returned: number; shortenedResults: number; redactedResults: number };
-    };
-    const logTail = payload.logTail as {
-      totalLines: number;
-      omittedLines: number;
-      truncatedLines: number;
-      redactedLines: number;
-    };
-
-    assert.equal(truncation.maxStructuredBytes, 24_576);
-    const { outcome: _outcome, ...boundedObservation } = payload;
-    assert.ok(Buffer.byteLength(JSON.stringify(boundedObservation), "utf8") <= truncation.maxStructuredBytes);
-    assert.equal(truncation.byteCapApplied, true);
-    assert.ok(
-      returnedPhases.length > 0 && returnedPhases.length < phases.length,
-      `expected a retained phase suffix, received ${returnedPhases.length} phases ` +
-        `(phaseBytes=${Buffer.byteLength(returnedPhases[0] ?? "", "utf8")}, ` +
-        `logs=${returnedLogs.length}, calls=${returnedCalls.length}, lineage=${(payload.lineage as unknown[]).length})`,
-    );
-    assert.match(returnedPhases[0]!, /^phase-(?!00)/);
-    assert.match(returnedPhases.at(-1)!, /^phase-49 /);
-    assert.deepEqual(
-      returnedPhases.map((phase) => Number(/^phase-(\d+)/.exec(phase)?.[1])),
-      Array.from(
-        { length: returnedPhases.length },
-        (_, offset) => phases.length - returnedPhases.length + offset,
-      ),
-      "second-stage compaction must drop oldest phases and retain one newest suffix",
-    );
-
-    assert.deepEqual(truncation.phases, {
-      total: phases.length,
-      returned: returnedPhases.length,
-      shortened: returnedPhases.length,
-    });
-    assert.equal(truncation.logs.total, logs.length);
-    assert.equal(truncation.logs.returned, returnedLogs.length);
-    assert.equal(truncation.logs.shortened, returnedLogs.length);
-    assert.equal(truncation.logs.redacted, returnedLogs.length);
-    assert.equal(logTail.totalLines, logs.length);
-    assert.equal(logTail.omittedLines, logs.length - returnedLogs.length);
-    assert.equal(logTail.truncatedLines, returnedLogs.length);
-    assert.equal(logTail.redactedLines, returnedLogs.length);
-    assert.equal(truncation.calls.total, journal.length);
-    assert.equal(truncation.calls.matched, journal.length);
-    assert.equal(truncation.calls.returned, returnedCalls.length);
-    assert.equal(
-      truncation.calls.shortenedResults,
-      returnedCalls.filter((call) => call.resultTruncated === true).length,
-    );
-    assert.equal(
-      truncation.calls.redactedResults,
-      returnedCalls.filter((call) => call.resultRedacted === true).length,
-    );
-    if (returnedLogs.length > 0) assert.match(returnedLogs.at(-1)!, /^log-49 /);
-    if (returnedCalls.length > 0) assert.equal(returnedCalls.at(-1)?.index, 49);
-  } finally {
-    await client.close();
-    await server.close();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("a 300-hop public resume lineage remains complete and reports a truthful structured limit", async () => {
-  const { client, dispose } = await connect(okRunner(), { listTools: true });
-  try {
-    const runIds: string[] = [];
-    for (let index = 0; index < 300; index++) {
-      const result = await client.callTool({
-        name: "workflow",
-        arguments: {
-          script: NO_AGENT_SCRIPT,
-          ...(runIds.length === 0 ? {} : { resumeFromRunId: runIds.at(-1) }),
-        },
-      });
-      assert.equal(result.isError, false);
-      runIds.push(String(structured(result)?.runId));
-    }
-
-    const inspected = await client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId: runIds.at(-1) },
-    });
-    const payload = structured(inspected);
-    const lineage = payload?.lineage as Array<Record<string, unknown>>;
-    const truncation = payload?.truncation as Record<string, unknown>;
-    const { outcome: _outcome, ...boundedObservation } = payload ?? {};
-    const bytes = Buffer.byteLength(JSON.stringify(boundedObservation), "utf8");
-    assert.deepEqual(lineage.map((entry) => entry.runId), runIds);
-    assert.equal(new Set(lineage.map((entry) => entry.runId)).size, 300);
-    assert.deepEqual(
-      resourceLinks(inspected).map((link) => link.uri),
-      [
-        `workflow://runs/${runIds.at(-1)}/result`,
-        ...runIds.map((runId) => `workflow://runs/${runId}/script`),
-        `workflow://runs/${runIds.at(-1)}/events`,
-      ],
-    );
-    assert.ok(Number(truncation.maxStructuredBytes) > 24_576);
-    assert.ok(bytes <= Number(truncation.maxStructuredBytes));
-  } finally {
-    await dispose();
-  }
-});
-
-test("a fresh MCP session can retrieve an inline checkpoint script resource and resume with it", async () => {
+test("a fresh MCP session can retrieve a checkpoint script and continue that exact run", async () => {
   const script = [
     'export const meta = { name: "resource-checkpoint", description: "cross-session recovery" };',
     'const decision = await checkpoint("ship?", { headless: "pause" });',
@@ -1126,12 +706,16 @@ test("a fresh MCP session can retrieve an inline checkpoint script resource and 
   try {
     const accepted = await first.client.callTool({
       name: "workflow",
-      arguments: { script, background: true },
+      arguments: { action: "run", script, background: true },
     });
     runId = String(structured(accepted)?.runId);
+    await waitUntil(async () => structured(await first.client.callTool({
+      name: "workflow",
+      arguments: { action: "status", runId },
+    }))?.status === "paused", "the checkpoint run should pause");
     const paused = await first.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 1_000 },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(paused)?.status, "paused");
     retrieved = resourceText(
@@ -1147,18 +731,19 @@ test("a fresh MCP session can retrieve an inline checkpoint script resource and 
     const resumed = await second.client.callTool({
       name: "workflow",
       arguments: {
-        script: retrieved!,
-        resumeFromRunId: runId!,
+        action: "resume",
+        runId: runId!,
         checkpointReplies: { 0: true },
       },
     });
     assert.equal(structured(resumed)?.status, "completed");
     assert.equal(JSON.stringify(structured(resumed)?.result), JSON.stringify({ decision: true }));
-    assert.equal(structured(resumed)?.scriptSource, "inline");
+    assert.equal(structured(resumed)?.scriptSource, "stored");
     const resumedRunId = String(structured(resumed)?.runId);
+    assert.equal(resumedRunId, runId);
     const coldAwait = await second.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId: resumedRunId, waitMs: 0 },
+      arguments: { action: "status", runId: resumedRunId },
     });
     assert.equal((structured(coldAwait)?.outcome as Record<string, unknown>).scriptSource, undefined);
     assert.equal(
@@ -1176,7 +761,7 @@ test("cold status does not infer an admission-only script source", async () => {
   try {
     const result = await first.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     runId = String(structured(result)?.runId);
   } finally {
@@ -1194,7 +779,7 @@ test("cold status does not infer an admission-only script source", async () => {
   try {
     const awaited = await second.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId: runId!, waitMs: 0 },
+      arguments: { action: "status", runId: runId! },
     });
     assert.equal(awaited.isError, false);
     assert.equal((structured(awaited)?.outcome as Record<string, unknown>).scriptSource, undefined);
@@ -1390,6 +975,103 @@ test("a slow events subscriber holds one promise plus one dirty bit while durabl
   } finally {
     await client.close();
     await mcp.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("public status compaction retains newest diagnostics and recomputes every counter", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agentprism-mcp-status-compaction-"));
+  const runner = okRunner();
+  const manager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: runner });
+  const run = await manager.runSync(NO_AGENT_SCRIPT.replace("no-agent", "status-compaction"));
+  const persistence = manager.getPersistence();
+  const state = persistence.load(run.runId);
+  assert.ok(state);
+
+  const phases = Array.from({ length: 50 }, (_, index) =>
+    `phase-${String(index).padStart(2, "0")} ${"phase detail ".repeat(70)}`,
+  );
+  const logs = Array.from({ length: 50 }, (_, index) =>
+    `log-${String(index).padStart(2, "0")} token=sk-1234567890abcdef ${"l".repeat(700)}`,
+  );
+  const journal = Array.from({ length: 50 }, (_, index) => ({
+    index,
+    hash: `hash-${index}`,
+    result: { token: `secret-${index}`, payload: "r".repeat(1_000) },
+    kind: "agent" as const,
+    call: {
+      kind: "agent" as const,
+      label: `call-${String(index).padStart(2, "0")}`,
+      phase: `phase-${String(index).padStart(2, "0")}`,
+    },
+  }));
+  persistence.save({ ...state, phases, logs, journal });
+
+  const inspectionManager = new WorkflowManager({ cwd: root, persistenceRoot: root, agent: runner });
+  const server = createWorkflowServer(runner, { manager: inspectionManager });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "status-compaction-client", version: "0.0.0" }, { capabilities: {} });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  try {
+    const inspected = await client.callTool({
+      name: "workflow",
+      arguments: { action: "status", runId: run.runId, lastN: 50, logLines: 50 },
+    });
+    const payload = structured(inspected)!;
+    const returnedPhases = payload.phases as string[];
+    const returnedLogs = (payload.logTail as Record<string, unknown>).lines as string[];
+    const returnedCalls = payload.calls as Array<Record<string, unknown>>;
+    const truncation = payload.truncation as {
+      maxStructuredBytes: number;
+      byteCapApplied: boolean;
+      phases: { total: number; returned: number; shortened: number };
+      logs: { total: number; returned: number; shortened: number; redacted: number };
+      calls: { total: number; matched: number; returned: number; shortenedResults: number; redactedResults: number };
+    };
+    const logTail = payload.logTail as {
+      totalLines: number;
+      omittedLines: number;
+      truncatedLines: number;
+      redactedLines: number;
+    };
+
+    assert.equal(truncation.maxStructuredBytes, 24_576);
+    const { outcome: _outcome, ...boundedObservation } = payload;
+    assert.ok(Buffer.byteLength(JSON.stringify(boundedObservation), "utf8") <= truncation.maxStructuredBytes);
+    assert.equal(truncation.byteCapApplied, true);
+    assert.ok(returnedPhases.length > 0 && returnedPhases.length < phases.length);
+    assert.match(returnedPhases.at(-1)!, /^phase-49 /);
+    assert.deepEqual(truncation.phases, {
+      total: phases.length,
+      returned: returnedPhases.length,
+      shortened: returnedPhases.length,
+    });
+    assert.equal(truncation.logs.total, logs.length);
+    assert.equal(truncation.logs.returned, returnedLogs.length);
+    assert.equal(truncation.logs.shortened, returnedLogs.length);
+    assert.equal(truncation.logs.redacted, returnedLogs.length);
+    assert.equal(logTail.totalLines, logs.length);
+    assert.equal(logTail.omittedLines, logs.length - returnedLogs.length);
+    assert.equal(logTail.truncatedLines, returnedLogs.length);
+    assert.equal(logTail.redactedLines, returnedLogs.length);
+    for (const line of returnedLogs) assert.doesNotMatch(line, /sk-1234567890abcdef/);
+    assert.equal(truncation.calls.total, journal.length);
+    assert.equal(truncation.calls.matched, journal.length);
+    assert.equal(truncation.calls.returned, returnedCalls.length);
+    assert.equal(
+      truncation.calls.shortenedResults,
+      returnedCalls.filter((call) => call.resultTruncated === true).length,
+    );
+    assert.equal(
+      truncation.calls.redactedResults,
+      returnedCalls.filter((call) => call.resultRedacted === true).length,
+    );
+    assert.doesNotMatch(JSON.stringify(returnedCalls), /secret-\d+/);
+    if (returnedLogs.length > 0) assert.match(returnedLogs.at(-1)!, /^log-49 /);
+    if (returnedCalls.length > 0) assert.equal(returnedCalls.at(-1)?.index, 49);
+  } finally {
+    await client.close();
+    await server.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

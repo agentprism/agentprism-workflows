@@ -11,7 +11,8 @@ import type { McpServer } from "@modelcontextprotocol/server";
 // This module registers the two panel-support pieces:
 //   - the ui:// panel resource (the Vite single-file React app, embedded at build time), and
 //   - the app-only `workflow-events` cursor tool (visibility: ["app"]) the panel polls to
-//     stay live without any model involvement.
+//     stay live without any model involvement, and
+//   - the app-only bounded `workflow-runs` query used for multi-run navigation.
 import { RunEventLogError } from "@automatalabs/workflows";
 import { z } from "zod";
 
@@ -22,6 +23,16 @@ import { workflowEventsOutputShape } from "./workflow-tool-output.js";
 
 export const RUN_MONITOR_RESOURCE_URI = "ui://agentprism-workflow/run-monitor.html";
 export const WORKFLOW_EVENTS_TOOL_NAME = "workflow-events";
+export const WORKFLOW_RUNS_TOOL_NAME = "workflow-runs";
+
+export interface WorkflowRunListItem {
+  runId: string;
+  workflowName: string;
+  status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+  startedAt: string;
+  updatedAt: string;
+  currentPhase?: string;
+}
 
 /** The dependencies the server shell binds when registering the panel surface. */
 export interface WorkflowAppUiDeps {
@@ -32,6 +43,8 @@ export interface WorkflowAppUiDeps {
     limit?: number;
     streamId?: string;
   }): WorkflowRunEventsResourceDocument;
+  /** One bounded active/recent query in the anchor run's authoritative project store. */
+  listRecentRuns(request: { anchorRunId: string; limit: number }): WorkflowRunListItem[];
   /**
    * Route reads of a fixed URI through the server's custom resources/read dispatch
    * (WorkflowScriptResources replaces the SDK default, so ui:// must be registered there too).
@@ -117,6 +130,43 @@ export function registerWorkflowAppUi(mcp: McpServer, deps: WorkflowAppUiDeps): 
           content: [{ type: "text", text: eventsErrorText(error) }],
           isError: true,
         };
+      }
+    },
+  );
+
+  mcp.registerTool(
+    WORKFLOW_RUNS_TOOL_NAME,
+    {
+      title: "List active and recent workflow runs (app-only)",
+      description: "Bounded project-local run navigation for the multi-run monitor panel.",
+      annotations: { readOnlyHint: true },
+      inputSchema: z.object({
+        anchorRunId: z.string().describe("Run whose authoritative project store supplies the listing."),
+        limit: z.number().int().min(1).max(24).optional().describe("Maximum rows; default 12."),
+      }),
+      outputSchema: z.object({
+        anchorRunId: z.string(),
+        runs: z.array(z.object({
+          runId: z.string(),
+          workflowName: z.string(),
+          status: z.enum(["pending", "running", "paused", "completed", "failed", "aborted"]),
+          startedAt: z.string(),
+          updatedAt: z.string(),
+          currentPhase: z.string().optional(),
+        })),
+      }),
+      _meta: appResourceToolMeta(RUN_MONITOR_RESOURCE_URI, ["app"]),
+    },
+    ({ anchorRunId, limit }) => {
+      try {
+        const runs = deps.listRecentRuns({ anchorRunId, limit: limit ?? 12 });
+        return {
+          structuredContent: { anchorRunId, runs },
+          content: [{ type: "text", text: `${runs.length} active/recent workflow runs.` }],
+          isError: false,
+        };
+      } catch (error) {
+        return { content: [{ type: "text", text: eventsErrorText(error) }], isError: true };
       }
     },
   );

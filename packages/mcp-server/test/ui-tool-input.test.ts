@@ -20,8 +20,7 @@ test("inline run input exposes its static skeleton before a result runId exists"
   assert.equal(gate?.kind, "loop");
   if (gate?.kind === "loop") assert.equal(gate.mode, "gate");
 
-  // The migration-compatible omitted action is still a run form.
-  assert.equal(inlineSkeletonFromArgs({ script: SCRIPT })?.name, "input-shape");
+  assert.equal(inlineSkeletonFromArgs({ script: SCRIPT }), undefined);
   assert.equal(inlineSkeletonFromArgs({ action: "run", scriptPath: "/tmp/x.js" }), undefined);
   assert.equal(inlineSkeletonFromArgs({ action: "status", script: SCRIPT }), undefined);
 });
@@ -32,12 +31,11 @@ test("only existing-run actions take runId from tool input", () => {
   assert.equal(observedRunIdFromArgs({ action: "stop", runId: "run-1" }), "run-1");
   assert.equal(observedRunIdFromArgs({ action: "permissions-response", runId: "run-1" }), "run-1");
   assert.equal(observedRunIdFromArgs({ action: "run", runId: "source-1" }), undefined);
-  assert.equal(observedRunIdFromArgs({ action: "resume", runId: "source-1" }), undefined);
+  assert.equal(observedRunIdFromArgs({ action: "resume", runId: "source-1" }), "source-1");
   assert.equal(observedRunIdFromArgs({ action: "config", runId: "run-1" }), undefined);
 });
 
-test("resume input can seed a skeleton resource without monitoring the source run", () => {
+test("same-run resume can seed a skeleton resource while monitoring that run", () => {
   assert.equal(skeletonSourceRunIdFromArgs({ action: "resume", runId: "source-1" }), "source-1");
   assert.equal(skeletonSourceRunIdFromArgs({ action: "status", runId: "run-1" }), undefined);
-  assert.equal(skeletonSourceRunIdFromArgs({ action: "run", resumeFromRunId: "source-1" }), undefined);
 });

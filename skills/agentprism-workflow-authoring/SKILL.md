@@ -1,6 +1,6 @@
 ---
 name: agentprism-workflow-authoring
-description: Write and run AgentPrism workflow scripts — the `export const meta` + agent()/parallel()/pipeline() JavaScript DSL executed by @automatalabs/workflows and by the @automatalabs/mcp-server `workflow` tool. Use when writing or editing a workflow script, or when running one through the MCP `workflow` tool. Covers the script API, per-call routing to ACP backends (Claude Code, Codex, OpenCode, pi, custom agents), structured outputs via JSON Schema, human checkpoints, worktree isolation, the resume rules, and run operations (run, status, stop, execution logs).
+description: Write and run AgentPrism workflow scripts — the `export const meta` + agent()/parallel()/pipeline() JavaScript DSL executed by @automatalabs/workflows and by the @automatalabs/mcp-server `workflow` tool. Use when writing or editing a workflow script, or when running one through the MCP `workflow` tool. Covers the script API, per-call routing to ACP backends (Claude Code, Codex, OpenCode, pi, custom agents), structured outputs via JSON Schema, human checkpoints, worktree isolation, same-run continuation, and the strict config/run/resume/status/result/permissions-response/stop lifecycle.
 ---
 
 # Writing AgentPrism workflow scripts
@@ -57,7 +57,7 @@ Run scripts through the MCP server's `workflow` tool — registration, the run/s
 - [ ] Every `parallel` element is a **thunk**; results are `.filter(Boolean)`-ed or null-checked.
 - [ ] Every prompt is self-contained: prior results are interpolated in, and every file path a prompt references was written by an earlier call, supplied through `args`, or created by that prompt's own instructions.
 - [ ] Schemas: object root, `additionalProperties: false`, everything `required`, a `description` on every field.
-- [ ] When using MCP, pinned model ids, modes, effort values, and `configOptions` come from `workflow` action `config`, never from memory. Read the harness-owned mode descriptions. Omission uses `defaultModeId` (Claude auto, Codex agent, OpenCode build; none for Pi); pin only exact advertised ids.
+- [ ] When using MCP, pinned model ids, modes, effort values, and `configOptions` come from `workflow` action `config`, never from memory. Read the harness-owned mode descriptions. Omission uses `defaultModeId` (Claude auto, Codex agent, OpenCode build; none for Pi); pin only exact advertised ids. Trusted autonomous implementation/review uses advertised Claude `bypassPermissions` or Codex `agent`; Claude `auto` is classifier-driven and may still request permission.
 - [ ] Worktree-isolated agents return their work as data — their edits are discarded when the call ends.
 - [ ] Replay is intentional: completed calls with matching identity and input fingerprints replay. Change a hashed field (normally the prompt) when a completed call must run again.
 - [ ] Loops terminate on bounds the script controls; caps and drops are `log()`-ed, not silent.

@@ -4,9 +4,10 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import type { Client } from "@modelcontextprotocol/client";
 import { createAcpRunner } from "@automatalabs/workflows";
 import { WorkflowPermissionBroker } from "../src/workflow-permissions.js";
-import { connect, makeRunner, structured } from "./_harness.js";
+import { connect, makeRunner, structured, type ToolCallResult } from "./_harness.js";
 
 const SCRIPT = [
   'export const meta = { name: "permission-tool", description: "permission tool coverage" };',
@@ -20,6 +21,25 @@ async function eventually(check: () => boolean, timeoutMs = 2_000): Promise<void
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.fail("condition did not become true");
+}
+
+async function waitForStatus(
+  client: Client,
+  runId: string,
+  accept: (status: Record<string, unknown>) => boolean,
+  timeoutMs = 2_000,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  let latest: Record<string, unknown> | undefined;
+  while (Date.now() < deadline) {
+    latest = structured(await client.callTool({
+      name: "workflow",
+      arguments: { action: "status", runId },
+    }) as ToolCallResult);
+    if (latest && accept(latest)) return latest;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`run ${runId} did not reach the expected status; latest=${JSON.stringify(latest)}`);
 }
 
 test("a foreground call returns action-required without abandoning its live run", async () => {
@@ -44,17 +64,14 @@ test("a foreground call returns action-required without abandoning its live run"
   try {
     const result = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { script: SCRIPT },
+      arguments: { action: "run", script: SCRIPT },
     }));
     assert.equal(result.status, "running");
     assert.equal((result.pendingPermissions as unknown[]).length, 1);
     const runId = result.runId as string;
     const pending = broker.list(runId)[0]!;
     broker.respond(runId, pending.permissionId, { outcome: { outcome: "cancelled" } });
-    const completed = structured(await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 2_000 },
-    }));
+    const completed = await waitForStatus(connected.client, runId, (status) => status.status === "completed");
     assert.equal(completed.status, "completed");
     assert.equal((completed.outcome as Record<string, unknown>).result, "done");
   } finally {
@@ -95,7 +112,7 @@ test("status exposes a live permission and permissions-response resumes the work
   try {
     const started = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { script: SCRIPT, background: true },
+      arguments: { action: "run", script: SCRIPT, background: true },
     }));
     const runId = started.runId as string;
     await eventually(() => broker.has(runId));
@@ -121,10 +138,7 @@ test("status exposes a live permission and permissions-response resumes the work
     }));
     assert.equal((responded.permissionResponse as Record<string, unknown>).permissionId, permissionId);
 
-    const awaited = structured(await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 2_000 },
-    }));
+    const awaited = await waitForStatus(connected.client, runId, (status) => status.status === "completed");
     assert.equal(awaited.status, "completed");
     assert.equal((awaited.outcome as Record<string, unknown>).result, "selected:cancel");
   } finally {
@@ -169,7 +183,7 @@ test("elicitation-capable status presents the exact options and resumes the agen
   try {
     const started = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { script: SCRIPT, background: true },
+      arguments: { action: "run", script: SCRIPT, background: true },
     }));
     const runId = started.runId as string;
     await eventually(() => broker.has(runId));
@@ -181,10 +195,11 @@ test("elicitation-capable status presents the exact options and resumes the agen
     assert.equal((inspected.permissionResponse as Record<string, unknown>).runId, runId);
     assert.deepEqual(inspected.pendingPermissions, []);
 
-    const awaited = structured(await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 2_000 },
-    }));
+    const awaited = await waitForStatus(
+      connected.client,
+      runId,
+      (status) => status.status === "completed",
+    );
     assert.equal((awaited.outcome as Record<string, unknown>).result, "allow_for_session");
   } finally {
     await connected.dispose();
@@ -235,7 +250,7 @@ test("the real ACP client, broker, and MCP tool preserve a same-kind Codex choic
   try {
     const started = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { script: SCRIPT, background: true },
+      arguments: { action: "run", script: SCRIPT, background: true },
     }));
     const runId = started.runId as string;
     await eventually(() => broker.has(runId));
@@ -262,10 +277,11 @@ test("the real ACP client, broker, and MCP tool preserve a same-kind Codex choic
         response: { outcome: { outcome: "selected", optionId: "cancel" } },
       },
     });
-    const terminal = structured(await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 3_000 },
-    }));
+    const terminal = await waitForStatus(
+      connected.client,
+      runId,
+      (status) => status.status === "completed",
+    );
     assert.equal((terminal.outcome as Record<string, unknown>).result, "provider-finished");
     const records = (await readFile(logPath, "utf8"))
       .trim()
@@ -291,7 +307,7 @@ test("the real ACP client, broker, and MCP tool preserve a same-kind Codex choic
   }
 });
 
-test("status returns early with action-required instead of waiting for its full bound", async () => {
+test("status immediately exposes an action-required permission snapshot", async () => {
   const broker = new WorkflowPermissionBroker();
   const runner = makeRunner(async (_prompt, options) => {
     await broker.resolver(
@@ -308,16 +324,14 @@ test("status returns early with action-required instead of waiting for its full 
   try {
     const started = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { script: SCRIPT, background: true },
+      arguments: { action: "run", script: SCRIPT, background: true },
     }));
     const runId = started.runId as string;
-    const before = Date.now();
+    await eventually(() => broker.has(runId));
     const awaited = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 2_000 },
+      arguments: { action: "status", runId },
     }));
-    assert.equal((awaited.wait as Record<string, unknown>).returnedBecause, "action-required");
-    assert.ok(Date.now() - before < 1_000);
     assert.equal((awaited.pendingPermissions as unknown[]).length, 1);
     const pending = broker.list(runId)[0]!;
     broker.respond(runId, pending.permissionId, { outcome: { outcome: "cancelled" } });

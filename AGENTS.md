@@ -26,6 +26,14 @@ Documents under `docs/specs/` are authoritative descriptions of implemented cont
 
 The user's actual request remains the source of scope. Preserve its exact intent when creating plans, workflow prompts, issues, or derived specifications; see `CONTRIBUTING.md`’s workflow source-gate rules.
 
+## Compatibility policy
+
+Do not add temporary compatibility layers unless the user explicitly requests one.
+
+- When an approved change replaces an API or contract, remove the old schema fields, aliases, parsers, runtime normalization, deprecated types, fallback behavior, tests, and documentation in the same change train.
+- Do not preserve hidden acceptance paths or migration shims “just in case.” Old artifacts that cannot satisfy a new safety invariant must fail clearly rather than be guessed, silently migrated, or executed under weaker semantics.
+- Explicitly supported protocol eras, wire versions, and public SDK surfaces are product contracts, not compatibility shims. Changing or removing one requires an explicit scope decision.
+
 ## Architecture and package boundaries
 
 This is a pnpm monorepo of nine `@automatalabs/*` packages:

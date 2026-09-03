@@ -170,13 +170,13 @@ test("whole-run stop exposes a durable pending operation when an external owner 
   }
 });
 
-test("stop durably aborts a background run, publishes stopped, retains its resource, and supports kill-patch-resume", async () => {
+test("stop durably aborts a background run, publishes stopped, and retains its resource", async () => {
   const dir = mkdtempSync(join(tmpdir(), "agentprism-mcp-stop-loop-"));
   const scriptPath = join(dir, "stop-loop.workflow.js");
   const original = [
     'export const meta = { name: "stop-loop", description: "stop and resume" };',
-    'const first = await agent("first", { label: "first", resume: { filesystem: "read-only" } });',
-    'const second = await agent("second", { label: "second", resume: { filesystem: "read-only" } });',
+    'const first = await agent("first", { label: "first" });',
+    'const second = await agent("second", { label: "second" });',
     "return { first, second };",
   ].join("\n");
   writeFileSync(scriptPath, original, "utf8");
@@ -185,7 +185,7 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
   try {
     const accepted = await client.callTool({
       name: "workflow",
-      arguments: { scriptPath, background: true },
+      arguments: { action: "run", scriptPath, background: true },
     });
     const runId = runIdOf(accepted);
     assert.deepEqual(links(accepted).map((link) => link.uri), [
@@ -229,44 +229,12 @@ test("stop durably aborts a background run, publishes stopped, retains its resou
     const resource = await client.readResource({ uri: `workflow://runs/${runId}/script` });
     assert.equal(resource.contents[0] && "text" in resource.contents[0] ? resource.contents[0].text : undefined, original);
 
-    const awaited = await client.callTool({
+    const snapshot = await client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 25_000, lastN: 1, logLines: 0 },
+      arguments: { action: "status", runId, lastN: 1, logLines: 0 },
     });
-    assert.equal(structured(awaited)?.status, "aborted");
-    assert.equal((structured(awaited)?.wait as Record<string, unknown>).returnedBecause, "terminal");
-    assert.deepEqual(
-      (structured(awaited)?.lineage as Array<Record<string, unknown>>).map((entry) => entry.runId),
-      [runId],
-    );
+    assert.equal(structured(snapshot)?.status, "aborted");
 
-    const changed = original.replace('agent("second"', 'agent("second patched"');
-    writeFileSync(scriptPath, changed, "utf8");
-    const resumedPromise = client.callTool({
-      name: "workflow",
-      arguments: { scriptPath, resumeFromRunId: runId, resumePolicy: "positional" },
-    });
-    await waitUntil(() => controlled.calls.length === 3, "the patched call should run after the replayed prefix");
-    assert.equal(controlled.calls[2].prompt, "second patched");
-    controlled.calls[2].resolve("patched result");
-    const resumed = await resumedPromise;
-    const resumedRunId = runIdOf(resumed);
-    assert.equal(structured(resumed)?.status, "completed", JSON.stringify(structured(resumed)));
-    assert.equal(
-      JSON.stringify(structured(resumed)?.result),
-      JSON.stringify({ first: "first result", second: "patched result" }),
-    );
-    const resumeReport = structured(resumed)?.resumeReport as Record<string, unknown>;
-    assert.equal(resumeReport.replayed, 1);
-    assert.equal(resumeReport.live, 1);
-    const inspected = await client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId: resumedRunId },
-    });
-    assert.deepEqual(
-      (structured(inspected)?.lineage as Array<Record<string, unknown>>).map((entry) => entry.runId),
-      [runId, resumedRunId],
-    );
   } finally {
     for (const call of controlled.calls) call.resolve("cleanup");
     await dispose();
@@ -281,6 +249,7 @@ test("stop with callIndex cancels one agent, keeps the run live, and treats labe
     const accepted = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "narrow-stop", description: "cancel one branch" };',
           "const values = await parallel([",
@@ -352,10 +321,16 @@ test("stop with callIndex cancels one agent, keeps the run live, and treats labe
     assert.equal(persisted.abortSignaled, undefined);
 
     controlled.calls[0].resolve("peer-ok");
-    const awaited = await client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 25_000 },
-    });
+    let awaited: ToolCallResult | undefined;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      awaited = await client.callTool({
+        name: "workflow",
+        arguments: { action: "status", runId },
+      });
+      if (structured(awaited)?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(awaited);
     assert.equal(structured(awaited)?.status, "completed");
     const outcome = structured(awaited)?.outcome as Record<string, unknown>;
     assert.equal(
@@ -387,6 +362,7 @@ test("stop with callIndex reports scoped ambiguity and leaves whole-run stop beh
     const accepted = await connection.client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "cancel-ambiguity", description: "duplicate indexes" };',
           "return await parallel([",
@@ -450,7 +426,7 @@ test("four stopped background runs immediately free every registry slot", async 
     for (let index = 0; index < 4; index++) {
       const accepted = await client.callTool({
         name: "workflow",
-        arguments: { script, background: true },
+        arguments: { action: "run", script, background: true },
       });
       assert.equal(accepted.isError, false);
       runIds.push(runIdOf(accepted));
@@ -465,7 +441,7 @@ test("four stopped background runs immediately free every registry slot", async 
 
     const fifth = await client.callTool({
       name: "workflow",
-      arguments: { script, background: true },
+      arguments: { action: "run", script, background: true },
     });
     assert.equal(fifth.isError, false);
     assert.equal(structured(fifth)?.status, "running");
@@ -487,6 +463,7 @@ test("stop refuses a final acknowledgement when the terminal snapshot save fails
     const accepted = await first.client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "stop-save-fault", description: "fault" };',
           'return await agent("block");',
@@ -562,6 +539,7 @@ test("stop refuses a final acknowledgement when the stopped event append fails",
     const accepted = await first.client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "stop-event-fault", description: "fault" };',
           'return await agent("block");',
@@ -612,7 +590,7 @@ test("stop is retry-safe for terminal runs and cold-stops an orphaned persisted 
   try {
     const completed = await firstConnection.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     completedRunId = runIdOf(completed);
     const repeated = await firstConnection.client.callTool({
@@ -675,6 +653,7 @@ test("stop clears durable checkpoint context on a paused live run", async () => 
     const paused = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "paused-stop", description: "paused stop" };',
           'return await checkpoint("approve", { headless: "pause" });',
@@ -695,56 +674,5 @@ test("stop clears durable checkpoint context on a paused live run", async () => 
     assert.equal(persisted.checkpointContext, undefined);
   } finally {
     await dispose();
-  }
-});
-
-test("stop cancels an in-flight foreground checkpoint elicitation", async () => {
-  const server = createWorkflowServer(okRunner());
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const client = new Client(
-    { name: "stop-elicitation-client", version: "0.0.0" },
-    { capabilities: { elicitation: {} } },
-  );
-  let elicitationStarted = false;
-  let elicitationCancelled = false;
-  client.setRequestHandler('elicitation/create', (_request, ctx) => {
-    elicitationStarted = true;
-    return new Promise((resolve) => {
-      ctx.mcpReq.signal.addEventListener(
-        "abort",
-        () => {
-          elicitationCancelled = true;
-          resolve({ action: "cancel" });
-        },
-        { once: true },
-      );
-    });
-  });
-  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-  try {
-    const foreground = client.callTool({
-      name: "workflow",
-      arguments: {
-        script: [
-          'export const meta = { name: "elicitation-stop", description: "stop a prompt" };',
-          'return await checkpoint("approve this", { headless: "pause" });',
-        ].join("\n"),
-      },
-    });
-    await waitUntil(() => elicitationStarted, "the client should receive the checkpoint elicitation");
-    const listed = await client.listResources();
-    const resource = listed.resources.find((candidate) => candidate.name.startsWith("elicitation-stop script ("));
-    assert.ok(resource);
-    const runId = resource.uri.split("/").at(-2);
-    assert.ok(runId);
-
-    const stopped = await client.callTool({ name: "workflow", arguments: { action: "stop", runId } });
-    assert.equal(structured(stopped)?.status, "aborted");
-    await waitUntil(() => elicitationCancelled, "stop should cancel the pending MCP elicitation request");
-    const foregroundResult = await foreground;
-    assert.equal(structured(foregroundResult)?.status, "aborted");
-  } finally {
-    await client.close();
-    await server.close();
   }
 });

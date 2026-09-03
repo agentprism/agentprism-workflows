@@ -66,7 +66,7 @@ test("the workflow tool is listable and callable before notifications/initialize
   // failure surfaced precisely as a missing structuredContent here.
   const result = await client.callTool({
     name: "workflow",
-    arguments: { script: 'export const meta = { name: "x", description: "x" };\nreturn 1;' },
+    arguments: { action: "run", script: 'export const meta = { name: "x", description: "x" };\nreturn 1;' },
   });
   assert.equal(result.isError ?? false, false, JSON.stringify(result.content));
   assert.ok(result.structuredContent, "a first tools/call must carry structuredContent");

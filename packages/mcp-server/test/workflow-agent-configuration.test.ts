@@ -14,11 +14,26 @@ const meta: WorkflowMeta = {
 };
 
 const calls: ValidatedAgentCall[] = [
-  { index: 0, label: "researcher", phase: "Research", backend: "claude", schema: false },
-  { index: 1, label: "reviewer", phase: "Review", backend: "claude", schema: true },
+  {
+    index: 0,
+    label: "researcher",
+    promptPreview: "Find primary sources for the release claim.",
+    phase: "Research",
+    backend: "claude",
+    schema: false,
+  },
+  {
+    index: 1,
+    label: "reviewer",
+    promptPreview: "Review the evidence and identify unsupported claims.",
+    phase: "Review",
+    backend: "claude",
+    schema: true,
+  },
   {
     index: 2,
     label: "pinned",
+    promptPreview: "Run the final implementation review.",
     phase: "Review",
     model: "codex/gpt-fixed",
     backend: "codex",
@@ -99,6 +114,8 @@ test("builds one flat form for every observed agent call with phase context", ()
   assert.match(plan.request.message, /Collect primary evidence/);
   assert.match(plan.request.message, /Review — reviewer/);
   assert.match(plan.request.message, /Check the evidence/);
+  assert.match(plan.request.message, /Task: Find primary sources for the release claim/);
+  assert.match(plan.request.message, /Task: Review the evidence and identify unsupported claims/);
 
   const firstRoute = plan.request.requestedSchema.properties.agent_0_model;
   assert.equal(firstRoute.type, "string");

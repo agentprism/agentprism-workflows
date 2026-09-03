@@ -4,84 +4,78 @@ Status: **implemented MCP contract**.
 
 ## Scope
 
-The model-facing `workflow` tool has a simple stored-content new-run action:
+The model-facing `workflow` tool continues one already-admitted run in place:
 
 ```ts
 interface WorkflowResumeToolInput {
   action: "resume";
   runId: string;
-  args?: unknown;
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
   background?: boolean;
 }
 ```
 
-`runId` always names an existing source. The action never resumes that ID in place: it submits a
-new manager execution with `resumeFromRunId` set to the source and returns the fresh target ID. The
-manager persists the ordinary `resumeSourceRunId` lineage, inherited replay seed, eligibility, and
-terminal report. The source remains immutable.
+`runId` is both the input and output run identity. Resume never allocates a child run, exposes an
+attempt identity, accepts new script content, or accepts replacement args. It reloads the persisted
+script, args, canonical host-owned agent configuration, journal, event stream, cumulative usage,
+checkpoint decisions, and eligible interrupted ACP session state. The same event stream continues
+from its durable cursor and provider usage is added to the run's existing total.
 
-The server loads the source from its project store and uses the exact persisted script. Omitted
-`args` uses the persisted strict-JSON args; an explicit JSON value, including `null`, replaces them.
-When the stored value is needed, `argsUnreplayable` fails directly before validation or target
-creation. An explicit replacement does not read the unreplayable value. Missing source records,
-unreadable/corrupt persistence, and missing/unreadable persisted scripts likewise fail directly and
-never silently start live.
+`maxAgents`, `concurrency`, and `agentRetries` are runtime controls for the continuing execution;
+they do not change logical inputs or agent routing. `background:true` returns after the continuation
+has been durably admitted under the same run lease. Foreground waits for the same run to settle.
 
-Resume accepts only the new run's operational execution overrides, replay policy, durable
-checkpoint replies, and background choice. It never copies source limits. Omitted limits resolve
-through the current manager defaults exactly like an ordinary new run. `projectDir`, `script`,
-`scriptPath`, and `resumeFromRunId` are forbidden on this simple branch because the source `runId`
-selects the project, content, and lineage.
+The MCP schema accepts no replacement script, arguments, provider selection, or source-run
+selector. The Run action accepts explicit new content only and cannot name a prior run.
 
-## Source lifecycle and replay
+## Canonical admission
 
-Completed, failed, aborted, and resumable paused sources are eligible when their persisted data
-passes normal journal-integrity checks. Terminal abort status and `abortSignaled` are diagnostic,
-not run-wide replay gates. Completed matching calls from an aborted source therefore retain normal
-content-addressed replay and zero current provider usage. Interrupted, failed, ambiguous, changed,
-or otherwise uncorrespondable occurrences run live under the existing fail-to-live matcher.
+Before the first live call, the host atomically persists a versioned admission snapshot containing
+the canonical effective occurrence-indexed model/mode/config selection, host-pinned default model,
+approved script backend map, selection hash, source, and admission timestamp. Raw form fields are
+never persisted. A continued run uses that snapshot without probing or eliciting again.
 
-Checkpoint pauses use the same action with `checkpointReplies` keyed by the source
-`checkpointContext.callIndex`. Background resume performs the normal critical initial save before
-acknowledging. A fresh server process can hydrate and resume the same persisted source without any
-in-memory source state.
+Strict occurrence coverage remains active for the life of the run. If execution reaches an agent
+occurrence that admission did not cover, the occurrence is durably recorded and the run fails
+closed. Every later resume refuses with `admission-uncovered`. A pre-contract run with no valid
+admission snapshot remains observable when its stored data permits, but MCP continuation refuses
+with a named admission error and instructs the caller to start a fresh Run. There is no migration,
+mapping guess, or fallback selection.
 
-## Advanced edited replay and compatibility
+## Checkpoint decisions
 
-The existing Run action remains the advanced path:
+`checkpointReplies` keys name this run's exact `checkpointContext.callIndex`. The reply must be
+strict JSON. Under the run lease, the first reply is appended to the durable journal before script
+continuation or acknowledgement. Repeating that exact value is idempotent. A later different value
+is reported as ignored and the first durable value remains authoritative. Cold reconstruction
+replays that decision forever and never re-asks the checkpoint.
 
-```ts
-{
-  action: "run",
-  script?: string,
-  scriptPath?: string,
-  args?: unknown,
-  resumeFromRunId: string,
-  // ordinary new-run overrides
-}
-```
+Only paused or failed continuable runs may start execution again. Missing, lease-owned,
+not-continuable, and admission-missing/invalid/uncovered states are tool errors naming the reason.
+Running, terminal, auth-blocked, and unanswered-checkpoint states are not errors: the response is
+the run's current observation (the same shape as `status`, including the pending `authContext` or
+`checkpointContext` and any reported checkpoint resolutions) with guidance on what to do next.
+Completed and aborted runs are terminal.
 
-Run still requires exactly one explicit content source. This preserves edited-script and
-edited-args replay, including kill-patch-resume. It uses the same manager-owned matcher, lineage,
-zero-current-usage replay behavior, and operational non-inheritance.
+Only a newly accepted answer for the pending checkpoint moves the run past that pause. An
+idempotent repeat or an ignored conflict for an already-journaled checkpoint is reported but never
+substitutes for the missing decision, and it never lets a later checkpoint fall back to its
+authored default. A foreground resume from a form-capable client elicits the pending checkpoint
+directly (and every later checkpoint the continuation reaches) through the same `inputRequired`
+lifecycle a fresh run uses; the client's retry re-enters as `resume` with `checkpointReplies` for
+that call, merged with any replies the original resume carried. A retry that names a checkpoint
+the run is no longer paused at continues with the caller's original replies so the response
+reports the durable decision or the checkpoint that is now pending.
 
-The output's admission-only `scriptSource` union adds `"stored"` for direct foreground and
-background simple-resume responses. Later status cannot infer an admission source and continues to
-omit that field. MCP Apps must use the result's new `runId` for resume calls, never the input's
-source ID.
+## Protocol and verification
 
-The completed action train publishes a strict seven-action Zod `oneOf`. Resume is one object branch
-with required literal `action` and `runId`, only its optional args/new-run/replay fields, and
-`additionalProperties:false`; script/project/status/result/control fields therefore fail at the
-MCP schema boundary. The same canonical Zod union performs runtime validation.
+The stateful legacy 2025 transport and stateless `2026-07-28` transport expose this identical
+lifecycle through one implementation. Their elicitation fulfillment mechanics differ, but their
+workflow schema and same-ID behavior do not.
 
-## Verification
-
-Focused coverage pins stored-script/default-args replay, explicit args and operational overrides,
-fresh IDs and lineage, completed/failed/aborted/checkpoint-paused sources, missing and unreadable
-content, unreplayable default args, background admission, zero-usage replay, and persistence restart.
+Focused coverage pins stable run IDs, immutable script/args/config, cumulative usage, exact journal
+prefix replay, cold continuation, admission failures, lease races, first-answer checkpoint
+durability, idempotent repeats, ignored conflicts, and both protocol eras.

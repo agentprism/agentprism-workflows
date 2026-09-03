@@ -1,29 +1,23 @@
-# Workflow resume and extension reference
+# Workflow continuation and extension reference
 
 **Context:** JavaScript passed to the MCP `workflow` tool. Workflow scripts use `agent(prompt, options?)`; REPL evals use a different API.
 
-## Determinism & the resume journal
+## Same-run continuation journal
 
-> **Resume rule:** replay is content-addressed and fail-to-live on correspondence: a completed call replays when its identity and input fingerprint match uniquely. Filesystem or world state never gates replay.
+Each `agent()` and `checkpoint()` result is journaled under a monotonic call index and identity hash.
+MCP `{ action:"resume", runId }` reloads the same run's persisted script, args, canonical effective
+agent configuration, journal, events, cumulative usage, and checkpoint decisions. It returns the
+same `runId`; there is no public execution-attempt or child-run model.
 
-The guide section **Determinism and resume** carries the full semantics: what each hash contains, matching, admission, continuation of interrupted calls, and checkpoint replay. Wire-level specifics for lookup:
+The canonical agent identity fields are `prompt`, resolved `model`, authored `mode`, non-empty
+sorted `configOptions`, `tier`, `phase`, `agentType`, resolved agent definition, and `schema`.
+Exact journal hits reconstruct completed calls without current provider usage. Eligible interrupted
+ACP calls may reattach at the live boundary. New live usage is added to the prior cumulative total.
 
-- Each `agent()` result is journaled under a monotonic call index and a SHA-256 identity hash. The canonical identity fields, in order, are `prompt`, resolved `model`, `mode` only when set, `configOptions` only when non-empty, `tier`, `phase`, `agentType`, resolved `agentDef`, and `schema`. Config-option keys are sorted before serialization. Missing fields other than `mode` and `configOptions` serialize as `null`; an unset `mode` and an unset/empty `configOptions` key are omitted for compatibility with older journals.
-- `agentDef` is the resolved definition's tools, disallowed tools, model, isolation, and body prompt. Changing a named definition therefore invalidates its call even when the `agentType` name is unchanged.
-- The legacy `resume: { filesystem: "read-only" }` annotation has no effect on admission or matching. Writers, readers, worktree calls, and unannotated calls follow the same journal rule.
-- `resumePolicy: "positional"` requests index/prefix correspondence but cannot bypass new-format format, metadata, manifest, cwd, or input checks. Marker-less journals and permanently marked manual/same-run legacy resumes retain historical hash-only positional behavior. Sources below input format 2 use `inputs-format-legacy`. Ancestor-scoped rows carried by a ≤0.23 resume hop replay only while that ancestor is still persisted; engine-minted nested scopes and deleted ancestor scopes stay live.
-- There is no `require`, `import`, Node API, or network API in the realm. `Date.now()`, `Math.random()`, and no-arg `new Date()` / `Date()` fail static validation; aliased or computed forms are blocked at runtime; `new Date(value)` works.
-
-Every new-run resume exposes `replayEligibility` on background acknowledgement, status, and the terminal result. It reports strategy, predicted/observed replayable prefix and counts, first non-replay/reason/detail, engine/input-format diagnostics, non-gating runtime/environment `provenanceChanges`, and non-gating operational changes; `resumeReport` retains the complete terminal per-call correspondence.
-
-An all-live outcome is expected when correspondence cannot be established, not when the world changed. Missing resume metadata, incompatible format literals, or an invalid manifest/seed can disable reuse. A new-format source containing any result row without a captured call path/input fact—possible with a call stack deeper than the raw-frame cap or a non-strict-JSON `meta` value—is source-wide `"manifest-invalid"`; excluding the row could make an ambiguous sibling look unique. Format-1 bytes are never reinterpreted; they enter the positional bridge and replayed rows are recorded under format 2.
-
-An args-controlled cap is the useful case: a cap that changes how many calls are reachable, but
-does not appear in an earlier call's prompt, lets those calls replay on resume. The worked example lives in `workflow/determinism-and-resume`. MCP `{ action:"resume", runId, args? }` creates a new run from the source's immutable stored script and stored-or-explicit strict-JSON args. It works from completed, failed, aborted, and resumable paused sources, never inherits their operational limits, and rejects missing/unreadable source content or unreplayable stored args. MCP Run with explicit content and `resumeFromRunId`, plus
-`WorkflowManager.runSync(script, newArgs, { resumeFromRunId })`, are the edited-content forms. `WorkflowManager.resume(runId)` is a
-different same-ID recovery API: it reloads the persisted original script/args and permanently uses
-legacy positional replay semantics, while the independent default-on channel may still continue an
-eligible usage/auth-interrupted live call.
+The host persists a versioned canonical admission snapshot before execution. Same-ID continuation
+uses it without new provider/model elicitation. Missing, invalid, or uncovered admission metadata
+fails closed. Checkpoint replies are first-writer-wins under the run lease and become permanent
+journal facts.
 
 ## <a name="custom-backends-metabackends"></a>Custom backends — `meta.backends`
 
@@ -34,29 +28,36 @@ export const meta = {
     browser: {
       command: "browser-acp",          // required: executable (absolute or on PATH)
       args: ["--headless"],            // default []
-      env: { BROWSER_PROFILE: "qa" },  // merged OVER the child's inherited env — per-backend secrets go here
-      sessionMeta: { viewport: "desktop" },  // static ACP _meta on every session/new (per-call `meta` merges over it)
-      structuredOutputTool: true,      // default true; false = keep this backend on the prompt/_meta schema fallback
+      env: { BROWSER_PROFILE: "qa" },  // merged over the child's inherited env
+      sessionMeta: { viewport: "desktop" },
+      structuredOutputTool: true,
     },
   },
 };
 ```
 
-Script-declared backends are **trust-gated**: they spawn commands on the host machine, so they stay inert until the composition root approves them — elicitation approval in the MCP server, `allowScriptBackends: true` (or a per-backend callback) on `runDynamicWorkflow`, `ExecOptions.scriptBackends` on a manager, or `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1`. A *declined* backend aborts the run rather than silently rerouting its calls to the default backend. Host-registered names always win over script declarations. Prefer host registration (`createAcpRunner({ backends })` / `AGENTPRISM_BACKENDS` env JSON) when you control the host.
+Script-declared backends spawn commands on the host and are trust-gated before admission. The MCP
+server obtains explicit approval; SDK hosts use `allowScriptBackends`, `ExecOptions.scriptBackends`,
+or their configured environment policy. A declined backend aborts admission rather than rerouting.
+Host-registered names win. Approved canonical backend definitions are stored in the run's admission
+snapshot so continuation never re-elicits or changes them.
 
 ## <a name="agenttype-definitions"></a>`agentType` definitions
 
-Markdown files at `<runCwd>/.agentprism/agents/<name>.md` (project) and `~/.agentprism/agents/<name>.md` (user); project wins on name collision. Frontmatter + body:
+Markdown files at `<runCwd>/.agentprism/agents/<name>.md` and
+`~/.agentprism/agents/<name>.md`; project wins:
 
 ```markdown
 ---
 description: Read-only security auditor
-tools: [read, grep, glob]        # allowlist of tool names (omit = all)
-disallowedTools: [bash]          # denylist, applied after the allowlist
-model: claude/opus[1m]           # verified id; agent({ model }) overrides it
-isolation: worktree              # optional
+tools: [read, grep, glob]
+disallowedTools: [bash]
+model: claude/opus[1m]
+isolation: worktree
 ---
 You are a security auditor. Report findings; never modify files.
 ```
 
-The body is prepended to the agent's task as role guidance. An unknown `agentType` logs a warning and runs with default tools/model (the name degrades to a prose hint).
+The body is prepended to the task. An unknown type warns and degrades to defaults. The resolved
+definition participates in agent identity, so a same-run continuation only replays the exact
+definition captured by its journal and admitted configuration.

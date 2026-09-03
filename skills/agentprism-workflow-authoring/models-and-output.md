@@ -14,12 +14,17 @@ The published examples use ids verified against live harness catalogs: `claude/o
 
 Never guess model ids, mode ids, effort values, or option names from memory. With MCP, call the `workflow` tool using `action:"config"` and optional `harnesses` / `modelFilter`; it returns the live catalog without starting a workflow.
 
-One no-prompt session per harness, zero tokens: each successful harness entry contains `modes`, `defaultModeId`, and its config-option catalog. A non-null `modes` object carries the raw advertised ids, names, descriptions, and `_meta`. Omitted modes use Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode; every authored/default id must be advertised. Config options list model ids (including bracket variants like `opus[1m]`), effort levels, and every other negotiable option exactly as the installed harness advertises them. `probed:true` means session/config discovery succeeded, **not** that every backend has proven it can authenticate a first prompt: ACP has no universal zero-token auth-status method, and some agents defer that check. Automatic MCP default selection treats failed probes and explicitly empty built-in model catalogs as unavailable, prefers stronger session-open evidence (Codex authorization; Pi's credential-filtered catalog), then falls back to the first session-ready backend whose prompt readiness is unknown. One additional caveat: the bare `config` probe reads each harness with its **default model** selected, and option domains are **model-specific**. An option can appear only after a particular model is selected. Ceilings differ per model. Provider-served variants of the same model can advertise different domains. The authoritative per-model probe is the validator run on your real script: it selects each authored model spec first and echoes that pair's advertised modes and options. Confirm every pinned value against its own echoed entry; do not read package internals to discover options.
+One no-prompt session per harness, zero tokens: each successful harness entry contains `modes`, `defaultModeId`, and its config-option catalog. A non-null `modes` object carries the raw advertised ids, names, descriptions, and `_meta`. Omitted modes use Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode; every authored/default id must be advertised. For trusted autonomous implementation/review workflows, select Claude `bypassPermissions` or Codex `agent` when advertised. Claude `auto` uses a model classifier and may request permission; it is not full-access autonomy. Config options list model ids (including bracket variants like `opus[1m]`), effort levels, and every other negotiable option exactly as the installed harness advertises them. `probed:true` means session/config discovery succeeded, **not** that every backend has proven it can authenticate a first prompt: ACP has no universal zero-token auth-status method, and some agents defer that check. Automatic MCP default selection treats failed probes and explicitly empty built-in model catalogs as unavailable, prefers stronger session-open evidence (Codex authorization; Pi's credential-filtered catalog), then falls back to the first session-ready backend whose prompt readiness is unknown. One additional caveat: the bare `config` probe reads each harness with its **default model** selected, and option domains are **model-specific**. An option can appear only after a particular model is selected. Ceilings differ per model. Provider-served variants of the same model can advertise different domains. The authoritative per-model probe is the validator run on your real script: it selects each authored model spec first and echoes that pair's advertised modes and options. Confirm every pinned value against its own echoed entry; do not read package internals to discover options.
+
+Before a new MCP run is admitted, every observed call's configuration form also shows phase
+title/detail, label, and a bounded credential-redacted task preview. Accepted values are converted
+to a versioned canonical effective snapshot and atomically persisted at admission; raw form fields
+are not stored. Same-ID continuation inherits that snapshot without another form.
 
 ```js
 const plan   = await agent(PLAN_PROMPT,          { label: "plan",      model: "opencode/zai/glm-5.2", schema: PLAN });
-const impl   = await agent(implPrompt(plan),     { label: "implement", model: "codex/gpt-5.6-sol" });
-const review = await agent(reviewPrompt(impl),   { label: "review",    model: "claude/opus[1m]", schema: REVIEW });
+const impl   = await agent(implPrompt(plan),     { label: "implement", model: "codex/gpt-5.6-sol", mode: "agent" });
+const review = await agent(reviewPrompt(impl),   { label: "review",    model: "claude/opus[1m]", mode: "bypassPermissions", schema: REVIEW });
 ```
 
 Use `configOptions` only for exact ACP session options advertised by that routed harness. With MCP, read the selected harness's `action:"config"` result before choosing ids or select values; catalogs vary by harness version, login, and machine.
@@ -28,6 +33,7 @@ Use `configOptions` only for exact ACP session options advertised by that routed
 const impl = await agent(implPrompt(plan), {
   label: "implement",
   model: "codex",
+  mode: "agent",
   configOptions: { "fast-mode": true, reasoning_effort: "high" },
 });
 ```

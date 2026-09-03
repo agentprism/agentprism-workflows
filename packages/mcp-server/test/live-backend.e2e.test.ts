@@ -281,7 +281,7 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
 
     poller = setInterval(pollOnce, 150);
 
-    const callPromise = client.callTool({ name: "workflow", arguments: { script, concurrency: 3 } }, {
+    const callPromise = client.callTool({ name: "workflow", arguments: { action: "run", script, concurrency: 3 } }, {
       onprogress: () => {
         out.progressEvents++;
       },
