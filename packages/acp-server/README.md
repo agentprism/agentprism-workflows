@@ -72,6 +72,219 @@ proxy stores no session-routing table.
 Built-in backend IDs are `claude`, `codex`, `opencode`, and `pi`. Custom backends use the existing
 `AGENTPRISM_BACKENDS` registry.
 
+## Using the official TypeScript client SDK
+
+Install the router, the official ACP TypeScript SDK, and a TypeScript runner:
+
+```bash
+pnpm add @automatalabs/acp-server @agentclientprotocol/sdk
+pnpm add --save-dev tsx @types/node
+```
+
+The following examples are consecutive sections of one `router-client.ts` file. They follow the
+official SDK's [current client example](https://github.com/agentclientprotocol/typescript-sdk/blob/main/src/examples/client.ts):
+`client(...).onRequest(...).connectWith(...)`, `ctx.request(...)`, and the
+`buildSession(...).withSession(...)` active-session API. The helper starts a fresh
+`agentprism-acp-server` stdio process for each connection. The example permission handler rejects
+safely; replace it with the application's actual user-confirmation UI.
+
+### Shared client and stdio setup
+
+```ts
+import { spawn } from "node:child_process";
+import { Readable, Writable } from "node:stream";
+import * as acp from "@agentclientprotocol/sdk";
+
+const ROUTER_NAMESPACE = "@automatalabs/agentprism";
+const PROBE_METHOD = "_automatalabs/agentprism/backends/probe";
+
+type ProbeBackendsParams = {
+  cwd: string;
+  additionalDirectories?: string[];
+  mcpServers: acp.McpServer[];
+  _meta?: Record<string, unknown> | null;
+};
+
+type BackendProbe =
+  | {
+      id: string;
+      name: string;
+      available: true;
+      agentInfo?: acp.Implementation | null;
+      agentCapabilities?: acp.AgentCapabilities;
+      modes?: acp.SessionModeState | null;
+      configOptions?: acp.SessionConfigOption[] | null;
+      initializeMeta?: Record<string, unknown> | null;
+      sessionMeta?: Record<string, unknown> | null;
+    }
+  | {
+      id: string;
+      name: string;
+      available: false;
+      stage: "initialize" | "session/new";
+      error: string;
+    };
+
+type ProbeBackendsResult = { backends: BackendProbe[] };
+
+class RouterClient implements acp.Client {
+  async requestPermission(
+    params: acp.RequestPermissionRequest,
+  ): Promise<acp.RequestPermissionResponse> {
+    const reject = params.options.find(
+      (option) => option.kind === "reject_once" || option.kind === "reject_always",
+    );
+    return reject
+      ? { outcome: { outcome: "selected", optionId: reject.optionId } }
+      : { outcome: { outcome: "cancelled" } };
+  }
+
+  async sessionUpdate(params: acp.SessionNotification): Promise<void> {
+    const update = params.update;
+    if (
+      update.sessionUpdate === "agent_message_chunk" &&
+      update.content.type === "text"
+    ) {
+      process.stdout.write(update.content.text);
+    } else {
+      console.error(`[${update.sessionUpdate}]`);
+    }
+  }
+}
+
+const client = new RouterClient();
+
+function initializeRequest(
+  mode: "discovery" | "backend",
+  backend?: string,
+): acp.InitializeRequest {
+  return {
+    protocolVersion: acp.PROTOCOL_VERSION,
+    clientInfo: { name: "agentprism-router-example", version: "1.0.0" },
+    clientCapabilities: {
+      _meta: {
+        [ROUTER_NAMESPACE]: {
+          acpRouter: { versions: [1] },
+        },
+      },
+    },
+    _meta: {
+      [ROUTER_NAMESPACE]: {
+        acpRouter:
+          mode === "discovery"
+            ? { version: 1, mode }
+            : { version: 1, mode, backend },
+      },
+    },
+  };
+}
+
+async function withRouter<T>(
+  operation: (ctx: acp.ClientContext) => Promise<T>,
+): Promise<T> {
+  const pnpm = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+  const child = spawn(pnpm, ["exec", "agentprism-acp-server"], {
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  if (!child.stdin || !child.stdout) throw new Error("router stdio unavailable");
+
+  const stream = acp.ndJsonStream(
+    Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
+    Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
+  );
+
+  try {
+    return await acp
+      .client({ name: "agentprism-router-example" })
+      .onRequest(acp.methods.client.session.requestPermission, (ctx) =>
+        client.requestPermission(ctx.params),
+      )
+      .connectWith(stream, operation);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+  }
+}
+```
+
+### Discover configured backends
+
+Discovery uses one initialized connection and the router-owned probe extension. The generic
+`request<Response, Params>()` overload is the official SDK path for custom methods:
+
+```ts
+const cwd = process.cwd();
+
+const { backends } = await withRouter(async (ctx) => {
+  await ctx.request(
+    acp.methods.agent.initialize,
+    initializeRequest("discovery"),
+  );
+
+  return ctx.request<ProbeBackendsResult, ProbeBackendsParams>(PROBE_METHOD, {
+    cwd,
+    mcpServers: [],
+  });
+});
+
+for (const backend of backends) {
+  if (backend.available) {
+    console.log(`${backend.id}: available (${backend.agentInfo?.name ?? backend.name})`);
+  } else {
+    console.log(`${backend.id}: unavailable at ${backend.stage}: ${backend.error}`);
+  }
+}
+```
+
+### Pin a backend, create a session, and prompt
+
+Backend operation uses a second initialized connection. The selection is repeated in
+`session/new`; the SDK's active-session helper then sends ordinary ACP traffic without additional
+router metadata. `session.sessionId` is the selected backend's native session ID.
+
+```ts
+const selected = process.argv[2] ?? backends.find((backend) => backend.available)?.id;
+if (!selected) throw new Error("No configured backend is available");
+
+await withRouter(async (ctx) => {
+  const initialized = await ctx.request(
+    acp.methods.agent.initialize,
+    initializeRequest("backend", selected),
+  );
+  console.log(`Connected to ${selected} using ACP v${initialized.protocolVersion}`);
+
+  await ctx
+    .buildSession({
+      cwd,
+      mcpServers: [],
+      _meta: {
+        [ROUTER_NAMESPACE]: {
+          acpRouter: { version: 1, backend: selected },
+        },
+      },
+    })
+    .withSession(async (session) => {
+      console.log(`Native backend session: ${session.sessionId}`);
+      session.prompt("Summarize this repository in three bullets.");
+
+      for (;;) {
+        const message = await session.nextUpdate();
+        if (message.kind === "stop") {
+          console.log(`\nStop reason: ${message.stopReason}`);
+          return message.response;
+        }
+
+        await client.sessionUpdate(message.notification);
+      }
+    });
+});
+```
+
+Run the file with an available backend ID from the discovery output:
+
+```bash
+pnpm exec tsx router-client.ts codex
+```
+
 ## Library API
 
 ```ts

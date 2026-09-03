@@ -13,7 +13,8 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packagesDir = join(repoRoot, "packages");
-const iconSource = join(repoRoot, "docs", "assets", "agentprism-mark.svg");
+const iconDir = join(repoRoot, "docs", "assets");
+const defaultIconFile = "agentprism-mark.svg";
 
 const REGISTRY_VERSION = "1.0.0";
 const REGISTRY_SITE_PATH = "acp-registry/v1/latest";
@@ -25,9 +26,26 @@ const RETRY_DELAY_MS = 1_000;
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 // This is the intentional publication allowlist. Discovery below fails if a
-// public @automatalabs/*-acp package is added without a corresponding entry,
-// so a new in-repo ACP server cannot be silently omitted from the registry.
+// public in-repo ACP server package is added without a corresponding entry, so
+// one cannot be silently omitted from the registry. ACP servers conventionally
+// end in `-acp`; `acp-server` is the extension-aware aggregation entry point.
+const ACP_PACKAGE_NAME_EXCEPTIONS = Object.freeze(["@automatalabs/acp-server"]);
 const AGENT_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    id: "agentprism-acp-server",
+    name: "AgentPrism ACP Server",
+    package: "@automatalabs/acp-server",
+    bin: "agentprism-acp-server",
+    iconFile: "agentprism-acp-server.svg",
+    description:
+      "AgentPrism's extension-aware ACP router for discovering configured backends and pinning one per client connection.",
+    repository: "https://github.com/agentprism/agentprism-workflows",
+    website:
+      "https://github.com/agentprism/agentprism-workflows/tree/main/packages/acp-server#readme",
+    authors: Object.freeze(["Automata Labs"]),
+    license: "Apache-2.0",
+    license_url: "https://github.com/agentprism/agentprism-workflows/blob/main/LICENSE",
+  }),
   Object.freeze({
     id: "agentprism-codex-acp",
     name: "AgentPrism Codex ACP",
@@ -59,7 +77,7 @@ const AGENT_DEFINITIONS = Object.freeze([
 const outputDir = parseOutputDir(process.argv.slice(2));
 const localPackages = await discoverPublishedAcpPackages();
 requireCompleteDefinitions(localPackages);
-await validateIconSource();
+await validateIconSources();
 
 // Finish every network/package validation before creating output. A failed
 // refresh therefore cannot leave a plausible but incomplete registry artifact.
@@ -75,7 +93,7 @@ const registryDir = join(outputDir, ...REGISTRY_SITE_PATH.split("/"));
 await mkdir(registryDir, { recursive: true });
 await Promise.all([
   writeJson(join(registryDir, "registry.json"), registry),
-  ...agents.map((agent) => copyFile(iconSource, join(registryDir, `${agent.id}.svg`))),
+  ...agents.map((agent) => copyFile(iconSourceFor(agent.id), join(registryDir, `${agent.id}.svg`))),
 ]);
 
 console.log(
@@ -118,7 +136,7 @@ async function discoverPublishedAcpPackages() {
     if (
       typeof manifest.name !== "string" ||
       !manifest.name.startsWith("@automatalabs/") ||
-      !manifest.name.endsWith("-acp") ||
+      !(manifest.name.endsWith("-acp") || ACP_PACKAGE_NAME_EXCEPTIONS.includes(manifest.name)) ||
       manifest.private === true
     ) {
       continue;
@@ -136,7 +154,7 @@ async function discoverPublishedAcpPackages() {
     discovered.set(manifest.name, { manifest, manifestPath });
   }
 
-  if (discovered.size === 0) throw new Error("no published @automatalabs/*-acp packages found");
+  if (discovered.size === 0) throw new Error("no published @automatalabs ACP server packages found");
   return discovered;
 }
 
@@ -266,17 +284,28 @@ function publishedBinNames(bin) {
   return Object.keys(bin);
 }
 
-async function validateIconSource() {
-  const icon = await readFile(iconSource, "utf8");
-  if (
-    !/<svg\b/.test(icon) ||
-    !/\bwidth="16"/.test(icon) ||
-    !/\bheight="16"/.test(icon) ||
-    !/\bviewBox="0 0 16 16"/.test(icon) ||
-    !/currentColor/.test(icon)
-  ) {
-    throw new Error(`${iconSource}: ACP icon must be a 16x16 currentColor SVG`);
+async function validateIconSources() {
+  const sources = new Set(
+    AGENT_DEFINITIONS.map((definition) => join(iconDir, definition.iconFile ?? defaultIconFile)),
+  );
+  for (const source of sources) {
+    const icon = await readFile(source, "utf8");
+    if (
+      !/<svg\b/.test(icon) ||
+      !/\bwidth="16"/.test(icon) ||
+      !/\bheight="16"/.test(icon) ||
+      !/\bviewBox="0 0 16 16"/.test(icon) ||
+      !/currentColor/.test(icon)
+    ) {
+      throw new Error(`${source}: ACP icon must be a 16x16 currentColor SVG`);
+    }
   }
+}
+
+function iconSourceFor(agentId) {
+  const definition = AGENT_DEFINITIONS.find((entry) => entry.id === agentId);
+  if (!definition) throw new Error(`missing ACP registry definition for ${agentId}`);
+  return join(iconDir, definition.iconFile ?? defaultIconFile);
 }
 
 function ensureTrailingSlash(value) {
