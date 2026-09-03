@@ -4,9 +4,10 @@
 //
 // npm's bulk download endpoint does not support scoped packages, so every
 // package is queried separately. All responses must describe the same period.
-// A range 404 is accepted only when registry metadata proves the package was
-// created after the requested window, in which case its exact contribution is
-// zero; nothing is written unless every other response is valid.
+// A range 404 is reconciled against registry creation metadata. Packages
+// created after the requested window contribute exactly zero. Packages created
+// inside it are retried from their creation day and pre-creation days are
+// zero-padded; nothing is written unless every post-creation row is valid.
 //
 // npm's named `last-month` alias can lag behind its explicit-date data even
 // when cache-busting and no-cache headers are used. Build an exact 30-day UTC
@@ -67,7 +68,7 @@ const details = {
   },
   packageCount: rows.length,
   totalDownloads: total,
-  method: "Sum of validated daily rows from separate npm range requests; registry-confirmed packages created after the window contribute zero.",
+  method: "Sum of validated npm daily range rows; registry-confirmed pre-creation days contribute zero.",
   note: "Counts are per package and are not deduplicated across dependency installs.",
   packages: rows.map((row) => ({
     name: row.package,
@@ -138,6 +139,17 @@ async function discoverPublishedPackages() {
 }
 
 async function fetchPackageDownloads(packageName, period) {
+  try {
+    return await fetchDownloadRange(packageName, period);
+  } catch (error) {
+    if (error?.status === 404) {
+      return recoverPackageDownloadsAfterRange404(packageName, period);
+    }
+    throw error;
+  }
+}
+
+async function fetchDownloadRange(packageName, period) {
   const url = new URL(
     `/downloads/range/${period.parameter}/${encodeURIComponent(packageName)}`,
     ensureTrailingSlash(DOWNLOADS_API),
@@ -145,15 +157,7 @@ async function fetchPackageDownloads(packageName, period) {
   // Explicit periods change daily, but retain cache busting for repeated same-day runs and
   // intermediaries that ignore request cache directives.
   url.searchParams.set("t", `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`);
-  let response;
-  try {
-    response = await fetchWithRetry(url);
-  } catch (error) {
-    if (error?.status === 404) {
-      return zeroDownloadsForPackageCreatedAfterPeriod(packageName, period);
-    }
-    throw error;
-  }
+  const response = await fetchWithRetry(url);
 
   let payload;
   try {
@@ -220,7 +224,7 @@ async function fetchPackageDownloads(packageName, period) {
   };
 }
 
-async function zeroDownloadsForPackageCreatedAfterPeriod(packageName, period) {
+async function recoverPackageDownloadsAfterRange404(packageName, period) {
   const url = new URL(encodeURIComponent(packageName), ensureTrailingSlash(NPM_REGISTRY));
   url.searchParams.set("t", `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`);
   const response = await fetchWithRetry(url);
@@ -248,13 +252,52 @@ async function zeroDownloadsForPackageCreatedAfterPeriod(packageName, period) {
     );
   }
   const firstDayAfterPeriod = Date.parse(`${shiftIsoDate(period.end, 1)}T00:00:00.000Z`);
-  if (createdAt < firstDayAfterPeriod) {
+  if (createdAt >= firstDayAfterPeriod) {
+    return zeroDownloads(packageName, period);
+  }
+
+  const creationDay = new Date(createdAt).toISOString().slice(0, 10);
+  if (creationDay < period.start) {
     throw new Error(
       `npm downloads API returned 404 for ${packageName}, but registry metadata says it was ` +
-        `created during or before the requested period (${created})`,
+        `created before the requested period (${created})`,
     );
   }
 
+  const postCreationDays = period.days.filter((day) => day >= creationDay);
+  const postCreationPeriod = {
+    parameter: `${creationDay}:${period.end}`,
+    start: creationDay,
+    end: period.end,
+    days: postCreationDays,
+  };
+  let postCreation;
+  try {
+    postCreation = await fetchDownloadRange(packageName, postCreationPeriod);
+  } catch (error) {
+    if (error?.status === 404) {
+      throw new Error(
+        `npm downloads API returned 404 for ${packageName} both for the complete period and ` +
+          `for its registry-confirmed post-creation period ${postCreationPeriod.parameter}`,
+      );
+    }
+    throw error;
+  }
+
+  const preCreationDays = period.days.slice(0, period.days.length - postCreationDays.length);
+  return {
+    package: packageName,
+    downloads: postCreation.downloads,
+    daily: [
+      ...preCreationDays.map((day) => ({ day, downloads: 0 })),
+      ...postCreation.daily,
+    ],
+    start: period.start,
+    end: period.end,
+  };
+}
+
+function zeroDownloads(packageName, period) {
   return {
     package: packageName,
     downloads: 0,

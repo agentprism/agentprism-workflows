@@ -45,7 +45,7 @@ test("download badge uses a complete explicit 30-day UTC window", async () => {
       description: "Explicit 30-day UTC window ending two full days before generation; start and end are inclusive.",
     });
     assert.equal(details.packageCount, api.requests.length);
-    assert.equal(details.method, "Sum of validated daily rows from separate npm range requests; registry-confirmed packages created after the window contribute zero.");
+    assert.equal(details.method, "Sum of validated npm daily range rows; registry-confirmed pre-creation days contribute zero.");
     assert.equal(details.totalDownloads, perPackage * details.packageCount);
     assert.equal(badge.message, `${formatCompact(details.totalDownloads)}/month`);
     assert.match(result.stdout, new RegExp(`\\(${expectedStart}\\.\\.${expectedEnd}\\)`));
@@ -82,7 +82,44 @@ test("download badge counts a registry-confirmed post-window package as zero whe
   }
 });
 
-test("download badge rejects a range 404 for a package that existed within the window", async () => {
+test("download badge retries from an in-window package's creation day and zero-pads earlier days", async () => {
+  const outputDir = await mkdtemp(join(tmpdir(), "agentprism-npm-downloads-partial-new-package-"));
+  const newPackage = "@automatalabs/acp-server";
+  const creationDay = "2026-08-20";
+  const postCreationPeriod = `${creationDay}:${expectedEnd}`;
+  const api = await startDownloadsApi(
+    ({ period, packageName }) => packageName !== newPackage
+      ? responseFor(packageName)
+      : period === expectedPeriod
+        ? { httpStatus: 404, body: { error: "full range begins before publication" } }
+        : responseForPeriod(packageName, creationDay, expectedEnd),
+    ({ packageName }) => packageName === newPackage
+      ? { name: newPackage, time: { created: `${creationDay}T12:00:00.000Z` } }
+      : null,
+  );
+
+  try {
+    const result = await runGenerator(outputDir, api.url);
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(
+      api.requests.filter((request) => request.packageName === newPackage).map((request) => request.period),
+      [expectedPeriod, postCreationPeriod],
+    );
+
+    const details = JSON.parse(await readFile(join(outputDir, "npm-downloads-details.json"), "utf8"));
+    const row = details.packages.find((entry) => entry.name === newPackage);
+    const postCreationDayCount = isoDays(creationDay, 30).indexOf(expectedEnd) + 1;
+    assert.deepEqual(row, {
+      name: newPackage,
+      downloads: postCreationDayCount * (postCreationDayCount + 1) / 2,
+    });
+  } finally {
+    await api.close();
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test("download badge rejects a range 404 for a package created before the requested window", async () => {
   const outputDir = await mkdtemp(join(tmpdir(), "agentprism-npm-downloads-missing-existing-"));
   const missingPackage = "@automatalabs/acp-server";
   const api = await startDownloadsApi(
@@ -90,14 +127,14 @@ test("download badge rejects a range 404 for a package that existed within the w
       ? { httpStatus: 404, body: { error: "missing" } }
       : responseFor(packageName),
     ({ packageName }) => packageName === missingPackage
-      ? { name: missingPackage, time: { created: "2026-08-20T12:00:00.000Z" } }
+      ? { name: missingPackage, time: { created: "2026-08-02T12:00:00.000Z" } }
       : null,
   );
 
   try {
     const result = await runGenerator(outputDir, api.url);
     assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /downloads API returned 404.*created during or before the requested period/s);
+    assert.match(result.stderr, /downloads API returned 404.*created before the requested period/s);
     await assertNotPublished(outputDir);
   } finally {
     await api.close();
@@ -164,11 +201,18 @@ test("download badge rejects an explicit final day that has not settled", async 
 });
 
 function responseFor(packageName) {
+  return responseForPeriod(packageName, expectedStart, expectedEnd);
+}
+
+function responseForPeriod(packageName, start, end) {
+  const days = isoDays(start, 30);
+  const endIndex = days.indexOf(end);
+  assert.notEqual(endIndex, -1, `${end} must be within 30 days of ${start}`);
   return {
     package: packageName,
-    start: expectedStart,
-    end: expectedEnd,
-    downloads: expectedDays.map((day, index) => ({ day, downloads: index + 1 })),
+    start,
+    end,
+    downloads: days.slice(0, endIndex + 1).map((day, index) => ({ day, downloads: index + 1 })),
   };
 }
 
