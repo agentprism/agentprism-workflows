@@ -1,50 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import type {
-  WorkflowReplayEligibility,
-  WorkflowRunFallback,
-  WorkflowRunResult,
-} from "@automatalabs/shared-types";
+import type { WorkflowRunFallback, WorkflowRunResult } from "@automatalabs/shared-types";
 
 import { toWorkflowToolResult, workflowToolOutputShape } from "../src/workflow-tool-output.js";
-
-const replayEligibility = {
-  strategy: "positional-v1",
-  sourceRunId: "source-run",
-  fallbackReason: "inputs-format-legacy",
-  eligibility: "legacy",
-  predictedReplayablePrefix: 2,
-  replayedPrefix: 0,
-  replayed: 0,
-  live: 0,
-  failed: 0,
-  sourceEngineVersion: "0.26.0",
-  currentEngineVersion: "0.27.0",
-  engineVersionComparison: "different",
-  sourceInputsFormat: 1,
-  currentInputsFormat: 2,
-  provenanceChanges: [{
-    field: "runtime.node",
-    source: "v24.16.0",
-    current: "v24.17.1",
-    detail: "source recorded runtime.node=v24.16.0; this run: v24.17.1",
-  }],
-  operationalChanges: [
-    {
-      option: "agentRetries",
-      source: 1,
-      current: 0,
-      detail: "source recorded agentRetries=1; this run: 0",
-    },
-    {
-      option: "concurrency",
-      source: 2,
-      current: 4,
-      detail: "source recorded concurrency=2; this run: 4",
-    },
-  ],
-} as const satisfies WorkflowReplayEligibility;
 
 const baseRun: WorkflowRunResult<null> = {
   runId: "continuation-schema-run",
@@ -55,7 +14,6 @@ const baseRun: WorkflowRunResult<null> = {
   agentCount: 0,
   durationMs: 0,
   logs: [],
-  replayEligibility,
   effectiveLimits: {
     maxAgents: 50,
     concurrency: 3,
@@ -78,8 +36,6 @@ test("resolved run limits survive MCP run-result projection and schema parsing",
   if (!parsed.success) assert.fail(parsed.error.message);
   assert.deepEqual(projected.limits, baseRun.effectiveLimits);
   assert.deepEqual(parsed.data.limits, baseRun.effectiveLimits);
-  assert.deepEqual(projected.replayEligibility, replayEligibility);
-  assert.deepEqual(parsed.data.replayEligibility, replayEligibility);
   assert.equal(projected.resultUri, resources.resultUri);
   assert.equal(projected.eventsUri, resources.eventsUri);
 });

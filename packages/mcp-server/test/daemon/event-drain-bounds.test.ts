@@ -2,12 +2,12 @@
 // responsive while its event-serving path drains a large journal. Two production daemon respawns
 // traced to watchEvents re-parsing the whole journal once per record yielded — a measured
 // 115.8-second synchronous main-thread block for a 500-record catch-up on a 9.7 MB journal — which
-// starved the /healthz probe past its 2-second budget and blew every in-flight await's waitMs.
+// starved the /healthz probe past its 2-second budget and blocked every in-flight request.
 //
 // This exercise runs a real createDaemon() on loopback with a real MCP client, grows a run's
 // journal to >= 20,000 records, then loads the daemon's event loop with the exact catch-up the
 // outage hit — a watchEvents drain of the full backlog on the daemon's own manager — while a real
-// events subscription and a real in-flight await are both active, and asserts /healthz keeps
+// events subscription and a real in-flight run are both active, and asserts /healthz keeps
 // answering within 2 seconds throughout. Pre-fix the per-record whole-file re-parse monopolises
 // the shared loop and the probe cannot be serviced within budget; post-fix the drain is served
 // from the writer's cached view and yields the loop between records.
@@ -38,7 +38,7 @@ test(
   async () => {
     // NO_AGENT_SCRIPT never invokes the runner, so the growable run completes immediately even
     // though the runner gate stays shut; ONE_AGENT_SCRIPT does invoke it, giving a genuinely
-    // in-flight run to await while the gate is held.
+    // in-flight run while the gate is held.
     const { runner, release } = gatedRunner();
     const daemon = await startDaemon(runner);
     const projectDir = makeProjectDir("event-drain-bounds");
@@ -51,7 +51,7 @@ test(
       // save cadence lags its append cadence.
       const created = await session.client.callTool({
         name: "workflow",
-        arguments: { script: NO_AGENT_SCRIPT, projectDir },
+        arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir },
       });
       assert.equal(created.isError ?? false, false, textOf(created));
       const runId = structured(created)?.runId as string;
@@ -77,21 +77,16 @@ test(
       // Publish a watermark that trails the tail by LAG_RECORDS (a genuinely lagging cursor).
       persistence.save({ ...seeded, eventSeq: tail - LAG_RECORDS });
 
-      // A genuinely in-flight await: ONE_AGENT_SCRIPT invokes the gated runner, so this background
-      // run stays "running" and the await below blocks on the event path until the gate is released.
+      // ONE_AGENT_SCRIPT invokes the gated runner, so this background run stays "running" while
+      // the event path is under load.
       const inflight = await session.client.callTool({
         name: "workflow",
-        arguments: { script: ONE_AGENT_SCRIPT, background: true, projectDir },
+        arguments: { action: "run", script: ONE_AGENT_SCRIPT, background: true, projectDir },
       });
       assert.equal(inflight.isError ?? false, false, textOf(inflight));
       const inflightRunId = structured(inflight)?.runId as string;
       assert.ok(inflightRunId);
       await waitUntil(() => daemon.activeRunCount() === 1, "the gated run should be running");
-      const awaiting = session.client.callTool({
-        name: "workflow",
-        arguments: { action: "status", runId: inflightRunId, waitMs: 15_000 },
-      });
-
       // A real events subscription over the grown run (arms the daemon's watcher/notification path).
       await session.client.subscribeResource({ uri: `workflow://runs/${runId}/events` });
 
@@ -113,7 +108,7 @@ test(
         }
       })();
 
-      // Probe /healthz repeatedly while the drain, the subscription, and the in-flight await are all
+      // Probe /healthz repeatedly while the drain, subscription, and run are all
       // live. Every probe must answer within budget.
       const elapsedProbes: number[] = [];
       for (let probe = 0; probe < 5; probe++) {
@@ -127,10 +122,17 @@ test(
       }
       assert.equal(drainedCount, tail, "the full backlog must drain");
 
-      // The in-flight await stays answerable too: releasing the gate settles it promptly.
+      // Releasing the gate settles the run; status remains a non-blocking snapshot.
       released = true;
       release();
-      const settled = await awaiting;
+      await waitUntil(async () => structured(await session.client.callTool({
+        name: "workflow",
+        arguments: { action: "status", runId: inflightRunId },
+      }))?.status === "completed", "the gated run should complete");
+      const settled = await session.client.callTool({
+        name: "workflow",
+        arguments: { action: "status", runId: inflightRunId },
+      });
       assert.equal(settled.isError ?? false, false, textOf(settled));
       assert.equal(structured(settled)?.status, "completed");
 

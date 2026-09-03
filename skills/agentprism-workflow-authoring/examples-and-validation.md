@@ -33,14 +33,14 @@ const outcome = await gate(
     `Implement: ${args.feature}\nPlan:\n- ${plan.steps.join("\n- ")}\n` +
     `Run the project's tests before finishing and report results.` +
     (feedback ? `\n\nReviewer feedback on attempt ${attempt}:\n${feedback}\nAddress every point.` : ""),
-    { label: `implement:${attempt + 1}`, model: "codex/gpt-5.6-sol", retries: 1 },
+    { label: `implement:${attempt + 1}`, model: "codex/gpt-5.6-sol", mode: "agent", retries: 1 },
   ),
   async (report) => {
     if (!report) return { ok: false, feedback: "implementation agent produced no result" };
     phase("Review");
     const reviews = (await parallel([   // two reviewers on different vendors
       () => agent(`Review the working-tree diff for correctness. Implementer's report:\n${report}`,
-                  { label: "review:correctness", model: "claude/opus[1m]", schema: VERDICT }),
+                  { label: "review:correctness", model: "claude/opus[1m]", mode: "bypassPermissions", schema: VERDICT }),
       () => agent(`Review the working-tree diff for regressions and missing tests. Report:\n${report}`,
                   { label: "review:coverage", model: "opencode/zai/glm-5.2", schema: VERDICT }),
     ])).filter(Boolean);
@@ -55,7 +55,10 @@ const outcome = await gate(
 return { implemented: outcome.ok, attempts: outcome.attempts, reviewVerdict: outcome.verdict, plan };
 ```
 
-(An omitted mode uses AgentPrism's autonomous built-in default. For a read-only planner, inspect the backend-owned mode descriptions from `action:"config"` and pin the exact advertised read-only/plan id.)
+These trusted implementation/review calls pin Codex `agent` and Claude `bypassPermissions` for
+full tool autonomy. Confirm both ids in the live catalog first. Claude `auto` uses a model classifier
+and may request permission; it is not the full-access mode. For a read-only planner, select the
+exact advertised read-only/plan mode instead.
 
 ## Worked example — fully backend-agnostic audit
 
@@ -110,7 +113,6 @@ When the inline examples above aren't enough, study the complete, validated scri
 
 - [`examples/repo-triage.workflow.js`](examples/repo-triage.workflow.js) — an autonomous cross-vendor repo triage and the broadest support-API tour: `pipeline` with no inter-stage barrier, a cross-vendor verification panel, `gate()` where writer and reviewer are different vendors, nesting a saved workflow by name, `completenessCheck()`, stage gating on tracked counters, string-form `args` hardening, path guards on schema outputs, and pause-class error rethrow.
 - [`examples/quick-wins.workflow.js`](examples/quick-wins.workflow.js) — a small hunter that runs standalone *or* nested: `loopUntilDry()` with per-round vendor rotation, dedup threading via a `seen` list, and a tracked round bound (nested runs share the parent's limiter).
-- [`examples/resume-loop-cap.workflow.js`](examples/resume-loop-cap.workflow.js) — content-addressed replay: run with a low `maxRounds`, resume with a higher one; unchanged rounds replay for zero tokens (worked through in Determinism and resume).
 
 [`examples/README.md`](examples/README.md) maps each script to what it teaches.
 

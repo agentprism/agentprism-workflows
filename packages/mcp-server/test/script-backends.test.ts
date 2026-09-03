@@ -4,8 +4,8 @@ import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 
 //     AGENTPRISM_ALLOW_SCRIPT_BACKENDS env opt-in (never a silent drop, never a hang);
 //   - env opt-in set -> approved headlessly, registry threaded to the runner;
-//   - eliciting client: accept -> run proceeds (approval is session-sticky per spawn config —
-//     the second call does NOT re-prompt); decline -> tool error naming the backend;
+//   - eliciting client: accept -> that run proceeds; a separate admission asks again, while
+//     same-ID continuation inherits the admitted backend snapshot; decline -> a clear error;
 //   - scripts without meta.backends are untouched by the gate.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -19,7 +19,7 @@ const SCRIPT_WITH_BACKENDS = [
   'return await agent("p", { model: "browser" });',
 ].join("\n");
 
-const PLAIN_SCRIPT = 'export const meta = { name: "plain", description: "d" };\nreturn await agent("p");';
+const PLAIN_SCRIPT = 'export const meta = { name: "plain", description: "d" };\nreturn await agent("p", { model: "claude" });';
 
 function capturingRunner(): { runner: AgentRunner; backends: () => unknown } {
   let captured: unknown;
@@ -48,6 +48,18 @@ async function connectEliciting(
   const client = new Client({ name: "mcp-server-test", version: "0.0.0" }, { capabilities: { elicitation: {} } });
   const prompts: string[] = [];
   client.setRequestHandler('elicitation/create', async (request) => {
+    const schema = request.params.requestedSchema;
+    const required = schema.required ?? [];
+    if (required.some((field) => field.startsWith("agent_") && field.endsWith("_model"))) {
+      const content: Record<string, string> = {};
+      for (const field of required) {
+        const property = schema.properties[field] as { oneOf?: Array<{ const: string }> } | undefined;
+        const choices = property?.oneOf ?? [];
+        const preferred = choices.find((choice) => choice.const === "browser") ?? choices[0];
+        if (preferred) content[field] = preferred.const;
+      }
+      return { action: "accept" as const, content };
+    }
     prompts.push(request.params.message);
     const { action, approve } = respond(request.params.message);
     return action === "accept" ? { action, content: { approve: approve ?? true } } : { action };
@@ -56,7 +68,7 @@ async function connectEliciting(
   return {
     client,
     prompts: () => prompts,
-    callWorkflow: (script: string) => client.callTool({ name: "workflow", arguments: { script } }),
+    callWorkflow: (script: string) => client.callTool({ name: "workflow", arguments: { action: "run", script } }),
     async dispose() {
       await client.close();
       await server.close();
@@ -71,7 +83,7 @@ async function connectPlain(runner: AgentRunner) {
   const client = new Client({ name: "mcp-server-test", version: "0.0.0" }, { capabilities: {} });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   return {
-    callWorkflow: (script: string) => client.callTool({ name: "workflow", arguments: { script } }),
+    callWorkflow: (script: string) => client.callTool({ name: "workflow", arguments: { action: "run", script } }),
     async dispose() {
       await client.close();
       await server.close();
@@ -111,7 +123,7 @@ test("env opt-in approves headlessly; the registry reaches the runner", async ()
   }
 });
 
-test("eliciting client: accept -> run proceeds; approval is session-sticky (no re-prompt)", async () => {
+test("eliciting client: each new run admission explicitly approves the spawn config", async () => {
   const { runner, backends } = capturingRunner();
   const conn = await connectEliciting(runner, () => ({ action: "accept", approve: true }));
   try {
@@ -124,7 +136,7 @@ test("eliciting client: accept -> run proceeds; approval is session-sticky (no r
 
     const second = await conn.callWorkflow(SCRIPT_WITH_BACKENDS);
     assert.equal(second.isError, false);
-    assert.equal(conn.prompts().length, 1, "the SAME spawn config did not re-prompt");
+    assert.equal(conn.prompts().length, 2, "a distinct run admission obtains its own approval");
   } finally {
     await conn.dispose();
   }
@@ -156,7 +168,7 @@ test("eliciting client: accept-with-approve:false is a DENY (explicit false beat
   }
 });
 
-test("scripts WITHOUT meta.backends never hit the gate (no elicitation, no error)", async () => {
+test("scripts WITHOUT meta.backends never hit the backend-approval gate", async () => {
   const { runner, backends } = capturingRunner();
   const conn = await connectEliciting(runner, () => ({ action: "decline" }));
   try {
@@ -164,6 +176,42 @@ test("scripts WITHOUT meta.backends never hit the gate (no elicitation, no error
     assert.equal(res.isError, false);
     assert.equal(conn.prompts().length, 0);
     assert.equal(backends(), undefined);
+  } finally {
+    await conn.dispose();
+  }
+});
+
+test("same-ID continuation inherits the admitted backend snapshot without a second approval", async () => {
+  let failFirst = true;
+  const seenBackends: unknown[] = [];
+  const runner = makeRunner((_prompt, options: RunOptions) => {
+    seenBackends.push(options.backends);
+    if (failFirst) {
+      failFirst = false;
+      throw new Error("first attempt failed");
+    }
+    return "ok";
+  });
+  const conn = await connectEliciting(runner, () => ({ action: "accept", approve: true }));
+  try {
+    const script = [
+      'export const meta = { name: "sb-continue", description: "d", backends: { browser: { command: "browser-acp", env: { HEADLESS: "1" } } } };',
+      'const reply = await agent("p", { model: "browser" });',
+      'if (reply === null) throw new Error("retry me");',
+      "return reply;",
+    ].join("\n");
+    const failed = await conn.callWorkflow(script);
+    assert.equal((failed.structuredContent as { status?: string } | undefined)?.status, "failed");
+    assert.equal(conn.prompts().length, 1);
+    const runId = String((failed.structuredContent as { runId?: string }).runId);
+
+    const continued = await conn.client.callTool({ name: "workflow", arguments: { action: "resume", runId } });
+    assert.equal(continued.isError, false, textOf(continued));
+    assert.equal((continued.structuredContent as { status?: string }).status, "completed");
+    assert.equal(conn.prompts().length, 1, "the admitted backend approval is inherited, never re-asked");
+    assert.equal(seenBackends.length, 2);
+    assert.deepEqual(seenBackends[1], seenBackends[0]);
+    assert.ok((seenBackends[1] as Record<string, unknown>)?.browser);
   } finally {
     await conn.dispose();
   }

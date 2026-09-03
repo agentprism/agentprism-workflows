@@ -57,7 +57,7 @@ test("completed foreground and status expose a distinct durable result resource 
   ].join("\n");
   const { client, dispose } = await connect(okRunner(), { listTools: true });
   try {
-    const completed = await client.callTool({ name: "workflow", arguments: { script } });
+    const completed = await client.callTool({ name: "workflow", arguments: { action: "run", script } });
     const runId = String(structured(completed)?.runId);
     const scriptUri = `workflow://runs/${runId}/script`;
     const resultUri = `workflow://runs/${runId}/result`;
@@ -84,7 +84,7 @@ test("completed foreground and status expose a distinct durable result resource 
 
     const awaited = await client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 0 },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(awaited)?.resultUri, resultUri);
     assert.equal(
@@ -110,6 +110,7 @@ test("JSON null remains exact while completed undefined results fail closed", as
     const nullResult = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "null-result", description: "null is JSON" };',
           "return null;",
@@ -129,6 +130,7 @@ test("JSON null remains exact while completed undefined results fail closed", as
     const noValue = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "undefined-result", description: "no JSON value" };',
           "return undefined;",
@@ -169,7 +171,7 @@ test("large exact results stay out of summary text and page losslessly on UTF-8 
   try {
     const completed = await client.callTool({
       name: "workflow",
-      arguments: { script, args: authored },
+      arguments: { action: "run", script, args: authored },
     });
     const runId = String(structured(completed)?.runId);
     const resultUri = `workflow://runs/${runId}/result`;
@@ -241,7 +243,7 @@ test("exact result retrieval survives restart and fails closed for every unavail
   const first = await connect(okRunner());
   let completedRunId: string;
   try {
-    const completed = await first.client.callTool({ name: "workflow", arguments: { script: restartScript } });
+    const completed = await first.client.callTool({ name: "workflow", arguments: { action: "run", script: restartScript } });
     completedRunId = String(structured(completed)?.runId);
   } finally {
     await first.dispose();
@@ -276,7 +278,7 @@ test("exact result retrieval survives restart and fails closed for every unavail
   try {
     const accepted = await running.client.callTool({
       name: "workflow",
-      arguments: { script: ONE_AGENT_SCRIPT, background: true },
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT, background: true },
     });
     const runId = String(structured(accepted)?.runId);
     await waitUntil(() => releaseRunning !== undefined, "background agent should start");
@@ -300,6 +302,7 @@ test("exact result retrieval survives restart and fails closed for every unavail
     const accepted = await paused.client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "paused-result", description: "no result yet" };',
           'return await checkpoint("continue?", { headless: "pause" });',
@@ -310,7 +313,7 @@ test("exact result retrieval survives restart and fails closed for every unavail
     const runId = String(structured(accepted)?.runId);
     const terminal = await paused.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 1_000 },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(terminal)?.status, "paused");
     const unavailable = await paused.client.callTool({
@@ -341,7 +344,7 @@ test("exact result retrieval survives restart and fails closed for every unavail
     { recoverable: false },
   )));
   try {
-    const terminal = await failed.client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    const terminal = await failed.client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
     const runId = String(structured(terminal)?.runId);
     assert.equal(structured(terminal)?.status, "failed");
     const unavailable = await failed.client.callTool({
@@ -359,7 +362,7 @@ test("exact result retrieval survives restart and fails closed for every unavail
   try {
     const completed = await corruptSource.client.callTool({
       name: "workflow",
-      arguments: { script: restartScript },
+      arguments: { action: "run", script: restartScript },
     });
     corruptRunId = String(structured(completed)?.runId);
   } finally {
@@ -393,7 +396,7 @@ test("exact result retrieval survives restart and fails closed for every unavail
   const client = new Client({ name: "result-delete", version: "0.0.0" }, { capabilities: {} });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   try {
-    const completed = await client.callTool({ name: "workflow", arguments: { script: restartScript } });
+    const completed = await client.callTool({ name: "workflow", arguments: { action: "run", script: restartScript } });
     const runId = String(structured(completed)?.runId);
     assert.equal(manager.deleteRun(runId), true);
     const deleted = await client.callTool({

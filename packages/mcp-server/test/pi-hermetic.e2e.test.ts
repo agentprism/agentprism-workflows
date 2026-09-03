@@ -52,7 +52,7 @@ test("first-class pi runs end to end through pi-acp's credential-free AgentSessi
     await client.listTools();
     const response = await client.callTool({
       name: "workflow",
-      arguments: { script: SCRIPT },
+      arguments: { action: "run", script: SCRIPT },
     }, { timeout: 45_000, maxTotalTimeout: 45_000 });
     const result = response.structuredContent as Record<string, unknown> | undefined;
     assert.equal(response.isError, false, stderr);
@@ -92,7 +92,7 @@ test("first-class pi captures schema output through the injected HTTP MCP tool",
   transport.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8_000); });
   try {
     await client.connect(transport);
-    const response = await client.callTool({ name: "workflow", arguments: { script: STRUCTURED_SCRIPT } }, {
+    const response = await client.callTool({ name: "workflow", arguments: { action: "run", script: STRUCTURED_SCRIPT } }, {
       timeout: 45_000,
       maxTotalTimeout: 45_000,
     });

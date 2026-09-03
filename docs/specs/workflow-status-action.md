@@ -4,96 +4,45 @@ Status: **implemented MCP contract**.
 
 ## Scope
 
-The model-facing `workflow` tool has one canonical run-observation action:
+The model-facing observation action is an immediate point-in-time read:
 
 ```ts
 interface WorkflowStatusToolInput extends WorkflowRunInspectionOptions {
   action: "status";
   runId: string;
-  waitMs?: number; // default 0; integer 0..25_000
 }
 ```
 
-Omitted `waitMs` and `waitMs: 0` perform an immediate bounded observation. A positive value reuses
-the existing durable event-tail/local-settlement wait and returns when the run becomes terminal, a
-permission requires action, the request bound expires, or the request itself is cancelled. The
-bound belongs only to the MCP request: reaching it never stops, pauses, resumes, or otherwise
-cancels workflow work.
+`lastN`, `labelGlob`, and `logLines` retain their validation, filtering, redaction, and projection
+bounds. Status never waits or emits polling metadata. Callers that need a
+later snapshot issue another status request; a status request never cancels, pauses, resumes, or
+otherwise changes workflow execution.
 
-`lastN`, `labelGlob`, and `logLines` keep their existing validation, filtering, redaction, and
-projection limits. Status retains owner-death reconciliation, cross-generation permission routing
-and elicitation, request progress-token behavior, script/result/events resource links, complete script
-lineage, cumulative usage telemetry, terminal outcome reconstruction, and the distinction between
-a failed workflow lifecycle and a failed status read.
+A successful response contains the bounded `WorkflowRunStatus`, cumulative token usage, current
+safe permission projection, terminal `outcome` when settled, script/result/events resource links,
+compact `latestActivity`, and immutable script identity. The detailed event resource remains the
+durable cursor source; lower-level SDK ancestry is not projected through MCP.
 
-Every successful status response carries:
+## Permission observation and collection
 
-```ts
-interface WorkflowStatusWaitMetadata {
-  requestedMs: number;
-  elapsedMs: number;
-  returnedBecause:
-    | "terminal"
-    | "timeout"
-    | "immediate"
-    | "action-required"
-    | "permission-resolved";
-}
+Status exposes an already-sanitized public permission projection but never opens an elicitation
+form. The projection names run ID, phase, agent label, backend, tool title, and tool kind. It
+includes a credential-redacted, strictly bounded rendering of available `rawInput`, `content`, and
+`locations`, so commands and file targets are visible. It also explains the exact scope of every
+ordered advertised option: one request or the remainder of that agent session, allow or reject.
+Private ACP session IDs and unredacted secrets never enter the projection. If the safe projection
+cannot retain the complete option set, it fails closed instead of presenting an ambiguous choice.
 
-interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
-  wait: WorkflowStatusWaitMetadata;
-  tokenUsage?: TokenUsage;
-  pendingPermissions?: WorkflowPendingPermission[];
-  interaction?: WorkflowPermissionInteraction;
-  permissionResponse?: WorkflowPermissionResponseAcknowledgement;
-  outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource" | "eventsUri"> & { eventsUri?: string };
-  scriptUri: string;
-  resultUri?: string;
-  eventsUri?: string;
-  latestActivity?: WorkflowRunLatestActivity[];
-  lineage: WorkflowScriptLineageEntry[];
-}
-```
+A form-capable foreground `run` or `resume` presents that same safe request in the originating call;
+its accepted response continues the exact same run and can encounter later permissions or
+checkpoints before completing. Background and form-less clients use the status projection for an
+on-demand observation and answer through `permissions-response` with one exact advertised option
+ID or cancellation.
 
-`outcome` is present exactly for a terminal run. A permission may return before `waitMs` with
-`returnedBecause: "action-required"`, or with `"permission-resolved"` when a compatible elicitation
-round resolves it. Targeted `stop` continues to return the same compact observation projection but
-is a stop result, not a second observation action.
+## Protocol and verification
 
-For every safe durable event stream, `eventsUri` names the detailed redacted source and a labelled
-events `resource_link` accompanies the response. `latestActivity` is reconstructed from that stream
-as one bounded sample per matching logical call: source timestamp/cursor, execution identity,
-turn/event counts, observed tokens, exactly one assistant preview or tool name, and
-`current`/`terminal` relevance. It survives targeted cancellation, whole-run abort, and restart;
-legacy or integrity-unsafe streams omit it. `lastN`/`labelGlob` filter activity along with call rows,
-and activity participates in the existing 24,576-byte structured status cap.
-
-## Compatibility migration
-
-The published tool schema and documentation advertise only `status`. The runtime parser accepts
-the two former action names long enough for installed clients to migrate, and normalizes them before
-dispatch:
-
-- legacy `inspect` becomes `status` with `waitMs: 0`;
-- legacy `await` preserves an explicit `waitMs`, or uses its historical omitted default of 20,000
-  ms.
-
-Legacy-only action types remain deprecated TypeScript migration aliases. They are not members of
-the canonical `WorkflowToolInput` union. No second handler or output contract is retained, and the
-server does not publish two ways to observe a run. The completed action train now publishes the
-strict seven-action `oneOf`; status requires its literal action, runId, and only its optional
-`waitMs`/inspection fields. Runtime alias normalization occurs before that canonical validation and
-does not add aliases to discovery. Omitted-action run receives the same compatibility treatment.
-
-## Preserved boundaries
-
-The engine method remains `WorkflowManager.inspectRun()` because it is the backend-agnostic safe
-snapshot primitive. Event-tail startup, cancellation, and cleanup bounds remain internal protocol
-safety mechanisms. Compatibility normalization does not change persistence, engine journaling,
-daemon ownership, or ACP runner boundaries.
-
-## Verification matrix
-
-Contract tests cover immediate status with omitted/zero wait, a positive wait timeout and terminal
-settlement, permission-required early return, targeted agent cancellation, unknown run behavior,
-published-schema exclusion of the legacy names, and runtime normalization of both legacy names.
+Legacy 2025 server-to-client elicitation and modern `2026-07-28` `input_required` use the same
+foreground run/resume permission contract. Tests cover immediate observation-only status reads,
+foreground permission collection, terminal outcomes, unknown runs, redaction and byte bounds,
+visible commands/file targets, exact option ordering/scope, private-session exclusion, and both
+protocol eras.

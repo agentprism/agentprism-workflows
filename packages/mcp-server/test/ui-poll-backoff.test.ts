@@ -26,6 +26,10 @@ import {
   WORKFLOW_EVENTS_TOOL_NAME,
   type EventsDoc,
 } from "../ui/src/workflow-events-poll.js";
+import {
+  readRecentRuns,
+  WORKFLOW_RUNS_TOOL_NAME,
+} from "../ui/src/workflow-runs.js";
 
 function record(seq: number, event: RunEventLogRecord["event"]): RunEventLogRecord {
   return {
@@ -102,6 +106,65 @@ test("polling calls the app-only tool with cursor arguments and folds structured
   assert.equal(model.name, "poll-flow");
   assert.deepEqual(model.phases, ["Scan"]);
   assert.equal(model.nodes.get(0)?.label, "finder");
+});
+
+test("switching among concurrent runs uses only app-only run/event tools, never model-facing status", async () => {
+  const calls: Array<{ name: string; arguments?: Record<string, unknown> }> = [];
+  const runs = [
+    {
+      runId: "run-a",
+      workflowName: "alpha",
+      status: "running" as const,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:01.000Z",
+    },
+    {
+      runId: "run-b",
+      workflowName: "beta",
+      status: "paused" as const,
+      startedAt: "2026-01-01T00:00:02.000Z",
+      updatedAt: "2026-01-01T00:00:03.000Z",
+    },
+  ];
+  const app = toolApp(async (request) => {
+    calls.push(request);
+    if (request.name === WORKFLOW_RUNS_TOOL_NAME) {
+      return { content: [], structuredContent: { runs }, isError: false };
+    }
+    if (request.name === WORKFLOW_EVENTS_TOOL_NAME) {
+      const runId = String(request.arguments?.runId);
+      return {
+        content: [],
+        structuredContent: {
+          schemaVersion: 1,
+          runId,
+          streamId: "a".repeat(32),
+          workflowName: runId === "run-a" ? "alpha" : "beta",
+          status: runId === "run-a" ? "running" : "paused",
+          finalized: false,
+          after: 0,
+          cursor: 0,
+          endCursor: 0,
+          hasMore: false,
+          events: [],
+        },
+        isError: false,
+      };
+    }
+    assert.fail(`unexpected model-facing tool call: ${request.name}`);
+  });
+
+  assert.deepEqual(await readRecentRuns(app, "run-a"), runs);
+  await readWorkflowEventsPage(app, { runId: "run-a", after: 0, streamId: undefined });
+  assert.deepEqual(await readRecentRuns(app, "run-b"), runs);
+  await readWorkflowEventsPage(app, { runId: "run-b", after: 0, streamId: undefined });
+  assert.deepEqual(calls.map((call) => call.name), [
+    WORKFLOW_RUNS_TOOL_NAME,
+    WORKFLOW_EVENTS_TOOL_NAME,
+    WORKFLOW_RUNS_TOOL_NAME,
+    WORKFLOW_EVENTS_TOOL_NAME,
+  ]);
+  assert.equal(calls.some((call) => call.name === "workflow"), false);
 });
 
 test("tool isError uses the existing classification, backoff, and bounded give-up path", async () => {

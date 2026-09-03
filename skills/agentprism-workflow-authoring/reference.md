@@ -13,11 +13,10 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `schema` | JSON Schema object | Structured output. Plain object literal only — no schema builders exist in the realm. Part of the resume hash. |
 | `model` | `string` | Model spec: optional registered harness prefix plus a verbatim id, or a backend-only name. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
 | `tier` | `"small" \| "medium" \| "big"` | Coarse tier resolved from host config; beats phase/meta model, loses to explicit `model`. Part of the resume hash. |
-| `mode` | `string` | Exact advertised ACP mode. Config preserves raw names/descriptions/metadata. Omission applies Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode; `defaultModeId` reports it. Authored/default ids are validated before prompt. Part of the resume hash only when authored. |
+| `mode` | `string` | Exact advertised ACP mode. Config preserves raw names/descriptions/metadata. Omission applies Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode; `defaultModeId` reports it. Trusted autonomous implementation/review uses advertised Claude `bypassPermissions` or Codex `agent`; Claude `auto` is a classifier mode and may request permission. Authored/default ids are validated before prompt. Part of the resume hash only when authored. |
 | `configOptions` | `Record<string, string \| boolean>` | Exact ACP session option ids and authored values. Applied in ascending id order after model and before the prompt, with no aliases or coercion. `"model"` is reserved for the dedicated `model` field. Part of the resume hash only when non-empty, with sorted keys. With MCP, read the advertised-options table from `workflow` action `config` before choosing values. |
 | `agentType` | `string` | Bind a named subagent definition (tools allow/deny, model, isolation, role prompt). See [agentType definitions](#agenttype-definitions). Part of the resume hash. |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree branched from the run cwd. **Always removed (worktree + branch) when the call ends** — edits are discarded; return work as data. Degrades to the shared tree outside a git repo (logged). |
-| `resume` | `{ filesystem: "read-only" }` | Deprecated compatibility annotation. It is recorded as legacy diagnostic provenance, is not sent to the runner or hashed, and has no effect on replay. New scripts should omit it. |
 | `cwd` | `string` | Per-session working directory; relative resolves against the run's base cwd. Overridden by worktree isolation. Not hashed. |
 | `retries` | `number` | Retries after *recoverable* failures (default 0, host-overridable). Exhausted retries ⇒ the call resolves `null`. |
 | `mcpServers` | `McpServerConfig[]` | MCP servers attached to this session. Stdio shape: `{ name, command, args: [], env: [{ name, value }] }` (`args`/`env` required, `env` is name/value pairs, not a map); `{ type: "http" \| "sse", name, url, headers: [] }` also accepted. Not hashed. |
@@ -27,8 +26,8 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `keepSession` | `boolean` | Skip release-time best-effort `session/close`; the non-secret re-attach record lands in `WorkflowRunResult.agentSessions` for host-side `loadSession()` / `resumeSession()`. Usage/auth pause failures are kept open automatically for managed continuation. Not identity-hashed; included in the input fingerprint. |
 
 Agent attempts have no model-facing wall-clock or idle timeout. They remain live until they complete,
-fail, or the host explicitly cancels the call or run. Every new run, including one admitted with
-`resumeFromRunId`, resolves retries, concurrency, and agent-count values from that run's request.
+fail, or the host explicitly cancels the call or run. MCP same-ID continuation may change only its
+runtime retry, concurrency, and agent-count limits.
 
 ## Model specs & routing
 
@@ -106,7 +105,7 @@ reach the host; keep evidence concise and never put credentials or other secrets
 | `headless` | `"default" \| "abort" \| "pause"` | No live channel: `"default"` takes `default ?? true`, `"abort"` aborts, and `"pause"` creates a persisted `checkpoint_required` pause. Default `"default"`. |
 | `timeoutMs` | `number` | Deadline for the interactive prompt. |
 
-The host supplies the live human channel (elicitation in the MCP server; `ExecOptions.confirm` in the SDK), and that channel wins even when `headless: "pause"` is declared. A durable pause carries non-secret `checkpointContext`; resume with `ExecOptions.checkpointReplies: { [context.callIndex]: decision }` or attach a live channel. On a new `resumeFromRunId` execution, reply keys always name indexes in the **source** recording; identity matching may inject that decision at a shifted current index. Completed host and headless checkpoint results both replay when identity and the checkpoint-options fingerprint over `default`, `headless`, and `timeoutMs` match. A changed option or ambiguous match runs fresh. Detached runs never pause for a checkpoint unless the author opts into `"pause"`.
+The host supplies the live human channel (elicitation in the MCP server; `ExecOptions.confirm` in the SDK), and that channel wins even when `headless: "pause"` is declared. A durable pause carries non-secret `checkpointContext`. MCP resumes that exact run with `checkpointReplies: { [context.callIndex]: decision }`. Under the run lease, the first strict-JSON answer is persisted before continuation; the same answer is idempotent and a later conflict is ignored in favor of the durable first answer. Completed host and headless checkpoint results replay when identity and the checkpoint-options fingerprint over `default`, `headless`, and `timeoutMs` match. Detached runs never pause for a checkpoint unless the author opts into `"pause"`.
 
 ## Error codes (`WorkflowError.code`)
 
@@ -126,35 +125,19 @@ The host supplies the live human channel (elicitation in the MCP server; `ExecOp
 
 `loopUntilDry` absorbs `AGENT_LIMIT_EXCEEDED` from its rounds and returns the partial result; everywhere else it propagates.
 
-## Determinism & the resume journal
+## Determinism & same-run continuation
 
-> **Resume rule:** replay is content-addressed and fail-to-live on correspondence: a completed call replays when its identity and input fingerprint match uniquely. Filesystem or world state never gates replay.
+> **Resume rule:** a completed call replays only at its exact persisted index when its identity and input fingerprint agree. Filesystem or world state never gates replay.
 
 The guide section **Determinism and resume** carries the full semantics: what each hash contains, matching, admission, continuation of interrupted calls, and checkpoint replay. Wire-level specifics for lookup:
 
 - Each `agent()` result is journaled under a monotonic call index and a SHA-256 identity hash. The canonical identity fields, in order, are `prompt`, resolved `model`, `mode` only when set, `configOptions` only when non-empty, `tier`, `phase`, `agentType`, resolved `agentDef`, and `schema`. Config-option keys are sorted before serialization. Missing fields other than `mode` and `configOptions` serialize as `null`; an unset `mode` and an unset/empty `configOptions` key are omitted for compatibility with older journals.
 - `agentDef` is the resolved definition's tools, disallowed tools, model, isolation, and body prompt. Changing a named definition therefore invalidates its call even when the `agentType` name is unchanged.
-- The legacy `resume: { filesystem: "read-only" }` annotation has no effect on admission or matching. Writers, readers, worktree calls, and unannotated calls follow the same journal rule.
-- `resumePolicy: "positional"` requests index/prefix correspondence but cannot bypass new-format format, metadata, manifest, cwd, or input checks. Marker-less journals and permanently marked manual/same-run legacy resumes retain historical hash-only positional behavior. Sources below input format 2 use `inputs-format-legacy`. Ancestor-scoped rows carried by a ≤0.23 resume hop replay only while that ancestor is still persisted; engine-minted nested scopes and deleted ancestor scopes stay live.
 - There is no `require`, `import`, Node API, or network API in the realm. `Date.now()`, `Math.random()`, and no-arg `new Date()` / `Date()` fail static validation; aliased or computed forms are blocked at runtime; `new Date(value)` works.
 
-Every new-run resume exposes `replayEligibility` on background acknowledgement, status, and the terminal result. It reports strategy, predicted/observed replayable prefix and counts, first non-replay/reason/detail, engine/input-format diagnostics, non-gating runtime/environment `provenanceChanges`, and non-gating operational changes; `resumeReport` retains the complete terminal per-call correspondence.
-
-An all-live outcome is expected when correspondence cannot be established, not when the world changed. Missing resume metadata, incompatible format literals, or an invalid manifest/seed can disable reuse. A new-format source containing any result row without a captured call path/input fact—possible with a call stack deeper than the raw-frame cap or a non-strict-JSON `meta` value—is source-wide `"manifest-invalid"`; excluding the row could make an ambiguous sibling look unique. Format-1 bytes are never reinterpreted; they enter the positional bridge and replayed rows are recorded under format 2.
-
-An args-controlled cap is the useful case: a cap that changes how many calls are reachable, but
-does not appear in an earlier call's prompt, lets those calls replay on resume. The worked example
-lives in the determinism-and-resume guide document and ships as
-`examples/resume-loop-cap.workflow.js`. This changed-args pattern is specific to new-run entry
-points that accept current args. MCP `{ action:"resume", runId, args? }` creates a new run from
-the source's immutable stored script and stored-or-explicit strict-JSON args. It works from
-completed, failed, aborted, and resumable paused sources, never inherits their operational limits,
-and rejects missing/unreadable source content or unreplayable stored args. MCP Run with explicit
-content and `resumeFromRunId`, plus `WorkflowManager.runSync(script, newArgs, { resumeFromRunId })`,
-are the edited-content forms. `WorkflowManager.resume(runId)` is a
-different same-ID recovery API: it reloads the persisted original script/args and permanently uses
-legacy positional replay semantics, while the independent default-on channel may still continue an
-eligible usage/auth-interrupted live call.
+MCP `{ action:"resume", runId }` continues that exact run with its persisted script, args, canonical
+agent configuration, journal, event stream, cumulative usage, and checkpoint decisions. It accepts
+no edited input and exposes no separate execution-attempt identity.
 
 ## <a name="custom-backends-metabackends"></a>Custom backends — `meta.backends`
 
@@ -197,8 +180,8 @@ The body is prepended to the agent's task as role guidance. An unknown `agentTyp
 The connected MCP `workflow` tool is the canonical way an agent runs an authored script; the per-action contracts are in the Running workflows guide section. The tool is self-contained: `config` discovers live backend options and `run` validates automatically before admission. The `workflow` tool is the server's whole *workflow* surface: config/run/resume/status/result/permissions-response/stop
 are action branches, not separate tools, and this input does not resolve a saved workflow name.
 The server also registers model-facing `docs` for selective version-matched workflow/REPL reference topics and `repl` for interactive orchestration. This optional skill remains a standalone guide for non-MCP or skills-first hosts. A
-run that pauses with `reason: "auth_required"` resumes via a new run after the backend's own CLI is
-logged in out-of-band (see below). Prompt-capable MCP hosts also get the compact **`author-workflow`** prompt with an optional `task` argument; it frames the task and directs the assistant to relevant `docs` topics instead of injecting this entire skill.
+run that pauses with `reason: "auth_required"` continues under the same ID after the backend's own
+CLI is logged in out-of-band (see below). Prompt-capable MCP hosts also get the compact **`author-workflow`** prompt with an optional `task` argument; it frames the task and directs the assistant to relevant `docs` topics instead of injecting this entire skill.
 
 Environment knobs shared by the MCP server and the SDK: `AGENTPRISM_DEFAULT_BACKEND`,
 `AGENTPRISM_ACP_POOL_SIZE` (schema-run parallelism on OpenCode/custom backends scales with the
@@ -209,9 +192,8 @@ installed exact-pinned package bin is used before the `npx -y @automatalabs/pi-a
 
 Embedding hosts drive the same contract directly through the SDK — `runDynamicWorkflow` /
 `WorkflowManager` from `@automatalabs/workflows`, with `exec` limits (`maxAgents`, `concurrency`,
-`agentRetries`), a live `confirm` checkpoint channel, and
-`exec.resumeFromRunId` for edited-script resume. See `docs/api.md` in the repository. The shapes
-below are the `workflow` tool's MCP surface, which is what script authors interact with.
+`agentRetries`) and a live `confirm` checkpoint channel. See `docs/api.md` in the repository. The
+shapes below are the `workflow` tool's MCP surface, which is what script authors interact with.
 
 Exact MCP tool input/output types:
 
@@ -230,9 +212,6 @@ interface WorkflowExecuteToolInputBase {
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  resumeFromRunId?: string;
-  resumePolicy?: "auto" | "positional";
-  checkpointReplies?: Record<number, unknown>;
   background?: boolean; // default false
 }
 
@@ -241,17 +220,14 @@ type WorkflowExecuteToolInput = WorkflowExecuteToolInputBase & (
   | { script?: never; scriptPath: string } // absolute path on the server
 );
 
-// Discovery publishes a strict seven-action oneOf. The runtime temporarily accepts omitted-action
-// run plus inspect/await aliases before canonical validation, but new callers use required action.
+// Discovery and runtime publish the same strict seven-action oneOf. Action is always required.
 
 interface WorkflowResumeToolInput {
   action: "resume";
   runId: string;
-  args?: unknown;
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
-  resumePolicy?: "auto" | "positional";
   checkpointReplies?: Record<number, unknown>;
   background?: boolean;
 }
@@ -264,7 +240,6 @@ interface WorkflowResumeToolInput {
 interface WorkflowStatusToolInput {
   action: "status";
   runId: string;
-  waitMs?: number;      // default 0; integer 0..25_000
   lastN?: number;       // default 20; integer 1..50
   labelGlob?: string;   // whole-label glob
   logLines?: number;    // default 20; integer 0..50
@@ -319,19 +294,11 @@ interface WorkflowBackgroundAccepted {
   scriptUri: string;
   eventsUri: string;
   limits: WorkflowRunLimits;
-  replayEligibility?: WorkflowReplayEligibility;
   pendingPermissions?: WorkflowPendingPermission[];
-  interaction: { permissionRequests: "may-block"; collectWith: ["status"]; respondWith: "permissions-response"; elicitation: "available" | "unavailable" };
-}
-
-interface WorkflowStatusWaitMetadata {
-  requestedMs: number;
-  elapsedMs: number;
-  returnedBecause: "terminal" | "timeout" | "immediate" | "action-required" | "permission-resolved";
+  interaction: { permissionRequests: "may-block"; collectWith: ["run", "resume"]; respondWith: "permissions-response"; elicitation: "available" | "unavailable" };
 }
 
 interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
-  wait: WorkflowStatusWaitMetadata;
   tokenUsage?: TokenUsage;
   pendingPermissions?: WorkflowPendingPermission[];
   outcome?: Omit<WorkflowExecutionToolResult<T>, "scriptSource" | "eventsUri"> & { eventsUri?: string }; // terminal; legacy streams may omit URI
@@ -339,7 +306,6 @@ interface WorkflowStatusToolResult<T = unknown> extends WorkflowRunStatus {
   resultUri?: string;
   eventsUri?: string;
   latestActivity?: WorkflowRunLatestActivity[];
-  lineage: Array<{ runId: string; uri: string; available: boolean }>;
 }
 
 interface WorkflowRunLatestActivity {
@@ -367,7 +333,6 @@ interface WorkflowStopToolInput {
   logLines?: number;
   script?: never;
   scriptPath?: never;
-  waitMs?: never;
 }
 ```
 
@@ -376,7 +341,7 @@ indexes, checkpoints, duplicate scoped indexes, and terminal runs are errors tha
 currently in-flight call-index/label pairs. A successful selected cancellation returns the ordinary
 live `WorkflowRunStatus`; whole-run stop returns the terminal `WorkflowStopResult`.
 
-`WorkflowRunResult.fallbacks?: WorkflowRunFallback[]` retains the compatibility shape
+`WorkflowRunResult.fallbacks?: WorkflowRunFallback[]` uses the public shape
 `{ callIndex, label, phase?, requestedSpec, resolvedModel?, backendId?, kind, message, continuation? }`.
 `kind` is `model | modifier | continuation`; continuation details report either a reattached
 `resume | load` method or an exact skip reason. The model-resolution pipeline itself produces no entries.
@@ -387,12 +352,10 @@ appear in foreground results plus terminal status `outcome`; neither appears on 
 
 At most four background runs may be active or starting per server instance. Foreground, status,
 result retrieval, and stop consume no slot; a durably stopped background run frees its slot immediately even
-while backend session wind-down remains. A timeout returns the freshest status and partial cumulative usage; replay
-hits cost/add zero. Terminal results have no MCP TTL and are reconstructed after restart while the
+while backend session wind-down remains. Status returns the freshest snapshot and cumulative usage;
+replayed exact-run hits cost/add zero. Terminal results have no MCP TTL and are reconstructed after restart while the
 project run record remains readable. The inherited status fields stay redacted/bounded at 24,576
-structured bytes and 8,192 text bytes. The full script lineage is never truncated; when lineage
-alone exceeds the status budget, `truncation.maxStructuredBytes` reports the larger actual envelope
-limit. Terminal `outcome` preserves the raw authored result/full logs and has no new total cap.
+structured bytes and 8,192 text bytes. Terminal `outcome` preserves the raw authored result/full logs and has no new total cap.
 Completed foreground/status results include `resultUri`; exact JSON up to 4,096 UTF-8 bytes is copied
 into model-visible text for content-first hosts. Larger results stay out of summary text and point
 to `workflow://runs/{runId}/result` plus bounded `action:"result"` paging. The outcome includes
@@ -400,9 +363,7 @@ to `workflow://runs/{runId}/result` plus bounded `action:"result"` paging. The o
 
 The background start has no enduring request signal, progress channel, or live checkpoint channel.
 It returns immediately and emits no progress after returning, even if the initiating request
-supplied a progress token. A later bounded `action:"status"` is a separate request; when that status request
-carries a progress token, it can stream coarse phase and distinct started/ended-call progress while
-pending. The legacy/inconsistent-log polling fallback emits no progress notifications. A headless
+supplied a progress token. A later `action:"status"` returns one immediate bounded snapshot. A headless
 checkpoint default continues; abort fails with `WORKFLOW_ABORTED`; pause returns
 `checkpoint_required` plus `outcome.checkpointContext`. Auth pauses return non-secret
 `outcome.authContext`; log the backend CLI in before resume. Background execution lives in the
@@ -410,9 +371,8 @@ serving process (the daemon, or the single process under `--in-process`): that p
 interrupt an in-flight call, and stale durable `pending`/`running` state reconciles under its lease
 to `paused` / `interrupted`.
 
-Every resumed background run durably seeds its inherited prefix (including a manager-owned
-checkpoint injection) beneath its new run ID before acknowledgement, so later resume hops remain
-self-contained. The MCP layer never rewrites that seed. Status never executes or resumes
+Every resumed background run durably saves any first checkpoint answer beneath the same run ID
+before acknowledgement. Status never executes or resumes
 the script; its cold preflight may only reconcile a dead owner's stale `pending`/`running` state
 to `paused` / `interrupted`.
 
@@ -422,16 +382,15 @@ labelled events link on admission and later status/terminal responses. Status de
 redacted `latestActivity` sample per matching call from that stream; the resource remains the
 detailed cursor/transcript authority. A completed JSON value is independently durable at
 `workflow://runs/{runId}/result`. Completed foreground/status responses include its
-`resultUri` and labelled link; run results link the new script and events, while status links the full
-script resume lineage oldest-to-newest as structured `{ runId, uri, available }` entries. Large
+`resultUri` and labelled link; responses link the exact run's script and events. Large
 result resources can be reconstructed exactly through 16,384-byte `action:"result"` chunks by
 following `endOffset` while `hasMore` is true; the bounded/redacted events resource is observability,
 not an exact-result API. Listing and
 completion include only the 50 newest runs, but a direct URI read works for any retained project
-run. A path is never persisted or implicitly re-read, and the MCP layer retains no scripts, args,
-or synthetic lineage metadata in process memory.
+run. A path is never persisted or implicitly re-read, and the MCP layer retains no scripts or args
+in process memory.
 
-`action:"stop"` is location-independent: it stops a local live run, cold-stops a lease-free persisted run, or writes an idempotent intent and forwards signed control to a predecessor that holds the run lease. Final success appends `stopped`, releases the lease, and returns the final status projection with `stopped:true`. When cross-generation control does not settle inside the bound, the successful nonterminal result carries `control:{state:"pending",operationId,requestedAt,owner?}`; retry stop or status. A repeated stop on a terminal run succeeds with `stopped:false,alreadyTerminal:true`. `forceOwner:true` explicitly authorizes terminating a superseded owner daemon and may interrupt sibling runs; it is forbidden with `callIndex`. Targeted call cancellation routes only to the live owner and is never reconstructed after owner loss. An in-flight stop may lack a quiescent terminal-environment proof, so the manager can conservatively run the following resume live; read `replayEligibility` and `resumeReport` rather than assuming a prefix replay.
+`action:"stop"` is location-independent: it stops a local live run, cold-stops a lease-free persisted run, or writes an idempotent intent and forwards signed control to a predecessor that holds the run lease. Final success appends `stopped`, releases the lease, and returns the final status projection with `stopped:true`. When cross-generation control does not settle inside the bound, the successful nonterminal result carries `control:{state:"pending",operationId,requestedAt,owner?}`; retry stop or status. A repeated stop on a terminal run succeeds with `stopped:false,alreadyTerminal:true`. `forceOwner:true` explicitly authorizes terminating a superseded owner daemon and may interrupt sibling runs; it is forbidden with `callIndex`. Targeted call cancellation routes only to the live owner and is never reconstructed after owner loss.
 
 Retain the run ID and check halted runs before guessing. The exact status input is:
 
@@ -439,7 +398,6 @@ Retain the run ID and check halted runs before guessing. The exact status input 
 interface WorkflowStatusToolInput {
   action: "status";
   runId: string;       // /^[a-z0-9]+-[a-z0-9]+$/, at most 128 characters
-  waitMs?: number;     // default 0; integer 0..25_000
   lastN?: number;      // default 20; integer 1..50
   labelGlob?: string;  // non-empty; at most 128 Unicode code points
   logLines?: number;   // default 20; integer 0..50
@@ -484,7 +442,6 @@ interface WorkflowRunStatus {
   reason?: string;
   errorCode?: string;
   limits?: WorkflowRunLimits; // absent only on legacy persisted records
-  replayEligibility?: WorkflowReplayEligibility;
   logTail: WorkflowLogTail;
   calls: WorkflowRunCallStatus[];
   filter: { lastN: number; logLines: number; labelGlob?: string };
@@ -513,8 +470,7 @@ interface WorkflowRunLimits {
 Inspection returns only this allowlisted projection: never raw script, args, prompts, histories,
 hashes, session IDs, cwd, checkpoint/auth details, or raw results. Credential-shaped data is
 redacted, results are structurally compacted, every outward text scalar/preview is capped at 512
-UTF-8 bytes, inherited status JSON at 24,576 bytes, and inspection text at 8,192 bytes. Full lineage
-can raise the structured envelope limit as reported by `truncation.maxStructuredBytes`. An unknown ID is
+UTF-8 bytes, inherited status JSON at 24,576 bytes, and inspection text at 8,192 bytes. An unknown ID is
 a tool error with no structured content; reading an existing failed run succeeds and reports
 `status:"failed"`. Every paused, failed, or aborted execution result also carries a redacted
 final-20 `logTail` (present when empty) and renders it in the immediate terminal text. Completed

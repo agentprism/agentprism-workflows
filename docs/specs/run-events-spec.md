@@ -2,9 +2,9 @@
 
 **Date:** 2026-07-15
 
-> **Current MCP action name:** references below to the historical `await` action describe the
-> event-tail behavior now used by `action:"status"` when `waitMs` is positive. See
-> [`workflow-status-action.md`](workflow-status-action.md).
+> **Current MCP lifecycle:** `action:"status"` is an immediate snapshot. The model-facing tool has
+> no event-wait action or wait control. Durable tailing is consumed by the capability-gated,
+> app-only run monitor and by SDK hosts. See [`workflow-status-action.md`](workflow-status-action.md).
 
 > **Current MCP discovery:** every admitted run with a *safe* durable log, and its later
 > status/terminal responses, returns the canonical `eventsUri` plus a labelled events
@@ -66,11 +66,12 @@ fallback). The logger writes an unstructured `<runId>.log` (appends during execu
 its buffered contents in `persist()`). There is no structured, append-only stream that another
 process can read, or that a consumer can attach to after a run has started.
 
-That absence is visible at the MCP composition root. Foreground calls optionally translate the
+That absence was visible at the MCP composition root. Foreground calls optionally translate the
 manager's live `onProgress(WorkflowSnapshot)` callback into coarse MCP
 `notifications/progress`, and only when the request supplied a `progressToken`. Background starts
-return before any request-scoped progress channel can remain active. `action: "await"` uses a
-process-local settlement promise when available and otherwise polls `inspectRun()` every 250 ms.
+return before any request-scoped progress channel can remain active. The run monitor now consumes
+the durable stream through an app-only bounded polling tool; model-facing status remains an
+immediate snapshot.
 
 The safety primitives needed for a persisted projection already exist in
 `packages/workflow-engine/src/run-observability.ts`: credential-shaped text redaction, sensitive-key
@@ -1286,46 +1287,18 @@ strings are protected raw persistence data while event strings are outward proje
 that joins a snapshot string (such as `scope`) to an event field must first apply the §2.5 rule-2
 projection to the snapshot value.
 
-The MCP server is one such host and changes without altering its tool input/output schemas:
+The MCP server is one such host without adding a model-facing tail contract:
 
-- Foreground execution keeps the existing live `onProgress` projection and request cancellation.
-- A background start still returns immediately and emits no progress notification on that
-  initiating request, even if it supplied a progress token; in particular it sends nothing after
-  the request has completed. A completed MCP request is not a durable progress channel.
-- `action: "await"` tails new-format event logs instead of polling. When that **await request**
-  carries a progress token, it emits the existing coarse notification shape after `phase`,
-  `agentStart`, and first terminal `agentEnd` for each `(scope, callIndex)`: `progress` is the
-  number of distinct ended calls, `total` is the number of distinct started calls (omitted while
-  zero), and `message` is the latest phase title. The persisted snapshot initializes those sets
-  from `agents[]` and `currentPhase`: every row with a non-negative `callIndex` contributes
-  `(projectedScope, callIndex)` to started, where `projectedScope` applies §2.5 rule 2 to
-  `scope ?? runId`; status `done`, `error`, or `skipped` also contributes it to ended. The initial
-  latest title is the same projection of `currentPhase` when present. Await then reads strictly
-  after `snapshot.eventSeq` while pinning `snapshot.eventStreamId`. A new `agentStart` not already
-  in started emits once; a new `agentEnd` first inserts its key into started if necessary, then
-  emits only when it newly enters ended; every `phase` record emits and replaces the latest title.
-  `message` is omitted until a phase title exists. An await attached late therefore avoids an
-  unbounded prefix scan and catches the suffix without double-counting. The scan avoided here is
-  progress-set reconstruction — the started/ended sets and latest phase title seed from the
-  snapshot's `agents[]` and `currentPhase`, and the tail is consumed strictly after
-  `snapshot.eventSeq`. File-level §2.10 validation still parses the complete LF-terminated prefix
-  on a cursor read; a watcher, having pinned its stream ID, may cache incremental validation state
-  across wakes within that generation so each 250 ms recovery wake is not O(file size).
-- The local settlement promise may still win the terminal race, but it does not disable tail-based
-  progress while the await is pending. Await cancellation closes the stream and does not cancel
-  the workflow, preserving current behavior.
-- Await falls back to the current 250 ms `inspectRun()` terminal poll for
-  `EVENT_LOG_UNAVAILABLE`, `WATERMARK_MISSING`, `STREAM_ID_MISSING`, `STREAM_MISMATCH`,
-  `EVENT_LOG_INCOMPLETE`, `CORRUPT_LOG`, `UNSUPPORTED_VERSION`, `SNAPSHOT_AHEAD`, `CURSOR_AHEAD`,
-  `RECORD_TOO_LARGE`, and `IO_ERROR`. `RUN_NOT_FOUND`/`ORPHANED_LOG` retain the existing unknown-run
-  tool error. The remaining codes can arise only from an invalid internal call or writer operation
-  and fail the await request as an internal error rather than being hidden. The polling fallback
-  emits no progress notifications, even when that await request supplied a progress token; the
-  safe inspection surface cannot reconstruct a gap-free distinct-call stream. It only preserves
-  bounded terminal waiting.
-
-`inspect`, foreground `onProgress`, the background acceptance result, and the bounded await result
-remain byte-compatible. The event log is the new progress source, not a new MCP action.
+- Foreground execution keeps the live `onProgress` projection and request cancellation.
+- A background start returns immediately and emits no progress notification after that initiating
+  request completes. A completed MCP request is not a durable progress channel.
+- Model-facing `action:"status"` reads one bounded snapshot and never watches or polls for a later
+  lifecycle transition.
+- The capability-gated app-only `workflow-events` tool reads bounded event pages for the run
+  monitor. `workflow-runs` separately lists a bounded authoritative set of active/recent runs so a
+  surviving panel can navigate concurrent work. Neither tool enters the model's tool loop.
+- SDK hosts may call the event read/watch seam directly and must handle the explicit integrity
+  errors above; unsafe streams are never presented as gap-free.
 
 ## 3. What this deliberately does not do
 
@@ -1351,8 +1324,8 @@ remain byte-compatible. The event log is the new progress source, not a new MCP 
 ## 4. Compatibility & semver
 
 Existing EventEmitter names, listener isolation, arbitrary string/symbol events, `onProgress`,
-`inspectRun`, `await` results, snapshot JSON fields, journal replay, and unstructured `.log` files
-remain readable/usable. New live fields (`scope`, `errorRecord`, ACP `callIndex`) are additive.
+`inspectRun`, snapshot JSON fields, journal replay, and unstructured `.log` files remain
+readable/usable. New live fields (`scope`, `errorRecord`, ACP `callIndex`) are additive.
 There is no EventEmitter deprecation. The exact SDK event union excludes the runner's internal
 `session_update` catch-all, while the existing `AgentEventPayload` alias retains that type argument
 and its original `AcpEventName` default as the compatibility-only branch specified in §2.4.
@@ -1363,12 +1336,12 @@ and snapshot removal; detached callbacks can no longer recreate durable state af
 This is an observable concurrency/data-integrity fix and must be named in the workflow-engine
 changeset.
 
-Old snapshots have no `eventSeq` and remain listable, inspectable, resumable, and deletable. A
-read/watch attempt reports `EVENT_LOG_UNAVAILABLE`. When an old run is resumed under the new
-manager, its lease-protected snapshot is first stamped with a fresh `eventStreamId` and
-`eventSeq: 0`, and its first persistable resume publication starts that stream at sequence 1; that
-first event is normally `resumed` but may be a resume-gate `paused`. The log makes no claim about
-pre-upgrade history.
+Old snapshots have no `eventSeq` and remain listable, inspectable, and deletable. A read/watch
+attempt reports `EVENT_LOG_UNAVAILABLE`. Strict MCP continuation also requires the canonical
+admission metadata defined by [`workflow-resume-action.md`](workflow-resume-action.md), so an old
+record is not upgraded or guessed into a continuable run. Lower-level SDK recovery may create a
+fresh stream under its own explicitly supported contract; the log makes no claim about pre-upgrade
+history.
 
 Unknown JSONL schema versions fail closed. New sidecars do not affect old package versions because
 their run listing scans only `.json` files.
@@ -1397,7 +1370,7 @@ One coordinated release:
 | `@automatalabs/acp-agents` | optional `AcpEventContext.callIndex` threaded through session state and every contextual event | minor |
 | `@automatalabs/workflows` | exact ACP specialization, `AgentEventPayload.callIndex`, typed SDK manager overloads/re-exports | minor |
 | `@automatalabs/agentprism-otel` | migrate local casts to shared payload types; use `(scope, callIndex)` correlation when present | patch |
-| `@automatalabs/mcp-server` | await tail consumption, progress-token reporting for awaited background runs, docs/prompt refresh; no schema change | patch |
+| `@automatalabs/mcp-server` | bounded app-only event/run-list consumption for the multi-run monitor | patch |
 
 Internal dependency ranges receive the repository's normal patch updates. The workflow-engine
 changeset must name the observable additions (new sidecar, write-time redaction, listener delivery
@@ -1487,16 +1460,11 @@ any exported name would be semver-major; the declared patch bump is valid only u
   `(scope, callIndex)` when present with the legacy label queue only as a compatibility fallback;
   tool spans consume direct ACP `callIndex`; all existing no-content/capture-content and detach
   tests stay green.
-- **mcp-server**: an awaited background run with a progress token emits monotonic distinct-ended /
-  distinct-started counts from the snapshot plus post-watermark tail; late attach, duplicate
-  terminal callbacks, nested scopes, and pause/resume do not double-count. No token sends no
-  notification. The initial
-  background-start request never sends after returning. Await cancellation closes the watcher but
-  not the run. A local promise still settles promptly while tail progress remains active. Legacy,
-  missing/mismatched-stream, corrupt, and incomplete logs fall back to the 250 ms inspection poll
-  without notifications even when a token is present. Foreground progress and all inspect/await
-  structured results remain pinned.
-- **retention/compatibility**: old run fixture lists/inspects/resumes unchanged; event reads report
+- **mcp-server**: foreground progress stays request-scoped; the initial background-start request
+  never sends after returning. The app-only event poller returns bounded pages for safe streams and
+  fails closed for missing, mismatched, corrupt, or incomplete streams. The app-only run listing is
+  capability-gated, authoritative, and bounded. Model-facing status remains immediate.
+- **retention/compatibility**: old run fixtures list/inspect unchanged; event reads report
   unavailable until a new execution suffix; `.events.jsonl` never appears in `list()`; direct and
   manager deletion remove it; running local deletion cannot be resurrected by a late callback;
   deletion loses cleanly to a writer in another process; an instrumented deletion proves
@@ -1527,12 +1495,12 @@ any exported name would be semver-major; the declared patch bump is valid only u
   `agentEvent`, including direct `(scope, callIndex)` filtering.
 - `packages/agentprism-otel/README.md`: note direct event-contract consumption and retained
   structural attachment API.
-- `skills/agentprism-workflow-authoring/SKILL.md` and `reference.md`: change only the host-call
-  guidance—background starts still have no enduring request channel, while a later bounded await
-  can stream coarse progress when it carries a progress token. There is no new workflow DSL.
+- `skills/agentprism-workflow-authoring/SKILL.md` and `reference.md`: keep host-call guidance clear
+  that background starts have no enduring request channel, status is immediate, and app-only event
+  polling is outside the model tool loop. There is no new workflow DSL.
 - Regenerate `packages/mcp-server/src/generated/authoring-prompt-content.ts` with
   `scripts/generate-authoring-prompt.mjs` and extend its drift/sentinel test for the corrected
-  background/await progress wording.
+  background progress wording.
 
 ## 7. Implementation breakdown
 
@@ -1555,9 +1523,8 @@ Five sequential, independently green PRs:
    reacquire/reload/save/release under the same lease. Existing manager tests run unchanged plus
    the new matrix.
 4. **PR4 — consumers (M).** Migrate agentprism-otel `types.ts`/`attach.ts` to the shared contract
-   and direct call correlation; replace MCP `server.ts`/`progress.ts` await polling with tail-first
-   settlement/progress plus the explicit legacy/error fallback; add package tests. No library wire
-   is introduced.
+   and direct call correlation; add bounded MCP App event/run-list consumers while keeping
+   model-facing status immediate; add package tests. No library wire is introduced.
 5. **PR5 — docs, skill, generated prompt, and release (S).** Complete the §6 sweep, update the
    roadmap item, regenerate the MCP prompt, add drift sentinels, and land coordinated Changesets
    with the semver table in §4.

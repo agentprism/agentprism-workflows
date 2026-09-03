@@ -39,7 +39,7 @@ interface LatestActivity {
 
 function runIdOf(result: ToolCallResult): string {
   const runId = structured(result)?.runId;
-  assert.equal(typeof runId, "string");
+  assert.equal(typeof runId, "string", textOf(result));
   return runId;
 }
 
@@ -186,10 +186,11 @@ test("status exposes live redacted activity and retains terminal activity after 
     const accepted = await first.client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         background: true,
         script: [
           'export const meta = { name: "activity-cancel", description: "targeted cancellation" };',
-          'return await agent("hold", { label: "active-review" });',
+          'return await agent("hold", { label: "active-review", model: "claude" });',
         ].join("\n"),
       },
     });
@@ -203,7 +204,7 @@ test("status exposes live redacted activity and retains terminal activity after 
     await waitUntil(() => runner.hasStarted(0), "the activity-producing call should start");
     const live = await first.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 0 },
+      arguments: { action: "status", runId },
     });
     const liveActivity = activityOf(live);
     assert.equal(liveActivity?.length, 1);
@@ -231,10 +232,16 @@ test("status exposes live redacted activity and retains terminal activity after 
     assert.equal(cancelledActivity?.[0]?.observedEvents, 3);
     assert.match(textOf(cancelled), /tool: read_file/);
 
-    const terminal = await first.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 1_000 },
-    });
+    let terminal: ToolCallResult | undefined;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      terminal = await first.client.callTool({
+        name: "workflow",
+        arguments: { action: "status", runId },
+      });
+      if (structured(terminal)?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(terminal);
     assert.equal(structured(terminal)?.status, "completed");
     assert.equal(activityOf(terminal)?.[0]?.relevance, "terminal");
     assert.equal((structured(terminal)?.outcome as Record<string, unknown>).eventsUri, eventsUri);
@@ -248,7 +255,7 @@ test("status exposes live redacted activity and retains terminal activity after 
   try {
     const persisted = await cold.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 0 },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(persisted)?.eventsUri, `workflow://runs/${runId}/events`);
     assert.equal(activityOf(persisted)?.[0]?.relevance, "terminal");
@@ -266,10 +273,11 @@ test("whole-run abort preserves the last activity as terminal", async () => {
     const accepted = await connection.client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         background: true,
         script: [
           'export const meta = { name: "activity-abort", description: "whole abort" };',
-          'return await agent("hold", { label: "abort-review" });',
+          'return await agent("hold", { label: "abort-review", model: "claude" });',
         ].join("\n"),
       },
     });
@@ -286,7 +294,7 @@ test("whole-run abort preserves the last activity as terminal", async () => {
 
     const status = await connection.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 0 },
+      arguments: { action: "status", runId },
     });
     assert.equal(structured(status)?.status, "aborted");
     assert.equal(activityOf(status)?.[0]?.relevance, "terminal");
@@ -302,11 +310,12 @@ test("latest activity participates in the existing structured byte cap", async (
   try {
     const calls = Array.from(
       { length: 50 },
-      (_, index) => `() => agent("work-${index}", { label: "activity-${String(index).padStart(2, "0")}" })`,
+      (_, index) => `() => agent("work-${index}", { label: "activity-${String(index).padStart(2, "0")}", model: "claude" })`,
     ).join(",\n");
     const completed = await connection.client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "activity-cap", description: "bounded activity" };',
           `return await parallel([${calls}]);`,
@@ -316,11 +325,11 @@ test("latest activity participates in the existing structured byte cap", async (
     const runId = runIdOf(completed);
     const status = await connection.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 0, lastN: 50, logLines: 50 },
+      arguments: { action: "status", runId, lastN: 50, logLines: 50 },
     });
     const payload = structured(status)!;
     const latestActivity = activityOf(status) ?? [];
-    const { outcome: _outcome, tokenUsage: _tokenUsage, wait: _wait, ...boundedStatus } = payload;
+    const { outcome: _outcome, tokenUsage: _tokenUsage, ...boundedStatus } = payload;
     assert.ok(Buffer.byteLength(JSON.stringify(boundedStatus), "utf8") <= 24_576);
     assert.equal((payload.truncation as Record<string, unknown>).byteCapApplied, true);
     assert.ok(latestActivity.length > 0 && latestActivity.length < 50);
@@ -343,7 +352,7 @@ test("legacy persisted rows omit events discovery and latest activity without br
   try {
     const completed = await first.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     runId = runIdOf(completed);
     runFile = persistedRunFile(runId);
@@ -368,7 +377,7 @@ test("legacy persisted rows omit events discovery and latest activity without br
   try {
     const status = await cold.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 0 },
+      arguments: { action: "status", runId },
     });
     assert.equal(status.isError, false);
     assert.equal(structured(status)?.status, "completed");
@@ -391,7 +400,7 @@ test("an eventLogIncomplete stream omits events discovery and latest activity wi
   try {
     const completed = await first.client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     runId = runIdOf(completed);
     runFile = persistedRunFile(runId);
@@ -416,7 +425,7 @@ test("an eventLogIncomplete stream omits events discovery and latest activity wi
   try {
     const status = await cold.client.callTool({
       name: "workflow",
-      arguments: { action: "status", runId, waitMs: 0 },
+      arguments: { action: "status", runId },
     });
     assert.equal(status.isError, false);
     assert.equal(structured(status)?.status, "completed");

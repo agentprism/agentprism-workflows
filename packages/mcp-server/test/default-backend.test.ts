@@ -10,7 +10,6 @@ import type {
 import {
   NoAutoDefaultBackendError,
   classifyAutoDefaultCandidates,
-  recordedDefaultModel,
   selectAutoDefaultBackend,
   workflowNeedsPinnedDefault,
 } from "../src/default-backend.js";
@@ -111,23 +110,6 @@ test("selection fails clearly when every backend is definitely unavailable", () 
       return true;
     },
   );
-});
-
-test("resume default recovery prefers the persisted pin and migrates one legacy model-less backend", () => {
-  assert.equal(recordedDefaultModel({ defaultModel: "codex" } as PersistedRunState), "codex");
-  assert.equal(recordedDefaultModel({
-    calls: [
-      { index: 0, kind: "agent", hash: "a", outcome: "result", origin: "runner", backendId: "pi" },
-      { index: 1, kind: "agent", hash: "b", outcome: "result", origin: "runner", backendId: "pi" },
-      { index: 2, kind: "agent", hash: "c", outcome: "result", origin: "runner", modelRequested: "codex", backendId: "codex" },
-    ],
-  } as PersistedRunState), "pi");
-  assert.equal(recordedDefaultModel({
-    calls: [
-      { index: 0, kind: "agent", hash: "a", outcome: "result", origin: "runner", backendId: "pi" },
-      { index: 1, kind: "agent", hash: "b", outcome: "result", origin: "runner", backendId: "claude" },
-    ],
-  } as PersistedRunState), undefined);
 });
 
 test("routing discovery requests a default only for calls with neither resolved model nor tier", () => {

@@ -91,6 +91,15 @@ export type EngineRunResult<T = unknown> = Omit<WorkflowRunResult<T>, "status" |
  * types): the engine no longer constructs an agent, so only the plain fields it
  * threads through remain.
  */
+export interface WorkflowAgentConfiguration {
+  /** Exact backend/model spec selected by the host for this agent occurrence. */
+  model: string;
+  /** Exact ACP session mode selected from the chosen harness's advertised modes. */
+  mode?: string;
+  /** Exact non-model ACP session options selected from the chosen harness's catalog. */
+  configOptions?: Record<string, string | boolean>;
+}
+
 export interface WorkflowAgentOptions {
   /** Base working directory for the run (e.g. the project root). */
   cwd?: string;
@@ -244,6 +253,22 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   ) => Promise<unknown>;
   /** Force every live checkpoint to become a durable CHECKPOINT_REQUIRED pause. */
   pauseOnCheckpoint?: boolean;
+  /**
+   * Host-selected configurations keyed by the zero-based, root-execution-wide agent
+   * occurrence ordinal. A selected model/mode/config becomes the effective call input
+   * before hashing and runner dispatch, so replay identity describes what actually ran.
+   */
+  agentConfigurations?: Readonly<Record<number, WorkflowAgentConfiguration>>;
+  /**
+   * Fail before dispatch if a live occurrence has no host selection.
+   * Composition roots use this after a preflight selection pass so a control-flow branch
+   * that the mock run did not reach cannot silently fall back to an ambient provider.
+   */
+  requireAgentConfiguration?: boolean;
+  /** Internal same-run continuation latch. Replays every exact index/hash journal hit. */
+  sameRunContinuation?: boolean;
+  /** Internal cumulative usage seed restored before a same-run continuation executes. */
+  tokenUsageBaseline?: Readonly<SharedRuntime["tokenUsage"]>;
   onLog?: (message: string, context?: WorkflowCallbackContext) => void;
   onPhase?: (title: string, context?: WorkflowCallbackContext) => void;
   onAgentStart?: (event: {
@@ -541,6 +566,7 @@ export async function runWorkflow<T = unknown>(
 ): Promise<EngineRunResult<T>> {
   const started = Date.now();
   const { meta, body } = parseWorkflowScript(script);
+  const agentConfigurations = snapshotHostAgentConfigurations(options.agentConfigurations);
   const journaling = options.journaling ?? true;
   if (!journaling && (options.resumeJournal || options.resumeFromRunId || options.preparedResume)) {
     throw new WorkflowError("journaling disabled for this run", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
@@ -614,7 +640,7 @@ export async function runWorkflow<T = unknown>(
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
     agentCount: 0,
-    tokenUsage: { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    tokenUsage: copyTokenUsageBaseline(options.tokenUsageBaseline),
     depth: 0,
     nestedSeq: 0,
   };
@@ -982,6 +1008,14 @@ export async function runWorkflow<T = unknown>(
     }
 
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
+    // shared.agentCount is incremented exactly once for every allocated agent() across the
+    // root and its nested workflow. Read it before allocation to address host selections
+    // with one deterministic, root-execution-wide ordinal.
+    const agentOrdinal = shared.agentCount;
+    const hostConfiguration = normalizeHostAgentConfiguration(
+      agentConfigurations?.[agentOrdinal],
+      agentOrdinal,
+    );
 
     const requestedLabel = agentOptions.label?.trim();
     const pendingLabel = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
@@ -1003,27 +1037,64 @@ export async function runWorkflow<T = unknown>(
         ? resolveTierModel(agentOptions.tier, modelTierConfig)
         : undefined;
     const phaseModel = agentOptions.tier ? undefined : resolveModelForPhase(assignedPhase, routingConfig);
-    const modelSpec =
+    const authoredModel =
       explicitModel ??
       (agentOptions.tier ? tierModel || options.mainModel : phaseModel ?? options.defaultModel);
+    const modelSpec = hostConfiguration?.model ?? authoredModel;
+    if (hostConfiguration === undefined && options.requireAgentConfiguration) {
+      throw new WorkflowError(
+        `agent ${JSON.stringify(pendingLabel)} occurrence ${agentOrdinal} has no host-selected configuration; ` +
+          "the preflight control path did not cover this live agent call",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        {
+          recoverable: false,
+          agentLabel: pendingLabel,
+          details: {
+            uncoveredOccurrence: {
+              ordinal: agentOrdinal,
+              label: pendingLabel,
+              ...(assignedPhase === undefined ? {} : { phase: assignedPhase }),
+            },
+          },
+        },
+      );
+    }
+    // A host selection is a complete model/mode/config decision, not a patch over the
+    // script's provider-specific settings. Otherwise changing providers could leak an
+    // authored mode or option id into the newly selected backend, and users could not
+    // clear authored options by leaving the selected provider fields empty.
+    const effectiveMode = hostConfiguration === undefined ? agentOptions.mode : hostConfiguration.mode;
+    const effectiveConfigOptions = hostConfiguration === undefined
+      ? agentOptions.configOptions
+      : hostConfiguration.configOptions;
+    const {
+      mode: _authoredMode,
+      configOptions: _authoredConfigOptions,
+      ...agentOptionsWithoutProviderConfig
+    } = agentOptions;
+    const effectiveAgentOptions: AgentOptions = {
+      ...agentOptionsWithoutProviderConfig,
+      ...(effectiveMode === undefined ? {} : { mode: effectiveMode }),
+      ...(effectiveConfigOptions === undefined ? {} : { configOptions: effectiveConfigOptions }),
+    };
     // For display in /workflows: the model this agent runs on — its explicit/phase/default
     // spec, else the session's main model. The real resolved id overrides this via
     // onModelResolved once the subagent session is created.
     let displayModel = modelSpec ?? options.mainModel;
-    if (hasModelConfigOption(agentOptions.configOptions)) {
-      // Surface the rejected authored call to validation/observability without invoking the
+    if (hasModelConfigOption(effectiveConfigOptions)) {
+      // Surface the rejected effective call to validation/observability without invoking the
       // AgentRunner. The following assertion is the pre-session authority.
       options.onAgentStart?.({
         label: pendingLabel,
         phase: assignedPhase,
         prompt,
         model: displayModel,
-        configOptions: agentOptions.configOptions,
+        configOptions: effectiveConfigOptions,
         callIndex: state.callSeq,
         scope: runId,
       });
     }
-    assertNoModelConfigOption(agentOptions.configOptions, pendingLabel);
+    assertNoModelConfigOption(effectiveConfigOptions, pendingLabel);
 
     const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
     const retryAttempts =
@@ -1035,9 +1106,9 @@ export async function runWorkflow<T = unknown>(
     const callHash = hashAgentCall(
       prompt,
       modelSpec,
-      agentOptions.mode,
+      effectiveMode,
       assignedPhase,
-      agentOptions,
+      effectiveAgentOptions,
       agentDefinitionKey(agentDef),
     );
     const callPath = captureCallPath(vmFilename, preludeLines);
@@ -1115,7 +1186,7 @@ export async function runWorkflow<T = unknown>(
         phase: assignedPhase,
         prompt,
         model: displayModel,
-        configOptions: agentOptions.configOptions,
+        configOptions: effectiveConfigOptions,
         callIndex,
         path: callPath,
         scope: runId,
@@ -1402,8 +1473,8 @@ export async function runWorkflow<T = unknown>(
                     resolvedIsolation,
                   ),
                   model: modelSpec,
-                  mode: agentOptions.mode,
-                  configOptions: agentOptions.configOptions,
+                  mode: effectiveMode,
+                  configOptions: effectiveConfigOptions,
                   tier: agentOptions.tier,
                   toolNames: agentDef?.tools,
                   disallowedToolNames: agentDef?.disallowedTools,
@@ -1647,6 +1718,7 @@ export async function runWorkflow<T = unknown>(
       sourceResumeSafety?: WorkflowResumeSafety;
       rebindSession: boolean;
       manifestProvenance: boolean;
+      reportJournal?: boolean;
     }): Promise<unknown> => {
       await Promise.resolve();
       throwIfAborted();
@@ -1704,7 +1776,9 @@ export async function runWorkflow<T = unknown>(
             : {}),
         },
       });
-      guardTerminal("onAgentJournal", () => options.onAgentJournal?.(entry));
+      if (input.reportJournal !== false) {
+        guardTerminal("onAgentJournal", () => options.onAgentJournal?.(entry));
+      }
       emitAgentEnd({
         label,
         phase: assignedPhase,
@@ -1903,28 +1977,19 @@ export async function runWorkflow<T = unknown>(
       const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
       const hashMatches = cached != null && cached.hash === callHash;
       const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-      if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+      if (hashMatches && !cachedEmptyOutput && (options.sameRunContinuation || callIndex < state.firstMiss)) {
         try {
-          emitAgentStart();
           const resultSnapshot = strictSnapshot(cached.result, `agent "${label}" replayed result`, label);
-          const cachedSession = cached.session ? cloneTelemetry(cached.session) : undefined;
-          const cachedUsage = cached.usage ? copyValidUsage(cached.usage) : undefined;
-          if (cachedSession) state.agentSessions.push(cachedSession);
-          settle({
-            outcome: "result",
-            origin: "journal-replay",
-            ...(cachedUsage ? { usage: cachedUsage } : {}),
+          return replayPreparedAgent({
+            entry: cached,
+            resultSnapshot,
+            sourceRunId: runId,
+            recordedIndex: callIndex,
+            match: "index-hash",
+            rebindSession: true,
+            manifestProvenance: true,
+            reportJournal: false,
           });
-          emitAgentEnd({
-            label,
-            phase: assignedPhase,
-            result: resultSnapshot,
-            tokens: 0,
-            model: displayModel,
-            session: cachedSession,
-            usage: cachedUsage,
-          });
-          return Promise.resolve(resultSnapshot);
         } catch (error) {
           const errorRecord = projectRecordedError(error);
           const workflowError = wrapError(error, { agentLabel: label });
@@ -2341,6 +2406,7 @@ export async function runWorkflow<T = unknown>(
       checkpointInjected?: true;
       checkpointHostDecision: boolean;
       manifestProvenance: boolean;
+      reportJournal?: boolean;
     }): unknown => {
       const terminalRecord = settle({
         outcome: "result",
@@ -2366,7 +2432,9 @@ export async function runWorkflow<T = unknown>(
         scope: runId,
         call: { kind: "checkpoint" as const, label: "checkpoint" as const, phase: state.currentPhase },
       });
-      guardTerminal("onAgentJournal", () => options.onAgentJournal?.(journalEntry));
+      if (input.reportJournal !== false) {
+        guardTerminal("onAgentJournal", () => options.onAgentJournal?.(journalEntry));
+      }
       const checkpointTaken: WorkflowCheckpointTaken = deepFreeze({
         callIndex,
         kind: checkpointKind ?? "confirm",
@@ -2589,19 +2657,25 @@ export async function runWorkflow<T = unknown>(
       }
     } else {
       const cached = journaling ? options.resumeJournal?.get(callIndex) : undefined;
-      if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+      if (
+        cached != null &&
+        cached.hash === callHash &&
+        (options.sameRunContinuation || callIndex < state.firstMiss)
+      ) {
         try {
           const resultSnapshot = strictSnapshot(cached.result, `checkpoint "${promptText}" replayed reply`);
-          settle({ outcome: "result", origin: "journal-replay" });
-          const entry: WorkflowCheckpointTaken = deepFreeze({
-            callIndex,
-            kind: checkpointKind ?? "confirm",
-            decision: resultSnapshot,
-            source: options.injectedCheckpointReplies?.has(callIndex) ? "injected" : "journal-replay",
+          return replayCheckpoint({
+            resultSnapshot,
+            sourceRunId: runId,
+            recordedIndex: callIndex,
+            match: "index-hash",
+            ...(options.injectedCheckpointReplies?.has(callIndex)
+              ? { checkpointInjected: true as const }
+              : {}),
+            checkpointHostDecision: true,
+            manifestProvenance: true,
+            reportJournal: false,
           });
-          state.checkpointsTaken.push(entry);
-          guardTerminal("onCheckpointTaken", () => options.onCheckpointTaken?.(entry));
-          return resultSnapshot;
         } catch (error) {
           settle({ outcome: "error", origin: "journal-replay", error: projectRecordedError(error) });
           throw error;
@@ -3176,6 +3250,55 @@ function hashCanonicalStrictJson(value: unknown): string | undefined {
   return canonical === undefined ? undefined : createHash("sha256").update(canonical).digest("hex");
 }
 
+/** Canonical host-owned occurrence map used by durable run admission. */
+export function canonicalizeWorkflowAgentConfigurations(
+  value: Readonly<Record<number, WorkflowAgentConfiguration>>,
+): Readonly<Record<number, WorkflowAgentConfiguration>> {
+  return snapshotHostAgentConfigurations(value) ?? deepFreeze({});
+}
+
+/** Stable binding for every provider-affecting value admitted by the host. */
+export function hashWorkflowAdmissionSelection(input: {
+  format: 1;
+  agentConfigurations: Readonly<Record<number, WorkflowAgentConfiguration>>;
+  defaultModel?: string;
+  scriptBackends?: Record<string, WorkflowBackendConfig>;
+}): string {
+  const hash = hashCanonicalStrictJson({
+    format: input.format,
+    agentConfigurations: canonicalizeWorkflowAgentConfigurations(input.agentConfigurations),
+    ...(input.defaultModel === undefined ? {} : { defaultModel: input.defaultModel }),
+    ...(input.scriptBackends === undefined ? {} : { scriptBackends: input.scriptBackends }),
+  });
+  if (hash === undefined) {
+    throw new WorkflowError(
+      "workflow admission selection must be strict JSON",
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  return hash;
+}
+
+function copyTokenUsageBaseline(
+  value: Readonly<SharedRuntime["tokenUsage"]> | undefined,
+): SharedRuntime["tokenUsage"] {
+  if (value === undefined) {
+    return { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 };
+  }
+  const fields = ["input", "output", "total", "cost", "cacheRead", "cacheWrite"] as const;
+  for (const field of fields) {
+    if (!Number.isFinite(value[field]) || value[field] < 0) {
+      throw new WorkflowError(
+        `tokenUsageBaseline.${field} must be a finite non-negative number`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+  }
+  return { ...value };
+}
+
 function hashCallInputs(inputs: {
   cwd: unknown;
   isolation: unknown;
@@ -3314,6 +3437,78 @@ function hashCheckpoint(promptText: string, options: CheckpointOptions): string 
     choices: options.choices ?? null,
   });
   return createHash("sha256").update(identity).digest("hex");
+}
+
+function snapshotHostAgentConfigurations(
+  value: Readonly<Record<number, WorkflowAgentConfiguration>> | undefined,
+): Readonly<Record<number, WorkflowAgentConfiguration>> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new WorkflowError(
+      "host agentConfigurations must be an object keyed by non-negative occurrence ordinals",
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  const snapshot: Record<number, WorkflowAgentConfiguration> = {};
+  for (const [key, configuration] of Object.entries(value)) {
+    if (!/^(?:0|[1-9][0-9]*)$/.test(key) || !Number.isSafeInteger(Number(key))) {
+      throw new WorkflowError(
+        `host agentConfigurations key ${JSON.stringify(key)} must be a non-negative safe integer`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    snapshot[Number(key)] = normalizeHostAgentConfiguration(configuration, Number(key))!;
+  }
+  return deepFreeze(snapshot);
+}
+
+function normalizeHostAgentConfiguration(
+  value: WorkflowAgentConfiguration | undefined,
+  ordinal: number,
+): WorkflowAgentConfiguration | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new WorkflowError(
+      `host agent configuration ${ordinal} must be an object`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  if (typeof value.model !== "string" || value.model.trim() === "") {
+    throw new WorkflowError(
+      `host agent configuration ${ordinal}.model must be a non-empty string`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  if (value.mode !== undefined && (typeof value.mode !== "string" || value.mode.trim() === "")) {
+    throw new WorkflowError(
+      `host agent configuration ${ordinal}.mode must be a non-empty string`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  const configOptions = value.configOptions;
+  if (
+    configOptions !== undefined &&
+    (!configOptions ||
+      typeof configOptions !== "object" ||
+      Array.isArray(configOptions) ||
+      Object.values(configOptions).some((entry) => typeof entry !== "string" && typeof entry !== "boolean"))
+  ) {
+    throw new WorkflowError(
+      `host agent configuration ${ordinal}.configOptions must contain only string or boolean values`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  return {
+    model: value.model,
+    ...(value.mode === undefined ? {} : { mode: value.mode }),
+    ...(configOptions === undefined ? {} : { configOptions: { ...configOptions } }),
+  };
 }
 
 function hashAgentCall(

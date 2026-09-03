@@ -98,8 +98,8 @@ Each call matches against the final resolved label passed to `AgentRunner.run()`
 - Adjacent `*` characters are equivalent to one `*`; an empty glob or a trailing escape is invalid.
 - A raw rule key that is an ECMAScript canonical array-index property name is invalid: `"0"`, or a non-zero decimal integer with no leading zero whose value is at most `4294967294`. `"01"` and `"4294967295"` are not canonical array indexes and are not rejected by this rule. This restriction applies to the raw glob key, not to labels. An exact numeric label remains expressible by escaping any one digit: the JSON or TypeScript source key `"\\10"` decodes to the non-index glob `\10`, which compiles to the literal label `10`.
 
-This is the mock-answer rule-key grammar, not the ad hoc inspection `labelGlob` contract in
-`01-run-observability.md`. Both use case-sensitive whole-label `*`, `?`, and backslash matching, but
+This is the mock-answer rule-key grammar, not the status inspection `labelGlob` contract in
+`../workflow-status-action.md`. Both use case-sensitive whole-label `*`, `?`, and backslash matching, but
 their reviewed terminal-escape behavior is intentionally distinct: a trailing escape is invalid in
 prevalidated mock-answer configuration, while inspection treats it as a literal backslash. Keep
 their normalizers separate and pin that distinction in their respective tests.

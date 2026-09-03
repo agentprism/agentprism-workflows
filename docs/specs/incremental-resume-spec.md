@@ -5,6 +5,11 @@
 > no longer the product contract. See the current
 > [journal replay contract](journal-replay-contract.md). Identity/fingerprint and journal-integrity
 > sections remain useful implementation history.
+>
+> **SDK-only replay surface (updated 2026-09-02):** every model-facing MCP replay/fork clause in
+> this historical design is superseded by [same-run MCP continuation](workflow-resume-action.md).
+> The SDK `resumeFromRunId`/`resumePolicy` APIs described here remain available to embedding hosts;
+> the MCP schema neither advertises nor accepts them.
 
 **Date:** 2026-07-15
 
@@ -25,7 +30,7 @@
 
 ## 1. Problem
 
-Mainline resume is positional today. `WorkflowManager` and the MCP server hydrate a
+The original SDK resume path was positional. `WorkflowManager` hydrates a
 `Map<number, JournalEntry>`, and `runWorkflow()` serves an entry only when its hash matches the
 call at that index and the index is less than the run-wide `firstMiss`. The first changed, missing,
 new, or empty cached agent result lowers `firstMiss`; that call and every later call run live.
@@ -420,22 +425,11 @@ same-ID run is re-registered or delegated; failure releases its lease and raises
 `PERSISTENCE_ERROR`. A managed run started with a caller-authored `resumeJournal` durably writes the
 same bit in its critical initial save. These
 marks are permanent: neither positional path applies v1 admission/safety rules, so its results must
-never be laundered into a later identity source. Hosts that want edited-script or non-contiguous
-reuse start a new managed run with `resumeFromRunId`; MCP continues to do exactly that.
+never be laundered into a later identity source. SDK hosts that want edited-script or non-contiguous
+reuse start a new managed run with `resumeFromRunId`.
 
-MCP `WorkflowExecuteToolInput` gains the same optional policy:
-
-```ts
-interface WorkflowExecuteToolInput {
-  // existing run fields unchanged
-  resumeFromRunId?: string;
-  resumePolicy?: "auto" | "positional";
-  checkpointReplies?: Record<number, unknown>;
-}
-```
-
-The MCP server stops building `resumeJournal` itself. It passes the ID, policy, and replies to the
-manager so foreground/background and SDK/MCP use one preparation algorithm.
+The MCP server deliberately exposes none of these fields or reports. Its `resume` action is the
+strict same-ID continuation contract and uses a versioned canonical host admission instead.
 
 The existing `WorkflowRunOptions.resumeFromRunId` remains informational at the bare-engine seam.
 The manager now sets it to the **source** run ID (today it passes the new managed run's ID when a
@@ -681,7 +675,7 @@ export interface PersistedResumeSeed {
 }
 
 /** Manager-prepared, engine-internal execution input. It is exported from the engine
- *  only because WorkflowRunOptions is public; SDK/MCP callers never construct it. */
+ *  only because WorkflowRunOptions is public; public callers never construct it. */
 export type PreparedResume =
   | {
       strategy: "identity-v1";
@@ -833,7 +827,7 @@ does not alter `hashCheckpoint()`, `hashCallInputs()`, or `CALL_INPUTS_FORMAT`. 
 value is written as `inputsHash` on every terminal checkpoint call row, including the
 `CHECKPOINT_REQUIRED` error row used for an injection.
 
-This fingerprint is required even for origin-`"confirm"` rows. The current MCP confirm path uses
+This fingerprint is required even for origin-`"confirm"` rows. A host confirm path may use
 `default` to populate/fallback a decision and `timeoutMs` to decide when that fallback occurs, so
 host provenance alone does not prove equal inputs. For identity replay, a host confirm result is a
 decision over the prompt, the documented `CheckpointOptions` values, and (if consulted) the
@@ -1327,11 +1321,8 @@ reason. Consequently, the engine finalizes and emits a live worktree decision on
 `createWorktree()` returns/throws but still before runner delegation; non-worktree and replay
 decisions emit at the earlier matcher point. `onResumeDecision` is invoked exactly once per index.
 
-MCP foreground results and terminal `await.outcome` carry `resumeReport` through the existing
-`WorkflowRunResult` projection. Bounded `inspect` does not expose it in v1; hosts inspect the
-persisted result or terminal outcome. Text summaries add one compact line such as
-`resume: identity-v1, 38 replayed, 2 live, 0 failed` or
-`resume: positional-v1/safe-prefix, 3 replayed, 7 live, 0 failed`, and never enumerate decisions.
+SDK terminal results carry `resumeReport` through `WorkflowRunResult`. This report is not projected
+through MCP; the MCP same-ID lifecycle exposes only bounded continuation telemetry.
 
 ### 2.14 Failure-mode analysis
 
@@ -1426,7 +1417,7 @@ includes its item/index normally has distinct hashes and matches independently.
 
 #### Unchanged checkpoint hash, changed host-decision inputs
 
-Recording: an MCP-hosted checkpoint has `default: false` and `timeoutMs: 0`. The confirm callback
+Recording: an SDK-hosted checkpoint has `default: false` and `timeoutMs: 0`. The confirm callback
 times out immediately and returns the authored default, so the row has origin `"confirm"` and
 decision `false`. The resumed script keeps the same prompt/kind/choices and call site but changes
 `default` to `true`; `hashCheckpoint()` is therefore unchanged, while a live confirm would return
@@ -1521,7 +1512,7 @@ One coordinated release:
 | `@automatalabs/shared-types` | safety/provenance/report types; checkpoint-capable `inputsHash` documentation; additive `WorkflowCallRecord` and `WorkflowRunResult` fields | minor |
 | `@automatalabs/workflow-engine` | format/admission/seed/matcher/barrier/budget/session implementation; checkpoint-options fingerprint; manager-owned `resumeFromRunId` | minor |
 | `@automatalabs/workflows` | DSL `agent().resume`, exec option/re-exports, SDK behavior | minor |
-| `@automatalabs/mcp-server` | optional `resumePolicy`, manager-owned hydration, result summary, regenerated authoring prompt | minor |
+| `@automatalabs/mcp-server` | no SDK replay/fork surface is exposed | none |
 | `@automatalabs/acp-agents` | none; the safety option is engine-owned and never reaches `RunOptions` | none |
 
 Changesets call out the default resume-policy change, logical budget behavior in identity mode,
@@ -1530,8 +1521,7 @@ positional nested-workflow hardening, positional cache hits now emitting fresh j
 new-format positional input-fingerprint/host-checkpoint gating, and the legacy positional exception.
 Two further observable back-compat changes must be named explicitly: the §2.5 common
 terminal-status gate now applies to marker-less/legacy sources, so an aborted (or `abortSignaled`)
-legacy source serves nothing where the MCP path previously resumed it silently (advertised flows
-are unaffected — the server offers resume only for paused runs); and the §2.6 terminal-save drop of
+legacy source serves nothing; and the §2.6 terminal-save drop of
 inherited unvisited positional suffix rows means a double-hop pause flow's bridged tail now runs
 live on the second hop where the previous latestRows-merged journal would have replayed it — a
 fail-safe regression required so a paused positional-v1 artifact satisfies its own §2.5 rule-6
@@ -1607,7 +1597,7 @@ bijection on the next hop.
   current rows plus inherited seed, while the same pause without an injectable reply falls back;
   changed/ambiguous checkpoint does not inject; changing `default`, `headless`, or `timeoutMs`
   makes an origin-`"confirm"` candidate live in both identity and safe-prefix positional modes;
-  the concrete MCP timeout/default case from §2.14 is pinned; a same-`(hash, inputsHash)` source row
+  the concrete host timeout/default case from §2.14 is pinned; a same-`(hash, inputsHash)` source row
   of any outcome blocks injection and flattening retains that block; an earlier positional miss prevents even a
   corresponding shifted injection, and a served shifted positional injection closes the prefix
   immediately after itself; missing/non-canonicalizable checkpoint inputs cannot replay or inject;
@@ -1656,15 +1646,13 @@ bijection on the next hop.
 
 ### 5.4 `@automatalabs/mcp-server`
 
-- Tool-schema parsing for `resumePolicy`; invalid values/action combinations and
-  `checkpointReplies` without `resumeFromRunId` rejected.
-- Foreground and background routes pass the ID to the manager and never construct their own index
-  map; missing ID is a tool error.
-- Shifted checkpoint reply mapping, durable initial seed before background accepted response, and
-  terminal multi-hop resume; the MCP confirm timeout/default path produces a checkpoint input
-  mismatch rather than a stale host-decision replay when either option changes.
-- Structured result includes the report; text contains only the compact count line.
-- Authoring-prompt generation/drift sentinels cover the new resume rule and safety annotation.
+- Discovery and runtime reject every SDK replay/fork field; only the strict same-ID `resume` branch
+  accepts checkpoint replies.
+- Foreground and background continuation keep the exact run ID and use the manager's canonical
+  admission, journal, event stream, and cumulative usage.
+- Structured results omit SDK correspondence reports and expose bounded same-ID continuation
+  telemetry only.
+- Authoring-doc generation/drift sentinels cover the same-ID rule.
 
 ## 6. Docs & skill updates
 
@@ -1680,11 +1668,11 @@ bijection on the next hop.
   or V8 upgrade invalidates every new-format cache via exact runtime equality while legacy
   journals keep replaying — a future relaxation to positional-with-input-gates on runtime mismatch
   must ship under a new format literal, never by reinterpreting v1 bytes.
-- `docs/api.md`: exact SDK/manager/MCP types, report/reason catalogs, legacy compatibility,
+- `docs/api.md`: exact SDK/manager types, report/reason catalogs, and separate strict MCP contract,
   session rebinding, and the filesystem boundary.
 - Root and package READMEs: one compact read-only/worktree fan-out example and link to API docs.
 - `docs/roadmap/incremental-resume.md`: mark the direction item implemented by this contract.
-- Regenerate `packages/mcp-server/src/generated/authoring-prompt-content.ts` via the existing script
+- Regenerate `packages/mcp-server/src/generated/authoring-docs-content.ts` via the existing script
   and update drift tests/sentinels.
 - Add a docs drift test over `RESUME_FALLBACK_REASONS`, `RESUME_DISABLED_REASONS`,
   `RESUME_CALL_LIVE_REASONS`, and `RESUME_CALL_FAILED_REASONS`.
@@ -1716,8 +1704,8 @@ in §4 rather than publishing an intermediate surface:
    public SDK exports/validation, and background durability. This is the first default-cache
    behavior change and includes the 40-way fan-out, both filesystem counterexamples, and crash
    tests.
-6. **PR6 — MCP integration.** MCP schema and manager-owned hydration, foreground/background result
-   projection, compact summaries, and checkpoint-reply integration tests.
+6. **PR6 — MCP boundary.** Keep the SDK replay controls out of MCP and test the separate strict
+   same-ID continuation path.
 7. **PR7 — docs/release/non-regression.** Skill/reference/API/README/roadmap updates, generated MCP
    prompt, reason drift tests, full isolation non-regression suite, and coordinated changesets.
 

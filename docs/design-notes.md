@@ -4,7 +4,7 @@ The deep design reference behind [`../README.md`](../README.md). It records *wha
 *which libraries* it uses, and *what each library actually supports* — with concrete,
 package-specific API references (field/method names, file:line, versions). For installation and
 usage, start with the README; read this when you need the protocol-level mechanics (ACP lifecycle,
-the structured-output crux, model/permission/usage wiring, the engine lineage).
+the structured-output crux, model/permission/usage wiring, and execution-engine internals).
 
 > Reference/design doc, not a roadmap or a tutorial. The implementation now lives in nine
 > `@automatalabs/*` packages — see [§2](#2-codebase--module-structure). The Pi `src/…` citations
@@ -173,7 +173,8 @@ or any other backend (exactly how the Pi tests drive it today via `options.agent
 
 Owns the **`workflow` tool definition** (input schema + handler) and the **`repl` tool** (registered
 over a per-project QuickJS VM through `@automatalabs/repl-engine`), plus the stdio MCP transport;
-streams progress via MCP `notifications/progress`; exposes the `resumeFromRunId` param. It registers
+streams progress via MCP `notifications/progress`; and owns the strict same-ID MCP continuation
+contract. It registers
 **no auth tools** — backend auth stays with the agents' own credential stores. It depends on
 `@automatalabs/workflows`, `@automatalabs/repl-engine`, and `@automatalabs/shared-types`, constructs
 the ACP runner, and injects it into the facade manager. It is just **one** consumer — the engine +
@@ -248,14 +249,15 @@ All versions below were re-verified from the installed workspace dependency grap
 
 - **`@agentclientprotocol/claude-agent-acp@0.73.0`** — ACP server wrapping Claude.
   Bin: `claude-agent-acp` (`npx @agentclientprotocol/claude-agent-acp`). Author: Zed Industries.
-  Resolves **`@anthropic-ai/claude-agent-sdk@0.3.258`** through the workspace override — the
+  Resolves **`@anthropic-ai/claude-agent-sdk@0.3.259`** through the workspace override — the
   adapter itself exact-pins `0.3.257`, so the override lifts the runtime to npm `latest`.
   Adapter 0.71–0.73 adds model-aware modes, per-model usage metadata, native subagent/task
   reporting, message-specific forks, and session titles. AgentPrism gives engine-owned Claude
   sessions a stable label-derived SDK title so the adapter does not launch its otherwise-unobserved
   background title-generation model call; interactive sessions retain generated titles. SDK
-  0.3.258 is a Claude Code parity update over 0.3.257's thinking-token and MCP resource-link
-  additions. The structured-output option/result declarations integrated below remain compatible.
+  0.3.259 adds batched user-message correlation and an opt-in no-prompt permission policy, plus
+  Claude Code parity. AgentPrism's host permission broker retains the default `host` policy, and
+  the structured-output, terminal-result, and usage surfaces integrated below remain compatible.
   Drop the override once the adapter catches up (CONTRIBUTING "When the dependency gate blocks").
   Ref: https://github.com/agentclientprotocol/claude-agent-acp
   > Naming note: the canonical package is **`claude-agent-acp`**, not "claude-acp".
@@ -286,7 +288,7 @@ All versions below were re-verified from the installed workspace dependency grap
 ## 4. The MCP side — exposing the `workflow` tool
 
 The `workflow` tool grew from Pi's single-form input
-([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into a strict **action union** — `config`, `run`, `resume`, `status`, `result`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. Tool discovery publishes a draft-2020-12 `oneOf` with one top-level branch per canonical action, literal required discriminators, branch-local properties, and `additionalProperties:false`. Run nests exact inline/path plus fresh/edited-replay variants; stop nests whole-run/targeted variants. The same Zod union performs runtime validation, so action combinations are no longer maintained by a separate manual discriminator. A pre-validation migration normalizer still accepts omitted-action run and retired inspect/await inputs, but those forms are absent from discovery and from the canonical TypeScript union:
+([`src/workflow-tool.ts:61`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-tool.ts#L61)) into a strict **action union** — `config`, `run`, `resume`, `status`, `result`, `permissions-response`, and `stop` — exposed via the MCP server instead of `defineTool`. Tool discovery publishes a draft-2020-12 `oneOf` with one top-level branch per canonical action, literal required discriminators, branch-local properties, and `additionalProperties:false`. Run nests exact inline/path variants; stop nests whole-run/targeted variants. The same Zod union performs runtime validation. There is no omitted-action default, retired action alias, pre-validation normalizer, deprecated field, or hidden acceptance path. Both the legacy 2025 transport and modern `2026-07-28` transport publish and execute this same lifecycle:
 
 - **Run** — supply **exactly one** of `script` or `scriptPath` (a raw JS string with no Markdown
   fences, or an absolute server-side path read once at admission; the first statement must be
@@ -295,27 +297,44 @@ The `workflow` tool grew from Pi's single-form input
   defaulting to the server's own project under `--in-process`. Agent-less deterministic scripts are
   valid; the validator warns when a script has neither `agent()` nor `checkpoint()`. Other run
   fields: `args`, `maxAgents` (default 1000), `concurrency` (clamped to 16), `agentRetries`
-  (clamped to ≤3), the explicit-resume
-  trio `resumeFromRunId` / `resumePolicy` / `checkpointReplies`, and `background`.
-- **Resume** — supply a source `runId`; the server reads that run's immutable persisted script and
-  stored strict-JSON args and always admits a fresh linked run. An explicit `args` value replaces
-  the stored value. It accepts the new run's operational overrides, replay policy, checkpoint
-  replies, and background mode, but no script or project path. It never inherits old operational
-  limits. Completed, failed, aborted, and resumable paused sources are valid when their persisted
-  data is readable; missing/unreadable content and unreplayable stored args fail before admission.
-  Edited replay remains the Run form with explicit `script`/`scriptPath` plus `resumeFromRunId`.
-- **Status / result / permissions-response / stop** — take a `runId` and never execution fields. `status` accepts the existing `lastN` / `labelGlob` / `logLines` projection bounds and `waitMs` (default 0): omitted/zero observes immediately and a positive value waits at most that long for terminal state or required permission. The request bound never cancels workflow work. `result` reads the authoritative completed value from persistence and returns at most 16,384 exact UTF-8 JSON bytes plus `endOffset`/`hasMore`; boundaries never split a code point and interior offsets fail closed. Status projects live ACP permission requests and returns early with `action-required`; `permissions-response` names the opaque request id and returns an exact advertised optionId or cancelled outcome. Whole-run stop is location-independent across daemon generations: the successor persists an idempotent intent, routes signed control to the lease owner, and may return a nonterminal pending-control acknowledgement before final settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and cancellation is never reconstructed after owner loss. Stop accepts the same projection bounds.
+  (clamped to ≤3), and `background`.
+- **Resume** — supply the exact `runId` plus optional runtime bounds, a strict-JSON
+  `checkpointReplies` answer, and `background`. The server continues that same identity under its
+  run lease using its immutable persisted script, args, cwd, approved script backends, canonical
+  agent configuration, journal, event stream, cumulative usage, and checkpoint history. It accepts
+  no replacement script, args, replay policy, source ID, or project path and never allocates a child
+  execution. An old record without the required canonical admission metadata remains inspectable
+  where naturally supported, but continuation fails clearly and requires a fresh Run.
+- **Status / result / permissions-response / stop** — take a `runId` and never execution fields.
+  `status` accepts the existing `lastN` / `labelGlob` / `logLines` projection bounds and always
+  returns one immediate snapshot; it has no wait control or wait metadata. `result` reads the
+  authoritative completed value from persistence and returns at most 16,384 exact UTF-8 JSON bytes
+  plus `endOffset`/`hasMore`; boundaries never split a code point and interior offsets fail closed.
+  Status projects live ACP permission requests; `permissions-response` names the opaque request id
+  and returns an exact advertised optionId or cancelled outcome. Whole-run stop is location-independent
+  across daemon generations: the successor persists an idempotent intent, routes signed control to
+  the lease owner, and may return a nonterminal pending-control acknowledgement before final
+  settlement. `forceOwner:true` explicitly authorizes terminating a superseded owner after identity
+  revalidation. `stop` with `callIndex` instead synchronously routes cancellation to one live
+  in-flight agent (its slot settles to `null` with `AGENT_CANCELLED`); force is forbidden and
+  cancellation is never reconstructed after owner loss. Stop accepts the same projection bounds.
 - **Bounds clamp, don't reject:** accept `concurrency`/`agentRetries` as plain numbers in the tool
   schema — *not* Zod `.max()`, which rejects out-of-range input with `InvalidParams`. The engine
   already clamps them (`normalizeConcurrency` → `MAX_CONCURRENCY` 16, `normalizeAgentRetries` →
   `MAX_AGENT_RETRIES` 3), so defer to it and keep the "clamped" semantics above (matches Pi). The
-  status *bounds* (`lastN`/`logLines`/`waitMs`), by contrast, are wire-contract limits rejected
+  status projection bounds (`lastN`/`logLines`), by contrast, are wire-contract limits rejected
   at the Zod boundary.
 
 **Unbounded agent execution with explicit cancellation.** Model-facing agent work has no elapsed-time
 budget or idle watchdog. An attempt remains live until it completes, fails, or the host explicitly
 cancels its call or run. Protocol startup, cancellation-grace, cleanup, lease, and transport bounds
 remain fixed implementation safety controls; they are not configurable agent work budgets.
+
+**Configuration elicitation is task-legible and canonical.** Before a new run is admitted, each
+observed agent occurrence shows its phase title/detail, label, and a bounded credential-redacted
+task/prompt preview. The user can therefore see what each selected model will do. Accepted form
+values are validated against the live catalog and converted into the canonical effective snapshot
+described below; private form scaffolding is not persisted.
 
 **Exact result discovery is separate from observability.** Completed runs with a persisted JSON
 value expose `workflow://runs/{runId}/result`, distinct from the immutable `/script` resource and the
@@ -339,7 +358,13 @@ request rather than stranding the tool call; that run is then operated like a ba
 But background support was **not** dropped. Runs execute in a shared per-user **workflow daemon**
 (the stdio entry is a thin shim that auto-starts it), so `background: true` acknowledges after
 durable admission with a `runId` and the run outlives the request — observed later with bounded
-`status` calls, and durable across client disconnects, shim kills, and session eviction. Version succession moves the family front door without moving live VM/ACP state: a predecessor keeps its run lease while the successor joins that lease to the predecessor's PID/instance record and forwards control over a user-key HMAC endpoint. A pre-control busy predecessor is temporarily retained for the first rolling upgrade. Owner exit, or the single client-owned process exiting under `--in-process`, can interrupt work; no timeout steals a live lease. Resume is **explicit**: `action:"resume"` creates a new run from a source's stored script/args, while Run with explicit content plus `resumeFromRunId` is the edited replay path.
+`status` snapshots, and durable across client disconnects, shim kills, and session eviction. Version succession moves the family front door without moving live VM/ACP state: a predecessor keeps its run lease while the successor joins that lease to the predecessor's PID/instance record and forwards control over a user-key HMAC endpoint. A pre-control busy predecessor is temporarily retained for the first rolling upgrade. Owner exit, or the single client-owned process exiting under `--in-process`, can interrupt work; no timeout steals a live lease. Resume is **explicit and same-ID**: `action:"resume"` continues the supplied run and does not create a model-visible execution attempt.
+
+The run-monitor UI is also resilient to hosts replacing an existing MCP App panel. Every surviving
+panel is a bounded multi-run dashboard: it defaults to the tool call's run and uses a
+capability-gated, app-only `workflow-runs` tool to navigate active and recent project runs. The
+listing comes from the authoritative manager/store, remains outside the model's tool loop, and is
+bounded independently of the detailed app-only event poller.
 
 The shipped server registers the `workflow` and `repl` tools — and no auth tool. Backend auth belongs to
 the agents' own CLI credential stores, and the server deliberately exposes no auth state for a
@@ -351,26 +376,29 @@ first-prompt authentication. When `AGENTPRISM_DEFAULT_BACKEND` is absent and a m
 reaches a model-less call, the MCP composition root probes configured backends, excludes failures
 and explicitly empty built-in catalogs, prefers positive session-open evidence (Codex's auth check;
 Pi's credential-filtered model catalog), then falls back to the first session-ready unknown. It
-pins that backend-only spec into engine validation, call identity, persistence, and resume. A later
+pins that backend-only spec into engine validation, call identity, persistence, and continuation. A later
 `AUTH_REQUIRED` pauses on that backend; there is no mid-run provider fallback. `AUTH_REQUIRED`
 pauses a run with the non-secret `authContext`; the recovery sequence is an out-of-band CLI login,
-then re-call `workflow` with `action:"resume"` and the source `runId`. Programmatic credential injection stays in the
+then re-call `workflow` with `action:"resume"` and the same `runId`. Programmatic credential injection stays in the
 SDK's auth-capable runner APIs for embedding hosts.
 
-Resume is **not lost**, it has two explicit new-run forms: the simple `resume` action hydrates the
-persisted source script/args, while `run` plus `resumeFromRunId` uses caller-supplied content. Both
-continue from the persisted journal. If the source paused inside a root agent turn on
-usage/auth, the manager separately projects its persisted call/session join into a continuation
-candidate. The resumed live occurrence reopens and continues that session when every identity,
-input, cwd, backend, and capability gate holds; otherwise it opens a fresh session. This channel is
-independent of replay strategy and adds no MCP input.
+MCP resume is one exact-run operation. Admission persists a versioned canonical host-owned effective
+agent-configuration snapshot atomically with the initial state. The snapshot contains the resolved
+provider/model/mode/config values by stable occurrence ordinal, not raw form fields. Continuation
+inherits it without re-elicitation and fails closed if a live occurrence was not covered or if an
+old record lacks required metadata. If the run paused inside a root agent turn on usage/auth, the
+manager projects its persisted call/session join into a continuation candidate. The resumed live
+occurrence reopens and continues that session when every identity, input, cwd, backend, and
+capability gate holds; otherwise it opens a fresh session. This channel adds no MCP input.
 
 Live ACP permission requests are a different, execution-affine human gate. The MCP runner installs a
 resolver that parks the original `session/request_permission` promise and records a bounded live
 projection keyed by run/call/permission id. The projection omits the private ACP session id, redacts
 credential-shaped diagnostics, bounds scalars and structure, and preserves every exact ordered option
 id inside a 64 KiB envelope; an unrepresentable option set is cancelled rather than partially shown.
-Status exposes the exact ordered backend options;
+The form renders the already-sanitized available tool-call raw input, content, and locations under
+strict field and total bounds, alongside run ID, phase, agent label, backend, tool title/kind, and
+the exact meaning/scope of each option. Status exposes the exact ordered backend options;
 legacy elicitation-capable clients receive a form immediately, modern clients use an integrity-bound
 `inputRequired` retry, and non-elicitation clients call `permissions-response`. Responses validate the
 selected option against the parked request and route through signed daemon control to the process that
@@ -385,6 +413,9 @@ clients provide the live channel. Without elicitation, the authored headless mod
 `"default"` takes `default ?? true`, `"abort"` aborts, and opt-in `"pause"` persists a
 `checkpoint_required` pause. The host resumes that pause with `action:"resume"`, its `runId`, and a decision in
 `checkpointReplies`; its `checkpointContext` supplies the call index and hash used to journal it.
+Under the run lease, the first strict-JSON answer is durable before continuation. Repeating the same
+answer is idempotent; later conflicts are ignored in favor of that first answer, which reconstruction
+replays forever.
 
 ---
 
@@ -485,6 +516,11 @@ mode for Pi. Custom backends retain their own current mode. Config discovery ret
 `id`, `name`, `description`, and `_meta`, plus AgentPrism's default id; both authored and built-in
 defaults are validated against the live advertised catalog before a prompt. No local replacement
 descriptions are maintained.
+
+Trusted autonomous implementation/review workflows explicitly select Claude
+`bypassPermissions` or Codex `agent`. Claude `auto` is a model-classifier mode that may still request
+permission; it is not described as fully autonomous. Permission elicitation remains a transparent
+human gate for other modes, not a substitute for choosing the backend's real full-access mode.
 
 Ref: https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission ·
 https://learn.chatgpt.com/docs/sandboxing/auto-review.md
@@ -596,14 +632,14 @@ export type PromptRequest = {
 // :213   ToolCallContent = Content | Diff | Terminal      — no structuredContent
 ```
 
-### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.73.0` → `@anthropic-ai/claude-agent-sdk@0.3.258`
+### 6.2 Claude — `@agentclientprotocol/claude-agent-acp@0.73.0` → `@anthropic-ai/claude-agent-sdk@0.3.259`
 
 **Supported, session-scoped, via the `_meta.claudeCode` vendor extension.**
 
 **(a) Set the schema — IN.** The SDK's `Options.outputFormat` is the native lever:
 
 ```ts
-// claude-agent-sdk 0.3.258  sdk.d.ts:1820
+// claude-agent-sdk 0.3.259  sdk.d.ts:1820
 /** Output format configuration for structured responses.
  *  When specified, the agent will return structured data matching the schema. */
 outputFormat?: OutputFormat;
@@ -651,7 +687,7 @@ Client `session/new` payload:
 and retries; on exhaustion it ends with a terminal subtype:
 
 ```ts
-// claude-agent-sdk 0.3.258  sdk.d.ts:4877  (SDKResultError.subtype)
+// claude-agent-sdk 0.3.259  sdk.d.ts:4894  (SDKResultError.subtype)
 'error_during_execution' | 'error_max_turns' | 'error_max_budget_usd'
   | 'error_max_structured_output_retries'
 ```
@@ -662,7 +698,7 @@ error / `max_turn_requests` stop reason).
 **(c) Read the result — OUT (the one rough edge).** The parsed object lands in:
 
 ```ts
-// claude-agent-sdk 0.3.258  sdk.d.ts:4955  (SDKResultSuccess)
+// claude-agent-sdk 0.3.259  sdk.d.ts:4977  (SDKResultSuccess)
 structured_output?: unknown;
 ```
 
@@ -1005,7 +1041,8 @@ resurrect a snapshot or sidecar after the run was removed.
   `patchedDependencies` transform). `CodexBackend` also normalizes schemas
   to OpenAI **strict** rules. Output rides the normal message stream (no `emitRawSDKMessages` needed).
 - **MCP turn semantics:** no "deliver result into a later turn" — run the `workflow` tool
-  synchronously with progress notifications; expose `resumeFromRunId` for continuation.
+  synchronously with progress notifications or admit it in the background; continuation keeps the
+  exact input run ID.
 - **Cross-provider routing = choose the server.** Per-call model tiering works *within* a
   provider via config options; switching providers means routing to a different ACP server.
 - **OpenCode is not bundled.** `OpenCodeBackend` resolves `AGENTPRISM_OPENCODE_ACP_CMD`, then a
@@ -1034,7 +1071,7 @@ resurrect a snapshot or sidecar after the run was removed.
 **Packages (verified versions, 2026-09-02):**
 - `@modelcontextprotocol/{client,server,node}@2.0.0` (dual-era MCP shell); `@modelcontextprotocol/sdk@1.30.0` remains on separate ACP embedded-client boundaries — https://github.com/modelcontextprotocol/typescript-sdk
 - `@agentclientprotocol/sdk@1.4.0` — https://github.com/agentclientprotocol
-- `@agentclientprotocol/claude-agent-acp@0.73.0` (workspace override resolves `@anthropic-ai/claude-agent-sdk@0.3.258`; adapter pin `0.3.257`) — https://github.com/agentclientprotocol/claude-agent-acp
+- `@agentclientprotocol/claude-agent-acp@0.73.0` (workspace override resolves `@anthropic-ai/claude-agent-sdk@0.3.259`; adapter pin `0.3.257`) — https://github.com/agentclientprotocol/claude-agent-acp
 - `@automatalabs/codex-acp` (workspace fork of `@agentclientprotocol/codex-acp` at `packages/codex-acp`, patch baked into dist) — upstream: https://github.com/agentclientprotocol/codex-acp
 - `@automatalabs/pi-acp` (Pi ACP server; workspace-lockstep built-in dependency, exact version stamped at publish) — `packages/pi-acp`
 - OpenCode (`opencode acp`) — https://opencode.ai

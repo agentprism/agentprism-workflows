@@ -8,6 +8,8 @@ export {
   parseWorkflowScript,
   workflowMayUseDefaultModel,
   hashCheckpointInputs,
+  canonicalizeWorkflowAgentConfigurations,
+  hashWorkflowAdmissionSelection,
   resolveWorkflowRunLimits,
   CALL_PATH_FORMAT,
   CALL_INPUTS_FORMAT,
@@ -17,6 +19,7 @@ export {
   type WorkflowRunOptions,
   type WorkflowCallbackContext,
   type WorkflowAgentAttemptControl,
+  type WorkflowAgentConfiguration,
   type WorkflowAgentOptions,
   type AgentOptions,
   type CheckpointOptions,
@@ -31,6 +34,8 @@ export {
   type ExecOptions,
   type ManagedRun,
   type WorkflowAgentCallCancellation,
+  type WorkflowContinuationRefusalReason,
+  type WorkflowContinuationStart,
   type PersistedRunStopResult,
 } from "./workflow-manager.js";
 export {
@@ -47,6 +52,7 @@ export {
   type PersistedResumeCallBlocker,
   type PersistedCheckpointInjection,
   type PersistedResumeSeed,
+  type PersistedRunAdmission,
   type PersistedRunLineageTombstone,
   type FsLayer,
   type RunPersistenceOptions,

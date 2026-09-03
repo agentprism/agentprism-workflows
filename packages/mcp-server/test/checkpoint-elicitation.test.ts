@@ -25,7 +25,7 @@ async function connectCheckpoint(
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   return {
     callWorkflow: (script: string, options: Record<string, unknown> = {}) =>
-      client.callTool({ name: "workflow", arguments: { script, ...options } }),
+      client.callTool({ name: "workflow", arguments: { action: "run", script, ...options } }),
     requests: () => requests,
     async dispose() {
       await client.close();
@@ -59,54 +59,6 @@ return await checkpoint('Pick one', { kind: 'select', choices: ['alpha', 'beta']
       default: "beta",
     });
     assert.deepEqual(schema.required, ["choice"]);
-  } finally {
-    await conn.dispose();
-  }
-});
-
-test("checkpoint timeout falls back to the declared default", async () => {
-  const conn = await connectCheckpoint(() => new Promise<ElicitResult>(() => {}));
-  try {
-    const script = `export const meta = { name: 'timeout-cp', description: 'checkpoint timeout' }
-return await checkpoint('Name?', { kind: 'input', default: 'fallback-name', timeoutMs: 5 })`;
-
-    const res = await conn.callWorkflow(script);
-
-    assert.equal(res.isError, false);
-    assert.equal(structured(res)?.result, "fallback-name");
-    assert.equal(conn.requests().length, 1, "the server tried to elicit before timing out");
-  } finally {
-    await conn.dispose();
-  }
-});
-
-test("changed checkpoint timeout/default inputs run the host channel instead of replaying a stale decision", async () => {
-  const conn = await connectCheckpoint(() => new Promise<ElicitResult>(() => {}));
-  try {
-    const sourceScript = `export const meta = { name: 'timeout-resume', description: 'checkpoint input identity' }
-return await checkpoint('Proceed?', { kind: 'confirm', default: false, timeoutMs: 0 })`;
-    const changedScript = `export const meta = { name: 'timeout-resume', description: 'checkpoint input identity' }
-return await checkpoint('Proceed?', { kind: 'confirm', default: true, timeoutMs: 0 })`;
-    const source = await conn.callWorkflow(sourceScript);
-    assert.equal(structured(source)?.result, false);
-
-    const resumed = await conn.callWorkflow(changedScript, {
-      resumeFromRunId: String(structured(source)?.runId),
-    });
-    assert.equal(structured(resumed)?.result, true);
-    const report = structured(resumed)?.resumeReport as Record<string, unknown> | undefined;
-    assert.equal(report?.strategy, "identity-v1");
-    assert.equal(report?.replayed, 0);
-    assert.equal(report?.live, 1);
-    assert.deepEqual(report?.calls, [
-      { index: 0, kind: "checkpoint", action: "live", reason: "inputs-changed" },
-    ]);
-    assert.equal(conn.requests().length, 2, "the changed call invokes MCP elicitation again");
-    assert.match(
-      textOf(resumed),
-      /^WARNING: resume: identity-v1; predicted replayable prefix 1; replayed prefix 0; 0 replayed, 1 live, 0 failed$/m,
-    );
-    assert.match(textOf(resumed), /first non-replay: call 0 inputs-changed/);
   } finally {
     await conn.dispose();
   }

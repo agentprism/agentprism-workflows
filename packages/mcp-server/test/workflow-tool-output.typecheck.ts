@@ -1,7 +1,5 @@
 import type {
   WorkflowCallRecord,
-  WorkflowReplayEligibility,
-  WorkflowResumeCallDecision,
   WorkflowRunLimits,
   WorkflowRunStatus,
 } from "@automatalabs/workflows";
@@ -10,7 +8,6 @@ import type {
   WorkflowBackgroundAccepted,
   WorkflowExecutionToolResult,
   WorkflowResultRetrieval,
-  WorkflowScriptLineageEntry,
   WorkflowScriptResourceFields,
   WorkflowStatusToolResult,
   WorkflowStopPendingResult,
@@ -18,27 +15,11 @@ import type {
 } from "../src/workflow-tool-output.js";
 
 declare const status: WorkflowRunStatus;
-const lineage: WorkflowScriptLineageEntry[] = [];
 const limits = {
   maxAgents: 1_000,
   concurrency: 6,
   agentRetries: 0,
 };
-const replayEligibility: WorkflowReplayEligibility = {
-  strategy: "identity-v1",
-  sourceRunId: "source-run",
-  predictedReplayablePrefix: 1,
-  replayedPrefix: 0,
-  replayed: 0,
-  live: 0,
-  failed: 0,
-  currentEngineVersion: "0.27.0",
-  engineVersionComparison: "source-unknown",
-  currentInputsFormat: 2,
-  provenanceChanges: [],
-  operationalChanges: [],
-};
-
 const execution: WorkflowExecutionToolResult = {
   runId: "aa-bb",
   status: "completed",
@@ -47,7 +28,6 @@ const execution: WorkflowExecutionToolResult = {
   resultUri: "workflow://runs/aa-bb/result",
   eventsUri: "workflow://runs/aa-bb/events",
   limits,
-  replayEligibility,
 };
 const resultRetrieval: WorkflowResultRetrieval = {
   action: "result",
@@ -69,17 +49,14 @@ const background: WorkflowBackgroundAccepted = {
   scriptUri: "workflow://runs/aa-bb/script",
   eventsUri: "workflow://runs/aa-bb/events",
   limits,
-  replayEligibility,
 };
 const statusFields = {
   ...status,
   scriptUri: "workflow://runs/aa-bb/script",
   eventsUri: "workflow://runs/aa-bb/events",
-  lineage,
 };
 const observed: WorkflowStatusToolResult = {
   ...statusFields,
-  wait: { requestedMs: 0, elapsedMs: 0, returnedBecause: "immediate" },
 };
 const stopped: WorkflowStopResult = {
   ...statusFields,
@@ -102,7 +79,6 @@ const pendingStop: WorkflowStopPendingResult = {
 const resourceFields: WorkflowScriptResourceFields = {
   scriptUri: "workflow://runs/aa-bb/script",
   resultUri: "workflow://runs/aa-bb/result",
-  lineage,
 };
 const removedBudgetLimit: WorkflowRunLimits = {
   maxAgents: 1,
@@ -119,16 +95,6 @@ const removedCallDebit: WorkflowCallRecord = {
   origin: "runner",
   // @ts-expect-error debit metadata is not part of current call records
   budgetDebit: 0,
-};
-const removedLogicalDebit: WorkflowResumeCallDecision = {
-  index: 0,
-  kind: "agent",
-  action: "replayed",
-  sourceRunId: "source",
-  recordedIndex: 0,
-  match: "index-hash",
-  // @ts-expect-error replay reports do not expose logical debit metadata
-  logicalBudgetDebit: 0,
 };
 
 // @ts-expect-error result retrieval requires the exact chunk
@@ -175,29 +141,16 @@ const executionWithoutEvents: WorkflowExecutionToolResult = {
   scriptUri: "workflow://runs/aa-bb/script",
   limits,
 };
-// @ts-expect-error status results require the complete lineage
-const statusWithoutLineage: WorkflowStatusToolResult = {
-  ...status,
-  scriptUri: "workflow://runs/aa-bb/script",
-  wait: { requestedMs: 0, elapsedMs: 0, returnedBecause: "immediate" },
-};
 // @ts-expect-error status results require scriptUri
 const statusWithoutUri: WorkflowStatusToolResult = {
   ...status,
-  lineage,
-  wait: { requestedMs: 0, elapsedMs: 0, returnedBecause: "immediate" },
 };
 // @ts-expect-error stop acknowledgements require alreadyTerminal
 const stopWithoutTerminalAck: WorkflowStopResult = {
   ...status,
   status: "aborted",
   scriptUri: "workflow://runs/aa-bb/script",
-  lineage,
   stopped: true,
-};
-// @ts-expect-error common inspection resource fields require lineage
-const fieldsWithoutLineage: WorkflowScriptResourceFields = {
-  scriptUri: "workflow://runs/aa-bb/script",
 };
 
 void [
@@ -211,13 +164,10 @@ void [
   resourceFields,
   removedBudgetLimit,
   removedCallDebit,
-  removedLogicalDebit,
   executionWithoutSource,
   executionWithoutLimits,
   executionWithoutEvents,
   backgroundWithoutUri,
-  statusWithoutLineage,
   statusWithoutUri,
   stopWithoutTerminalAck,
-  fieldsWithoutLineage,
 ];

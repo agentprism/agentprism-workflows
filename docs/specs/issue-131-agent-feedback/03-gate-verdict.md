@@ -297,8 +297,8 @@ Changeset: **minor**, because the published authoring type surface gains an addi
 ### `packages/mcp-server` (`@automatalabs/mcp-server`)
 
 The `workflow` tool remains the only tool. The gate-verdict item itself adds no input or output field
-because `result` is already `unknown`; the coordinated run/inspect/await schema changes are owned by
-`01-run-observability.md` and `02-detached-runs.md`. The checked-in `author-workflow` prompt content
+because `result` is already `unknown`; the current run/status action contracts are owned by
+`../workflow-action-schema.md` and `../workflow-status-action.md`. The checked-in `author-workflow` prompt content
 changes when regenerated from the updated authoring skill and reference.
 
 Changeset: **patch**, because this package receives a version-matched generated documentation refresh but no tool, prompt argument, or runtime protocol shape change.

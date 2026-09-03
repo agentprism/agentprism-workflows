@@ -73,11 +73,6 @@ function plain<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-const RESUME_LOOP_CAP_EXAMPLE = readFileSync(
-  new URL("../../../skills/agentprism-workflow-authoring/examples/resume-loop-cap.workflow.js", import.meta.url),
-  "utf8",
-);
-
 test("valid script: parse + dry run complete; calls, backends, checkpoints, phases reported", async () => {
   const script = [
     'export const meta = { name: "v", description: "d", phases: [{ title: "Fan" }, { title: "Judge" }] };',
@@ -116,6 +111,23 @@ test("valid script: parse + dry run complete; calls, backends, checkpoints, phas
   assert.match(result.pair[1], /dry-run/);
   assert.deepEqual(report.dryRun!.phasesVisited, ["Fan", "Judge"]);
   assert.equal(report.warnings.length, 0);
+});
+
+test("agent configuration discovery exposes a useful bounded redacted task preview", async () => {
+  const secret = "sk-proj-1234567890abcdef";
+  const longTask = `Inspect deployment ${secret} and report concrete file targets ${"detail ".repeat(100)}`;
+  const report = await validateWorkflowScript(
+    `export const meta = { name: "preview", description: "preview" };\n` +
+      `return await agent(${JSON.stringify(longTask)}, { label: "review", model: "codex" });`,
+    { probeConfig: false },
+  );
+  assert.equal(report.ok, true);
+  const preview = report.dryRun?.agentCalls[0]?.promptPreview;
+  assert.ok(preview);
+  assert.match(preview, /Inspect deployment \[REDACTED\]/);
+  assert.doesNotMatch(preview, /sk-proj-/);
+  assert.ok(Buffer.byteLength(preview, "utf8") <= 384);
+  assert.match(preview, /…$/);
 });
 
 test("defaultModel is resolved during the dry run and probeConfig:false performs routing discovery without probes", async () => {
@@ -792,20 +804,6 @@ test("probe failure warns once per backend/model pair, reports probed:false, and
   } finally {
     restore();
   }
-});
-
-test("published resume-loop-cap example validates its default and intentional six-round failure", async () => {
-  const complete = await validateWorkflowScript(RESUME_LOOP_CAP_EXAMPLE);
-  assert.equal(complete.ok, true);
-  assert.equal(complete.exitCode, 0);
-  assert.equal(complete.dryRun?.status, "completed");
-  assert.equal(complete.dryRun?.agentCalls.length, 8);
-
-  const capped = await validateWorkflowScript(RESUME_LOOP_CAP_EXAMPLE, { args: { maxRounds: 6 } });
-  assert.equal(capped.exitCode, 2);
-  assert.equal(capped.dryRun?.status, "failed");
-  assert.equal(capped.dryRun?.agentCalls.length, 6);
-  assert.match(capped.dryRun?.reason ?? "", /review cap 6 reached before 8 rounds/);
 });
 
 test("determinism violation fails the static parse (exit 1), no dry run", async () => {

@@ -2,9 +2,9 @@
 
 Status: **implemented contract for the daemon run-control release train**.
 
-> **Current MCP action name:** historical `inspect`/`await` references below map to
-> `action:"status"`; daemon ownership and control behavior are unchanged. See
-> [`workflow-status-action.md`](workflow-status-action.md).
+> `action:"status"` is the sole model-facing observation action and returns immediately. Daemon
+> ownership and control behavior are shared by the legacy 2025 and modern `2026-07-28` transports.
+> See [`workflow-status-action.md`](workflow-status-action.md).
 
 ## Source request
 
@@ -22,10 +22,9 @@ The shared MCP daemon has two identities that must not be conflated:
 - the **execution owner** is the process holding a particular workflow run's filesystem lease.
 
 During an upgrade, the front door may move while an execution remains in the predecessor. Persisted
-state makes `inspect` and `await` location-independent, but an abort controller and an in-flight ACP
+state makes immediate status location-independent, but an abort controller and an in-flight ACP
 turn are process-local. The former behavior routed `stop` to the successor, which could see the run
-but could not control it; `resumeFromRunId` was then also refused because the live predecessor still
-held the source lease.
+but could not control it while the live predecessor still held the run lease.
 
 This train makes run control location-independent without attempting to migrate a live JavaScript
 VM, promise graph, or ACP connection between processes.
@@ -42,9 +41,8 @@ VM, promise graph, or ACP connection between processes.
    HTTP reply loss or owner exit and is idempotent by operation ID.
 5. **No fabricated cancellation.** Per-agent cancellation is routed to the live owner but is not
    reconstructed after owner death. Owner loss never manufactures an `AGENT_CANCELLED` result.
-6. **No automatic execution replay.** Succession never silently creates a `resumeFromRunId`
-   execution. Resume remains an explicit new run because replay can spend tokens and repeat
-   external effects.
+6. **No automatic continuation.** Succession never silently continues a run. MCP resume is an
+   explicit same-ID action under the existing run lease.
 7. **Fail-safe version skew.** A first control-capable shim does not strand work on a predecessor
    that predates this protocol.
 8. **Explicit destructive escalation.** Killing an execution-owner process is never inferred from
@@ -175,8 +173,8 @@ interface WorkflowStopPendingResult extends WorkflowRunStatus {
 }
 ```
 
-A later `stop`, `inspect`, or `await` observes the same run. Final success retains the stronger
-existing guarantee: resume is safe immediately and a follow-up await adds nothing.
+A later `stop` or `status` observes the same run. Final success retains the stronger guarantee that
+the terminal state is already durable.
 
 ### 6.2 Per-agent cancellation
 
@@ -277,7 +275,7 @@ release. Old readers ignore them; new readers accept their absence.
 This train does not:
 
 - transfer a live VM or ACP socket;
-- automatically create a resumed run;
+- automatically continue a run;
 - add heartbeat/TTL lease stealing;
 - turn the stdio shim into a run-aware request router;
 - impose an automatic drain deadline;
@@ -306,6 +304,6 @@ The deterministic suite must cover:
 12. Force rejects current, non-daemon, mismatched, and live-unverifiable owners; an authorized
     superseded owner termination cold-stops the target and leaves sibling recovery resumable.
 13. Wrong/missing/stale HMAC requests are rejected and cannot mutate a run.
-14. `inspect`, `await`, event reads, and stop retries remain coherent across generations.
+14. `status`, app-only event reads, and stop retries remain coherent across generations.
 15. Existing total-version-order, stale-lock recovery, stop durability-fault, and session-recovery
     tests remain green.

@@ -23,7 +23,7 @@ test("a dropped foreground call's response is replayed via GET + Last-Event-ID",
     const pending = session.client.request(
       {
         method: "tools/call",
-        params: { name: "workflow", arguments: { script: ONE_AGENT_SCRIPT, projectDir } },
+        params: { name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT, projectDir } },
       },
       { onresumptiontoken: (token) => (resumptionToken = token) },
     );

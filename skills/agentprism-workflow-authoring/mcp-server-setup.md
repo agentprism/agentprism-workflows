@@ -1,42 +1,86 @@
-## Running workflows — the MCP `workflow` tool
+# Running workflows — the MCP `workflow` tool
 
-Agents run workflows through the `workflow` tool served by `@automatalabs/mcp-server`. The server also registers `docs` for selective version-matched workflow/REPL reference topics and `repl` for interactive orchestration. This skill is optional when `docs` is connected. Register the server once in the host's MCP configuration (project-scoped is typical):
+The shared daemon owns execution, so admitted runs survive client session churn. `config` and
+`run` require an absolute `projectDir` on the daemon; every other action locates the project from
+the run ID. A single-project in-process server may default `projectDir`.
+
+Discovery and runtime expose the same strict seven-action union: `config`, `run`, `resume`,
+`status`, `result`, `permissions-response`, and `stop`. Every request must include its exact
+`action`, and every branch rejects fields from another branch. There are no aliases, omitted-action
+defaults, wait controls, or hidden cross-action inputs.
+
+## Actions
+
+- **Config** (`{ action:"config", projectDir, harnesses?, modelSpecs?, modelFilter? }`) discovers
+  the live model/mode/config catalogs without sending a prompt. Pin only values it advertises.
+  Trusted autonomous implementation/review workflows should select Claude `bypassPermissions` or
+  Codex `agent` when advertised. Claude `auto` uses a model classifier and may request permission;
+  it is not full-access autonomy.
+- **Run** (`{ action:"run", projectDir, script | scriptPath, args?, background?, ...runtime }`)
+  requires exactly one content source. The server reads a path once, statically validates and mock
+  executes the script, then performs routed config checks. When form elicitation is available, each
+  observed call shows phase title/detail, label, and a bounded credential-redacted task preview.
+  Accepted provider/model/mode/config selections become one versioned canonical host snapshot
+  atomically persisted at admission; raw form fields are not stored. An uncovered live occurrence
+  fails closed. Invalid preflight creates no run or background reservation.
+- **Resume** (`{ action:"resume", runId, checkpointReplies?, background?, ...runtime }`) continues
+  that exact paused or failed run ID. It inherits the persisted script, args, cwd, approved script
+  backends, canonical agent configuration, journal, events, cumulative usage, and checkpoint
+  decisions without re-elicitation. It never creates a child run or accepts edited inputs. Old
+  records without required canonical metadata remain inspectable but require a fresh Run.
+- **Status** (`{ action:"status", runId, lastN?, labelGlob?, logLines? }`) returns one immediate,
+  bounded on-demand snapshot. It never waits, elicits, or changes execution, and may expose a
+  sanitized pending ACP permission request.
+- **Result** (`{ action:"result", runId, offset?, maxBytes? }`) pages the exact JSON result of a
+  completed run in at most 16,384 UTF-8 bytes without splitting code points.
+- **Permission response** (`{ action:"permissions-response", runId, permissionId, response }`)
+  selects one exact advertised option ID or cancels the live request. Capable foreground run/resume
+  calls instead get a form showing run ID, phase, label, backend, tool title/kind, bounded redacted
+  raw input/content/locations, and the exact meaning/scope of every option. Private session IDs and
+  secrets are never shown.
+- **Stop** aborts the whole run, or includes `callIndex` to cancel one live agent call. A targeted
+  call settles to `null` with `AGENT_CANCELLED`; siblings continue.
+
+For a checkpoint pause, use the exact `checkpointContext.callIndex` in `checkpointReplies`. The
+first strict-JSON answer is durable before continuation. Repeating it is idempotent; later conflicts
+are ignored in favor of the first answer.
+
+## Long-running loop
 
 ```json
-{ "mcpServers": { "agentprism-workflows": { "command": "npx", "args": ["-y", "@automatalabs/mcp-server@latest"] } } }
+{
+  "action": "run",
+  "projectDir": "/absolute/project",
+  "background": true,
+  "script": "export const meta = { name: 'review', description: 'Review a target' }; return await agent(`Review ${args.target}`, { label: 'review', model: 'codex', mode: 'agent' });",
+  "args": { "target": "packages/core" }
+}
 ```
 
-The stdio command the host spawns is a thin **shim**. It proxies to a shared per-user **workflow daemon** (Streamable HTTP on loopback, auto-started on first use). Runs survive session end, host restarts, and tool timeouts. During an upgrade the successor becomes the front door while signed run-control forwarding reaches a predecessor that still owns execution. Owner exit can interrupt in-flight work. Any later session can check status or stop a run. Runs, journals, logs, and outstanding whole-stop intents persist under `~/.agentprism/workflows/` per project namespace.
+Retain the returned run ID. The MCP Apps monitor or durable events resource follows progress
+without model tool calls; request status only when one on-demand model-readable sample is needed:
 
-Every `run` call names its project with the required `projectDir` argument — an absolute path, normally the workspace root. One registration serves every project. `resume`/`status`/`result`/`stop` take only a `runId`; the runId locates its project store automatically. Add `--in-process` to the args for the pre-daemon single-process behavior (`projectDir` is then optional), or register the daemon's HTTP endpoint directly in HTTP-capable hosts (`agentprism-workflow daemon url` prints snippets). The command resolves at spawn time, so a reconnect (`/mcp` in Claude Code) picks up the latest published version.
+```json
+{ "action": "status", "runId": "RUN_ID" }
+```
 
-Tool discovery publishes a strict seven-action `oneOf`. Always send the required canonical
-`action`; every branch accepts only its own documented fields. During migration the runtime still
-maps omitted action to `run`, retired `inspect` to immediate `status`, and retired `await` to
-`status` with its historical 20-second omitted wait, but those compatibility forms are not
-advertised.
+After completion, page the exact result:
 
-### The `workflow` tool, by action
+```json
+{ "action": "result", "runId": "RUN_ID", "offset": 0, "maxBytes": 16384 }
+```
 
-- **Config** (`{ action: "config", projectDir, harnesses?, modelSpecs?, modelFilter? }`): discover live model, mode, effort, and `configOptions` values from no-prompt backend sessions. Use `harnesses` plus `modelFilter` to find ids, then `modelSpecs` to select exact models and read their model-specific option domains. Each successful entry preserves raw mode ids, names, descriptions, and `_meta`, and reports `defaultModeId`. Omitted modes use Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode; every selected/default id is validated against the live catalog. It starts no workflow and spends zero tokens. Use it only when pinning those values; an omitted model or backend-only model uses configured defaults without discovery.
-- **Run** (`{ action:"run", script | scriptPath, projectDir, ... }`): supply exactly one of `script` (the raw source string, no Markdown fences) or `scriptPath` (an absolute path on the server's filesystem), plus `projectDir`. The tool automatically performs static validation, a mocked dry run, and routed config checks before admission. Invalid scripts return bounded `status:"rejected"` diagnostics with no run ID, background slot, or token spend. A path is read once at admission and its content snapshotted; later edits affect only a new run. `args` arrives in the script as the `args` global; the run's base directory is the `cwd` global. Some hosts hand `args` through as a JSON **string** — tolerate both shapes (`typeof args === "string" ? JSON.parse(args) : args`). Foreground streams progress for the request lifetime. Pass `background: true` for anything that may outlive one request; it acknowledges after durable admission with a `runId`.
-- **Status** (`{ action: "status", runId, waitMs?, lastN?, labelGlob?, logLines? }`): the canonical bounded snapshot of calls, logs, and live `pendingPermissions`. Omit `waitMs` (or pass zero) for an immediate observation; a positive value waits only for terminal state or a required permission and never cancels workflow work. A timeout is progress, not failure, and terminal responses add `outcome`. Completed runs expose `resultUri` and an exact-result resource link without putting large output into the bounded status. Permission diagnostics omit the private ACP session id, are credential-redacted and bounded, and preserve the complete ordered exact option-id list or fail closed. Elicitation-capable clients present the backend's exact choices.
-- **Result** (`{ action:"result", runId, offset?, maxBytes? }`): retrieve a completed authored result as exact UTF-8 JSON chunks of at most 16,384 bytes. Start at offset zero and continue at each `endOffset` while `hasMore` is true. UTF-8 code points are never split; invalid interior offsets and runs without completed values fail closed.
-- **Permission response** (`{ action:"permissions-response", runId, permissionId, response }`): select one exact advertised optionId or cancel a live ACP request. Caller-supplied response `_meta` is forbidden. It routes only to the execution owner and cannot be reconstructed after owner loss.
-- **Stop**: `{ action:"stop", runId }` durably aborts the whole run and normally returns its final snapshot; stopping a terminal run is a successful no-op. Across an upgrade it persists an idempotent intent and forwards to the execution owner. If settlement exceeds the control wait, the successful response is nonterminal with `control.state:"pending"`; retry stop or status. `{ action:"stop", runId, callIndex }` synchronously routes to the live owner and cancels exactly that agent with `AGENT_CANCELLED`; it is never reconstructed after owner loss. Whole-run `forceOwner:true` explicitly authorizes terminating a superseded owner daemon and may interrupt sibling runs; it is forbidden with `callIndex`. `labelGlob` only filters output.
-- **Resume** (`{ action:"resume", runId, args?, checkpointReplies?, background?, ...newRunOverrides }`): always creates a fresh linked run from the source's immutable stored script and stored strict-JSON args; explicit `args` replaces the stored value. Completed, failed, aborted, and resumable paused sources work when their persisted data supports replay. Missing/unreadable content and unreplayable args fail directly, and old operational limits are never inherited. Use Run with explicit `script`/`scriptPath` plus `resumeFromRunId` for edited-content replay. Read `replayEligibility`; uncertain calls run live. Full semantics: **Determinism and resume**.
+If the run pauses or fails and is continuable:
 
-### Operating rules
+```json
+{ "action": "resume", "runId": "RUN_ID", "background": true }
+```
 
-- **Always retain the returned `runId`.** A paused, failed, or aborted response carries a redacted final-20 `logTail`. Read it before you change anything. Every admitted script is immutable at `workflow://runs/{runId}/script`; durable-log runs return `eventsUri` and a labelled events link on admission and later status/terminal responses; and a completed JSON result is independently durable at `workflow://runs/{runId}/result`. Completed foreground/status responses copy exact JSON up to 4,096 UTF-8 bytes into model-visible text; larger results point to the resource and bounded `action:"result"` paging. Script, events, and result links are labelled separately.
-- **Two fingerprints control replay.** The identity hash covers the prompt, the resolved model, `mode` when set, non-empty sorted `configOptions`, `tier`, `phase`, `agentType`, the resolved agent definition, and the schema. The input fingerprint covers the resolved label, per-call `cwd` and isolation, `keepSession`, images, MCP servers, session/prompt metadata, and the approved script-backend digest.
-- **Operational bounds are not replay inputs.** Host `concurrency` and `agentRetries`, plus per-call `retries`, enter neither fingerprint. A resume does not inherit them from its source run; pass the values you want on every run. Agent attempts have no elapsed-time budget and remain live until completion, failure, or explicit call/run cancellation.
-- **Old journals stay usable.** Input formats below 2 replay positionally with `fallbackReason: "inputs-format-legacy"`. A current-format crash snapshot uses identity matching even without terminal-environment capture. Ancestor-scoped rows carried from ≤0.23 resume chains replay only while that ancestor run is still persisted. Journals resume across filesystem, environment, engine, Node, and V8 changes; `replayEligibility` reports those differences as diagnostics, never as gates.
-- **A background start returns immediately.** It sends no progress after it returns; collect progress with later bounded status calls. Background runs have no live checkpoint channel, so authored `headless` checkpoint modes apply. After owner death, a pending whole-stop intent is applied under the reclaimed lease; otherwise cold preflights reconcile stale `pending`/`running` state to `paused` with `pauseReason:"interrupted"`. A live owner lease is never stolen on timeout.
-- A run paused with `reason: "auth_required"` resumes with `{ action:"resume", runId }` after you log in the backend's own CLI out of band.
+The returned ID is still `RUN_ID`.
 
-### Execution logs — the events resource
+## Run monitor
 
-Every journaling run publishes an MCP resource at `workflow://runs/{runId}/events`; use the returned `eventsUri`. `status.latestActivity` keeps one bounded durable sample per call—cursor/timestamp, counts, observed tokens, assistant preview or tool name, and current/terminal relevance—while the resource remains the detailed source. Subscribe to the canonical URI for advisory `resources/updated` hints, then read and paginate with `after`, `limit`, and `streamId`. This bounded/redacted stream is observability, not an exact result-reconstruction API; use `/result` or `action:"result"` for authored output. Progress is coarse and redacted: `agentTranscript` rows are assistant/tool upserts partitioned by `(scope, callIndex, executionStartSeq)` and reduced by greatest revision per entry index. The durable cursor is authoritative when hints coalesce or a subscriber falls behind.
-
-Embedding hosts can drive the same contract with `runDynamicWorkflow` / `WorkflowManager` from `@automatalabs/workflows`; the script contract is identical either way.
+MCP Apps hosts may replace one panel with another. Every surviving panel is therefore a bounded
+multi-run dashboard: it defaults to the initiating tool call's run and obtains active/recent
+navigation from the capability-gated app-only `workflow-runs` tool. `workflow-events` supplies
+bounded live detail. Neither app-only tool enters the model's tool loop.

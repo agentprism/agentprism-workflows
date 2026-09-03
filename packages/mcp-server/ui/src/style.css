@@ -75,6 +75,18 @@ body {
   letter-spacing: 0.02em;
 }
 
+.run-switch {
+  max-width: 220px;
+  min-width: 120px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-node);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
 .run-tag,
 .run-id {
   color: var(--text-faint);

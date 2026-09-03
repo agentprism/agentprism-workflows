@@ -27,13 +27,16 @@ import type {
   CheckpointContext,
   JournalEntry,
   WorkflowCallRecord,
+  WorkflowBackendConfig,
   WorkflowCheckpointTaken,
+  WorkflowContinuationResult,
   WorkflowReplayEligibility,
   WorkflowResumeReport,
   WorkflowRunFallback,
   WorkflowRunLimits,
 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
+import type { WorkflowAgentConfiguration } from "./workflow.js";
 import type { ReplayReport } from "./isolation.js";
 import type { RunEnvironmentIdentity } from "./run-environment.js";
 import { withRunEventsUsingFs, type RunEventPersistence } from "./run-event-persistence.js";
@@ -76,6 +79,25 @@ export interface PersistedResumeFormat {
    *  terminal run, or a non-git run without meaningful terminal provenance. Presence,
    *  absence, and value are diagnostic only and never affect journal replay. */
   terminalEnvironment?: RunEnvironmentIdentity;
+}
+
+/** Immutable host-owned provider selection captured in the run's first durable save. */
+export interface PersistedRunAdmission {
+  format: 1;
+  strict: true;
+  agentConfigurations: Readonly<Record<number, WorkflowAgentConfiguration>>;
+  defaultModel?: string;
+  scriptBackends?: Record<string, WorkflowBackendConfig>;
+  selectionHash: string;
+  source: "mcp-elicitation" | "mcp-routing" | "host";
+  recordedAt: string;
+  /** A live occurrence not covered by the admitted map permanently closes continuation. */
+  uncoveredOccurrence?: {
+    ordinal: number;
+    label: string;
+    phase?: string;
+    recordedAt: string;
+  };
 }
 
 export interface PersistedResumeCandidate {
@@ -148,6 +170,9 @@ export interface PersistedRunState {
     checkpointInputsFormat?: number;
   };
   environment?: RunEnvironmentIdentity;
+  /** Required by same-ID continuation; deliberately absent on pre-contract runs. */
+  admission?: PersistedRunAdmission;
+  continuation?: WorkflowContinuationResult;
   resume?: PersistedResumeFormat;
   /** Immediate run named by resumeFromRunId, written once by the engine at admission. */
   readonly resumeSourceRunId?: string;

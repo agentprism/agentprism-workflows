@@ -22,7 +22,7 @@ const canonicalInputs = {
   config: { action: "config", projectDir: "/tmp/project", harnesses: ["codex"] },
   run: { action: "run", script: "export const meta = {};" },
   resume: { action: "resume", runId: "source-1" },
-  status: { action: "status", runId: "source-1", waitMs: 25_000 },
+  status: { action: "status", runId: "source-1" },
   result: { action: "result", runId: "source-1", offset: 0, maxBytes: 16_384 },
   "permissions-response": {
     action: "permissions-response",
@@ -35,7 +35,7 @@ const canonicalInputs = {
 
 const crossActionInputs = {
   "config + run field": { action: "config", script: "x" },
-  "run + status field": { action: "run", script: "x", waitMs: 0 },
+  "run + status field": { action: "run", script: "x", lastN: 1 },
   "resume + run field": { action: "resume", runId: "source-1", script: "x" },
   "status + control field": { action: "status", runId: "source-1", callIndex: 0 },
   "result + status field": { action: "result", runId: "source-1", lastN: 1 },
@@ -46,7 +46,7 @@ const crossActionInputs = {
     response: { outcome: { outcome: "cancelled" } },
     offset: 0,
   },
-  "stop + request wait": { action: "stop", runId: "source-1", waitMs: 1 },
+  "stop + result field": { action: "stop", runId: "source-1", offset: 1 },
 } as const;
 
 type JsonObject = Record<string, unknown>;
@@ -103,13 +103,13 @@ test("runtime and published JSON Schema accept every canonical action and reject
   const validate = new AjvJsonSchemaValidator().getValidator(published as JsonSchemaType);
   for (const [name, input] of Object.entries(canonicalInputs)) {
     assert.equal(workflowToolCanonicalInputSchema.safeParse(input).success, true, `${name} canonical runtime`);
-    assert.equal(Schema.safeParse(input).success, true, `${name} compatibility runtime`);
+    assert.equal(Schema.safeParse(input).success, true, `${name} runtime`);
     assert.equal(validate(input).valid, true, `${name} published schema`);
     assert.equal(parseWorkflowToolInput(input).action, input.action, `${name} parser`);
   }
   for (const [name, input] of Object.entries(crossActionInputs)) {
     assert.equal(workflowToolCanonicalInputSchema.safeParse(input).success, false, `${name} canonical runtime`);
-    assert.equal(Schema.safeParse(input).success, false, `${name} compatibility runtime`);
+    assert.equal(Schema.safeParse(input).success, false, `${name} runtime`);
     assert.equal(validate(input).valid, false, `${name} published schema`);
     assert.throws(
       () => parseWorkflowToolInput(input),
@@ -119,18 +119,10 @@ test("runtime and published JSON Schema accept every canonical action and reject
   }
 });
 
-test("run structurally enforces explicit content XOR and edited-replay dependencies", () => {
+test("run requires exactly one explicit script source and rejects fields outside its branch", () => {
   for (const input of [
     { action: "run", script: "x" },
     { action: "run", scriptPath: "/tmp/workflow.js" },
-    { action: "run", script: "x", resumeFromRunId: "source-1" },
-    {
-      action: "run",
-      scriptPath: "/tmp/workflow.js",
-      resumeFromRunId: "source-1",
-      resumePolicy: "positional",
-      checkpointReplies: { "0": true },
-    },
   ]) {
     assert.equal(Schema.safeParse(input).success, true, JSON.stringify(input));
   }
@@ -139,36 +131,48 @@ test("run structurally enforces explicit content XOR and edited-replay dependenc
     { action: "run" },
     { action: "run", script: "x", scriptPath: "/tmp/workflow.js" },
     { action: "run", scriptPath: "relative/workflow.js" },
-    { action: "run", script: "x", resumePolicy: "auto" },
     { action: "run", script: "x", checkpointReplies: { "0": true } },
+    { action: "run", script: "x", offset: 0 },
   ]) {
     assert.equal(Schema.safeParse(input).success, false, JSON.stringify(input));
   }
 });
 
-test("legacy inspect, await, and omitted-action run normalize before canonical validation", () => {
-  assert.throws(() => workflowToolInputShape.action.parse("inspect"));
-  assert.throws(() => workflowToolInputShape.action.parse("await"));
-  assert.equal(workflowToolCanonicalInputSchema.safeParse({ action: "inspect", runId: "a-b" }).success, false);
-  assert.equal(workflowToolCanonicalInputSchema.safeParse({ action: "await", runId: "a-b" }).success, false);
-  assert.deepEqual(parseWorkflowToolInput({ action: "inspect", runId: "a-b" }), {
-    action: "status",
-    runId: "a-b",
-    waitMs: 0,
-  });
-  assert.deepEqual(parseWorkflowToolInput({ action: "await", runId: "a-b" }), {
-    action: "status",
-    runId: "a-b",
-    waitMs: 20_000,
-  });
-  assert.equal(parseWorkflowToolInput({ action: "await", runId: "a-b", waitMs: 7 }).waitMs, 7);
-  assert.throws(() => parseWorkflowToolInput({ action: "inspect", runId: "a-b", waitMs: 1 }));
-  assert.deepEqual(parseWorkflowToolInput({ script: "x" }), {
-    action: "run",
-    script: "x",
-    checkpointReplies: undefined,
-    background: false,
-  });
+test("unknown and omitted actions fail at the same strict runtime boundary", () => {
+  assert.throws(() => workflowToolInputShape.action.parse("unknown-action"));
+  assert.equal(
+    workflowToolCanonicalInputSchema.safeParse({ action: "unknown-action", runId: "a-b" }).success,
+    false,
+  );
+  assert.throws(() => parseWorkflowToolInput({ action: "unknown-action", runId: "a-b" }));
+  assert.throws(() => parseWorkflowToolInput({ script: "x" }));
+});
+
+test("published and runtime schemas reject every retired wait, alias, and edited-replay input", async () => {
+  const published = await workflowToolInputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" });
+  const validate = new AjvJsonSchemaValidator().getValidator(published as JsonSchemaType);
+  const retiredInputs = {
+    waitMs: { action: "status", runId: "source-1", waitMs: 20_000 },
+    inspect: { action: "inspect", runId: "source-1" },
+    await: { action: "await", runId: "source-1" },
+    "omitted action": { runId: "source-1" },
+    resumeFromRunId: { action: "run", script: "x", resumeFromRunId: "source-1" },
+    resumePolicy: { action: "run", script: "x", resumePolicy: "positional" },
+    "resume args": { action: "resume", runId: "source-1", args: { changed: true } },
+    "resume edited inline script": { action: "resume", runId: "source-1", script: "return 'edited';" },
+    "resume edited script path": { action: "resume", runId: "source-1", scriptPath: "/tmp/edited.js" },
+  } as const;
+
+  for (const [name, input] of Object.entries(retiredInputs)) {
+    assert.equal(workflowToolCanonicalInputSchema.safeParse(input).success, false, `${name} canonical runtime`);
+    assert.equal(Schema.safeParse(input).success, false, `${name} runtime`);
+    assert.equal(validate(input).valid, false, `${name} published schema`);
+    assert.throws(
+      () => parseWorkflowToolInput(input),
+      (error: unknown) => error instanceof ProtocolError && error.code === ProtocolErrorCode.InvalidParams,
+      `${name} parser`,
+    );
+  }
 });
 
 test("config/run require projectDir only in shared-daemon mode", () => {
@@ -190,39 +194,34 @@ test("config/run require projectDir only in shared-daemon mode", () => {
   );
 });
 
-test("run/resume defaults, arbitrary args, and checkpoint reply keys remain compatible", () => {
+test("run args and same-ID resume checkpoint replies use disjoint strict fields", () => {
   const run = parseWorkflowToolInput({
     action: "run",
     script: "x",
     args: ["any", { json: true }],
-    resumeFromRunId: "source-1",
-    checkpointReplies: { "0": true, "12": "ship" },
   });
   assert.equal(run.action, "run");
   assert.deepEqual(run.args, ["any", { json: true }]);
-  assert.deepEqual(run.checkpointReplies, { 0: true, 12: "ship" });
   assert.equal(run.background, false);
   const resume = parseWorkflowToolInput({
     action: "resume",
     runId: "source-1",
-    args: null,
     concurrency: 99,
+    checkpointReplies: { "0": true, "12": "ship" },
     background: true,
   });
   assert.deepEqual(resume, {
     action: "resume",
     runId: "source-1",
-    args: null,
     concurrency: 99,
-    checkpointReplies: undefined,
+    checkpointReplies: { 0: true, 12: "ship" },
     background: true,
   });
   for (const key of ["nope", "-1", "9007199254740992"]) {
     assert.equal(
       Schema.safeParse({
-        action: "run",
-        script: "x",
-        resumeFromRunId: "source-1",
+        action: "resume",
+        runId: "source-1",
         checkpointReplies: { [key]: true },
       }).success,
       false,
@@ -235,7 +234,6 @@ test("status/result apply request defaults and retain their exact bounds", () =>
   assert.deepEqual(parseWorkflowToolInput({ action: "status", runId: "a-b" }), {
     action: "status",
     runId: "a-b",
-    waitMs: 0,
   });
   assert.deepEqual(parseWorkflowToolInput({ action: "result", runId: "a-b" }), {
     action: "result",
@@ -243,9 +241,6 @@ test("status/result apply request defaults and retain their exact bounds", () =>
     offset: 0,
     maxBytes: 16_384,
   });
-  for (const waitMs of [-1, 25_001, 1.5]) {
-    assert.equal(Schema.safeParse({ action: "status", runId: "a-b", waitMs }).success, false);
-  }
   for (const input of [
     { action: "status", runId: "a-b", lastN: 0 },
     { action: "status", runId: "a-b", lastN: 51 },
@@ -318,6 +313,5 @@ test("execution resource knobs remain clamp-at-runtime rather than schema maxima
 test("field catalog is canonical and points detailed syntax to selective docs", () => {
   assert.match(workflowToolInputShape.action.description ?? "", /workflow\/run-lifecycle/);
   assert.match(workflowToolInputShape.script.description ?? "", /raw JavaScript workflow source/);
-  assert.match(workflowToolInputShape.resumeFromRunId.description ?? "", /edited-script replay/);
   assert.ok(!("startInBackground" in workflowToolInputShape));
 });

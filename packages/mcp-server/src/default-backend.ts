@@ -1,7 +1,6 @@
 import {
   probeHarnessConfig,
   type HarnessConfigReport,
-  type PersistedRunState,
   type ValidateHarnessOptions,
   type ValidateProbeRunner,
   type ValidateWorkflowReport,
@@ -36,21 +35,6 @@ export class NoAutoDefaultBackendError extends Error {
 /** The mock dry run has already applied agentType/tier/phase/meta routing to call.model. */
 export function workflowNeedsPinnedDefault(report: ValidateWorkflowReport): boolean {
   return report.dryRun?.agentCalls.some((call) => call.model === undefined && call.tier === undefined) === true;
-}
-
-/**
- * Preserve an automatic default across a resume. Current recordings carry defaultModel directly;
- * older recordings can be migrated when every model-less call was served by one recorded backend.
- */
-export function recordedDefaultModel(source: PersistedRunState | null): string | undefined {
-  if (!source) return undefined;
-  if (typeof source.defaultModel === "string" && source.defaultModel.trim() !== "") return source.defaultModel;
-  const backends = new Set(
-    (source.calls ?? [])
-      .filter((call) => call.kind === "agent" && call.modelRequested === undefined && call.backendId)
-      .map((call) => call.backendId!),
-  );
-  return backends.size === 1 ? [...backends][0] : undefined;
 }
 
 function modelCatalogState(harness: ValidateHarnessOptions): "usable" | "empty" | "absent" {

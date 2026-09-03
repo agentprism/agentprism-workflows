@@ -281,7 +281,7 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
 
     poller = setInterval(pollOnce, 150);
 
-    const callPromise = client.callTool({ name: "workflow", arguments: { script, concurrency: 3 } }, {
+    const callPromise = client.callTool({ name: "workflow", arguments: { action: "run", script, concurrency: 3 } }, {
       onprogress: () => {
         out.progressEvents++;
       },
@@ -509,6 +509,7 @@ test("live workflow config discovery: every backend exposes its no-prompt catalo
     const guessedMode = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         projectDir,
         script: [
           'export const meta = { name: "live-pi-mode-rejection", description: "reject guessed mode before admission" };',

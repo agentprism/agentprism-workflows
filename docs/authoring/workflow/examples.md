@@ -35,14 +35,14 @@ const outcome = await gate(
     `Implement: ${args.feature}\nPlan:\n- ${plan.steps.join("\n- ")}\n` +
     `Run the project's tests before finishing and report results.` +
     (feedback ? `\n\nReviewer feedback on attempt ${attempt}:\n${feedback}\nAddress every point.` : ""),
-    { label: `implement:${attempt + 1}`, model: "codex/gpt-5.6-sol", retries: 1 },
+    { label: `implement:${attempt + 1}`, model: "codex/gpt-5.6-sol", mode: "agent", retries: 1 },
   ),
   async (report) => {
     if (!report) return { ok: false, feedback: "implementation agent produced no result" };
     phase("Review");
     const reviews = (await parallel([   // two reviewers on different vendors
       () => agent(`Review the working-tree diff for correctness. Implementer's report:\n${report}`,
-                  { label: "review:correctness", model: "claude/opus[1m]", schema: VERDICT }),
+                  { label: "review:correctness", model: "claude/opus[1m]", mode: "bypassPermissions", schema: VERDICT }),
       () => agent(`Review the working-tree diff for regressions and missing tests. Report:\n${report}`,
                   { label: "review:coverage", model: "opencode/zai/glm-5.2", schema: VERDICT }),
     ])).filter(Boolean);
@@ -57,7 +57,10 @@ const outcome = await gate(
 return { implemented: outcome.ok, attempts: outcome.attempts, reviewVerdict: outcome.verdict, plan };
 ```
 
-(An omitted mode uses AgentPrism's autonomous built-in default. For a genuinely read-only planner, inspect the backend-owned mode names/descriptions from `action:"config"` and pin the exact advertised read-only/plan id.)
+These trusted implementation/review calls pin Codex `agent` and Claude `bypassPermissions` for
+full tool autonomy. Confirm both ids in the live catalog first. Claude `auto` uses a model classifier
+and may request permission; it is not the full-access mode. For a read-only planner, select the
+exact advertised read-only/plan mode instead.
 
 ## Worked example — fully backend-agnostic audit
 
@@ -114,4 +117,4 @@ The mocked pass executes reachable script control flow with schema-conforming fa
 
 The routed config pass probes each distinct backend/model pair without prompting. Unknown option ids, invalid select values, wrong value types, and the reserved `"model"` config key reject the script with direct alternatives. A backend that cannot be probed produces an explicit warning and leaves only that backend's option domain unverified.
 
-For model/config details, read `workflow/models-and-config`. For edited-script replay patterns, read `workflow/determinism-and-resume`.
+For model/config details, read `workflow/models-and-config`. For exact-run recovery semantics, read `workflow/determinism-and-resume`.

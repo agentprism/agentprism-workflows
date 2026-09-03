@@ -13,11 +13,10 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `schema` | JSON Schema object | Structured output. Plain object literal only — no schema builders exist in the realm. Part of the resume hash. |
 | `model` | `string` | Model spec: optional registered harness prefix plus a verbatim id, or a backend-only name. See [Model specs & routing](#model-specs--routing). Part of the resume hash. |
 | `tier` | `"small" \| "medium" \| "big"` | Coarse tier resolved from host config; beats phase/meta model, loses to explicit `model`. Part of the resume hash. |
-| `mode` | `string` | Exact ACP session mode id advertised by the selected backend/model. Config preserves each raw name, description, and `_meta`. When omitted, AgentPrism applies Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi mode; `defaultModeId` reports that choice. Authored and built-in defaults are validated before prompting. Part of the resume hash only when authored. |
+| `mode` | `string` | Exact ACP session mode id advertised by the selected backend/model. For trusted implementation/review work use Claude `bypassPermissions` or Codex `agent` when advertised. Claude `auto` is classifier-driven and may request permission; it is not full-access autonomy. Config preserves raw names/descriptions/metadata, and every selected id is validated before prompting. Part of call identity only when authored. |
 | `configOptions` | `Record<string, string \| boolean>` | Exact ACP session option ids and authored values. Applied in ascending id order after model and before the prompt, with no aliases or coercion. `"model"` is reserved for the dedicated `model` field. Part of the resume hash only when non-empty, with sorted keys. With MCP, read the advertised-options table from `workflow` action `config` before choosing values. |
 | `agentType` | `string` | Bind a named subagent definition (tools allow/deny, model, isolation, role prompt). See [agentType definitions](#agenttype-definitions). Part of the resume hash. |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree branched from the run cwd. **Always removed (worktree + branch) when the call ends** — edits are discarded; return work as data. Degrades to the shared tree outside a git repo (logged). |
-| `resume` | `{ filesystem: "read-only" }` | Deprecated compatibility annotation. It is recorded as legacy diagnostic provenance, is not sent to the runner or hashed, and has no effect on replay. New scripts should omit it. |
 | `cwd` | `string` | Per-session working directory; relative resolves against the run's base cwd. Overridden by worktree isolation. Not hashed. |
 | `retries` | `number` | Retries after *recoverable* failures (default 0, host-overridable). Exhausted retries ⇒ the call resolves `null`. |
 | `mcpServers` | `McpServerConfig[]` | MCP servers attached to this session. Stdio shape: `{ name, command, args: [], env: [{ name, value }] }` (`args`/`env` required, `env` is name/value pairs, not a map); `{ type: "http" \| "sse", name, url, headers: [] }` also accepted. Not hashed. |
@@ -27,8 +26,8 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 | `keepSession` | `boolean` | Skip release-time best-effort `session/close`; the non-secret re-attach record lands in `WorkflowRunResult.agentSessions` for host-side `loadSession()` / `resumeSession()`. Usage/auth pause failures are kept open automatically for managed continuation. Not identity-hashed; included in the input fingerprint. |
 
 Agent attempts have no model-facing wall-clock or idle timeout. They remain live until they complete,
-fail, or the host explicitly cancels the call or run. Every new run, including one admitted with
-`resumeFromRunId`, resolves retries, concurrency, and agent-count values from that run's request.
+fail, or the host explicitly cancels the call or run. Same-ID MCP continuation may apply new runtime
+limits, but it cannot change the persisted script, args, or effective agent configuration.
 
 ## Model specs & routing
 

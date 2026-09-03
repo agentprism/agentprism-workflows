@@ -52,9 +52,6 @@ function inspectionFixture(status: "running" | "completed" | "failed" | "aborted
       logs: { total: 0, returned: 0, shortened: 0, redacted: 0 },
       calls: { total: 0, matched: 0, returned: 0, shortenedResults: 0, redactedResults: 0 },
     },
-    lineage: [
-      { runId: "fixture-run", uri: "workflow://runs/fixture-run/script", available: true },
-    ],
   };
 }
 
@@ -69,12 +66,10 @@ function outputVariantFixtures() {
   const inspection = inspectionFixture();
   const terminalStatus = {
     ...inspectionFixture("completed"),
-    wait: { requestedMs: 100, elapsedMs: 5, returnedBecause: "terminal" as const },
     outcome: terminalOutcomeFixture,
   };
   const nonterminalStatus = {
     ...inspection,
-    wait: { requestedMs: 100, elapsedMs: 5, returnedBecause: "timeout" as const },
     tokenUsage: { input: 1, output: 2, total: 3, cost: 0 },
   };
   const stop = {
@@ -148,18 +143,18 @@ test("tool registration: one `workflow` tool advertises config plus the run life
   try {
     const { tools } = await client.listTools();
     // The model-facing surface is selective `docs`, `workflow`, and `repl` (the persistent
-    // workspace tool), plus the app-only `workflow-events` poller (visibility
-    // ["app"] — Apps hosts keep it out of the model's tool loop; see app-ui.ts).
+    // workspace tool), plus app-only event and run-list queries (visibility
+    // ["app"] — Apps hosts keep them out of the model's tool loop; see app-ui.ts).
     assert.deepEqual(
       tools.map((candidate) => candidate.name).sort(),
-      ["docs", "repl", "workflow", "workflow-events"],
+      ["docs", "repl", "workflow", "workflow-events", "workflow-runs"],
     );
     const tool = tools.find((candidate) => candidate.name === "workflow");
     assert.ok(tool, "the workflow tool is registered");
     assert.equal(tool.title, "Run and manage deterministic agent workflows");
     assert.match(tool.description ?? "", /workflow\/quickstart/);
     assert.match(tool.description ?? "", /workflow\/run-lifecycle/);
-    assert.match(tool.description ?? "", /status for an immediate snapshot or request-bounded wait/);
+    assert.match(tool.description ?? "", /status for an immediate snapshot/);
     assert.doesNotMatch(tool.description ?? "", /action:\"(?:inspect|await)\"/);
     assert.doesNotMatch(tool.description ?? "", /parallel\(|Minimal script|first statement|agent option keys/);
     assert.doesNotMatch(tool.description ?? "", /npx|CLI|shell out/i);
@@ -197,8 +192,6 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       "checkpointContext",
       "fallbacks",
       "checkpointsTaken",
-      "resumeReport",
-      "replayEligibility",
       "limits",
       "workflowName",
       "phases",
@@ -206,7 +199,6 @@ test("tool registration: one `workflow` tool advertises config plus the run life
       "calls",
       "filter",
       "truncation",
-      "wait",
       "outcome",
       "action",
       "validation",
@@ -229,15 +221,14 @@ test("tool registration: one `workflow` tool advertises config plus the run life
     }
     assert.deepEqual(field(tool.outputSchema, "required"), undefined);
     const variants = field(tool.outputSchema, "oneOf") as Array<Record<string, unknown>>;
-    assert.equal(variants.length, 10);
+    assert.equal(variants.length, 9);
     assert.deepEqual(variants.map((variant) => variant.required), [
       ["action", "runId", "status", "resultUri", "mimeType", "encoding", "totalBytes", "offset", "endOffset", "hasMore", "chunk"],
       ["action", "ok", "harnessOptions", "omittedHarnesses", "models"],
       ["action", "status", "validation"],
       ["runId", "status", "scriptUri", "eventsUri", "scriptSource", "limits"],
       ["runId", "status", "scriptUri", "eventsUri", "scriptSource", "limits"],
-      ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage", "wait"],
-      ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation", "lineage"],
+      ["runId", "status", "scriptUri", "workflowName", "phases", "logTail", "calls", "filter", "truncation"],
       [
         "runId",
         "status",
@@ -248,7 +239,6 @@ test("tool registration: one `workflow` tool advertises config plus the run life
         "calls",
         "filter",
         "truncation",
-        "lineage",
         "permissionResponse",
       ],
       [
@@ -261,7 +251,6 @@ test("tool registration: one `workflow` tool advertises config plus the run life
         "calls",
         "filter",
         "truncation",
-        "lineage",
         "stopped",
         "alreadyTerminal",
       ],
@@ -275,7 +264,6 @@ test("tool registration: one `workflow` tool advertises config plus the run life
         "calls",
         "filter",
         "truncation",
-        "lineage",
         "stopped",
         "alreadyTerminal",
         "control",
@@ -483,7 +471,7 @@ test("model-less MCP workflows auto-select and cache the first backend with posi
   );
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
-    const first = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    const first = await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
     assert.notEqual(first.isError, true);
     assert.deepEqual(liveModels, ["codex"]);
     assert.match(textOf(first), /auto-selected backend "codex"/);
@@ -493,7 +481,7 @@ test("model-less MCP workflows auto-select and cache the first backend with posi
     assert.equal(probes.filter(({ spec }) => spec === "pi").length, 1);
     assert.equal(probes.filter(({ spec }) => spec === "codex").length, 2, "discovery plus routed preflight");
 
-    const second = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    const second = await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
     assert.notEqual(second.isError, true);
     assert.deepEqual(liveModels, ["codex", "codex"]);
     assert.equal(probes.filter(({ spec }) => spec === "claude").length, 1, "project discovery is cached");
@@ -502,61 +490,6 @@ test("model-less MCP workflows auto-select and cache the first backend with posi
     assert.equal(probes.filter(({ spec }) => spec === "codex").length, 3, "only normal preflight repeats");
   } finally {
     await dispose();
-    if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
-    else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
-  }
-});
-
-test("a resumed MCP run inherits its source's pinned automatic backend instead of rediscovering", async () => {
-  const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
-  delete process.env.AGENTPRISM_DEFAULT_BACKEND;
-  const modelOption = (currentValue: string) => ({
-    id: "model",
-    name: "Model",
-    type: "select" as const,
-    currentValue,
-    options: [{ value: currentValue, name: currentValue }],
-  });
-  const firstRunner = Object.assign(makeRunner(() => "source"), {
-    defaultBackendId: () => "claude",
-    listBackends: () => ["claude", "codex"],
-    listCustomBackends: () => [],
-    async probeConfigOptions(spec?: string) {
-      const backendId = spec ?? "claude";
-      return { backendId, options: [modelOption(backendId === "codex" ? "gpt" : "opus")] };
-    },
-  });
-  const firstConnection = await connect(firstRunner, { listTools: true });
-  let sourceRunId: string;
-  try {
-    const source = await firstConnection.client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
-    assert.notEqual(source.isError, true);
-    sourceRunId = String(structured(source)?.runId);
-  } finally {
-    await firstConnection.dispose();
-  }
-
-  const probes: string[] = [];
-  const resumedRunner = Object.assign(makeRunner(() => "should replay"), {
-    defaultBackendId: () => "claude",
-    listBackends: () => ["pi"],
-    listCustomBackends: () => [],
-    async probeConfigOptions(spec?: string) {
-      probes.push(spec ?? "claude");
-      return { backendId: spec ?? "claude", options: [modelOption("default")] };
-    },
-  });
-  const secondConnection = await connect(resumedRunner, { listTools: true });
-  try {
-    const resumed = await secondConnection.client.callTool({
-      name: "workflow",
-      arguments: { script: ONE_AGENT_SCRIPT, resumeFromRunId: sourceRunId! },
-    });
-    assert.notEqual(resumed.isError, true);
-    assert.deepEqual(probes, ["codex"], "the inherited source backend receives only normal preflight");
-    assert.match(textOf(resumed), /inherit pinned backend "codex" from the resume source/);
-  } finally {
-    await secondConnection.dispose();
     if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
     else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
   }
@@ -583,7 +516,7 @@ test("an explicit AGENTPRISM_DEFAULT_BACKEND wins and skips automatic candidate 
   );
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
-    const result = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    const result = await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
     assert.notEqual(result.isError, true);
     assert.deepEqual(liveModels, ["pi"]);
     assert.deepEqual(probes, ["pi"], "only the normal routed preflight probes the explicit backend");
@@ -620,7 +553,7 @@ test("automatic default discovery rejects admission when every backend is defini
   );
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
-    const result = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    const result = await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
     assert.equal(result.isError, true);
     assert.equal(structured(result), undefined, "no run or validation artifact is created");
     assert.equal(liveCalls, 0);
@@ -658,6 +591,7 @@ test("fully pinned and agent-less workflows do not trigger automatic backend dis
     const pinned = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "pinned", description: "d" };',
           'return agent("work", { label: "work", model: "pi" });',
@@ -669,7 +603,7 @@ test("fully pinned and agent-less workflows do not trigger automatic backend dis
     assert.deepEqual(probes, ["pi"], "the explicit call receives only its normal preflight probe");
 
     probes.length = 0;
-    const deterministic = await client.callTool({ name: "workflow", arguments: { script: NO_AGENT_SCRIPT } });
+    const deterministic = await client.callTool({ name: "workflow", arguments: { action: "run", script: NO_AGENT_SCRIPT } });
     assert.notEqual(deterministic.isError, true);
     assert.deepEqual(probes, []);
   } finally {
@@ -712,6 +646,7 @@ test("conservative routing warnings distinguish spread-built explicit models fro
     const result = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "spread-model", description: "d" };',
           'const shared = { model: "pi/deepseek/deepseek-v4-flash" };',
@@ -732,7 +667,7 @@ test("conservative routing warnings distinguish spread-built explicit models fro
   }
 });
 
-test("static routing discovery pins the default for a model-less branch the fabricated dry run does not reach", async () => {
+test("a live branch not covered by canonical preflight configuration fails closed", async () => {
   const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
   delete process.env.AGENTPRISM_DEFAULT_BACKEND;
   const liveModels: Array<string | undefined> = [];
@@ -765,6 +700,7 @@ test("static routing discovery pins the default for a model-less branch the fabr
     const result = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "hidden-default", description: "d" };',
           'const decision = await agent("decide", { label: "decide", model: "claude" });',
@@ -773,9 +709,10 @@ test("static routing discovery pins the default for a model-less branch the fabr
         ].join("\n"),
       },
     });
-    assert.notEqual(result.isError, true);
-    assert.deepEqual(liveModels, ["claude", "codex"]);
-    assert.match(textOf(result), /Backend "codex" is pinned only as the fallback/);
+    assert.equal(result.isError, true);
+    assert.equal(structured(result)?.status, "failed");
+    assert.deepEqual(liveModels, ["claude"]);
+    assert.match(textOf(result), /occurrence 1 has no host-selected configuration/);
   } finally {
     await dispose();
     if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
@@ -802,7 +739,6 @@ test("runtime and advertised output schemas enforce exact result branches", asyn
     },
     "failed status outcome with result URI": {
       ...inspectionFixture("failed"),
-      wait: { requestedMs: 100, elapsedMs: 5, returnedBecause: "terminal" as const },
       outcome: {
         ...terminalOutcomeFixture,
         status: "failed" as const,
@@ -900,7 +836,7 @@ test("foreground and terminal status outcomes expose result observability while 
       'return await checkpoint("Release?", { kind: "select", choices: ["ship", "hold"], default: "hold" });',
     ].join("\n");
 
-    const foreground = await client.callTool({ name: "workflow", arguments: { script } });
+    const foreground = await client.callTool({ name: "workflow", arguments: { action: "run", script } });
     const foregroundResult = structured(foreground);
     assert.equal((foregroundResult?.fallbacks as unknown[])?.length, 1);
     assert.deepEqual(foregroundResult?.checkpointsTaken, [
@@ -915,12 +851,19 @@ test("foreground and terminal status outcomes expose result observability while 
     assert.equal(Object.hasOwn(status ?? {}, "fallbacks"), false);
     assert.equal(Object.hasOwn(status ?? {}, "checkpointsTaken"), false);
 
-    const accepted = await client.callTool({ name: "workflow", arguments: { script, background: true } });
-    const awaited = await client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId: String(structured(accepted)?.runId), waitMs: 1_000 },
-    });
-    const awaitResult = structured(awaited);
+    const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", script, background: true } });
+    const backgroundRunId = String(structured(accepted)?.runId);
+    let awaitResult: Record<string, unknown> | undefined;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const statusResult = await client.callTool({
+        name: "workflow",
+        arguments: { action: "status", runId: backgroundRunId },
+      });
+      awaitResult = structured(statusResult);
+      if (awaitResult?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(awaitResult?.status, "completed");
     assert.equal(Object.hasOwn(awaitResult ?? {}, "fallbacks"), false);
     assert.equal(Object.hasOwn(awaitResult ?? {}, "checkpointsTaken"), false);
     const outcome = field(awaitResult?.outcome, "fallbacks") as unknown[];
@@ -1008,7 +951,7 @@ test("status surfaces a live run's in-flight agent calls", async () => {
       'await agent("hold", { label: "held-agent" });',
       'return true;',
     ].join("\n");
-    const accepted = await client.callTool({ name: "workflow", arguments: { script, background: true } });
+    const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", script, background: true } });
     const runId = String(structured(accepted)?.runId);
 
     // Wait until the held agent is actually in flight (its start is durable in the event log).
@@ -1031,11 +974,16 @@ test("status surfaces a live run's in-flight agent calls", async () => {
     assert.ok(liveStatus, "a live inspection surfaced the in-flight agent call");
 
     release("held-done");
-    const awaited = await client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 10_000 },
-    });
-    assert.equal(structured(awaited)?.status, "completed");
+    let awaited: Awaited<ReturnType<typeof client.callTool>> | undefined;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      awaited = await client.callTool({
+        name: "workflow",
+        arguments: { action: "status", runId },
+      });
+      if (structured(awaited)?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(awaited && structured(awaited)?.status, "completed");
     const settled = await client.callTool({ name: "workflow", arguments: { action: "status", runId } });
     const settledCalls = (structured(settled)?.calls as Array<Record<string, unknown>>) ?? [];
     assert.equal(settledCalls.length, 2);
@@ -1044,53 +992,6 @@ test("status surfaces a live run's in-flight agent calls", async () => {
       "settled calls carry no in-flight status",
     );
   } finally {
-    await dispose();
-  }
-});
-
-test("legacy inspect and await requests normalize to the canonical status behavior", async () => {
-  let release!: (value: string) => void;
-  let released = false;
-  const held = new Promise<string>((resolve) => {
-    release = resolve;
-  });
-  const { client, dispose } = await connect(makeRunner(() => held), { listTools: true });
-  try {
-    const accepted = await client.callTool({
-      name: "workflow",
-      arguments: { script: ONE_AGENT_SCRIPT, background: true },
-    });
-    const runId = String(structured(accepted)?.runId);
-
-    const immediate = await client.callTool({
-      name: "workflow",
-      arguments: { action: "inspect", runId },
-    });
-    assert.notEqual(immediate.isError, true);
-    assert.equal(field(structured(immediate)?.wait, "requestedMs"), 0);
-    assert.equal(field(structured(immediate)?.wait, "returnedBecause"), "immediate");
-    assert.ok(Number(field(structured(immediate)?.wait, "elapsedMs")) >= 0);
-
-    const timed = await client.callTool({
-      name: "workflow",
-      arguments: { action: "await", runId, waitMs: 1 },
-    });
-    assert.notEqual(timed.isError, true);
-    assert.equal(field(structured(timed)?.wait, "requestedMs"), 1);
-    assert.equal(field(structured(timed)?.wait, "returnedBecause"), "timeout");
-
-    released = true;
-    release("legacy-migrated");
-    const terminal = await client.callTool({
-      name: "workflow",
-      arguments: { action: "await", runId },
-    });
-    assert.notEqual(terminal.isError, true);
-    assert.equal(field(structured(terminal)?.wait, "requestedMs"), 20_000);
-    assert.equal(field(structured(terminal)?.wait, "returnedBecause"), "terminal");
-    assert.equal(structured(terminal)?.status, "completed");
-  } finally {
-    if (!released) release("cleanup");
     await dispose();
   }
 });
@@ -1112,7 +1013,7 @@ test("unknown status is an exact tool error; reading a failed run is successful"
       'No workflow run found for runId "missing-run" in this server\'s project-scoped run store.',
     );
 
-    const failed = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    const failed = await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
     assert.equal(failed.isError, true);
     const failedRun = structured(failed);
     const inspected = await client.callTool({
@@ -1138,7 +1039,7 @@ test("status keeps its observation projection within 24 KiB and text within 8 Ki
       'for (let i = 0; i < 50; i++) { phase(`dynamic-${i}-${"x".repeat(600)}`); log(`line-${i}-${"😀".repeat(1000)}`); await agent(`prompt-${i}`, { label: `call-${i}` }); }',
       'return true;',
     ].join("\n");
-    const run = await client.callTool({ name: "workflow", arguments: { script } });
+    const run = await client.callTool({ name: "workflow", arguments: { action: "run", script } });
     assert.equal(structured(run)?.status, "completed");
     const runId = String(structured(run)?.runId);
     const inspected = await client.callTool({
@@ -1170,6 +1071,7 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     const paused = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: `export const meta = { name: "paused-tail", description: "paused" };\n${logs}\nawait checkpoint("q", { headless: "pause" });`,
       },
     });
@@ -1188,6 +1090,7 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     const failed = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: `export const meta = { name: "failed-tail", description: "failed" };\n${logs}\nawait agent("fail");`,
       },
     });
@@ -1199,6 +1102,7 @@ test("paused and failed terminal summaries carry redacted final-20 log tails and
     const empty = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: 'export const meta = { name: "empty-tail", description: "empty" };\nawait agent("fail");',
       },
     });
@@ -1215,7 +1119,7 @@ test("completed run -> isError:false, structuredContent is the WorkflowRunResult
   // also proves the completed structuredContent VALIDATES against the advertised schema.
   const { client, dispose } = await connect(okRunner(), { listTools: true });
   try {
-    const res = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    const res = await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
 
     assert.equal(res.isError, false, "a completed run is not an error");
     const sc = structured(res);
@@ -1250,7 +1154,7 @@ test("tool boundary: over-max concurrency/agentRetries are CLAMPED, not rejected
     // begins "Input validation error: ...". Instead the run executes to completion.
     const res = await client.callTool({
       name: "workflow",
-      arguments: { script: NO_AGENT_SCRIPT, concurrency: 1000, agentRetries: 99 },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT, concurrency: 1000, agentRetries: 99 },
     });
 
     assert.equal(res.isError, false, "over-max knobs are accepted, not rejected");
@@ -1278,7 +1182,7 @@ test("paused run -> shell does NOT throw: isError:false, status 'paused', resetH
   );
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
-    const res = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    const res = await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
 
     assert.equal(res.isError, false, "paused is resumable, NOT an error");
     const sc = structured(res);
@@ -1309,7 +1213,7 @@ test("failed run -> shell does NOT throw: returns isError:true with status 'fail
   );
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
-    const res = await client.callTool({ name: "workflow", arguments: { script: ONE_AGENT_SCRIPT } });
+    const res = await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
 
     assert.equal(res.isError, true, "a failed run maps to isError:true");
     const sc = structured(res);
@@ -1351,6 +1255,7 @@ test("automatic routed config validation rejects unknown options before the live
     const result = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "bad-config", description: "must not admit" };',
           'return await agent("work", { label: "work", model: "claude", configOptions: { invented: true } });',
@@ -1406,6 +1311,7 @@ test("automatic mode validation rejects a guessed default when the selected back
     const result = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "bad-mode", description: "must not admit" };',
           'return agent("work", { label: "pi-call", model: "pi/openai/model", mode: "default", configOptions: { thinkingLevel: "high" } });',
@@ -1441,6 +1347,7 @@ test("unknown workflow agent option keys reject before config probing or admissi
     const result = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         script: [
           'export const meta = { name: "foreign-options", description: "must not admit" };',
           'return agent("work", { label: "pi-call", backend: "pi", model: "openai/model", config: { thinkingLevel: "high" } });',
@@ -1467,6 +1374,7 @@ test("mocked dry-run failure is rejected before real agent execution or backgrou
     const result = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         background: true,
         script: [
           'export const meta = { name: "preflight-failure", description: "must not admit" };',
@@ -1491,7 +1399,7 @@ test("mocked dry-run failure is rejected before real agent execution or backgrou
 test("malformed script is rejected with structured pre-admission diagnostics and no run ID", async () => {
   const { client, dispose } = await connect(okRunner());
   try {
-    const res = await client.callTool({ name: "workflow", arguments: { script: 'await agent("hi");' } });
+    const res = await client.callTool({ name: "workflow", arguments: { action: "run", script: 'await agent("hi");' } });
 
     assert.equal(res.isError, true, "a parse failure is a tool error");
     const output = structured(res);
@@ -1511,7 +1419,7 @@ test("malformed script (meta present but invalid) -> isError:true with the valid
   try {
     const res = await client.callTool({
       name: "workflow",
-      arguments: { script: 'export const meta = { description: "missing a name" };\nreturn 1;' },
+      arguments: { action: "run", script: 'export const meta = { description: "missing a name" };\nreturn 1;' },
     });
 
     assert.equal(res.isError, true);

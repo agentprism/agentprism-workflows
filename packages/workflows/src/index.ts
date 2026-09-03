@@ -19,7 +19,12 @@ import {
   WorkflowManager as EngineWorkflowManager,
 } from "@automatalabs/workflow-engine";
 import type { AcpEventName, AcpRunnerEventMap, AcpUpdateKind } from "@automatalabs/acp-agents";
-import type { ExecOptions, WorkflowDir, WorkflowManagerOptions } from "@automatalabs/workflow-engine";
+import type {
+  ExecOptions,
+  WorkflowContinuationStart,
+  WorkflowDir,
+  WorkflowManagerOptions,
+} from "@automatalabs/workflow-engine";
 import type { AgentRunner, RunEvent, WorkflowBackendConfig, WorkflowRunResult } from "@automatalabs/shared-types";
 import { approveScriptBackends, type ScriptBackendApproval } from "./script-backends.js";
 import {
@@ -132,7 +137,10 @@ export type {
   WorkflowRunOptions,
   WorkflowRunLimitOptions,
   WorkflowAgentAttemptControl,
+  WorkflowAgentConfiguration,
   WorkflowAgentCallCancellation,
+  WorkflowContinuationRefusalReason,
+  WorkflowContinuationStart,
   PersistedRunStopResult,
   AgentOptions,
   ExecOptions,
@@ -569,6 +577,25 @@ export class WorkflowManager extends EngineWorkflowManager {
       }
       void resumed.promise.then(releaseBridge, releaseBridge);
       return resumed;
+    } catch (error) {
+      releaseBridge();
+      throw error;
+    }
+  }
+
+  override async continueRun(
+    runId: string,
+    exec: ExecOptions = {},
+  ): Promise<WorkflowContinuationStart> {
+    const releaseBridge = this.acquireAcpRunnerBridge(exec.agent);
+    try {
+      const continued = await super.continueRun(runId, exec);
+      if (!continued.accepted) {
+        releaseBridge();
+        return continued;
+      }
+      void continued.promise.then(releaseBridge, releaseBridge);
+      return continued;
     } catch (error) {
       releaseBridge();
       throw error;

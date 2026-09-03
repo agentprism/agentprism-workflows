@@ -67,6 +67,22 @@ async function rawModernToolCall(
   return await response.json() as RawJsonRpcResponse;
 }
 
+function acceptAgentConfiguration(request: { params: { requestedSchema?: {
+  required?: string[];
+  properties: Record<string, unknown>;
+} } }): Record<string, string> | undefined {
+  const schema = request.params.requestedSchema;
+  const required = schema?.required ?? [];
+  if (!required.some((field) => field.startsWith("agent_") && field.endsWith("_model"))) return undefined;
+  return Object.fromEntries(required.map((field) => {
+    const property = schema?.properties[field] as { oneOf?: Array<{ const: string }> } | undefined;
+    const choices = property?.oneOf ?? [];
+    const selected = choices.find((choice) => choice.const.startsWith("codex")) ?? choices[0];
+    assert.ok(selected);
+    return [field, selected.const];
+  }));
+}
+
 async function exerciseEra(
   mode: "legacy" | "modern",
   daemonUrl: string,
@@ -84,7 +100,7 @@ async function exerciseEra(
     }
     const listed = await connected.client.listTools();
     const tools = listed.tools.map((tool) => tool.name).sort();
-    assert.deepEqual(tools, ["docs", "repl", "workflow", "workflow-events"]);
+    assert.deepEqual(tools, ["docs", "repl", "workflow", "workflow-events", "workflow-runs"]);
     const workflow = listed.tools.find((tool) => tool.name === "workflow");
     assert.ok(workflow);
     const panel = await connected.client.readResource({
@@ -137,7 +153,7 @@ test("modern envelope classification wins over a stale legacy session header", a
     const response = await rawModernToolCall(
       daemon.url,
       1,
-      { script: SCRIPT, projectDir },
+      { action: "run", script: SCRIPT, projectDir },
       undefined,
       { "mcp-session-id": "stale-legacy-session" },
     );
@@ -162,7 +178,7 @@ test("modern input_required resumes a durable workflow checkpoint while legacy b
 return await checkpoint("Pick one", { kind: "select", choices: ["alpha", "beta"], default: "beta" });`;
     const result = await connected.client.callTool({
       name: "workflow",
-      arguments: { script, projectDir },
+      arguments: { action: "run", script, projectDir },
     });
     assert.equal(result.isError, false);
     assert.equal(structured(result)?.status, "completed");
@@ -177,65 +193,133 @@ return await checkpoint("Pick one", { kind: "select", choices: ["alpha", "beta"]
   }
 });
 
-test("modern input_required resolves a live workflow permission with the exact optionId", async () => {
-  const broker = new WorkflowPermissionBroker();
-  const runner = makeRunner(async (_prompt, options) => {
-    const response = await broker.resolver(
-      {
-        sessionId: "modern-permission-session",
-        toolCall: { toolCallId: "modern-permission-tool", title: "Run tests", kind: "execute" },
-        options: [
-          { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
-          { optionId: "allow_for_session", name: "Allow for session", kind: "allow_always" },
-        ],
+for (const protocolMode of ["legacy", "modern"] as const) {
+  test(`${protocolMode} foreground permission elicitation continues the original run call`, async () => {
+    const broker = new WorkflowPermissionBroker();
+    const runner = makeRunner(async (_prompt, options) => {
+      const outcomes: string[] = [];
+      for (const suffix of ["first", "second"]) {
+        const response = await broker.resolver(
+          {
+            sessionId: `${protocolMode}-permission-session`,
+            toolCall: {
+              toolCallId: `${protocolMode}-permission-tool-${suffix}`,
+              title: `Run ${suffix} command`,
+              kind: "execute",
+            },
+            options: [
+              { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+              { optionId: "allow_for_session", name: "Allow for session", kind: "allow_always" },
+            ],
+          },
+          {
+            sessionId: `${protocolMode}-permission-session`,
+            backendId: "codex",
+            runId: options.runId,
+            callIndex: options.callIndex,
+          },
+        );
+        outcomes.push(response.outcome.outcome === "selected" ? response.outcome.optionId : "cancelled");
+      }
+      return outcomes.join(",");
+    });
+    const daemon = await startDaemon(runner, broker);
+    const projectDir = makeProjectDir(`dual-era-permission-${protocolMode}`);
+    const connected = await connectHttp(daemon.url, {
+      protocolMode,
+      uiCapability: "absent",
+      elicit: (request) => {
+        const configuration = acceptAgentConfiguration(request);
+        return configuration
+          ? { action: "accept", content: configuration }
+          : { action: "accept", content: { optionId: "allow_for_session" } };
       },
-      {
-        sessionId: "modern-permission-session",
-        backendId: "codex",
-        runId: options.runId,
-        callIndex: options.callIndex,
-      },
-    );
-    return response.outcome.outcome === "selected" ? response.outcome.optionId : "cancelled";
-  });
-  const daemon = await startDaemon(runner, broker);
-  const projectDir = makeProjectDir("dual-era-permission");
-  const connected = await connectHttp(daemon.url, {
-    protocolMode: "modern",
-    uiCapability: "absent",
-    elicit: () => ({ action: "accept", content: { optionId: "allow_for_session" } }),
-  });
-  try {
-    const script = `export const meta = { name: "modern-permission", description: "modern permission" };
+    });
+    try {
+      const script = `export const meta = { name: "${protocolMode}-permission", description: "permission" };
 return await agent("work", { label: "worker", model: "codex" });`;
-    const accepted = await connected.client.callTool({
-      name: "workflow",
-      arguments: { script, projectDir, background: true },
-    });
-    const runId = structured(accepted)?.runId;
-    assert.equal(typeof runId, "string");
-    await waitUntil(() => broker.has(runId as string), "modern permission request");
+      const terminal = await connected.client.callTool({
+        name: "workflow",
+        arguments: { action: "run", script, projectDir },
+      });
+      assert.equal(terminal.isError, false, JSON.stringify(terminal.content));
+      assert.equal(structured(terminal)?.status, "completed");
+      assert.equal(structured(terminal)?.result, "allow_for_session,allow_for_session");
+      assert.equal(connected.elicitations.length, 3, "agent configuration plus two live permissions");
+      assert.deepEqual(broker.list(structured(terminal)?.runId as string), []);
+    } finally {
+      await connected.dispose();
+      await daemon.close();
+    }
+  });
+}
 
-    const resolved = await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 5_000 },
+for (const protocolMode of ["legacy", "modern"] as const) {
+  test(`${protocolMode} status observes but never elicits a background permission`, async () => {
+    const broker = new WorkflowPermissionBroker();
+    const runner = makeRunner(async (_prompt, options) => {
+      const response = await broker.resolver(
+        {
+          sessionId: `${protocolMode}-background-permission-session`,
+          toolCall: { toolCallId: `${protocolMode}-background-permission-tool`, title: "Run tests", kind: "execute" },
+          options: [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }],
+        },
+        {
+          sessionId: `${protocolMode}-background-permission-session`,
+          backendId: "codex",
+          runId: options.runId,
+          callIndex: options.callIndex,
+        },
+      );
+      return response.outcome.outcome === "selected" ? response.outcome.optionId : "cancelled";
     });
-    assert.equal(resolved.isError, false);
-    assert.equal(structured(resolved)?.permissionResponse?.outcome?.optionId, "allow_for_session");
-    assert.equal(structured(resolved)?.wait?.requestedMs, 5_000);
-    assert.equal(structured(resolved)?.wait?.returnedBecause, "permission-resolved");
-    assert.equal(connected.elicitations.length, 1);
+    const daemon = await startDaemon(runner, broker);
+    const projectDir = makeProjectDir(`dual-era-status-permission-${protocolMode}`);
+    let permissionForms = 0;
+    const connected = await connectHttp(daemon.url, {
+      protocolMode,
+      uiCapability: "absent",
+      elicit: (request) => {
+        const configuration = acceptAgentConfiguration(request);
+        if (configuration) return { action: "accept", content: configuration };
+        permissionForms++;
+        return { action: "accept", content: { optionId: "allow_once" } };
+      },
+    });
+    try {
+      const script = `export const meta = { name: "${protocolMode}-status-permission", description: "permission" };
+return await agent("work", { label: "worker", model: "codex" });`;
+      const accepted = await connected.client.callTool({
+        name: "workflow",
+        arguments: { action: "run", script, projectDir, background: true },
+      });
+      const runId = structured(accepted)?.runId as string;
+      await waitUntil(() => broker.has(runId), `${protocolMode} background permission request`);
 
-    const terminal = await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 5_000 },
-    });
-    assert.equal(structured(terminal)?.outcome?.result, "allow_for_session");
-  } finally {
-    await connected.dispose();
-    await daemon.close();
-  }
-});
+      const observed = await connected.client.callTool({
+        name: "workflow",
+        arguments: { action: "status", runId },
+      });
+      assert.equal(observed.isError, false);
+      assert.equal(permissionForms, 0);
+      assert.equal(structured(observed)?.pendingPermissions?.length, 1);
+      const permissionId = structured(observed)?.pendingPermissions?.[0]?.permissionId;
+      assert.equal(typeof permissionId, "string");
+      await connected.client.callTool({
+        name: "workflow",
+        arguments: {
+          action: "permissions-response",
+          runId,
+          permissionId,
+          response: { outcome: { outcome: "selected", optionId: "allow_once" } },
+        },
+      });
+    } finally {
+      await connected.dispose();
+      await daemon.close();
+    }
+  });
+}
 
 test("modern input_required enforces script-backend approval before admission", async () => {
   let capturedBackends: unknown;
@@ -247,20 +331,25 @@ test("modern input_required enforces script-backend approval before admission", 
   const connected = await connectHttp(daemon.url, {
     protocolMode: "modern",
     uiCapability: "absent",
-    elicit: () => ({ action: "accept", content: { approve: true } }),
+    elicit: (request) => {
+      const configuration = acceptAgentConfiguration(request);
+      return configuration
+        ? { action: "accept", content: configuration }
+        : { action: "accept", content: { approve: true } };
+    },
   });
   try {
     const script = `export const meta = { name: "modern-backend", description: "modern backend", backends: { browser: { command: "browser-acp" } } };
 return await agent("approved backend", { model: "browser" });`;
     const result = await connected.client.callTool({
       name: "workflow",
-      arguments: { script, projectDir },
+      arguments: { action: "run", script, projectDir },
     });
     assert.equal(result.isError, false);
     assert.equal(structured(result)?.status, "completed");
     assert.deepEqual(capturedBackends, { browser: { command: "browser-acp" } });
-    assert.equal(connected.elicitations.length, 1);
-    assert.match(connected.elicitations[0]?.params.message ?? "", /browser-acp/);
+    assert.equal(connected.elicitations.length, 2);
+    assert.ok(connected.elicitations.some((request) => /browser-acp/.test(request.params.message)));
   } finally {
     await connected.dispose();
     await daemon.close();
@@ -285,7 +374,7 @@ test("modern subscriptions/listen receives list and durable run-event updates", 
 return await agent("wait", { label: "wait" });`;
     const accepted = await connected.client.callTool({
       name: "workflow",
-      arguments: { script, projectDir, background: true },
+      arguments: { action: "run", script, projectDir, background: true },
     });
     const runId = structured(accepted)?.runId;
     assert.equal(typeof runId, "string");
@@ -309,56 +398,12 @@ return await agent("wait", { label: "wait" });`;
   }
 });
 
-test("modern response-stream cancellation aborts status waiting without cancelling the workflow", async () => {
-  const controlled = gatedRunner();
-  const daemon = await startDaemon(controlled.runner);
-  const projectDir = makeProjectDir("dual-era-cancellation");
-  const connected = await connectHttp(daemon.url, {
-    protocolMode: "modern",
-    uiCapability: "absent",
-  });
-  try {
-    const script = `export const meta = { name: "modern-cancel", description: "modern cancel" };
-return await agent("wait", { label: "wait" });`;
-    const accepted = await connected.client.callTool({
-      name: "workflow",
-      arguments: { script, projectDir, background: true },
-    });
-    const runId = structured(accepted)?.runId;
-    assert.equal(typeof runId, "string");
-
-    const controller = new AbortController();
-    const awaiting = connected.client.callTool(
-      { name: "workflow", arguments: { action: "status", runId, waitMs: 25_000 } },
-      { signal: controller.signal },
-    );
-    setTimeout(() => controller.abort(), 25);
-    await assert.rejects(awaiting, /abort|cancel|closed/i);
-
-    const inspection = await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId },
-    });
-    assert.equal(structured(inspection)?.status, "running");
-    controlled.release();
-    const completed = await connected.client.callTool({
-      name: "workflow",
-      arguments: { action: "status", runId, waitMs: 10_000 },
-    });
-    assert.equal(structured(completed)?.status, "completed");
-  } finally {
-    controlled.release();
-    await connected.dispose();
-    await daemon.close();
-  }
-});
-
 test("modern checkpoint requestState applies the authored default after its deadline", async () => {
   const daemon = await startDaemon(okRunner());
   const projectDir = makeProjectDir("dual-era-checkpoint-timeout");
   const script = `export const meta = { name: "modern-timeout", description: "modern timeout" };
 return await checkpoint("Continue?", { kind: "confirm", default: false, timeoutMs: 5 });`;
-  const args = { script, projectDir };
+  const args = { action: "run", script, projectDir };
   try {
     const first = await rawModernToolCall(daemon.url, 1, args);
     assert.equal(first.result?.resultType, "input_required");
@@ -375,25 +420,32 @@ return await checkpoint("Continue?", { kind: "confirm", default: false, timeoutM
   }
 });
 
-test("modern multi-round-trip state rejects scriptPath content drift", async () => {
+test("modern checkpoint continuation uses the admitted script when scriptPath later changes", async () => {
   const daemon = await startDaemon(okRunner());
   const projectDir = makeProjectDir("dual-era-script-path-drift");
   const scriptPath = join(projectDir, "checkpoint.workflow.js");
   const original = `export const meta = { name: "path-checkpoint", description: "path checkpoint" };
 return await checkpoint("Continue?", { kind: "confirm" });`;
   writeFileSync(scriptPath, original, "utf8");
-  const args = { scriptPath, projectDir };
+  const args = { action: "run", scriptPath, projectDir };
   try {
     const first = await rawModernToolCall(daemon.url, 1, args);
     const requestState = first.result?.requestState;
     assert.equal(typeof requestState, "string");
-    writeFileSync(scriptPath, `${original}\n// changed while prompting`, "utf8");
-    const rejected = await rawModernToolCall(daemon.url, 2, args, {
+    writeFileSync(
+      scriptPath,
+      `export const meta = { name: "mutated", description: "must not execute" }; return "mutated";`,
+      "utf8",
+    );
+    const completed = await rawModernToolCall(daemon.url, 2, args, {
       requestState: requestState as string,
       inputResponses: { checkpoint: { action: "accept", content: { approve: true } } },
     });
-    assert.equal(rejected.result?.isError, true);
-    assert.match(JSON.stringify(rejected.result?.content), /scriptPath content changed/);
+    assert.equal(completed.error, undefined);
+    const result = completed.result?.structuredContent as Record<string, unknown> | undefined;
+    assert.equal(result?.status, "completed");
+    assert.equal(result?.result, true);
+    assert.equal(result?.scriptSource, "stored");
   } finally {
     await daemon.close();
   }
@@ -403,7 +455,7 @@ test("modern requestState survives daemon replacement and rejects tampering", as
   const projectDir = makeProjectDir("dual-era-request-state");
   const script = `export const meta = { name: "restart-checkpoint", description: "restart checkpoint" };
 return await checkpoint("Continue?", { kind: "confirm", default: false });`;
-  const args = { script, projectDir };
+  const args = { action: "run", script, projectDir };
   const firstDaemon = await startDaemon(okRunner());
   const first = await rawModernToolCall(firstDaemon.url, 1, args);
   const requestState = first.result?.requestState;
