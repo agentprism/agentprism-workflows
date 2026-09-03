@@ -509,6 +509,7 @@ test("live workflow config discovery: every backend exposes its no-prompt catalo
     const guessedMode = await client.callTool({
       name: "workflow",
       arguments: {
+        action: "run",
         projectDir,
         script: [
           'export const meta = { name: "live-pi-mode-rejection", description: "reject guessed mode before admission" };',
