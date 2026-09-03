@@ -4,11 +4,12 @@
 
 Today the engine and the agents it drives are colocated: every backend is a subprocess
 (`claude-agent-acp`, `codex-acp`, `opencode acp`, or a registry-declared custom command) spoken
-to over stdio. The ACP [remote transport
-RFD](https://agentclientprotocol.com/rfds/streamable-http-websocket-transport) (Active,
-targeted as a **v1-additive** feature) standardizes driving agents over the network — one
-`/acp` endpoint offering a streamable-HTTP/SSE profile and a WebSocket profile. This item adds
-remote backends to the client side and a runner gateway on the serving side.
+to over stdio. The aggregation server can expose those local backends to clients over stdio,
+Streamable HTTP, or WebSocket, but `acp-agents` cannot yet consume a remote backend URL. The ACP
+[remote transport RFD](https://agentclientprotocol.com/rfds/streamable-http-websocket-transport)
+(Active, targeted as a **v1-additive** feature) standardizes that network path. This item adds
+remote backends to the client side and the additional deployment controls required by a hardened
+runner gateway.
 
 ## Design
 
@@ -33,14 +34,13 @@ implementation swaps exactly one seam: the SDK's `ndJsonStream` over child stdio
 everything above the connection layer is untouched. Connection pooling keys by endpoint
 instead of by child process.
 
-### 2. WebSocket-first
+### 2. Serving transport foundation — implemented
 
-The WS profile is the first target because (a) the TypeScript SDK already ships experimental
-client *and* server support for it, (b) a WS-only server is spec-legal (remote clients must
-support both profiles; servers may support only WS), and (c) the SSE profile still has known
-spec/reference-implementation divergences (stream routing of `session/load` results, unknown-
-session GET behavior, cookie affinity) that are slated for the RFD's hardening phase. The
-HTTP+SSE client profile follows once those settle.
+`agentprism-acp-server --http` uses the TypeScript SDK's official experimental server and Node
+adapter surfaces to expose both Streamable HTTP and WebSocket on one `/acp` endpoint. Each accepted
+connection retains the existing extension negotiation and connection-pinned transparent proxy.
+This establishes transport reachability only; the deployment, identity, workspace, and durability
+controls below remain separate gateway work.
 
 ### 3. The runner gateway (serving side)
 
@@ -121,14 +121,13 @@ integrators.
 
 ## Sequencing
 
-1. **Spike:** drive a `goose serve` instance (the RFD's reference server) over WS from an
-   AgentRunner behind a config flag — validates the transport seam against real
-   infrastructure before any server-side work, and incidentally makes Goose a drivable
-   backend.
-2. Remote backend config union + reconnect/`session/load` reconciliation in `acp-agents`.
-3. Runner gateway (WS-only server first) with per-principal auth and runner-side registry.
-4. Runner-side structured-output capture; HTTP+SSE client profile once the RFD hardening
-   phase lands.
+1. **Serving transport foundation — complete:** one connection-pinned router per stdio,
+   Streamable HTTP, or WebSocket connection.
+2. **Spike:** drive a remote ACP server over WS from an AgentRunner behind a config flag — validates
+   the client transport seam against real infrastructure.
+3. Remote backend config union + reconnect/`session/load` reconciliation in `acp-agents`.
+4. Runner gateway deployment controls with per-principal auth and runner-side registry.
+5. Runner-side structured-output capture and reconnect hardening.
 
 ## Open questions
 

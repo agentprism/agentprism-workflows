@@ -44,7 +44,7 @@ export interface ServeAcpServerOptions {
   signal?: AbortSignal;
 }
 
-/** Serve one connection-pinned AgentPrism ACP stdio connection until either side closes. */
+/** Serve one connection-pinned AgentPrism ACP V1 stream until either side closes. */
 export async function serveAcpServer(options: ServeAcpServerOptions = {}): Promise<void> {
   const stream = options.stream ?? stdioStream();
   const targets = options.targets ? [...options.targets] : resolveBackendTargets({ backends: options.backends });
