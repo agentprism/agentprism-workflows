@@ -2,10 +2,11 @@ name: GitHub Pages data
 
 on:
   schedule:
-    # npm publishes the previous UTC day's counts shortly after midnight.
+    # The generator uses an explicit 30-day UTC window ending two full days ago,
+    # after npm's daily aggregation should have settled.
     - cron: "17 6 * * *"
-    # Second attempt: the generator fails (and publishes nothing) when npm's
-    # edge hands the runner a stale window, so retry later the same day.
+    # Second attempt: structural or final-day completeness failures publish
+    # nothing, so retry later the same day without weakening those guards.
     - cron: "23 18 * * *"
   workflow_dispatch: {}
   push:
