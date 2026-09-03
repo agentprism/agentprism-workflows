@@ -6,7 +6,7 @@ import test from "node:test";
 // Adapted import: AgentUsage is part of the frozen seam contract, which now lives in
 // @automatalabs/shared-types (pi imported it from "../src/agent.js"). The engine re-exports
 // it, but importing from its canonical home keeps the seam explicit.
-import type { AgentUsage } from "@automatalabs/shared-types";
+import type { AgentRunner, AgentUsage } from "@automatalabs/shared-types";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 
@@ -654,6 +654,214 @@ test("resume re-runs the changed call AND everything after it (longest-unchanged
     resumeJournal: new Map(journal.map((e) => [e.index, e])),
   });
   assert.equal(second.state.calls, 2, "edited call (1) + its suffix (2) re-run; only the prefix (0) is cached");
+});
+
+const configuredResumeScript = `export const meta = { name: 'configured_resume', description: 'host-selected resume identity' }
+const prefix = await agent('prefix', { label: 'prefix', model: 'authored/prefix' })
+const selected = await agent('selected', { label: 'selected', model: 'authored/model', mode: 'authored-mode', configOptions: { effort: 'low', fast: false } })
+const suffix = await agent('suffix', { label: 'suffix', model: 'authored/suffix' })
+return { prefix, selected, suffix }`;
+
+const configuredResumeSelection = {
+  0: { model: "claude/haiku" },
+  1: {
+    model: "claude/sonnet",
+    mode: "code",
+    configOptions: { effort: "high", fast: true },
+  },
+  2: { model: "codex/gpt-5" },
+} as const;
+
+/** The recorded identity hash of every call, in call order; a run without call records is a failure. */
+function callHashes(run: { calls?: ReadonlyArray<{ hash: string }> }): string[] {
+  assert.ok(run.calls, "the run reports its call records");
+  return run.calls.map((call) => call.hash);
+}
+
+/** A runner that records every live prompt and marks its replies so replayed vs live output is distinguishable. */
+function markedAgent(marker: string): { prompts: string[]; runner: AgentRunner } {
+  const prompts: string[] = [];
+  const runner = {
+    async run(prompt: string) {
+      prompts.push(prompt);
+      return `${marker}:${prompt}`;
+    },
+  } as AgentRunner;
+  return { prompts, runner };
+}
+
+test("host-selected effective configuration controls replay identity and longest-unchanged-prefix invalidation", async () => {
+  const baselineAgent = markedAgent("baseline");
+  const journal: JournalEntry[] = [];
+  const baseline = await runWorkflow(configuredResumeScript, {
+    agent: baselineAgent.runner,
+    agentConfigurations: configuredResumeSelection,
+    requireAgentConfiguration: true,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+  assert.deepEqual(baselineAgent.prompts, ["prefix", "selected", "suffix"]);
+  assert.equal(journal.length, 3);
+  const resumeJournal = new Map(journal.map((entry) => [entry.index, entry]));
+
+  for (const [label, selectedConfiguration] of [
+    ["identical", configuredResumeSelection[1]],
+    [
+      "reordered configOptions",
+      {
+        model: "claude/sonnet",
+        mode: "code",
+        configOptions: { fast: true, effort: "high" },
+      },
+    ],
+  ] as const) {
+    const replayAgent = markedAgent(`unexpected-${label}`);
+    const replay = await runWorkflow(configuredResumeScript, {
+      agent: replayAgent.runner,
+      agentConfigurations: { ...configuredResumeSelection, 1: selectedConfiguration },
+      requireAgentConfiguration: true,
+      persistLogs: false,
+      resumeJournal,
+    });
+    assert.deepEqual(replayAgent.prompts, [], `${label} effective selections must not dispatch the runner`);
+    assert.deepEqual(
+      callHashes(replay),
+      callHashes(baseline),
+      `${label} effective selections must retain every call hash`,
+    );
+    assert.equal(JSON.stringify(replay.result), JSON.stringify(baseline.result));
+  }
+
+  for (const [label, selectedConfiguration] of [
+    [
+      "provider/model",
+      {
+        model: "codex/gpt-5",
+        mode: "code",
+        configOptions: { effort: "high", fast: true },
+      },
+    ],
+    [
+      "mode",
+      {
+        model: "claude/sonnet",
+        mode: "plan",
+        configOptions: { effort: "high", fast: true },
+      },
+    ],
+    [
+      "one config option",
+      {
+        model: "claude/sonnet",
+        mode: "code",
+        configOptions: { effort: "medium", fast: true },
+      },
+    ],
+    // Omission is a real choice (the provider's default), not "keep the previous value".
+    [
+      "cleared mode",
+      {
+        model: "claude/sonnet",
+        configOptions: { effort: "high", fast: true },
+      },
+    ],
+    [
+      "cleared config options",
+      {
+        model: "claude/sonnet",
+        mode: "code",
+      },
+    ],
+  ] as const) {
+    const liveAgent = markedAgent(`live-${label}`);
+    const changed = await runWorkflow(configuredResumeScript, {
+      agent: liveAgent.runner,
+      agentConfigurations: { ...configuredResumeSelection, 1: selectedConfiguration },
+      requireAgentConfiguration: true,
+      persistLogs: false,
+      resumeJournal,
+    });
+
+    assert.deepEqual(
+      liveAgent.prompts,
+      ["selected", "suffix"],
+      `${label} must replay only the unchanged prefix and execute the changed call plus suffix`,
+    );
+    const changedHashes = callHashes(changed);
+    const baselineHashes = callHashes(baseline);
+    assert.equal(changedHashes.length, 3);
+    assert.equal(changedHashes[0], baselineHashes[0], "the unchanged prefix keeps its identity");
+    assert.notEqual(changedHashes[1], baselineHashes[1], `${label} must change selected-call identity`);
+    assert.equal(
+      changedHashes[2],
+      baselineHashes[2],
+      "the unchanged suffix retains its own identity even though correspondence requires live execution",
+    );
+    assert.equal(
+      JSON.stringify(changed.result),
+      JSON.stringify({
+        prefix: "baseline:prefix",
+        selected: `live-${label}:selected`,
+        suffix: `live-${label}:suffix`,
+      }),
+    );
+  }
+});
+
+test("host replacement keeps a completed call replayable when only authored provider configuration changes", async () => {
+  const baselineAgent = markedAgent("baseline");
+  const journal: JournalEntry[] = [];
+  const baseline = await runWorkflow(configuredResumeScript, {
+    agent: baselineAgent.runner,
+    agentConfigurations: configuredResumeSelection,
+    requireAgentConfiguration: true,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  const changedAuthoredConfiguration = configuredResumeScript
+    .replace("'authored/model'", "'other/provider-model'")
+    .replace("'authored-mode'", "'other-authored-mode'")
+    .replace("{ effort: 'low', fast: false }", "{ effort: 'medium', fast: true }");
+  const replayAgent = markedAgent("unexpected-live");
+  const replay = await runWorkflow(changedAuthoredConfiguration, {
+    agent: replayAgent.runner,
+    agentConfigurations: configuredResumeSelection,
+    requireAgentConfiguration: true,
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+  });
+
+  assert.deepEqual(replayAgent.prompts, []);
+  assert.equal(JSON.stringify(replay.result), JSON.stringify(baseline.result));
+  assert.deepEqual(callHashes(replay), callHashes(baseline));
+
+  // Control: without a host selection the same authored edits DO change identity and re-run
+  // the call plus its suffix, so the replay above is explained by replacement, not by the
+  // hash ignoring provider-specific configuration.
+  const unconfiguredAgent = markedAgent("unconfigured");
+  const unconfiguredJournal: JournalEntry[] = [];
+  const unconfigured = await runWorkflow(configuredResumeScript, {
+    agent: unconfiguredAgent.runner,
+    persistLogs: false,
+    onAgentJournal: (entry) => unconfiguredJournal.push(entry),
+  });
+  assert.deepEqual(unconfiguredAgent.prompts, ["prefix", "selected", "suffix"]);
+  const editedAgent = markedAgent("edited");
+  const edited = await runWorkflow(changedAuthoredConfiguration, {
+    agent: editedAgent.runner,
+    persistLogs: false,
+    resumeJournal: new Map(unconfiguredJournal.map((entry) => [entry.index, entry])),
+  });
+  assert.deepEqual(editedAgent.prompts, ["selected", "suffix"]);
+  const editedHashes = callHashes(edited);
+  const unconfiguredHashes = callHashes(unconfigured);
+  assert.equal(editedHashes[0], unconfiguredHashes[0]);
+  assert.notEqual(editedHashes[1], unconfiguredHashes[1]);
+  assert.equal(
+    JSON.stringify(edited.result),
+    JSON.stringify({ prefix: "unconfigured:prefix", selected: "edited:selected", suffix: "edited:suffix" }),
+  );
 });
 
 const resumeLoopCapScript = `export const meta = { name: 'resume-loop-cap', description: 'Run expensive review rounds up to an args-controlled cap', phases: [{ title: 'Review' }] };

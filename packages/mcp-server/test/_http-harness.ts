@@ -1,7 +1,7 @@
 // HTTP-transport sibling of _harness.ts: a real createDaemon() on an ephemeral loopback
 // port, driven by real SDK Clients over StreamableHTTPClientTransport. Importing _harness
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
+import type { ElicitRequest, ElicitResult, FetchLike } from "@modelcontextprotocol/client";
 
 // first inherits its $HOME isolation, stub runner factories, and result accessors.
 import { mkdtempSync } from "node:fs";
@@ -52,9 +52,14 @@ export async function connectHttp(
     protocolMode?: "legacy" | "auto" | "modern";
     /** Advertise the elicitation capability and answer checkpoint forms with this. */
     elicit?: (request: ElicitRequest) => ElicitResult | Promise<ElicitResult>;
+    /** Optional recorder/mutator for real Streamable HTTP requests. */
+    fetch?: FetchLike;
   } = {},
 ): Promise<HttpConnected> {
-  const transport = new StreamableHTTPClientTransport(new URL(url));
+  const transport = new StreamableHTTPClientTransport(
+    new URL(url),
+    opts.fetch ? { fetch: opts.fetch } : undefined,
+  );
   const client = new Client(
     { name: "mcp-http-test", version: "0.0.0" },
     {
@@ -62,11 +67,19 @@ export async function connectHttp(
         ...uiClientCapabilities(opts.uiCapability ?? "matching"),
         ...(opts.elicit ? { elicitation: { form: {} } } : {}),
       },
-      ...(opts.protocolMode === undefined || opts.protocolMode === "legacy"
+      // Pin the era explicitly so a test named "legacy" or "modern" can never drift with an
+      // SDK default change: legacy is the plain 2025 initialize handshake, modern is exactly
+      // the 2026-07-28 revision (no fallback), auto probes with conservative fallback.
+      ...(opts.protocolMode === undefined
         ? {}
         : {
             versionNegotiation: {
-              mode: opts.protocolMode === "auto" ? "auto" as const : { pin: "2026-07-28" },
+              mode:
+                opts.protocolMode === "legacy"
+                  ? "legacy" as const
+                  : opts.protocolMode === "auto"
+                    ? "auto" as const
+                    : { pin: "2026-07-28" },
             },
           }),
     },
