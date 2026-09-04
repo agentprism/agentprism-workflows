@@ -94,7 +94,7 @@ importers:
         specifier: ^1.4.0
         version: 1.4.0(zod@4.4.3)
       '@openai/codex':
-        specifier: ^0.153.2
+        specifier: ^0.153.3
         version: 0.153.3
       diff:
         specifier: ^9.0.0

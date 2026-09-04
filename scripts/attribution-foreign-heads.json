@@ -110,6 +110,11 @@
       "sha": "432a4594a396448db6c2e7772a5851ab68b71ef2",
       "imported": "2026-09-04",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (build(deps): bump openai/codex-action (#432))"
+    },
+    {
+      "sha": "061f9a4a2e463a220d7a3ab2ae5e9732837085ef",
+      "imported": "2026-09-04",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (chore(main): release 1.10.0 (#472))"
     }
   ]
 }
