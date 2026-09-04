@@ -107,6 +107,11 @@ no alias, fallback reader, or compatibility parser. Clients that do not implemen
 Extension still see ordinary `skill://` resources if they browse `resources/list`, but they do not
 receive the retired model-facing documentation tool.
 
+This specification supersedes only the authoring-distribution paths and regeneration instructions in
+older feature-specific specifications that name the retired standalone skill, generated prompt/docs
+modules, or their generators. Those documents remain historical implementation maps; their workflow,
+REPL, backend, resume, and runtime behavior contracts are unchanged.
+
 The `author-workflow` prompt remains a compact, user-controlled task frame. It tells the assistant to
 activate `skill://agentprism-workflow-authoring/SKILL.md` through the host's skill-loading path and
 never embeds the skill or treats an ordinary `resources/read` as activation.
