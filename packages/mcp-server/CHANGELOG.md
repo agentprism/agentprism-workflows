@@ -1,5 +1,17 @@
 # @automatalabs/mcp-server
 
+## 3.0.0
+
+### Major Changes
+
+- 67ca48d: Replace the MCP `docs` tool and `agentprism://docs/*` resources with the accepted SEP-2640 Skills Extension. The server now publishes separate workflow-authoring and REPL-orchestration Agent Skills through `skills/list`, `skills/get`, standard resource reads, and capability-gated directory reads.
+
+### Patch Changes
+
+- Updated dependencies [67ca48d]
+  - @automatalabs/workflows@2.0.0
+  - @automatalabs/repl-engine@0.4.19
+
 ## 2.0.3
 
 ### Patch Changes
