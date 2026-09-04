@@ -15,23 +15,26 @@ import {
 } from "@agentclientprotocol/sdk";
 import { Readable, Writable } from "node:stream";
 import type { CustomBackendConfig, RawBackendConnection } from "@automatalabs/acp-agents";
-import { resolveBackendTargets, type BackendTarget } from "./backends.js";
+import { indexBackendTargets, resolveBackendTargets, type BackendTarget } from "./backends.js";
 import {
   ACP_BACKENDS_PROBE_METHOD,
-  ACP_ROUTER_META_NAMESPACE,
-  assertSessionBackend,
   discoveryInitializeResponse,
   isRecord,
-  mergeBackendInitializeResponse,
+  parseAcpV1Initialize,
   parseProbeBackendsParams,
-  parseRouterInitialize,
   type BackendProbe,
   type ProbeBackendsParams,
   type ProbeBackendsResult,
 } from "./protocol.js";
 import { RawRpcPeer, errorResponse, type RawRpcHandler } from "./raw-rpc.js";
 
+export type AcpServerEndpoint =
+  | { readonly kind: "discovery" }
+  | { readonly kind: "backend"; readonly backendId: string };
+
 export interface ServeAcpServerOptions {
+  /** Selects this stream's role before ACP initialize begins. */
+  endpoint: AcpServerEndpoint;
   /** Outer ACP stream. Defaults to process stdin/stdout. */
   stream?: Stream;
   /** Programmatic custom backends merged over AGENTPRISM_BACKENDS. */
@@ -44,13 +47,24 @@ export interface ServeAcpServerOptions {
   signal?: AbortSignal;
 }
 
-/** Serve one connection-pinned AgentPrism ACP V1 stream until either side closes. */
-export async function serveAcpServer(options: ServeAcpServerOptions = {}): Promise<void> {
-  const stream = options.stream ?? stdioStream();
-  const targets = options.targets ? [...options.targets] : resolveBackendTargets({ backends: options.backends });
-  const targetsById = new Map(targets.map((target) => [target.id, target]));
-  if (targetsById.size !== targets.length) throw new Error("ACP backend target ids must be unique");
+/** Serve one endpoint-pinned AgentPrism ACP V1 stream until either side closes. */
+export async function serveAcpServer(options: ServeAcpServerOptions): Promise<void> {
+  if (!options || !options.endpoint) throw new TypeError("serveAcpServer requires an endpoint");
+  if (options.endpoint.kind !== "discovery" && options.endpoint.kind !== "backend") {
+    throw new TypeError("serveAcpServer endpoint kind must be discovery or backend");
+  }
+  const targets = options.targets
+    ? [...options.targets]
+    : resolveBackendTargets({ backends: options.backends });
+  const targetsById = indexBackendTargets(targets);
+  const target = options.endpoint.kind === "backend"
+    ? targetsById.get(options.endpoint.backendId)
+    : undefined;
+  if (options.endpoint.kind === "backend" && !target) {
+    throw new Error(`Unknown AgentPrism ACP backend ${JSON.stringify(options.endpoint.backendId)}`);
+  }
 
+  const stream = options.stream ?? stdioStream();
   const outerReader = stream.readable.getReader();
   const first = await readFirst(outerReader, options.signal);
   if (!first) {
@@ -65,9 +79,9 @@ export async function serveAcpServer(options: ServeAcpServerOptions = {}): Promi
     return;
   }
 
-  let parsed;
+  let initializeRequest: InitializeRequest;
   try {
-    parsed = parseRouterInitialize(firstRequest.params);
+    initializeRequest = parseAcpV1Initialize(firstRequest.params);
   } catch (error) {
     await writeResponseAndClose(stream.writable, {
       jsonrpc: "2.0",
@@ -78,11 +92,11 @@ export async function serveAcpServer(options: ServeAcpServerOptions = {}): Promi
     return;
   }
 
-  if (parsed.selection.mode === "discovery") {
+  if (options.endpoint.kind === "discovery") {
     await serveDiscoveryConnection(
       { readable: remainingReadable, writable: stream.writable },
       firstRequest,
-      parsed.request,
+      initializeRequest,
       targets,
       options.version ?? packageVersion(),
       options.signal,
@@ -90,20 +104,7 @@ export async function serveAcpServer(options: ServeAcpServerOptions = {}): Promi
     return;
   }
 
-  const target = targetsById.get(parsed.selection.backend);
-  if (!target) {
-    await writeResponseAndClose(stream.writable, {
-      jsonrpc: "2.0",
-      id: firstRequest.id,
-      error: RequestError.invalidParams(
-        undefined,
-        `unknown AgentPrism ACP backend ${JSON.stringify(parsed.selection.backend)}`,
-      ).toErrorResponse(),
-    });
-    await remainingReadable.cancel();
-    return;
-  }
-
+  if (!target) throw new Error("ACP backend endpoint lost its selected target");
   await serveBackendConnection(
     { readable: remainingReadable, writable: stream.writable },
     firstRequest,
@@ -270,14 +271,11 @@ async function serveBackendConnection(
       return;
     }
 
-    const response = requireInitializeResponse(initialized.result);
-    await outerWriter.write({
-      ...initialized,
-      result: mergeBackendInitializeResponse(response, target.id),
-    });
+    requireInitializeResponse(initialized.result);
+    await outerWriter.write(initialized);
     initializeResponded = true;
 
-    const clientToBackend = pumpClientToBackend(outerReader, innerWriter, outerWriter, target.id, signal);
+    const clientToBackend = pumpClientToBackend(outerReader, innerWriter, signal);
     const backendToClient = pumpUnchanged(innerReader, outerWriter, signal);
     await Promise.race([clientToBackend, backendToClient]);
     await Promise.allSettled([
@@ -336,36 +334,12 @@ async function readInitializeResponse(
 async function pumpClientToBackend(
   reader: ReadableStreamDefaultReader<AnyMessage>,
   backendWriter: WritableStreamDefaultWriter<AnyMessage>,
-  clientWriter: WritableStreamDefaultWriter<AnyMessage>,
-  backendId: string,
   signal?: AbortSignal,
 ): Promise<void> {
   while (!signal?.aborted) {
     const item = await reader.read();
     if (item.done) return;
-    const message = item.value;
-
-    if ("method" in message && message.method === methods.agent.session.new && "id" in message) {
-      try {
-        assertSessionBackend(message.params, backendId);
-      } catch (error) {
-        await clientWriter.write({ jsonrpc: "2.0", id: message.id, error: errorResponse(error) });
-        continue;
-      }
-    }
-
-    if ("method" in message && message.method.startsWith("_automatalabs/agentprism/")) {
-      if ("id" in message) {
-        await clientWriter.write({
-          jsonrpc: "2.0",
-          id: message.id,
-          error: RequestError.methodNotFound(message.method).toErrorResponse(),
-        });
-      }
-      continue;
-    }
-
-    await backendWriter.write(message);
+    await backendWriter.write(item.value);
   }
 }
 

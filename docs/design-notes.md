@@ -118,11 +118,11 @@ The REPL engine (roadmap `repl-orchestrator`) is **not** a leaf outside that cha
                                 implemented; the package is published independently).
 ```
 
-`@automatalabs/acp-server` is a separate composition root over `acp-agents`. Each stdio,
-Streamable HTTP, or WebSocket connection acts as an ACP agent toward one extension-aware client and
-as an ACP client toward the selected backend. A discovery connection probes all configured
-backends; an operational connection pins one backend during `initialize` and then forwards ACP
-traffic without rewriting session IDs. The official TypeScript SDK owns the network transport's
+`@automatalabs/acp-server` is a separate composition root over `acp-agents`. Transport-boundary
+selection pins each stdio process or network path to discovery or one backend before ACP
+`initialize`. Discovery uses `/acp/discovery`; ordinary ACP clients use
+`/acp/backends/{id}`. Operational connections forward initialize and later traffic without
+rewriting metadata or session IDs. The official TypeScript SDK owns the network transport's
 connection/SSE correlation; it does not add an AgentPrism session-routing table.
 
 `workflow-engine` and `acp-agents` are **siblings**: neither imports the other. They meet only at
@@ -226,7 +226,7 @@ outside the engine/runner dependency chain.
 | Module | Piece | Replaces (Pi) | New |
 |---|---|---|---|
 | `acp-agents` | **Leaf** — run one subagent | `WorkflowAgent` in [`src/agent.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/agent.ts) (`createAgentSession`, `ModelRegistry`, `createCodingTools`) | `AcpAgentRunner.run()` (via `createAcpRunner()`) — drives Claude, Codex, OpenCode, pi, or custom ACP agents |
-| `acp-server` | **ACP composition root** — aggregate backend servers | no Pi equivalent | stdio, Streamable HTTP, and WebSocket listeners over negotiated discovery connections plus connection-pinned transparent ACP V1 proxying |
+| `acp-server` | **ACP composition root** — aggregate backend servers | no Pi equivalent | explicit stdio selection plus `/discovery` and `/backends/{id}` Streamable HTTP/WebSocket paths, with connection-pinned transparent ACP V1 proxying |
 | `workflows` | **Facade** — compose + validate | no Pi equivalent | public SDK, one-shot helper, workflow folders/validator, manager ACP-event bridge |
 | `mcp-server` | **Shell** — expose tools | [`extensions/workflow.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/extensions/workflow.ts) + `createWorkflowTool` `defineTool` + TUI ([`display.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/display.ts), [`task-panel.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/task-panel.ts), [`workflow-ui.ts`](https://github.com/QuintinShaw/pi-dynamic-workflows/blob/1b0291ab58c91037ea7b067875960530d52bedce/src/workflow-ui.ts)) | stdio MCP server registering the `workflow` and `repl` tools (no auth tools); progress via MCP notifications |
 | `agentprism-otel` | **Observability** | no Pi equivalent | OTel trace/metric mapping over manager events |
@@ -438,9 +438,9 @@ replays forever.
 
 AgentPrism's backend subprocess connections use **JSON-RPC 2.0 over stdio**, newline-delimited
 (messages MUST NOT contain embedded newlines; stdout = protocol, stderr = free for logs). The
-aggregation server accepts that same ACP V1 message protocol over stdio, Streamable HTTP, and
-WebSocket; its HTTP/WebSocket listener uses the official TypeScript SDK transport implementation.
-Protocol version is `1`.
+aggregation server accepts that same ACP V1 message protocol over explicitly selected stdio,
+`/acp/discovery`, and `/acp/backends/{id}` Streamable HTTP/WebSocket endpoints; its network listener
+uses the official TypeScript SDK transport implementation. Protocol version is `1`.
 Spec: https://agentclientprotocol.com/protocol/v1/transports ·
 https://agentclientprotocol.com/rfds/streamable-http-websocket-transport
 

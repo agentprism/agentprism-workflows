@@ -6,10 +6,9 @@ Root monorepo, delivery, attribution, compatibility, and release rules always ap
 
 This package is the ACP V1 composition root defined by
 [`docs/roadmap/acp-server.md`](../../docs/roadmap/acp-server.md). It accepts stdio, Streamable HTTP,
-and WebSocket connections, and owns only the AgentPrism router capability, discovery connection,
-backend selection during operational `initialize`, connection-pinned transparent proxy, and those
-outer transport listeners. Keep workflow execution and backend-specific protocol behavior out of
-this package.
+and WebSocket connections, and owns only transport-boundary endpoint selection, the dedicated
+backend-discovery extension, connection-pinned transparent proxying, and those outer transport
+listeners. Keep workflow execution and backend-specific protocol behavior out of this package.
 
 Operational connections preserve the selected backend's ACP messages, `_meta`, and session IDs.
 Do not add session routing tables, synthetic model catalogs, backend fallbacks, authentication,

@@ -17,7 +17,7 @@ Run **dynamic, multi-agent workflow scripts** — `agent()`, `parallel()`, `pipe
 - **As a TypeScript SDK** — `@automatalabs/workflows` — embed the runner in your own program.
 - **As a stdio MCP server** — `@automatalabs/mcp-server`, built on the SDK — expose `workflow` and `repl` tools to any MCP host (Claude Code, Zed, …).
 
-> All ten `@automatalabs/*` packages are **published on npm** — see [Install](#install). Two are primary workflow entry points: the `@automatalabs/workflows` SDK and the `@automatalabs/mcp-server` stdio server. `@automatalabs/acp-server` is the extension-aware ACP aggregation entry point.
+> All ten `@automatalabs/*` packages are **published on npm** — see [Install](#install). Two are primary workflow entry points: the `@automatalabs/workflows` SDK and the `@automatalabs/mcp-server` stdio server. `@automatalabs/acp-server` is the transport-routed ACP aggregation entry point.
 
 ---
 
@@ -156,7 +156,7 @@ These are the packages you interact with directly. The first two are the primary
 |---|---|
 | **`@automatalabs/workflows`** | The canonical public **SDK** — a thin facade that runs workflow scripts programmatically over the default ACP backend, and re-exports the supported engine + backend integration surface. Start here. |
 | **`@automatalabs/mcp-server`** | The stdio **MCP server** (bin: `agentprism-workflow`) exposing the `workflow` tool (foreground/background run, bounded status, resume, permission response, stop) and the `repl` tool (a persistent JavaScript REPL for live subagent orchestration) — built on `@automatalabs/workflows` and `@automatalabs/repl-engine`. |
-| **`@automatalabs/acp-server`** | The extension-aware **ACP proxy** (bin: `agentprism-acp-server`) over stdio, Streamable HTTP, or WebSocket: probe every configured backend on a discovery connection, then pin each operational connection to Claude, Codex, OpenCode, pi, or a custom ACP server. |
+| **`@automatalabs/acp-server`** | The transport-routed **ACP proxy** (bin: `agentprism-acp-server`) over stdio, Streamable HTTP, or WebSocket: use a dedicated discovery endpoint, then connect directly to a path or stdio process pinned to Claude, Codex, OpenCode, pi, or a custom ACP server. |
 | **`@automatalabs/pi-acp`** | The standalone stdio **ACP server** (bin: `pi-acp`) embedding the pi coding agent in-process; exact-pinned and spawned by the first-class `pi` backend. |
 
 One optional integration package attaches to the SDK's manager surface:
@@ -185,8 +185,9 @@ Our independently published ACP servers are available as an [ACP-format registry
 https://agentprism.github.io/agentprism-workflows/acp-registry/v1/latest/registry.json
 ```
 
-It currently contains the extension-aware `@automatalabs/acp-server` router, the
-`@automatalabs/codex-acp` fork, and the from-scratch `@automatalabs/pi-acp` server. Each npx
+It contains the directly launchable `@automatalabs/codex-acp` fork and from-scratch
+`@automatalabs/pi-acp` server. The `@automatalabs/acp-server` aggregator is not a single registry
+agent because its stdio process requires an explicit discovery or backend selector. Each npx
 distribution is pinned to the npm `latest` version that CI
 has verified is actually published; the GitHub Pages data workflow refreshes the registry after
 successful releases and on its regular schedule.

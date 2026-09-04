@@ -26,7 +26,7 @@ test("generator publishes the official ACP top-level shape with pinned npm versi
     assert.deepEqual(document.extensions, []);
     assert.deepEqual(
       document.agents.map((agent) => agent.id),
-      ["agentprism-acp-server", "agentprism-codex-acp", "agentprism-pi-acp"],
+      ["agentprism-codex-acp", "agentprism-pi-acp"],
     );
 
     const expectedPackages = new Map(
@@ -55,11 +55,10 @@ test("generator publishes the official ACP top-level shape with pinned npm versi
       assert.match(icon, /currentColor/);
     }
 
-    const [routerIcon, defaultIcon] = await Promise.all([
-      readFile(join(publishedDir, "agentprism-acp-server.svg"), "utf8"),
-      readFile(join(publishedDir, "agentprism-codex-acp.svg"), "utf8"),
-    ]);
-    assert.notEqual(routerIcon, defaultIcon);
+    await assert.rejects(
+      stat(join(publishedDir, "agentprism-acp-server.svg")),
+      (error) => error?.code === "ENOENT",
+    );
   } finally {
     await registry.close();
     await rm(outputDir, { recursive: true, force: true });
@@ -89,7 +88,7 @@ test("generator refuses to publish when npm latest has not reached the checked-i
 
 async function loadPackageFixtures() {
   const fixtures = [];
-  for (const directory of ["acp-server", "codex-acp", "pi-acp"]) {
+  for (const directory of ["codex-acp", "pi-acp"]) {
     const manifest = JSON.parse(
       await readFile(join(repoRoot, "packages", directory, "package.json"), "utf8"),
     );

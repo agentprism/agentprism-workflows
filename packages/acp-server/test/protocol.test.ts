@@ -1,121 +1,72 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { RequestError, type InitializeRequest } from "@agentclientprotocol/sdk";
+import { PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
 import {
+  ACP_BACKEND_DISCOVERY_VERSION,
   ACP_BACKENDS_PROBE_METHOD,
-  ACP_ROUTER_META_NAMESPACE,
-  assertSessionBackend,
+  ACP_META_NAMESPACE,
   discoveryInitializeResponse,
-  mergeBackendInitializeResponse,
+  parseAcpV1Initialize,
   parseProbeBackendsParams,
-  parseRouterInitialize,
-} from "../src/index.js";
+} from "../src/protocol.js";
 
-function initialize(mode: "discovery" | "backend", backend?: string): InitializeRequest {
-  return {
-    protocolVersion: 1,
-    clientCapabilities: {
-      _meta: {
-        [ACP_ROUTER_META_NAMESPACE]: {
-          acpRouter: { versions: [1] },
-        },
-      },
-    },
-    _meta: {
-      [ACP_ROUTER_META_NAMESPACE]: {
-        acpRouter: {
-          version: 1,
-          mode,
-          ...(backend === undefined ? {} : { backend }),
-        },
-      },
-    },
-  };
-}
-
-test("parses discovery and connection-pinned backend initialization", () => {
-  assert.deepEqual(parseRouterInitialize(initialize("discovery")).selection, {
-    version: 1,
-    mode: "discovery",
-  });
-  assert.deepEqual(parseRouterInitialize(initialize("backend", "codex")).selection, {
-    version: 1,
-    mode: "backend",
-    backend: "codex",
-  });
-});
-
-test("rejects clients that do not negotiate the router capability", () => {
-  const request = initialize("backend", "codex");
-  request.clientCapabilities = {};
-  assert.throws(() => parseRouterInitialize(request), RequestError);
-});
-
-test("session/new must repeat the pinned backend", () => {
+test("standard ACP initialize is independent of AgentPrism routing metadata", () => {
   const params = {
-    cwd: "/workspace",
-    mcpServers: [],
-    _meta: {
-      [ACP_ROUTER_META_NAMESPACE]: {
-        acpRouter: { version: 1, backend: "codex" },
-      },
-    },
+    protocolVersion: PROTOCOL_VERSION,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: false } },
+    clientInfo: { name: "ordinary-client", version: "1.0.0" },
+    _meta: { vendor: { trace: "kept" } },
   };
-  assert.doesNotThrow(() => assertSessionBackend(params, "codex"));
-  assert.throws(() => assertSessionBackend(params, "claude"), RequestError);
+
+  assert.equal(parseAcpV1Initialize(params), params);
+  assert.throws(() => parseAcpV1Initialize({ protocolVersion: 2 }), RequestError);
 });
 
-test("discovery helpers preserve backend capabilities and unrelated metadata", () => {
-  const discovery = discoveryInitializeResponse("0.1.0");
-  assert.equal(
-    ((discovery.agentCapabilities?._meta?.[ACP_ROUTER_META_NAMESPACE] as {
-      acpRouter: { methods: { probeBackends: string } };
-    }).acpRouter.methods.probeBackends),
-    ACP_BACKENDS_PROBE_METHOD,
-  );
+test("the discovery initialize advertises only the backend probe extension", () => {
+  const response = discoveryInitializeResponse("9.8.7");
 
-  const merged = mergeBackendInitializeResponse(
-    {
-      protocolVersion: 1,
-      agentInfo: { name: "codex", version: "2.0.0" },
-      agentCapabilities: {
-        loadSession: true,
-        _meta: {
-          vendor: { enabled: true },
-          [ACP_ROUTER_META_NAMESPACE]: { retained: true },
-        },
+  assert.deepEqual(response.agentCapabilities._meta, {
+    [ACP_META_NAMESPACE]: {
+      backendDiscovery: {
+        version: ACP_BACKEND_DISCOVERY_VERSION,
+        methods: { probeBackends: ACP_BACKENDS_PROBE_METHOD },
       },
-      _meta: { responseVendor: true },
     },
-    "codex",
-  );
-  assert.equal(merged.agentInfo?.name, "codex");
-  assert.equal(merged.agentCapabilities?.loadSession, true);
-  assert.deepEqual(merged.agentCapabilities?._meta?.vendor, { enabled: true });
-  assert.deepEqual(merged.agentCapabilities?._meta?.[ACP_ROUTER_META_NAMESPACE], {
-    retained: true,
-    acpRouter: { version: 1, mode: "backend", backend: "codex" },
   });
-  assert.deepEqual(merged._meta, { responseVendor: true });
+  assert.deepEqual(response.agentInfo, {
+    name: "agentprism-acp-server",
+    title: "AgentPrism ACP Server Discovery",
+    version: "9.8.7",
+  });
 });
 
-test("probe params require absolute workspace paths", () => {
-  assert.deepEqual(
-    parseProbeBackendsParams({
-      cwd: "/workspace",
-      additionalDirectories: ["/other"],
-      mcpServers: [],
-      _meta: { trace: "t1" },
-    }),
-    {
-      cwd: "/workspace",
-      additionalDirectories: ["/other"],
-      mcpServers: [],
-      _meta: { trace: "t1" },
-    },
-  );
+test("backend probes validate the temporary session boundary", () => {
   assert.throws(
     () => parseProbeBackendsParams({ cwd: "relative", mcpServers: [] }),
     RequestError,
+  );
+  assert.throws(
+    () =>
+      parseProbeBackendsParams({
+        cwd: "/tmp/project",
+        additionalDirectories: ["relative"],
+        mcpServers: [],
+      }),
+    RequestError,
+  );
+
+  assert.deepEqual(
+    parseProbeBackendsParams({
+      cwd: "/tmp/project",
+      additionalDirectories: ["/tmp/shared"],
+      mcpServers: [],
+      _meta: { trace: "probe" },
+    }),
+    {
+      cwd: "/tmp/project",
+      additionalDirectories: ["/tmp/shared"],
+      mcpServers: [],
+      _meta: { trace: "probe" },
+    },
   );
 });

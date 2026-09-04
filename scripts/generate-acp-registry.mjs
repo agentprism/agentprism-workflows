@@ -26,26 +26,11 @@ const RETRY_DELAY_MS = 1_000;
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 // This is the intentional publication allowlist. Discovery below fails if a
-// public in-repo ACP server package is added without a corresponding entry, so
-// one cannot be silently omitted from the registry. ACP servers conventionally
-// end in `-acp`; `acp-server` is the extension-aware aggregation entry point.
-const ACP_PACKAGE_NAME_EXCEPTIONS = Object.freeze(["@automatalabs/acp-server"]);
+// public in-repo `*-acp` agent package is added without a corresponding entry,
+// so one cannot be silently omitted from the registry. The transport-routed
+// `acp-server` aggregator requires an explicit endpoint selector and therefore
+// is not itself one launchable agent registry entry.
 const AGENT_DEFINITIONS = Object.freeze([
-  Object.freeze({
-    id: "agentprism-acp-server",
-    name: "AgentPrism ACP Server",
-    package: "@automatalabs/acp-server",
-    bin: "agentprism-acp-server",
-    iconFile: "agentprism-acp-server.svg",
-    description:
-      "AgentPrism's extension-aware ACP router for discovering configured backends and pinning one per client connection.",
-    repository: "https://github.com/agentprism/agentprism-workflows",
-    website:
-      "https://github.com/agentprism/agentprism-workflows/tree/main/packages/acp-server#readme",
-    authors: Object.freeze(["Automata Labs"]),
-    license: "Apache-2.0",
-    license_url: "https://github.com/agentprism/agentprism-workflows/blob/main/LICENSE",
-  }),
   Object.freeze({
     id: "agentprism-codex-acp",
     name: "AgentPrism Codex ACP",
@@ -136,7 +121,7 @@ async function discoverPublishedAcpPackages() {
     if (
       typeof manifest.name !== "string" ||
       !manifest.name.startsWith("@automatalabs/") ||
-      !(manifest.name.endsWith("-acp") || ACP_PACKAGE_NAME_EXCEPTIONS.includes(manifest.name)) ||
+      !manifest.name.endsWith("-acp") ||
       manifest.private === true
     ) {
       continue;

@@ -6,7 +6,7 @@ import { createWebSocketStream } from "@agentclientprotocol/sdk/experimental/ws-
 import type { RawBackendConnection } from "@automatalabs/acp-agents";
 import { WebSocket } from "ws";
 import {
-  ACP_ROUTER_META_NAMESPACE,
+  ACP_META_NAMESPACE,
   listenAcpHttpServer,
   type BackendTarget,
 } from "../src/index.js";
@@ -23,17 +23,9 @@ function streamPair(): [acp.Stream, acp.Stream] {
 function initializeParams() {
   return {
     protocolVersion: acp.PROTOCOL_VERSION,
-    clientInfo: { name: "network-router-test", version: "1.0.0" },
-    clientCapabilities: {
-      _meta: {
-        [ACP_ROUTER_META_NAMESPACE]: { acpRouter: { versions: [1] } },
-      },
-    },
-    _meta: {
-      [ACP_ROUTER_META_NAMESPACE]: {
-        acpRouter: { version: 1, mode: "backend", backend: "codex" },
-      },
-    },
+    clientInfo: { name: "ordinary-network-client", version: "1.0.0" },
+    clientCapabilities: { _meta: { clientVendor: true } },
+    _meta: { trace: "network" },
   } satisfies acp.InitializeRequest;
 }
 
@@ -41,25 +33,22 @@ function sessionParams() {
   return {
     cwd: "/workspace",
     mcpServers: [],
-    _meta: {
-      [ACP_ROUTER_META_NAMESPACE]: {
-        acpRouter: { version: 1, backend: "codex" },
-      },
-    },
+    _meta: { sessionVendor: true },
   } satisfies acp.NewSessionRequest;
 }
 
-test("HTTP and WebSocket connections each reach a connection-pinned router", async () => {
-  const receivedInitializes: unknown[] = [];
-  const backendFailures: unknown[] = [];
-  let opened = 0;
-  const target: BackendTarget = {
-    id: "codex",
-    name: "Codex",
+function fakeTarget(
+  id: string,
+  opens: string[],
+  receivedInitializes: unknown[],
+  failures: unknown[],
+): BackendTarget {
+  return {
+    id,
+    name: id.toUpperCase(),
     async open() {
-      const [router, backend] = streamPair();
-      opened += 1;
-      const nativeSessionId = `native-session-${opened}`;
+      const [proxy, backend] = streamPair();
+      opens.push(id);
       const serving = (async () => {
         const reader = backend.readable.getReader();
         const writer = backend.writable.getWriter();
@@ -74,7 +63,8 @@ test("HTTP and WebSocket connections each reach a connection-pinned router", asy
             id: initialized.value.id,
             result: {
               protocolVersion: acp.PROTOCOL_VERSION,
-              agentInfo: { name: "codex-acp", version: "test" },
+              agentInfo: { name: `${id}-acp`, version: "test" },
+              agentCapabilities: { _meta: { backendVendor: id } },
             },
           });
 
@@ -86,7 +76,7 @@ test("HTTP and WebSocket connections each reach a connection-pinned router", asy
           await writer.write({
             jsonrpc: "2.0",
             id: created.value.id,
-            result: { sessionId: nativeSessionId },
+            result: { sessionId: `native-${id}-session` },
           });
           await reader.read();
         } finally {
@@ -94,10 +84,10 @@ test("HTTP and WebSocket connections each reach a connection-pinned router", asy
           writer.releaseLock();
         }
       })();
-      serving.catch((error) => backendFailures.push(error));
+      serving.catch((error) => failures.push(error));
       return {
-        backendId: "codex",
-        stream: router,
+        backendId: id,
+        stream: proxy,
         closed: serving,
         stderrTail: "",
         async close() {
@@ -107,37 +97,87 @@ test("HTTP and WebSocket connections each reach a connection-pinned router", asy
       } satisfies RawBackendConnection;
     },
   };
+}
+
+test("HTTP and WebSocket paths select discovery or one configured backend before initialize", async () => {
+  const opens: string[] = [];
+  const receivedInitializes: unknown[] = [];
+  const failures: unknown[] = [];
+  const targets = [
+    fakeTarget("codex", opens, receivedInitializes, failures),
+    fakeTarget("claude", opens, receivedInitializes, failures),
+  ];
 
   const server = await listenAcpHttpServer({
     host: "127.0.0.1",
     port: 0,
-    targets: [target],
+    basePath: "/router",
+    targets,
     version: "test",
   });
   try {
-    const connections: Array<[string, acp.Stream]> = [
-      ["HTTP", createHttpStream(server.url)],
-      ["WebSocket", createWebSocketStream(server.webSocketUrl, { WebSocket })],
-    ];
-    for (const [index, [transport, stream]] of connections.entries()) {
-      const result = await acp.client({ name: `network-router-${transport}` }).connectWith(
-        stream,
-        async (context) => {
-          const initialized = await context.request(acp.methods.agent.initialize, initializeParams());
-          const selection = initialized.agentCapabilities?._meta?.[ACP_ROUTER_META_NAMESPACE] as {
-            acpRouter?: { backend?: string };
-          };
-          assert.equal(selection.acpRouter?.backend, "codex");
-          return context.request(acp.methods.agent.session.new, sessionParams());
-        },
-      );
-      assert.equal(result.sessionId, `native-session-${index + 1}`);
-    }
+    assert.equal(server.discovery.path, "/router/discovery");
+    assert.deepEqual(
+      server.backends.map(({ backendId, path }) => ({ backendId, path })),
+      [
+        { backendId: "codex", path: "/router/backends/codex" },
+        { backendId: "claude", path: "/router/backends/claude" },
+      ],
+    );
+
+    const oldEndpoint = await fetch(`http://${server.host}:${server.port}/router`);
+    assert.equal(oldEndpoint.status, 404);
+    const unknownBackend = await fetch(`http://${server.host}:${server.port}/router/backends/missing`);
+    assert.equal(unknownBackend.status, 404);
+
+    const discoveryStream = createHttpStream(server.discovery.url);
+    const discovery = await acp.client({ name: "discovery-client" }).connectWith(
+      discoveryStream,
+      (context) => context.request(acp.methods.agent.initialize, initializeParams()),
+    );
+    assert.equal(discovery.agentInfo?.name, "agentprism-acp-server");
+    assert.ok(
+      (discovery.agentCapabilities._meta?.[ACP_META_NAMESPACE] as { backendDiscovery?: unknown })
+        .backendDiscovery,
+    );
+    assert.deepEqual(opens, []);
+
+    const codex = server.backends.find((endpoint) => endpoint.backendId === "codex")!;
+    const codexSession = await acp.client({ name: "codex-http-client" }).connectWith(
+      createHttpStream(codex.url),
+      async (context) => {
+        const initialized = await context.request(acp.methods.agent.initialize, initializeParams());
+        assert.deepEqual(initialized.agentCapabilities?._meta, { backendVendor: "codex" });
+        return context.request(acp.methods.agent.session.new, sessionParams());
+      },
+    );
+    assert.equal(codexSession.sessionId, "native-codex-session");
+
+    const claude = server.backends.find((endpoint) => endpoint.backendId === "claude")!;
+    const claudeSession = await acp.client({ name: "claude-websocket-client" }).connectWith(
+      createWebSocketStream(claude.webSocketUrl, { WebSocket }),
+      async (context) => {
+        const initialized = await context.request(acp.methods.agent.initialize, initializeParams());
+        assert.deepEqual(initialized.agentCapabilities?._meta, { backendVendor: "claude" });
+        return context.request(acp.methods.agent.session.new, sessionParams());
+      },
+    );
+    assert.equal(claudeSession.sessionId, "native-claude-session");
   } finally {
     await server.close();
   }
 
-  assert.equal(opened, 2);
+  assert.deepEqual(opens, ["codex", "claude"]);
   assert.deepEqual(receivedInitializes, [initializeParams(), initializeParams()]);
-  assert.deepEqual(backendFailures, []);
+  assert.deepEqual(failures, []);
+});
+
+test("network routes reject backend ids that cannot be represented canonically", async () => {
+  await assert.rejects(
+    listenAcpHttpServer({
+      port: 0,
+      targets: [{ id: "bad/id", name: "Bad", async open() { throw new Error("unused"); } }],
+    }),
+    /must match/,
+  );
 });

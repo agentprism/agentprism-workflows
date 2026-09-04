@@ -11,20 +11,9 @@ import {
   type SessionModeState,
 } from "@agentclientprotocol/sdk";
 
-export const ACP_ROUTER_META_NAMESPACE = "@automatalabs/agentprism" as const;
-export const ACP_ROUTER_VERSION = 1 as const;
+export const ACP_META_NAMESPACE = "@automatalabs/agentprism" as const;
+export const ACP_BACKEND_DISCOVERY_VERSION = 1 as const;
 export const ACP_BACKENDS_PROBE_METHOD = "_automatalabs/agentprism/backends/probe" as const;
-
-const BACKEND_ID_PATTERN = /^[a-z][a-z0-9._-]*$/;
-
-export type RouterSelection =
-  | { readonly version: 1; readonly mode: "discovery" }
-  | { readonly version: 1; readonly mode: "backend"; readonly backend: string };
-
-export interface ParsedRouterInitialize {
-  readonly request: InitializeRequest;
-  readonly selection: RouterSelection;
-}
 
 export interface ProbeBackendsParams {
   cwd: string;
@@ -57,70 +46,13 @@ export interface ProbeBackendsResult {
   backends: BackendProbe[];
 }
 
-/** Validate the ACP and AgentPrism portions of the connection's first initialize request. */
-export function parseRouterInitialize(params: unknown): ParsedRouterInitialize {
+/** Validate the standard ACP portion of the connection's first initialize request. */
+export function parseAcpV1Initialize(params: unknown): InitializeRequest {
   const request = requireRecord(params, "initialize params") as InitializeRequest;
   if (request.protocolVersion !== PROTOCOL_VERSION) {
     throw invalidParams(`AgentPrism ACP server supports protocol version ${PROTOCOL_VERSION}`);
   }
-
-  const clientCapabilities = requireRecord(request.clientCapabilities, "clientCapabilities");
-  const capabilityMeta = requireRecord(clientCapabilities._meta, "clientCapabilities._meta");
-  const capabilityNamespace = requireRecord(
-    capabilityMeta[ACP_ROUTER_META_NAMESPACE],
-    `clientCapabilities._meta[${JSON.stringify(ACP_ROUTER_META_NAMESPACE)}]`,
-  );
-  const capability = requireRecord(capabilityNamespace.acpRouter, "acpRouter client capability");
-  if (
-    !Array.isArray(capability.versions) ||
-    !capability.versions.every((value) => Number.isSafeInteger(value)) ||
-    !capability.versions.includes(ACP_ROUTER_VERSION)
-  ) {
-    throw invalidParams(`client must advertise AgentPrism ACP router version ${ACP_ROUTER_VERSION}`);
-  }
-
-  const requestMeta = requireRecord(request._meta, "initialize._meta");
-  const requestNamespace = requireRecord(
-    requestMeta[ACP_ROUTER_META_NAMESPACE],
-    `initialize._meta[${JSON.stringify(ACP_ROUTER_META_NAMESPACE)}]`,
-  );
-  const selection = requireRecord(requestNamespace.acpRouter, "initialize acpRouter selection");
-  if (selection.version !== ACP_ROUTER_VERSION) {
-    throw invalidParams(`initialize must select AgentPrism ACP router version ${ACP_ROUTER_VERSION}`);
-  }
-  if (selection.mode === "discovery") {
-    return { request, selection: { version: ACP_ROUTER_VERSION, mode: "discovery" } };
-  }
-  if (selection.mode !== "backend") {
-    throw invalidParams('initialize acpRouter mode must be "discovery" or "backend"');
-  }
-  if (typeof selection.backend !== "string" || !BACKEND_ID_PATTERN.test(selection.backend)) {
-    throw invalidParams(`initialize acpRouter backend must match ${BACKEND_ID_PATTERN}`);
-  }
-  return {
-    request,
-    selection: {
-      version: ACP_ROUTER_VERSION,
-      mode: "backend",
-      backend: selection.backend,
-    },
-  };
-}
-
-/** Validate the redundant backend assertion required on every session/new request. */
-export function assertSessionBackend(params: unknown, selectedBackend: string): void {
-  const request = requireRecord(params, "session/new params");
-  const meta = requireRecord(request._meta, "session/new._meta");
-  const namespace = requireRecord(
-    meta[ACP_ROUTER_META_NAMESPACE],
-    `session/new._meta[${JSON.stringify(ACP_ROUTER_META_NAMESPACE)}]`,
-  );
-  const selection = requireRecord(namespace.acpRouter, "session/new acpRouter selection");
-  if (selection.version !== ACP_ROUTER_VERSION || selection.backend !== selectedBackend) {
-    throw invalidParams(
-      `session/new must select router version ${ACP_ROUTER_VERSION} and backend ${JSON.stringify(selectedBackend)}`,
-    );
-  }
+  return request;
 }
 
 /** Validate and copy the temporary session inputs accepted by the discovery probe. */
@@ -135,7 +67,9 @@ export function parseProbeBackendsParams(params: unknown): ProbeBackendsParams {
   if (
     value.additionalDirectories !== undefined &&
     (!Array.isArray(value.additionalDirectories) ||
-      !value.additionalDirectories.every((directory) => typeof directory === "string" && isAbsolute(directory)))
+      !value.additionalDirectories.every(
+        (directory) => typeof directory === "string" && isAbsolute(directory),
+      ))
   ) {
     throw invalidParams("probe additionalDirectories must contain only absolute paths");
   }
@@ -152,50 +86,21 @@ export function parseProbeBackendsParams(params: unknown): ProbeBackendsParams {
   };
 }
 
-/** Router-owned initialize response for a discovery connection. */
+/** Initialize response for the dedicated backend-discovery endpoint. */
 export function discoveryInitializeResponse(version: string): InitializeResponse {
   return {
     protocolVersion: PROTOCOL_VERSION,
     agentInfo: {
       name: "agentprism-acp-server",
-      title: "AgentPrism ACP Server",
+      title: "AgentPrism ACP Server Discovery",
       version,
     },
     agentCapabilities: {
       _meta: {
-        [ACP_ROUTER_META_NAMESPACE]: {
-          acpRouter: {
-            version: ACP_ROUTER_VERSION,
-            mode: "discovery",
+        [ACP_META_NAMESPACE]: {
+          backendDiscovery: {
+            version: ACP_BACKEND_DISCOVERY_VERSION,
             methods: { probeBackends: ACP_BACKENDS_PROBE_METHOD },
-          },
-        },
-      },
-    },
-  };
-}
-
-/** Add the proxy's negotiated capability without changing the selected backend's response fields. */
-export function mergeBackendInitializeResponse(
-  response: InitializeResponse,
-  backend: string,
-): InitializeResponse {
-  const capabilities = response.agentCapabilities ?? {};
-  const capabilityMeta = capabilities._meta ?? {};
-  const namespaceValue = capabilityMeta[ACP_ROUTER_META_NAMESPACE];
-  const namespace = isRecord(namespaceValue) ? namespaceValue : {};
-  return {
-    ...response,
-    agentCapabilities: {
-      ...capabilities,
-      _meta: {
-        ...capabilityMeta,
-        [ACP_ROUTER_META_NAMESPACE]: {
-          ...namespace,
-          acpRouter: {
-            version: ACP_ROUTER_VERSION,
-            mode: "backend",
-            backend,
           },
         },
       },

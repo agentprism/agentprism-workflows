@@ -10,7 +10,7 @@ import {
 import type { RawBackendConnection } from "@automatalabs/acp-agents";
 import {
   ACP_BACKENDS_PROBE_METHOD,
-  ACP_ROUTER_META_NAMESPACE,
+  ACP_META_NAMESPACE,
   serveAcpServer,
   type BackendTarget,
 } from "../src/index.js";
@@ -24,34 +24,23 @@ function streamPair(): [Stream, Stream] {
   ];
 }
 
-function initializeParams(mode: "discovery" | "backend", backend?: string) {
+function initializeParams() {
   return {
     protocolVersion: 1,
     clientCapabilities: {
       terminal: true,
-      _meta: {
-        [ACP_ROUTER_META_NAMESPACE]: { acpRouter: { versions: [1] } },
-        clientVendor: { enabled: true },
-      },
+      _meta: { clientVendor: { enabled: true } },
     },
-    clientInfo: { name: "test-client", version: "1.0.0" },
-    _meta: {
-      [ACP_ROUTER_META_NAMESPACE]: {
-        acpRouter: { version: 1, mode, ...(backend === undefined ? {} : { backend }) },
-      },
-      trace: "trace-1",
-    },
+    clientInfo: { name: "ordinary-acp-client", version: "1.0.0" },
+    _meta: { trace: "trace-1" },
   };
 }
 
-function sessionParams(backend: string) {
+function sessionParams() {
   return {
     cwd: "/workspace",
     mcpServers: [],
-    _meta: {
-      [ACP_ROUTER_META_NAMESPACE]: { acpRouter: { version: 1, backend } },
-      sessionVendor: true,
-    },
+    _meta: { sessionVendor: true },
   };
 }
 
@@ -97,7 +86,7 @@ function response(message: AnyMessage): AnyResponse {
   return message;
 }
 
-test("backend mode forwards initialize and all post-session traffic without rewriting session ids", async () => {
+test("a backend endpoint transparently proxies an ordinary ACP client", async () => {
   let backendFailure: unknown;
   const codex = fakeTarget("codex", "Codex", async (stream) => {
     const reader = stream.readable.getReader();
@@ -105,24 +94,21 @@ test("backend mode forwards initialize and all post-session traffic without rewr
     try {
       const initialized = request(await readMessage(reader));
       assert.equal(initialized.method, methods.agent.initialize);
-      assert.deepEqual(initialized.params, initializeParams("backend", "codex"));
+      assert.deepEqual(initialized.params, initializeParams());
       await writer.write({
         jsonrpc: "2.0",
         id: initialized.id,
         result: {
           protocolVersion: 1,
           agentInfo: { name: "codex-acp", version: "2.0.0" },
-          agentCapabilities: {
-            loadSession: true,
-            _meta: { backendVendor: true },
-          },
+          agentCapabilities: { loadSession: true, _meta: { backendVendor: true } },
           _meta: { initializeVendor: true },
         },
       });
 
       const created = request(await readMessage(reader));
       assert.equal(created.method, methods.agent.session.new);
-      assert.deepEqual(created.params, sessionParams("codex"));
+      assert.deepEqual(created.params, sessionParams());
       await writer.write({
         jsonrpc: "2.0",
         id: created.id,
@@ -156,7 +142,6 @@ test("backend mode forwards initialize and all post-session traffic without rewr
         id: prompted.id,
         result: { stopReason: "end_turn", _meta: { promptVendor: true } },
       });
-
       await reader.read();
     } catch (error) {
       backendFailure = error;
@@ -168,7 +153,11 @@ test("backend mode forwards initialize and all post-session traffic without rewr
   });
 
   const [client, server] = streamPair();
-  const serving = serveAcpServer({ stream: server, targets: [codex], version: "0.1.0" });
+  const serving = serveAcpServer({
+    endpoint: { kind: "backend", backendId: "codex" },
+    stream: server,
+    targets: [codex],
+  });
   const reader = client.readable.getReader();
   const writer = client.writable.getWriter();
 
@@ -176,31 +165,26 @@ test("backend mode forwards initialize and all post-session traffic without rewr
     jsonrpc: "2.0",
     id: 1,
     method: methods.agent.initialize,
-    params: initializeParams("backend", "codex"),
+    params: initializeParams(),
   });
-  const initialized = response(await readMessage(reader));
-  assert.ok("result" in initialized);
-  const initializeResult = initialized.result as Record<string, unknown>;
-  assert.deepEqual(initializeResult.agentInfo, { name: "codex-acp", version: "2.0.0" });
-  assert.deepEqual(
-    ((initializeResult.agentCapabilities as { _meta: Record<string, unknown> })._meta),
-    {
-      backendVendor: true,
-      [ACP_ROUTER_META_NAMESPACE]: {
-        acpRouter: { version: 1, mode: "backend", backend: "codex" },
-      },
+  assert.deepEqual(await readMessage(reader), {
+    jsonrpc: "2.0",
+    id: 1,
+    result: {
+      protocolVersion: 1,
+      agentInfo: { name: "codex-acp", version: "2.0.0" },
+      agentCapabilities: { loadSession: true, _meta: { backendVendor: true } },
+      _meta: { initializeVendor: true },
     },
-  );
-  assert.deepEqual(initializeResult._meta, { initializeVendor: true });
+  });
 
   await writer.write({
     jsonrpc: "2.0",
     id: 2,
     method: methods.agent.session.new,
-    params: sessionParams("codex"),
+    params: sessionParams(),
   });
-  const created = response(await readMessage(reader));
-  assert.deepEqual(created, {
+  assert.deepEqual(await readMessage(reader), {
     jsonrpc: "2.0",
     id: 2,
     result: {
@@ -240,14 +224,14 @@ test("backend mode forwards initialize and all post-session traffic without rewr
   writer.releaseLock();
 });
 
-test("discovery mode probes backend initialize and temporary session configuration", async () => {
+test("the discovery endpoint probes backend initialize and temporary session configuration", async () => {
   const codex = fakeTarget("codex", "Codex", async (stream) => {
     const reader = stream.readable.getReader();
     const writer = stream.writable.getWriter();
     try {
       const initialized = request(await readMessage(reader));
       assert.equal(initialized.method, methods.agent.initialize);
-      assert.deepEqual(initialized.params, initializeParams("discovery"));
+      assert.deepEqual(initialized.params, initializeParams());
       await writer.write({
         jsonrpc: "2.0",
         id: initialized.id,
@@ -297,7 +281,12 @@ test("discovery mode probes backend initialize and temporary session configurati
   };
 
   const [client, server] = streamPair();
-  const serving = serveAcpServer({ stream: server, targets: [codex, unavailable], version: "0.1.0" });
+  const serving = serveAcpServer({
+    endpoint: { kind: "discovery" },
+    stream: server,
+    targets: [codex, unavailable],
+    version: "0.1.0",
+  });
   const reader = client.readable.getReader();
   const writer = client.writable.getWriter();
 
@@ -305,14 +294,14 @@ test("discovery mode probes backend initialize and temporary session configurati
     jsonrpc: "2.0",
     id: 1,
     method: methods.agent.initialize,
-    params: initializeParams("discovery"),
+    params: initializeParams(),
   });
   const initialized = response(await readMessage(reader));
   assert.ok("result" in initialized);
   assert.equal(
     ((((initialized.result as { agentCapabilities: { _meta: Record<string, unknown> } }).agentCapabilities
-      ._meta[ACP_ROUTER_META_NAMESPACE] as { acpRouter: { methods: { probeBackends: string } } })
-      .acpRouter.methods.probeBackends)),
+      ._meta[ACP_META_NAMESPACE] as { backendDiscovery: { methods: { probeBackends: string } } })
+      .backendDiscovery.methods.probeBackends)),
     ACP_BACKENDS_PROBE_METHOD,
   );
 
@@ -358,45 +347,9 @@ test("discovery mode probes backend initialize and temporary session configurati
   writer.releaseLock();
 });
 
-test("backend mode rejects a mismatched session/new without forwarding it", async () => {
-  let receivedSessionNew = false;
-  const codex = fakeTarget("codex", "Codex", async (stream) => {
-    const reader = stream.readable.getReader();
-    const writer = stream.writable.getWriter();
-    try {
-      const initialized = request(await readMessage(reader));
-      await writer.write({ jsonrpc: "2.0", id: initialized.id, result: { protocolVersion: 1 } });
-      const item = await reader.read();
-      receivedSessionNew = !item.done;
-    } finally {
-      reader.releaseLock();
-      writer.releaseLock();
-    }
-  });
-
-  const [client, server] = streamPair();
-  const serving = serveAcpServer({ stream: server, targets: [codex] });
-  const reader = client.readable.getReader();
-  const writer = client.writable.getWriter();
-  await writer.write({
-    jsonrpc: "2.0",
-    id: 1,
-    method: methods.agent.initialize,
-    params: initializeParams("backend", "codex"),
-  });
-  await readMessage(reader);
-  await writer.write({
-    jsonrpc: "2.0",
-    id: 2,
-    method: methods.agent.session.new,
-    params: sessionParams("claude"),
-  });
-  const rejected = response(await readMessage(reader));
-  assert.ok("error" in rejected);
-  assert.equal(rejected.error.code, -32602);
-  await writer.close();
-  await serving;
-  assert.equal(receivedSessionNew, false);
-  reader.releaseLock();
-  writer.releaseLock();
+test("backend endpoint selection fails before the ACP handshake for an unknown id", async () => {
+  await assert.rejects(
+    serveAcpServer({ endpoint: { kind: "backend", backendId: "missing" }, targets: [] }),
+    /Unknown AgentPrism ACP backend "missing"/,
+  );
 });

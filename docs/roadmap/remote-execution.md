@@ -20,7 +20,7 @@ A backend config becomes a union — "a command I spawn" or "an endpoint I conne
 ```jsonc
 {
   "image-gen":    { "command": "my-image-agent", "args": ["--acp"] },          // today
-  "cloud-claude": { "transport": "ws", "url": "wss://runner.example/acp",
+  "cloud-claude": { "transport": "ws", "url": "wss://runner.example/acp/backends/claude",
                     "auth": { "bearer": "…" } }                                 // new
 }
 ```
@@ -37,10 +37,11 @@ instead of by child process.
 ### 2. Serving transport foundation — implemented
 
 `agentprism-acp-server --http` uses the TypeScript SDK's official experimental server and Node
-adapter surfaces to expose both Streamable HTTP and WebSocket on one `/acp` endpoint. Each accepted
-connection retains the existing extension negotiation and connection-pinned transparent proxy.
-This establishes transport reachability only; the deployment, identity, workspace, and durability
-controls below remain separate gateway work.
+adapter surfaces to expose both Streamable HTTP and WebSocket on `/acp/discovery` and one
+`/acp/backends/{id}` path per configured backend. The selected path pins each operational
+connection before ordinary ACP initialize, after which the proxy is transparent. This establishes
+transport reachability only; the deployment, identity, workspace, and durability controls below
+remain separate gateway work.
 
 ### 3. The runner gateway (serving side)
 
@@ -67,9 +68,9 @@ positioned to provide:
   detach to involuntary disconnect.
 
 The serving-side aggregation and backend-selection contract is defined in
-[`acp-server.md`](acp-server.md): clients negotiate the AgentPrism routing extension on a discovery
-connection, then pin each operational ACP connection to one allowlisted backend during `initialize`.
-Spawn commands and environment secrets never reach the client.
+[`acp-server.md`](acp-server.md): clients use the dedicated discovery path, then connect each
+operational ACP connection to one allowlisted backend path before `initialize`. Spawn commands and
+environment secrets never reach the client.
 
 **Packaging:** the runner ships as its own package, `@automatalabs/acp-server` — named by the
 protocol surface it exposes, mirroring `@automatalabs/mcp-server` (the adapters it fronts are
@@ -78,7 +79,7 @@ themselves ACP servers; this is the one remote clients connect to). One namespac
 Node installed bootstraps with a single command:
 
 ```bash
-npx -y @automatalabs/acp-server start   # install + daemonize + print "wss://<host>:<port>/acp" + token
+npx -y @automatalabs/acp-server start   # install + daemonize + print backend/discovery URLs + token
 npx -y @automatalabs/acp-server stop    # graceful drain, then shutdown
 npx -y @automatalabs/acp-server status | logs -f | token [--rotate] | doctor
 npx -y @automatalabs/acp-server run     # foreground mode, for Docker/systemd/Fly-style supervisors
