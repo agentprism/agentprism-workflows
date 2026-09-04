@@ -68,6 +68,7 @@ describe('CodexACPAgent - initialize', () => {
                         baseInstructions: true,
                         developerInstructions: true,
                     },
+                    authStatus: {},
                 },
             },
             authMethods: getCodexAuthMethods(),
@@ -86,7 +87,7 @@ describe('CodexACPAgent - initialize', () => {
                 jetbrains: {
                     air: {
                         version: 1,
-                        capabilities: ["sessionFailure", "agentFileChangeReport", "nativeSubagentSessions"],
+                        capabilities: ["sessionFailure", "agentFileChangeReport", "nativeSubagentSessions", "asyncTasks"],
                     },
                 },
             },
@@ -100,7 +101,7 @@ describe('CodexACPAgent - initialize', () => {
 
         const result = await agent.initialize(params);
 
-        expect(result.agentCapabilities?._meta).toEqual(customAgentCapabilities);
+        expect(result.agentCapabilities?._meta).toEqual({...customAgentCapabilities, authStatus: {}});
         expect(result.agentCapabilities?._meta?.[CUSTOM_CAPABILITY_NAMESPACE]).toEqual({
             outputSchema: true,
             baseInstructions: true,

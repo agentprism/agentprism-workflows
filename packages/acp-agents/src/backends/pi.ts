@@ -108,6 +108,8 @@ export const piBackendDefinition = defineBuiltinBackend({
         "@agentclientprotocol/sdk",
         "@earendil-works/pi-ai",
         "@earendil-works/pi-coding-agent",
+        // The coding-agent public SDK imports pi-server; track the runtime we supply.
+        "@earendil-works/pi-server",
         // Test-surface runtime dep of pi-acp: exact-pinned on the same upstream version line as
         // pi-ai/pi-coding-agent, so it must move in lockstep or the suite tests a stale runtime.
         "@earendil-works/pi-agent-core",

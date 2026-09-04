@@ -83,6 +83,7 @@
           "@agentclientprotocol/sdk",
           "@earendil-works/pi-ai",
           "@earendil-works/pi-coding-agent",
+          "@earendil-works/pi-server",
           "@earendil-works/pi-agent-core"
         ],
         "sourceUpstreams": [],

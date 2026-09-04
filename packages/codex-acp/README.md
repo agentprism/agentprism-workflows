@@ -21,6 +21,7 @@ This package is a fork of [`agentclientprotocol/codex-acp`](https://github.com/a
 - Shell command, file change, [permission request](docs/permission-extension.md), MCP tool call, terminal output, reasoning, plan, web search, image generation, image view, token usage, and review events.
 - Client `fs.readTextFile` capability: when the client advertises it, file-change diff content is read through `fs/read_text_file` (so diffs reflect unsaved editor buffers), with local file system fallback otherwise. File writes happen inside codex itself — the app-server delegates no file IO to the client.
 - [Native ACP subagent sessions](docs/subagent-sessions.md) (after capability negotiation) with separate child histories and root-routed permissions; a legacy tool-call fallback otherwise. Legacy tool updates retain Codex thread identity and activity details in namespaced `_meta.codex.subagent` metadata.
+- [Background terminal tasks](docs/async-tasks.md) in AIR, with task status and targeted stop support after capability negotiation.
 - Session-scoped long-running goals through the provider-neutral [goal extension](docs/goal-extension.md).
 - A per-turn [agent file-change report](docs/agent-file-change-report.md) after capability negotiation.
 - Client-provided MCP servers over command-based stdio config and HTTP transport.
@@ -160,6 +161,12 @@ See [readme-dev.md](readme-dev.md) for local client configuration, binary packag
 Subagent sessions follow the draft [ACP subagent RFD](https://github.com/agentclientprotocol/agent-client-protocol/pull/1992) and are enabled only after bilateral capability negotiation during `initialize`. Without native negotiation, the subagent lifecycle stays an ordinary ACP tool call.
 
 See [docs/subagent-sessions.md](docs/subagent-sessions.md) for the negotiation, lifecycle events, `session/load` reconstruction, and legacy fallback details.
+
+### Background terminal tasks
+
+Codex can keep a shell command running after a turn continues. AIR clients can show this work in the Async Tasks panel and stop one command.
+
+See [docs/async-tasks.md](docs/async-tasks.md) for the capability, lifecycle events, and stop request.
 
 ## License
 

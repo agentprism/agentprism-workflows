@@ -100,6 +100,8 @@ re-issue is safe). A query for an unknown session is the standard `unknown_sessi
 
 The `pnpm test` script intentionally runs `tsc -p tsconfig.type-tests.json` before the runtime test suite. This is a small deviation from the test-script example in the frozen specification and ensures the T2b public type-contract check is enforced in local and CI test runs.
 
+Run `node scripts/smoke-pi-package.mjs` from the repository root after changing Pi dependencies. It packs this adapter and checks its public SDK import in fresh npm and pnpm installations. The adapter explicitly supplies `@earendil-works/pi-server`: Pi 0.85.0's public SDK imports that runtime but omits it from its published dependency list.
+
 ## Built on pi — THIRD-PARTY notice
 
-This package depends on and embeds `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, and `@earendil-works/pi-ai` version 0.84.4. pi is Copyright Earendil Inc., Mario Zechner, and Armin Ronacher and is distributed under the MIT License. The dependency packages retain the full MIT copyright and license text. pi-acp itself is Apache-2.0.
+This package depends on and embeds `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-ai`, and `@earendil-works/pi-server` version 0.85.0. pi is Copyright Earendil Inc., Mario Zechner, and Armin Ronacher and is distributed under the MIT License. The dependency packages retain the full MIT copyright and license text. pi-acp itself is Apache-2.0.

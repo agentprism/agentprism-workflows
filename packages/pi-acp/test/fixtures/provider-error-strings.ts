@@ -1,4 +1,11 @@
-export const FIXTURE_PI_PIN = "0.84.4";
+export const FIXTURE_PI_PIN = "0.85.0";
+// 2026-09-04 bump 0.84.4 -> 0.85.0: re-verified auth-guidance.js and both agent-session
+// authentication templates against the published dists; all captured guidance is unchanged.
+// pi-ai overflow/error-body/provider-retry.js are byte-identical. retry.js only omits the
+// undefined errorMessage property when aborting a retry sleep; error classification is unchanged.
+// Session creation/config APIs stay compatible. Idle/abort now cover manual compaction and branch
+// summaries, and session forks preserve compaction boundaries. The removed auto_retry_end type
+// declaration was a duplicate union member; the event still exists and remains exhaustively handled.
 // 2026-08-28 bump 0.84.3 -> 0.84.4: the agent-core release changes when
 // prepareNextTurn hooks run, but pi-acp configures neither prepareNextTurn nor shouldStopAfterTurn.
 // Coding-agent changes add UI/RPC capabilities and fix compaction, custom-message ordering,

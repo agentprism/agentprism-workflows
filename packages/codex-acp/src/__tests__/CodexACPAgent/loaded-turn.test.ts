@@ -45,6 +45,8 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
             projectId: null,
             historyMode: "legacy",
             modelProvider: "openai",
+            model: "gpt-5",
+            reasoningEffort: null,
             createdAt: 123,
             updatedAt: 124,
             recencyAt: null,
@@ -80,6 +82,7 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
                             phase: null,
                             memoryCitation: null,
                             delivery: null,
+                            questions: null,
                         },
                     ],
                 },
@@ -321,6 +324,7 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
             phase: null,
             memoryCitation: null,
             delivery: null,
+            questions: null,
         };
         const fixture = setupFixture(thread);
         await load(fixture, "session-1");
@@ -363,6 +367,7 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
             phase: null,
             memoryCitation: null,
             delivery: null,
+            questions: null,
         };
         const fixture = setupFixture(thread);
         await load(fixture, "session-1");
