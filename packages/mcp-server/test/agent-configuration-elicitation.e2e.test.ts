@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import test from "node:test";
 import {
   INVALID_PARAMS,
@@ -11,7 +11,7 @@ import {
 } from "@modelcontextprotocol/client";
 import type { AgentRunner, RunOptions } from "@automatalabs/shared-types";
 import type { DaemonHandle } from "../src/daemon/http-daemon.js";
-import { structured } from "./_harness.js";
+import { structured, makeRunner, persistedRunFile } from "./_harness.js";
 import { connectHttp, makeProjectDir, startDaemon, waitUntil } from "./_http-harness.js";
 
 const SCRIPT = `export const meta = {
@@ -26,10 +26,7 @@ phase("Research");
 await agent("research", { label: "researcher" });
 phase("Review");
 return agent("review", {
-  label: "reviewer",
-  model: "codex/gpt-5",
-  mode: "codex-authored-mode",
-  configOptions: { reasoning: "medium" }
+  label: "reviewer"
 });`;
 
 interface ObservedCall {
@@ -338,6 +335,186 @@ const EXPECTED_DISPATCH: ObservedCall[] = [
   { model: "codex/gpt-5", mode: undefined, configOptions: { reasoning: "high" } },
   { model: "claude/sonnet", mode: "code", configOptions: { fast: true } },
 ];
+
+for (const protocolMode of ["legacy", "modern"] as const) {
+  test(`${protocolMode}: inherited and backend-only models do not require optional configuration`, async () => {
+    const seen: ObservedCall[] = [];
+    const daemon = await startDaemon(configurableRunner(seen));
+    const connected = await connectHttp(daemon.url, {
+      protocolMode, elicit: () => ({ action: "decline" }),
+    });
+    try {
+      const result = await connected.client.callTool({
+        name: "workflow",
+        arguments: {
+          action: "run", projectDir: makeProjectDir(`inherited-models-${protocolMode}`),
+          args: { model: "codex/gpt-5" },
+          script: `export const meta = {
+            name: "inherited-models", description: "Resolve configured models",
+            model: "codex/gpt-5", phases: [{ title: "Setup" }, { title: "Review", model: "claude/sonnet" }]
+          };
+          await agent("meta");
+          phase("Review");
+          await agent("phase");
+          await agent("backend", { model: "codex" });
+          return agent("dynamic", { model: args.model });`,
+        },
+      });
+      assert.equal(connected.elicitations.length, 0);
+      assert.equal(structured(result)?.status, "completed");
+      assert.deepEqual(seen.map(call => call.model), ["codex/gpt-5", "claude/sonnet", "codex", "codex/gpt-5"]);
+    } finally {
+      await connected.dispose();
+      await daemon.close();
+    }
+  });
+
+  test(`${protocolMode}: mixed configuration preserves authored calls and resumes without another form`, async () => {
+    const seen: ObservedCall[] = [];
+    let failLast = true;
+    let probes = 0;
+    const runner = makeRunner((_prompt, options) => {
+      seen.push({ model: options.model, mode: options.mode, configOptions: options.configOptions });
+      if (options.label === "last" && failLast) {
+        failLast = false;
+        throw new Error("retry the last call");
+      }
+      return "ok";
+    });
+    const catalog = configurableRunner([]);
+    runner.listBackends = catalog.listBackends;
+    runner.probeConfigOptions = async (...args) => {
+      probes++;
+      return catalog.probeConfigOptions!(...args);
+    };
+    const daemon = await startDaemon(runner);
+    const connected = await connectHttp(daemon.url, {
+      protocolMode,
+      elicit: request => {
+        const params = request.params as { requestedSchema: { required?: string[]; properties: Record<string, unknown> } };
+        assert.deepEqual(params.requestedSchema.required, ["agent_1_model"]);
+        assert.ok(Object.keys(params.requestedSchema.properties).every(field => field.startsWith("agent_1_")));
+        return { action: "accept", content: { agent_1_model: "codex/gpt-5", agent_1_provider_1_config_0: "high" } };
+      },
+    });
+    try {
+      const result = await connected.client.callTool({
+        name: "workflow",
+        arguments: {
+          action: "run", projectDir: makeProjectDir(`mixed-models-${protocolMode}`), agentRetries: 0,
+          script: `export const meta = { name: "mixed-models", description: "Fill only missing models" };
+          await agent("first", { label: "first", model: "claude/sonnet", mode: "code", configOptions: { fast: true } });
+          await agent("missing", { label: "missing" });
+          const last = await agent("last", { label: "last", model: "codex/gpt-5", configOptions: { reasoning: "medium" } });
+          if (last === null) throw new Error("last must succeed");
+          return last;`,
+        },
+      });
+      assert.equal(structured(result)?.status, "failed");
+      const runId = String(structured(result)?.runId);
+      assert.deepEqual(seen, [
+        { model: "claude/sonnet", mode: "code", configOptions: { fast: true } },
+        { model: "codex/gpt-5", mode: undefined, configOptions: { reasoning: "high" } },
+        { model: "codex/gpt-5", mode: undefined, configOptions: { reasoning: "medium" } },
+      ]);
+      const file = persistedRunFile(runId);
+      assert.ok(file);
+      const { admission } = JSON.parse(readFileSync(file, "utf8"));
+      assert.equal(admission.strict, true);
+      assert.deepEqual(admission.agentConfigurations, {
+        0: { model: "claude/sonnet", mode: "code", configOptions: { fast: true } },
+        1: { model: "codex/gpt-5", configOptions: { reasoning: "high" } },
+        2: { model: "codex/gpt-5", configOptions: { reasoning: "medium" } },
+      });
+      assert.doesNotMatch(JSON.stringify(admission), /agent_1_model|agent_1_provider/);
+      const admissionProbes = probes;
+      const resumed = await connected.client.callTool({ name: "workflow", arguments: { action: "resume", runId } });
+      assert.equal(structured(resumed)?.status, "completed");
+      assert.equal(structured(resumed)?.runId, runId);
+      assert.equal(connected.elicitations.length, 1);
+      assert.equal(probes, admissionProbes);
+      assert.equal(seen.length, 4, "resume replays the completed prefix");
+      assert.deepEqual(seen[3], seen[2]);
+    } finally {
+      await connected.dispose();
+      await daemon.close();
+    }
+  });
+
+  test(`${protocolMode}: invalid authored configuration is rejected without elicitation or dispatch`, async () => {
+    const seen: ObservedCall[] = [];
+    const daemon = await startDaemon(configurableRunner(seen));
+    const connected = await connectHttp(daemon.url, {
+      protocolMode, elicit: () => ({ action: "decline" }),
+    });
+    try {
+      const result = await connected.client.callTool({
+        name: "workflow",
+        arguments: {
+          action: "run", projectDir: makeProjectDir(`invalid-authored-${protocolMode}`),
+          script: `export const meta = { name: "invalid-authored", description: "Reject invalid config" };
+          return agent("review", { model: "codex/gpt-5", configOptions: { reasoning: "invalid" } });`,
+        },
+      });
+      assert.equal(connected.elicitations.length, 0);
+      assert.equal(structured(result)?.status, "rejected");
+      assert.equal(structured(result)?.runId, undefined);
+      assert.deepEqual(seen, []);
+    } finally {
+      await connected.dispose();
+      await daemon.close();
+    }
+  });
+
+  test(`${protocolMode}: fully configured parallel reviews run without configuration elicitation`, async () => {
+    const seen: ObservedCall[] = [];
+    const probes: Array<string | undefined> = [];
+    const runner = makeRunner((_prompt, options) => {
+      seen.push({ model: options.model, mode: options.mode, configOptions: options.configOptions });
+      return "reviewed";
+    });
+    runner.probeConfigOptions = async (spec) => {
+      probes.push(spec);
+      return {
+        backendId: "codex",
+        modes: { currentModeId: "read-only", availableModes: [{ id: "read-only", name: "Read only" }] },
+        options: [],
+      };
+    };
+    const daemon = await startDaemon(runner);
+    const connected = await connectHttp(daemon.url, {
+      protocolMode,
+      elicit: () => ({ action: "decline" }),
+    });
+    try {
+      const result = await connected.client.callTool({
+        name: "workflow",
+        arguments: {
+          action: "run",
+          projectDir: makeProjectDir(`configured-reviews-${protocolMode}`),
+          script: `export const meta = {
+            name: "configured-reviews", description: "Review three surfaces",
+            phases: [{ title: "Independent review", model: "codex/gpt-6-astra" }]
+          };
+          phase("Independent review");
+          return parallel(["architecture", "api-tests", "docs-release"].map(label =>
+            () => agent("Review " + label, { label, model: "codex/gpt-6-astra", mode: "read-only" })
+          ));`,
+        },
+      });
+      assert.equal(connected.elicitations.length, 0);
+      assert.equal(structured(result)?.status, "completed");
+      assert.deepEqual(seen, Array.from({ length: 3 }, () => ({
+        model: "codex/gpt-6-astra", mode: "read-only", configOptions: undefined,
+      })));
+      assert.ok(probes.length > 0, "authored configuration still receives routed validation");
+      assert.ok(probes.every(spec => spec === "codex/gpt-6-astra"), "no all-provider selection probes");
+    } finally {
+      await connected.dispose();
+      await daemon.close();
+    }
+  });
+}
 
 for (const protocolMode of ["legacy", "modern"] as const) {
   test(`${protocolMode}: declining agent configuration prevents admission and live dispatch`, async () => {

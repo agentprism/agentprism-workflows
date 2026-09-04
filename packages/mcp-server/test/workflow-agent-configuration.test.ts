@@ -36,6 +36,8 @@ const calls: ValidatedAgentCall[] = [
     promptPreview: "Run the final implementation review.",
     phase: "Review",
     model: "codex/gpt-fixed",
+    mode: "read-only",
+    configOptions: { reasoning: "medium" },
     backend: "codex",
     schema: false,
   },
@@ -102,14 +104,15 @@ const harnesses: ValidateHarnessOptions[] = [
   },
 ];
 
-test("builds one flat form for every observed agent call with phase context", () => {
+test("builds one flat form only for unresolved agent models with phase context", () => {
   const plan = buildWorkflowAgentConfigurationPlan(meta, calls, harnesses);
   assert.ok(plan);
-  assert.deepEqual(plan.callIndexes, [0, 1, 2]);
-  assert.deepEqual(plan.request.requestedSchema.required, ["agent_0_model", "agent_1_model", "agent_2_model"]);
+  assert.deepEqual(plan.callIndexes, [0, 1]);
+  assert.deepEqual(plan.request.requestedSchema.required, ["agent_0_model", "agent_1_model"]);
   assert.ok(plan.request.requestedSchema.properties.agent_0_model);
   assert.ok(plan.request.requestedSchema.properties.agent_1_model);
-  assert.ok(plan.request.requestedSchema.properties.agent_2_model);
+  assert.ok(Object.keys(plan.request.requestedSchema.properties).every(field => !field.startsWith("agent_2_")));
+  assert.doesNotMatch(plan.request.message, /Run the final implementation review/);
   assert.match(plan.request.message, /Research — researcher/);
   assert.match(plan.request.message, /Collect primary evidence/);
   assert.match(plan.request.message, /Review — reviewer/);
@@ -141,7 +144,6 @@ test("parses only the chosen provider's advertised mode and config fields", () =
     agent_1_provider_0_mode: "code",
     agent_1_provider_0_config_0: "low",
     agent_1_provider_0_config_1: false,
-    agent_2_model: "codex/gpt-5",
   });
   assert.deepEqual(configurations, {
     0: { model: "codex/gpt-5", configOptions: { reasoning: "high" } },
@@ -150,7 +152,7 @@ test("parses only the chosen provider's advertised mode and config fields", () =
       mode: "code",
       configOptions: { effort: "low", fast: false },
     },
-    2: { model: "codex/gpt-5" },
+    2: { model: "codex/gpt-fixed", mode: "read-only", configOptions: { reasoning: "medium" } },
   });
 });
 
@@ -161,8 +163,13 @@ test("rejects response values outside the probed catalog", () => {
     () => plan.parse({
       agent_0_model: "other/unknown",
       agent_1_model: "claude/opus",
-      agent_2_model: "codex/gpt-5",
     }),
     /invalid provider\/model selection/,
   );
+});
+
+test("fully configured calls need neither a form nor an available selection catalog", () => {
+  assert.equal(buildWorkflowAgentConfigurationPlan(meta, [calls[2]!], []), undefined);
+  assert.equal(buildWorkflowAgentConfigurationPlan(meta, [{ ...calls[2]!, model: "codex" }], []), undefined);
+  assert.equal(buildWorkflowAgentConfigurationPlan(meta, [], []), undefined);
 });

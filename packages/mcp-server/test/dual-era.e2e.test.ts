@@ -293,10 +293,8 @@ for (const protocolMode of ["legacy", "modern"] as const) {
       protocolMode,
       uiCapability: "absent",
       elicit: (request) => {
-        const configuration = acceptAgentConfiguration(request);
-        return configuration
-          ? { action: "accept", content: configuration }
-          : { action: "accept", content: { optionId: "allow_for_session" } };
+        assert.equal(acceptAgentConfiguration(request), undefined, "the authored model needs no configuration form");
+        return { action: "accept", content: { optionId: "allow_for_session" } };
       },
     });
     try {
@@ -309,7 +307,7 @@ return await agent("work", { label: "worker", model: "codex" });`;
       assert.equal(terminal.isError, false, JSON.stringify(terminal.content));
       assert.equal(structured(terminal)?.status, "completed");
       assert.equal(structured(terminal)?.result, "allow_for_session,allow_for_session");
-      assert.equal(connected.elicitations.length, 3, "agent configuration plus two live permissions");
+      assert.equal(connected.elicitations.length, 2, "only the two live permissions");
       assert.deepEqual(broker.list(structured(terminal)?.runId as string), []);
     } finally {
       await connected.dispose();
@@ -396,10 +394,8 @@ test("modern input_required enforces script-backend approval before admission", 
     protocolMode: "modern",
     uiCapability: "absent",
     elicit: (request) => {
-      const configuration = acceptAgentConfiguration(request);
-      return configuration
-        ? { action: "accept", content: configuration }
-        : { action: "accept", content: { approve: true } };
+      assert.equal(acceptAgentConfiguration(request), undefined, "the authored backend needs no configuration form");
+      return { action: "accept", content: { approve: true } };
     },
   });
   try {
@@ -412,7 +408,7 @@ return await agent("approved backend", { model: "browser" });`;
     assert.equal(result.isError, false);
     assert.equal(structured(result)?.status, "completed");
     assert.deepEqual(capturedBackends, { browser: { command: "browser-acp" } });
-    assert.equal(connected.elicitations.length, 2);
+    assert.equal(connected.elicitations.length, 1, "only the script-backend spawn approval");
     assert.ok(connected.elicitations.some((request) => /browser-acp/.test(request.params.message)));
   } finally {
     await connected.dispose();

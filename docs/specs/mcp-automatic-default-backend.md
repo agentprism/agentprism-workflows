@@ -12,9 +12,10 @@
 
 This is an MCP composition-root policy. The SDK runner's routing contract remains unchanged: an
 omitted model still uses `AGENTPRISM_DEFAULT_BACKEND`, whose historical fallback is Claude.
-For MCP clients that advertise form elicitation, the workflow tool now supersedes automatic routing
-for every dry-run-observed `agent()` occurrence with one pre-execution user selection form (see the
-MCP server API contract). Automatic selection is the host policy only when all of these
+For MCP clients that advertise form elicitation, the workflow tool fills unresolved models on
+dry-run-observed `agent()` occurrences with one pre-execution user selection form (see the MCP server
+API contract). Authored effective models, including inherited and backend-only specs, are preserved;
+optional mode/config omissions never trigger that form. Automatic selection is the host policy only when all of these
 are true:
 
 1. the connected client does not support form elicitation;
