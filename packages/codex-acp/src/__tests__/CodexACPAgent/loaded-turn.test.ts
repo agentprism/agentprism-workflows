@@ -45,6 +45,8 @@ describe("CodexACPAgent - _session/loaded_turn extension", () => {
             projectId: null,
             historyMode: "legacy",
             modelProvider: "openai",
+            model: "gpt-5",
+            reasoningEffort: null,
             createdAt: 123,
             updatedAt: 124,
             recencyAt: null,
