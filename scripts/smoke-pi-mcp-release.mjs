@@ -162,11 +162,26 @@ assert.doesNotMatch(authSpec, /PI_ACP_PROTOCOL_CONTRACT\.(customCapabilityNamesp
 assert.doesNotMatch(authSpec, /@automatalabs\/pi-acp[^\n]{0,160}outputSchema/);
 
 const mcpEntry = installedRequire.resolve("@automatalabs/mcp-server");
-const { buildAuthoringPromptText } = await import(pathToFileURL(mcpEntry).href);
+const {
+  AUTHORING_SKILL_ENTRIES,
+  WORKFLOW_AUTHORING_SKILL_URI,
+  authoringSkillResource,
+  buildAuthoringPromptText,
+} = await import(pathToFileURL(mcpEntry).href);
 const authoringPrompt = buildAuthoringPromptText();
-assert.match(authoringPrompt, /Pi, OpenCode,[^\n]*StructuredOutput[^\n]*HTTP MCP support/i);
-assert.match(authoringPrompt, /prompt-embedded schema and validated final-text JSON fallback/i);
-assert.doesNotMatch(authoringPrompt, /Pi[^\n]{0,300}(native[^\n]*outputSchema|no injected MCP tool)/i);
+assert.ok(authoringPrompt.includes(WORKFLOW_AUTHORING_SKILL_URI));
+// SEP-2640 keeps the prompt compact; the published skill now owns provider guidance.
+const workflowSkill = AUTHORING_SKILL_ENTRIES.find(({ uri }) => uri === WORKFLOW_AUTHORING_SKILL_URI);
+assert.ok(workflowSkill, "published workflow skill is discoverable");
+const modelsUri = new URL("references/models-and-config.md", WORKFLOW_AUTHORING_SKILL_URI).href;
+assert.ok(workflowSkill.resources.some(({ uri }) => uri === modelsUri));
+const modelsResource = authoringSkillResource(modelsUri);
+assert.equal(modelsResource.contents.length, 1);
+assert.equal(modelsResource.contents[0].uri, modelsUri);
+const modelGuidance = modelsResource.contents[0].text;
+assert.match(modelGuidance, /Pi, OpenCode,[^\n]*StructuredOutput[^\n]*HTTP MCP support/i);
+assert.match(modelGuidance, /prompt-embedded schema and validated final-text JSON fallback/i);
+assert.doesNotMatch(modelGuidance, /Pi[^\n]{0,300}(native[^\n]*outputSchema|no injected MCP tool)/i);
 
 const piCodingAgent = dependencyPackageRoot("@earendil-works/pi-coding-agent", piRoot);
 const piAi = dependencyPackageRoot("@earendil-works/pi-ai", piRoot);
