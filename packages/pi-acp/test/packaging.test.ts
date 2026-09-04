@@ -11,6 +11,7 @@ test("T24 manifest has exact runtime pins and split packed entries", async () =>
     "@agentclientprotocol/sdk": "1.4.0",
     "@earendil-works/pi-ai": "0.85.0",
     "@earendil-works/pi-coding-agent": "0.85.0",
+    "@earendil-works/pi-server": "0.85.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     typebox: "1.3.2",
   });
@@ -34,6 +35,7 @@ test("T25 freshness gate tracks the direct pi runtime", async () => {
   });
   assert.ok(pi.freshness.npm.includes("@earendil-works/pi-coding-agent"));
   assert.ok(pi.freshness.npm.includes("@earendil-works/pi-ai"));
+  assert.ok(pi.freshness.npm.includes("@earendil-works/pi-server"));
 });
 
 test("T26 root project references pi-acp and a publishing changeset exists", async () => {
