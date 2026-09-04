@@ -310,8 +310,8 @@ test("execution resource knobs remain clamp-at-runtime rather than schema maxima
   assert.equal(clampWorkflowInput({ action: "run", script: "x", maxAgents: 7.9 }).maxAgents, 7);
 });
 
-test("field catalog is canonical and points detailed syntax to selective docs", () => {
-  assert.match(workflowToolInputShape.action.description ?? "", /workflow\/run-lifecycle/);
+test("field catalog is canonical and points detailed syntax to the authoring skill", () => {
+  assert.match(workflowToolInputShape.action.description ?? "", /agentprism-workflow-authoring skill/);
   assert.match(workflowToolInputShape.script.description ?? "", /raw JavaScript workflow source/);
   assert.ok(!("startInBackground" in workflowToolInputShape));
 });

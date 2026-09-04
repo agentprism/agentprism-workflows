@@ -80,23 +80,43 @@ export type {
 } from "./workflow-tool-output.js";
 export { createProgressReporter } from "./progress.js";
 export type { WorkflowProgressCallback, WorkflowToolExtra } from "./progress.js";
-export { registerAuthoringPrompt, buildAuthoringPromptText, AUTHORING_PROMPT_NAME } from "./authoring-prompt.js";
 export {
-  AUTHORING_DOC_MIME_TYPE,
-  DOCS_TOOL_NAME,
-  authoringDocResource,
-  authoringDocTopic,
-  docsToolInputShape,
-  docsToolOutputShape,
-  registerAuthoringDocs,
-} from "./docs-tool.js";
-export type { DocsToolResult, RegisterAuthoringDocsOptions } from "./docs-tool.js";
+  registerAuthoringPrompt,
+  buildAuthoringPromptText,
+  AUTHORING_PROMPT_NAME,
+  WORKFLOW_AUTHORING_SKILL_URI,
+} from "./authoring-prompt.js";
 export {
-  AUTHORING_DOCS_SCHEMA_VERSION,
-  AUTHORING_DOC_TOPICS,
-  AUTHORING_DOC_TOPIC_IDS,
-} from "./generated/authoring-docs-content.js";
-export type { AuthoringDocTopicId, GeneratedAuthoringDocTopic } from "./generated/authoring-docs-content.js";
+  AUTHORING_SKILL_ENTRIES,
+  DIRECTORY_READ_METHOD,
+  INODE_DIRECTORY_MIME_TYPE,
+  SKILLS_EXTENSION_ID,
+  SKILLS_GET_METHOD,
+  SKILLS_LIST_METHOD,
+  authoringSkillResource,
+  directoryReadParamsSchema,
+  directoryReadResultSchema,
+  registerAuthoringSkills,
+  skillsGetParamsSchema,
+  skillsGetResultSchema,
+  skillsListParamsSchema,
+  skillsListResultSchema,
+} from "./authoring-skills.js";
+export type {
+  AuthoringSkillDirectoryChild,
+  AuthoringSkillEntry,
+  AuthoringSkillResourceRef,
+  RegisterAuthoringSkillsOptions,
+} from "./authoring-skills.js";
+export {
+  AUTHORING_SKILLS,
+  AUTHORING_SKILLS_SCHEMA_VERSION,
+  AUTHORING_SKILL_URIS,
+} from "./generated/authoring-skills-content.js";
+export type {
+  GeneratedAuthoringSkill,
+  GeneratedAuthoringSkillResource,
+} from "./generated/authoring-skills-content.js";
 export { replToolInputShape, replToolOutputShape } from "./repl-tool.js";
 export type { ReplToolOptions } from "./repl-tool.js";
 export {

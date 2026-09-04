@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { envFingerprint } from "../../src/daemon/daemon-info.js";
+import { SKILLS_LIST_METHOD, skillsListResultSchema } from "../../src/authoring-skills.js";
 const distEntry = resolve(fileURLToPath(import.meta.url), "../../../dist/entry.js");
 const e2eHome = mkdtempSync(join(tmpdir(), "agentprism-shim-e2e-home-"));
 const childEnv: Record<string, string> = {
@@ -215,15 +216,20 @@ test("the full MCP feature surface works through the shim: prompts, resources, e
   assert.ok(prompts.prompts.some((prompt) => prompt.name === "author-workflow"));
   const prompt = await session.client.getPrompt({ name: "author-workflow", arguments: {} });
   const promptText = prompt.messages.map((m) => (m.content.type === "text" ? m.content.text : "")).join("");
-  assert.ok(promptText.length < 2_000, "the prompt should point to selective docs through the shim");
-  assert.match(promptText, /docs.*workflow\/quickstart/);
+  assert.ok(promptText.length < 2_000, "the prompt should point to the authoring skill through the shim");
+  assert.match(promptText, /skill:\/\/agentprism-workflow-authoring\/SKILL\.md/);
 
-  const docs = await session.client.callTool({ name: "docs", arguments: { topic: "workflow/quickstart" } });
-  const embeddedDoc = docs.content.find((block) => block.type === "resource");
-  assert.ok(embeddedDoc && embeddedDoc.type === "resource" && "text" in embeddedDoc.resource);
-  const directDoc = await session.client.readResource({ uri: embeddedDoc.resource.uri });
-  assert.ok("text" in directDoc.contents[0]!);
-  assert.equal(directDoc.contents[0]!.text, embeddedDoc.resource.text);
+  const skills = await session.client.request(
+    { method: SKILLS_LIST_METHOD, params: {} },
+    skillsListResultSchema,
+  );
+  const workflowSkill = skills.skills.find(
+    (skill) => skill.uri === "skill://agentprism-workflow-authoring/SKILL.md",
+  );
+  assert.ok(workflowSkill);
+  const directSkill = await session.client.readResource({ uri: workflowSkill.uri });
+  assert.ok("text" in directSkill.contents[0]!);
+  assert.match(String(directSkill.contents[0]!.text), /Workflow scripts: quickstart/);
 
   // Elicitation: a foreground checkpoint answered by THIS client through the pump.
   const checkpointScript = [

@@ -44,7 +44,7 @@ This is a pnpm monorepo of ten `@automatalabs/*` packages:
 - `acp-server`: connection-pinned ACP proxy and backend-discovery server.
 - `workflows`: the public SDK facade composing the engine and ACP runner.
 - `repl-engine`: persistent QuickJS REPL orchestration over the same backend stack.
-- `mcp-server`: MCP composition root exposing `workflow`, `repl`, and selective authoring docs.
+- `mcp-server`: MCP composition root exposing `workflow`, `repl`, and their SEP-2640 authoring skills.
 - `pi-acp`: in-process pi ACP server.
 - `codex-acp`: published fork maintained as a non-squashed upstream subtree.
 - `agentprism-otel`: optional observability bridge.
@@ -77,8 +77,7 @@ For MCP server work, preserve the deliberate SDK boundary: production server cod
 
 Follow the complete map in `CONTRIBUTING.md`. In particular:
 
-- `docs/authoring/**` is the source for the selective MCP `docs` tool. After editing it, run `pnpm generate:authoring-docs` and commit `packages/mcp-server/src/generated/authoring-docs-content.ts` with the source.
-- `skills/agentprism-workflow-authoring/**` is the separate optional guide for non-MCP/skills-first hosts. Update it when the same contract affects those users, but do not treat it as the source of the MCP docs bundle.
+- `docs/authoring/**` contains the canonical Agent Skills served by the MCP Skills Extension. Commit `packages/mcp-server/src/generated/authoring-skills-content.ts` with source changes; `pnpm build` refreshes it through the shared ensure step, and `pnpm generate:authoring-skills` is available for explicit regeneration.
 - After changing a built-in backend definition, regenerate and check `scripts/acp-backends.manifest.json`; never hand-edit it.
 - Dependency bumps require the welded pin fixtures, behavioral classifications, docs, and lockfile to move together.
 - Treat generated Codex app-server types as generated; use the package generator and review the upstream protocol source.

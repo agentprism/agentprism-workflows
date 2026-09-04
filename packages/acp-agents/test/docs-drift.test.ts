@@ -290,9 +290,8 @@ test("auth, MCP, and authoring docs retain the implemented contracts", () => {
     "MCP README must name the complete strict workflow action lifecycle",
   );
   assert.match(mcpReadme, /continue(?:s| that) the exact run ID/i);
-  // The MCP server's whole tool surface is the single `workflow` tool: backend auth belongs to
-  // the agents' own CLI credential stores (auth/provider management lives in the SDK runner
-  // APIs). Retired MCP tool names must not resurface in the current-state docs.
+  // Backend auth belongs to the agents' own CLI credential stores (auth/provider management lives
+  // in the SDK runner APIs). Retired MCP tool names must not resurface in current-state docs.
   const apiDocs = readRepoFile("docs/api.md");
   for (const retired of [
     "workflow_auth_status",
@@ -308,17 +307,16 @@ test("auth, MCP, and authoring docs retain the implemented contracts", () => {
   }
   assert.ok(!mcpReadme.includes("return r.text"), "schema-less MCP examples return a string directly");
 
-  const reference = readRepoFile("skills/agentprism-workflow-authoring/reference.md");
-  assert.ok(reference.includes("| `keepSession` |"), "the exhaustive agent option table must include keepSession");
-  assert.ok(reference.includes('reason: "auth_required"'), "authoring reference must explain auth pauses");
+  const agentReference = readRepoFile("docs/authoring/agentprism-workflow-authoring/references/api-agents.md");
+  const controlFlowReference = readRepoFile("docs/authoring/agentprism-workflow-authoring/references/api-control-flow.md");
+  assert.ok(agentReference.includes("| `keepSession` |"), "the exhaustive agent option table must include keepSession");
+  assert.ok(controlFlowReference.includes('reason: "auth_required"'), "authoring reference must explain auth pauses");
 });
 
 test("trusted autonomous examples pin explicit modes and describe Claude auto accurately", () => {
   const trustedExamples = [
-    "docs/authoring/workflow/checkpoints-and-quality.md",
-    "docs/authoring/workflow/examples.md",
-    "skills/agentprism-workflow-authoring/gates-and-lenses.md",
-    "skills/agentprism-workflow-authoring/examples-and-validation.md",
+    "docs/authoring/agentprism-workflow-authoring/references/checkpoints-and-quality.md",
+    "docs/authoring/agentprism-workflow-authoring/references/examples.md",
   ];
   for (const path of trustedExamples) {
     const text = readRepoFile(path);
@@ -332,9 +330,8 @@ test("trusted autonomous examples pin explicit modes and describe Claude auto ac
   const modeGuidance = [
     "README.md",
     "packages/mcp-server/README.md",
-    "docs/authoring/workflow/models-and-config.md",
-    "skills/agentprism-workflow-authoring/SKILL.md",
-    "skills/agentprism-workflow-authoring/models-and-output.md",
+    "docs/authoring/agentprism-workflow-authoring/SKILL.md",
+    "docs/authoring/agentprism-workflow-authoring/references/models-and-config.md",
   ];
   for (const path of modeGuidance) {
     const text = readRepoFile(path);
@@ -354,8 +351,8 @@ test("maintained examples do not reintroduce invalid agent/model contracts", () 
     "docs/design-notes.md",
     "packages/mcp-server/README.md",
     "packages/workflows/README.md",
-    "skills/agentprism-workflow-authoring/SKILL.md",
-    "skills/agentprism-workflow-authoring/reference.md",
+    "docs/authoring/agentprism-workflow-authoring/SKILL.md",
+    "docs/authoring/agentprism-workflow-authoring/references/api-agents.md",
   ];
   for (const path of maintainedDocs) {
     const text = readRepoFile(path);

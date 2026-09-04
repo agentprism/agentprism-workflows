@@ -35,13 +35,8 @@ The backend is chosen **per `agent()` call**: a `claude/opus[1m]` review step, a
 
 You describe the workflow in plain language; your agent designs it with the right APIs, validates it, and runs it. The connected MCP server is self-documenting:
 
-- **`docs` tool** — the preferred agent-controlled path. It serves version-matched workflow and REPL documentation one bounded topic at a time. Call it with no topic for the index, then select only what the task needs.
-- **MCP prompt** — prompt-capable hosts also expose **`author-workflow`** (optional `task`). It frames the task and directs the assistant to the selective `docs` topics instead of injecting the entire guide.
-- **Optional agent skill** — non-MCP or skills-first hosts can still install the standalone authoring skill:
-
-  ```bash
-  npx skills add agentprism/agentprism-workflows
-  ```
+- **Agent Skills over MCP** — the server advertises separate, version-matched workflow and REPL skills through SEP-2640. Skills-aware hosts expose their names and descriptions first, then load `SKILL.md` and only the referenced files needed for the task.
+- **MCP prompt** — prompt-capable hosts also expose **`author-workflow`** (optional `task`). It frames the task and directs the assistant to activate the workflow-authoring skill without injecting the guide.
 
 A representative ask:
 
@@ -520,7 +515,7 @@ both call rows and activity. Its structured payload, including `latestActivity`,
 UTF-8 bytes and its text at 8,192 bytes.
 Paused, failed, and aborted execution responses also include a redacted final-20 `logTail` immediately.
 
-The model-facing surface is `docs`, `workflow`, and `repl`. `docs` embeds one selected, version-matched text/markdown topic per call; `repl` is a persistent QuickJS-in-WASM JavaScript VM (one per project) for live, stateful orchestration. Prompt-capable hosts additionally get the compact user-controlled **`author-workflow`** MCP prompt (optional `task` argument), which directs the assistant to relevant `docs` topics. Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `{ "action":"resume", "runId":"…" }` for the paused source. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
+The model-facing tool surface is `workflow` and `repl`; `repl` is a persistent QuickJS-in-WASM JavaScript VM (one per project) for live, stateful orchestration. The server also advertises `agentprism-workflow-authoring` and `agentprism-repl-orchestration` through the MCP Skills Extension, and prompt-capable hosts get the compact user-controlled **`author-workflow`** MCP prompt (optional `task` argument). Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `{ "action":"resume", "runId":"…" }` for the paused source. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
 
 ---
 
@@ -537,17 +532,7 @@ A script is plain JavaScript whose **first statement** is the `meta` literal. In
 
 Determinism is enforced (`Date.now`/`Math.random`/`new Date()` are neutered in the realm) so same-run journal identities and input fingerprints are reproducible. A matching exact occurrence replays; an interrupted or mismatched occurrence runs live.
 
-> **Writing scripts with an AI agent?** The MCP `workflow` tool is self-contained: its description teaches the compact DSL, `action:"config"` exposes live choices, and `run` validates automatically. This repo also publishes an optional exhaustive backend-agnostic authoring skill —
-> [`skills/agentprism-workflow-authoring`](skills/agentprism-workflow-authoring/SKILL.md) — in the standard
-> `SKILL.md` format. Install it into your coding agent (Claude Code, Codex, Cursor, OpenCode, …) with the
-> [skills.sh](https://skills.sh) CLI:
->
-> ```bash
-> npx skills add agentprism/agentprism-workflows
-> ```
->
-> It teaches the full DSL: per-call backend routing, structured outputs, checkpoints, isolation,
-> and the determinism rules.
+> **Writing scripts with an AI agent?** The MCP `workflow` tool is self-contained: `action:"config"` exposes live choices and `run` validates automatically. Skills-aware hosts can activate the server's version-matched `skill://agentprism-workflow-authoring/SKILL.md` guidance for the full DSL, backend routing, structured outputs, checkpoints, isolation, and determinism rules.
 
 MCP users need no separate validation or discovery step outside the tool. For terminal and CI workflows, the packages retain equivalent commands. Validate a script **without spending tokens**: `npx @automatalabs/workflows validate <file> --args '<json>'`.
 After its static parse and mock-agent dry run, validation opens each distinctly routed ACP harness
@@ -679,7 +664,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 - [`packages/workflows/examples/`](packages/workflows/examples/) — **runnable examples**, from a single gated script to a complete standalone project (`repo-triage`) that mixes three selected backends in one autonomous multi-stage run.
 - [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events (incl. auth pauses and the `agentEvent` token-level stream), `ExecOptions`, the runner surface (`run()`, auth controller, session hand-off, model routing, event bus, interactive sessions, capabilities), backend resolution + environment variables, the SDK auth/provider APIs, and the full `WorkflowError` code table.
 - [`docs/design-notes.md`](docs/design-notes.md) — the deep protocol-level design: ACP lifecycle, the structured-output crux, model/permission/usage/cancellation mechanics, and execution-engine internals.
-- [`skills/agentprism-workflow-authoring/`](skills/agentprism-workflow-authoring/SKILL.md) — the **agent skill for authoring workflow scripts** (install with `npx skills add agentprism/agentprism-workflows`): the DSL, per-call backend routing, structured output, and a full option reference, written for AI agents that write workflows.
+- [`docs/authoring/`](docs/authoring/) — the canonical workflow and REPL Agent Skills bundled with the MCP server through SEP-2640.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — local development, testing (including the gated live-backend e2e), and releasing.
 - [Agent Client Protocol](https://agentclientprotocol.com) · [Model Context Protocol](https://modelcontextprotocol.io)
 

@@ -2,7 +2,7 @@
 
 **Context:** JavaScript passed to the MCP `workflow` tool. Workflow scripts use `agent(prompt, options?)`; REPL evals use a different API.
 
-These helpers spawn their own subagents on the default model. Hand-roll with `parallel` + `agent` when you want panel members on specific backends. Full signatures are in `workflow/api-control-flow`.
+These helpers spawn their own subagents on the default model. Hand-roll with `parallel` + `agent` when you want panel members on specific backends. Full signatures are in [`api-control-flow.md`](api-control-flow.md).
 
 | helper | shape | use for |
 |---|---|---|

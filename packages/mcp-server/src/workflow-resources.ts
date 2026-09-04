@@ -582,7 +582,7 @@ export class WorkflowScriptResources {
 
     this.mcp.server.setRequestHandler('resources/subscribe', (request, ctx) => {
       const uri = request.params.uri;
-      // Fixed external resources (authoring docs and the app panel) never update.
+      // Fixed external resources (authoring skills and the app panel) never update.
       // Accept host auto-subscription as a no-op rather than claiming a listed URI is missing.
       const external = this.externalReaders.get(uri);
       if (external) {
