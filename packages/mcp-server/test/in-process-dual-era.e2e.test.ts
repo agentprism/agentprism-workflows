@@ -35,7 +35,7 @@ test("--in-process uses serveStdio to serve modern and capability-project the Ap
   try {
     assert.equal(capable.client.getProtocolEra(), "modern");
     const tools = await capable.client.listTools();
-    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["docs", "repl", "workflow", "workflow-events", "workflow-runs"]);
+    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["repl", "workflow", "workflow-events", "workflow-runs"]);
     const result = await capable.client.callTool({ name: "workflow", arguments: { action: "run", script: SCRIPT } });
     assert.equal((result.structuredContent as Record<string, unknown> | undefined)?.status, "completed");
   } finally {
@@ -46,7 +46,7 @@ test("--in-process uses serveStdio to serve modern and capability-project the Ap
   try {
     assert.equal(incapable.client.getProtocolEra(), "modern");
     const tools = await incapable.client.listTools();
-    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["docs", "repl", "workflow"]);
+    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["repl", "workflow"]);
     assert.equal(tools.tools.find((tool) => tool.name === "workflow")?._meta, undefined);
   } finally {
     await incapable.close();

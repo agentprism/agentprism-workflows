@@ -17,9 +17,9 @@ import type {
 
 // packages/mcp-server/src/server.ts
 //
-// The MCP shell: constructs an McpServer, registers the `workflow`, `repl`, and selective
-// `docs` model-facing tools (plus the user-controlled `author-workflow` prompt), and is the
-// composition root where all three packages meet — the injected acp-agents
+// The MCP shell: constructs an McpServer, registers the `workflow` and `repl` model-facing
+// tools, serves their version-matched Agent Skills, and adds the user-controlled
+// `author-workflow` prompt. This is the composition root where all three packages meet — the injected acp-agents
 // AgentRunner is wired into a workflow-engine WorkflowManager (DI) and every tool call runs
 // through WorkflowManager.runSync.
 //
@@ -106,7 +106,7 @@ import type {
 } from "./workflow-tool-output.js";
 import { createProgressReporter, formatAgentProgressMessage } from "./progress.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
-import { registerAuthoringDocs } from "./docs-tool.js";
+import { registerAuthoringSkills, SKILLS_EXTENSION_ID } from "./authoring-skills.js";
 import { registerReplTool } from "./repl-tool.js";
 import { ReplPresenceLedger } from "./repl-presence.js";
 import { CapabilityAwareToolCatalog } from "./tool-catalog.js";
@@ -154,34 +154,30 @@ export const SERVER_VERSION: string =
     : (require("../package.json") as { version: string }).version;
 
 // Server-wide guidance returned in the MCP initialize response (ServerOptions.instructions),
-// surfaced by hosts to orient the calling agent to the three model-facing tools and when to reach
-// for each. Kept short and behavioral — the exhaustive contract lives in each tool's own
-// description and the package README.
+// surfaced by hosts to orient the calling agent to the two model-facing tools and the two
+// version-matched Agent Skills. Kept short and behavioral — exhaustive guidance is loaded through
+// the host's skill activation path only when needed.
 export const SERVER_INSTRUCTIONS = [
-  "This server exposes three model-facing tools for authoring and orchestrating multi-agent work. " +
-    "workflow and repl spawn subagents over the same ACP backends — the registry built-ins Claude, Codex, OpenCode, and " +
-    "pi, plus any registered custom agents — and key their durable state by an absolute projectDir " +
-    "(required on the shared daemon; defaults to the server's own project in single-project mode). " +
-    "Backend credentials come from each agent's own login (claude, codex, opencode, pi), so there " +
-    "is nothing auth-shaped to configure here.",
-  "• docs — SELECTIVE VERSION-MATCHED REFERENCE. Omit topic or use topic:\"index\" for the bounded catalog, then read exactly one workflow/* or repl/* topic. It embeds the selected text/markdown resource, runs no code, opens no backend, and needs no projectDir. Use it when the compact tool descriptions do not contain enough syntax or lifecycle detail.",
-  "• workflow — DETERMINISTIC BATCH orchestration. Use action:\"run\" with a JavaScript workflow script (inline or " +
-    "by absolute scriptPath) that fans out agent() subagents and optional checkpoint() gates; it " +
-    "runs to completion in the foreground, or background:true returns a durable runId for bounded " +
-    "action:\"status\"/\"permissions-response\"/\"stop\" calls, with journaling and replay. " +
-    "action:\"resume\" continues the exact runId from its durable admission and journal. " +
-    "Status surfaces exact live ACP permission options when an agent needs external action. Reach " +
-    "for it when the orchestration is known up front and you want it repeatable and resumable. " +
-    "action:\"config\" discovers the live backend/model option catalog without starting a run, and " +
-    "every run is statically checked, mock-executed, and config-probed before admission. Read docs topic workflow/quickstart for authoring and workflow/run-lifecycle for actions.",
-  "• repl — INTERACTIVE STATEFUL orchestration. A persistent per-project JavaScript VM you drive " +
-    "incrementally with action:\"eval\"; named bindings, pending subagent calls, raised checkpoints, " +
-    "and `_` (the previous eval's completion value) persist between calls and survive daemon restarts. " +
-    "Console logging produces output text only and creates no persistent value. Reach for it when you want " +
-    "to inspect intermediate results and decide the next step adaptively, or keep a human in the " +
-    "loop via checkpoint(). Read docs topic repl/quickstart first when the persistent handle API is unfamiliar.",
+  "This server exposes two model-facing tools for orchestrating multi-agent work. workflow and repl " +
+    "spawn subagents over the same ACP backends — the registry built-ins Claude, Codex, OpenCode, and " +
+    "pi, plus any registered custom agents — and key durable state by an absolute projectDir " +
+    "(required on the shared daemon; defaulted by a single-project server). Backend credentials come " +
+    "from each agent's own login, so there is nothing auth-shaped to configure here.",
+  "Version-matched authoring guidance is available through the server's Agent Skills. Activate " +
+    "skill://agentprism-workflow-authoring/SKILL.md for deterministic workflow scripts, or " +
+    "skill://agentprism-repl-orchestration/SKILL.md for the persistent REPL. Load a skill through " +
+    "the host's skill-loading path, then read only the supporting resources it references as needed.",
+  "• workflow — DETERMINISTIC BATCH orchestration. Use action:\"run\" with a JavaScript workflow " +
+    "script that fans out agent() subagents and optional checkpoint() gates. background:true returns " +
+    "a durable runId for bounded status, permissions-response, result, and stop calls; resume continues " +
+    "the exact run from its durable admission and journal. action:\"config\" discovers the live backend " +
+    "and model option catalog. Every run is statically checked, mock-executed, and config-probed before admission.",
+  "• repl — INTERACTIVE STATEFUL orchestration. A persistent per-project JavaScript VM driven with " +
+    "action:\"eval\". Named bindings, pending subagent handles, queued turns, checkpoints, and `_` " +
+    "persist between calls and survive daemon restarts. Use it when the next orchestration step depends " +
+    "on inspecting intermediate results.",
   "Rule of thumb: use workflow when you can script the whole plan ahead of time; use repl when you " +
-    "want a live, stateful session that evolves call by call.",
+    "want a live session that evolves call by call.",
 ].join("\n\n");
 
 export { BackgroundRunRegistry, MAX_BACKGROUND_RUNS } from "./project-registry.js";
@@ -1421,7 +1417,7 @@ function formatStatusSummary(result: WorkflowStatusToolResult): string {
 }
 
 /**
- * Build the MCP server with the `workflow`, `repl`, and selective `docs` model-facing tools,
+ * Build the MCP server with the `workflow` and `repl` model-facing tools, their Agent Skills,
  * plus the user-controlled `author-workflow` prompt. Prompts are a separate MCP primitive and never enter the model's tool-selection
  * loop). Backend auth is the agents' own concern (their CLI credential stores); a run that
  * genuinely hits AUTH_REQUIRED pauses with authContext and resumes after an out-of-band CLI
@@ -1556,12 +1552,15 @@ export function createWorkflowServer(
   });
 
   // registerCapabilities is illegal after a transport attaches. Merge the complete resources
-  // capability and advertise this server's Apps support before handler registration and before
-  // createWorkflowServer returns. The current legacy era carries server extensions in initialize;
-  // the separately gated modern era moves that advertisement to server/discover.
+  // capability and advertise Apps plus SEP-2640 Skills support before handler registration and
+  // before createWorkflowServer returns. The current legacy era carries server extensions in
+  // initialize; the separately gated modern era moves that advertisement to server/discover.
   mcp.server.registerCapabilities({
     resources: { subscribe: true, listChanged: true },
-    extensions: { [EXTENSION_ID]: {} },
+    extensions: {
+      [EXTENSION_ID]: {},
+      [SKILLS_EXTENSION_ID]: { directoryRead: true },
+    },
   });
 
   // Composition root: the ACP-backed AgentRunner is injected into the engine here. Each
@@ -1574,7 +1573,7 @@ export function createWorkflowServer(
     ? undefined
     : projects.adopt(options.manager ?? new WorkflowManager({ agent: runner }), options.backgroundRuns);
   const scriptResources = new WorkflowScriptResources(mcp, { router: projects }, options.modernNotifier);
-  registerAuthoringDocs(mcp, {
+  registerAuthoringSkills(mcp, {
     registerResourceReader: (uri, read) => scriptResources.registerExternalResourceReader(uri, read),
   });
   // Session-sticky approvals for script-declared backends (one prompt per unique spawn config).
@@ -1641,7 +1640,7 @@ export function createWorkflowServer(
         (requireProjectDir
           ? "Config and run require an absolute projectDir on this shared daemon. "
           : "Config and run may omit projectDir on this single-project server. ") +
-        "For script syntax start with docs topic workflow/quickstart; for action, background, permission, resource, stop, and resume semantics read workflow/run-lifecycle, then only its relevant related topic.",
+        "For deeper syntax and lifecycle guidance, activate skill://agentprism-workflow-authoring/SKILL.md through the host's skill-loading path and read only the references needed.",
     inputSchema: workflowToolInputSchema,
     outputSchema: workflowToolOutputSchema,
     annotations: undefined,

@@ -22,7 +22,7 @@ export const WORKFLOW_RESULT_CHUNK_BYTES_MIN = 4;
 
 const actionSchema = z
   .enum(["config", "run", "resume", "status", "result", "permissions-response", "stop"])
-  .describe("Workflow operation. See docs topic workflow/run-lifecycle for the action guide.");
+  .describe("Workflow operation. Activate the agentprism-workflow-authoring skill for the action guide.");
 const scriptSchema = z
   .string()
   .min(1)

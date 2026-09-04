@@ -1,3 +1,8 @@
+---
+name: agentprism-workflow-authoring
+description: Write and run deterministic AgentPrism workflow scripts through the MCP workflow tool. Use for workflow DSL syntax, agent routing, structured output, checkpoints, composition, validation, background runs, status, stop, result retrieval, and same-run resume.
+---
+
 # Workflow scripts: quickstart
 
 **Context:** JavaScript passed to the MCP `workflow` tool. This is not REPL code: workflow scripts use `agent(prompt, options?)`, allow top-level `return`, and start from a required metadata export.
@@ -102,7 +107,15 @@ durable checkpoint decisions. Use `status` on that same ID, then `result` after 
 
 ## What to read next
 
-- `workflow/composition-and-failure` — metadata, fan-out, phases, and null semantics.
-- `workflow/api-agents` — every `agent()` option and structured output.
-- `workflow/run-lifecycle` — config, run, status, stop, and resume.
-- `workflow/examples` — complete composition patterns.
+Read only the references needed for the task:
+
+- [`references/composition-and-failure.md`](references/composition-and-failure.md) — metadata, fan-out, phases, and null semantics.
+- [`references/api-agents.md`](references/api-agents.md) — every `agent()` option and structured output.
+- [`references/run-lifecycle.md`](references/run-lifecycle.md) — config, run, status, stop, and resume.
+- [`references/models-and-config.md`](references/models-and-config.md) — backend routing and live model/config discovery.
+- [`references/checkpoints-and-quality.md`](references/checkpoints-and-quality.md) — quality loops and human checkpoints.
+- [`references/environment-and-tools.md`](references/environment-and-tools.md) — execution roots, isolation, tools, and custom backends.
+- [`references/determinism-and-resume.md`](references/determinism-and-resume.md) — replay identity and continuation.
+- [`references/api-control-flow.md`](references/api-control-flow.md) — complete control-flow signatures.
+- [`references/api-resume-and-backends.md`](references/api-resume-and-backends.md) — detailed resume and backend-extension contracts.
+- [`references/examples.md`](references/examples.md) — complete composition patterns.

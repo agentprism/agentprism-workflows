@@ -117,4 +117,4 @@ The mocked pass executes reachable script control flow with schema-conforming fa
 
 The routed config pass probes each distinct backend/model pair without prompting. Unknown option ids, invalid select values, wrong value types, and the reserved `"model"` config key reject the script with direct alternatives. A backend that cannot be probed produces an explicit warning and leaves only that backend's option domain unverified.
 
-For model/config details, read `workflow/models-and-config`. For exact-run recovery semantics, read `workflow/determinism-and-resume`.
+For model/config details, read [`models-and-config.md`](models-and-config.md). For exact-run recovery semantics, read [`determinism-and-resume.md`](determinism-and-resume.md).

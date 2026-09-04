@@ -4,8 +4,13 @@
 // the tool call's POST stream). These are the features a stdio host used to get from the
 // in-process server; the daemon must serve them identically.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 
+import {
+  SKILLS_LIST_METHOD,
+  skillsListResultSchema,
+} from "../../src/authoring-skills.js";
 import { okRunner, structured, textOf, NO_AGENT_SCRIPT, ONE_AGENT_SCRIPT } from "../_harness.js";
 import { connectHttp, gatedRunner, makeProjectDir, startDaemon, waitUntil } from "../_http-harness.js";
 
@@ -26,31 +31,37 @@ test("author-workflow prompt is listed and served over HTTP", async () => {
     const prompt = await session.client.getPrompt({ name: "author-workflow", arguments: {} });
     const text = prompt.messages.map((m) => (m.content.type === "text" ? m.content.text : "")).join("");
     assert.ok(text.length < 2_000, "the prompt should frame the task without injecting every topic");
-    assert.match(text, /docs.*workflow\/quickstart/);
+    assert.match(text, /skill:\/\/agentprism-workflow-authoring\/SKILL\.md/);
     await session.dispose();
   } finally {
     await daemon.close();
   }
 });
 
-test("selective docs tool embeds the same static resource served over HTTP", async () => {
+test("Skills Extension manifests and resources are served over HTTP", async () => {
   const daemon = await startDaemon(okRunner());
   try {
     const session = await connectHttp(daemon.url);
-    const result = await session.client.callTool({
-      name: "docs",
-      arguments: { topic: "repl/agent-handles" },
-    });
-    assert.equal(result.isError, false);
-    const embedded = result.content.find((block) => block.type === "resource");
-    assert.ok(embedded && embedded.type === "resource" && "text" in embedded.resource);
-    assert.equal(embedded.resource.uri, "agentprism://docs/repl/agent-handles");
+    const listed = await session.client.request(
+      { method: SKILLS_LIST_METHOD, params: {} },
+      skillsListResultSchema,
+    );
+    const repl = listed.skills.find(
+      (skill) => skill.uri === "skill://agentprism-repl-orchestration/SKILL.md",
+    );
+    assert.ok(repl && Array.isArray(repl.resources));
+    const manifestResource = repl.resources.find((resource) => resource.uri === repl.uri);
+    assert.ok(manifestResource);
 
-    const listed = await session.client.listResources();
-    assert.ok(listed.resources.some((resource) => resource.uri === embedded.resource.uri));
-    const read = await session.client.readResource({ uri: embedded.resource.uri });
+    const read = await session.client.readResource({ uri: repl.uri });
+    assert.equal(read.contents.length, 1);
     assert.ok("text" in read.contents[0]!);
-    assert.equal(read.contents[0]!.text, embedded.resource.text);
+    const bytes = Buffer.from(String(read.contents[0]!.text), "utf8");
+    assert.equal(bytes.length, manifestResource.size);
+    assert.equal(
+      `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+      manifestResource.digest,
+    );
     await session.dispose();
   } finally {
     await daemon.close();

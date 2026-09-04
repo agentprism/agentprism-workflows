@@ -17,6 +17,13 @@ import {
   waitUntil,
 } from "./_http-harness.js";
 import { EXTENSION_ID } from "../src/mcp-apps.js";
+import {
+  DIRECTORY_READ_METHOD,
+  SKILLS_EXTENSION_ID,
+  SKILLS_GET_METHOD,
+  SKILLS_LIST_METHOD,
+  skillsListResultSchema,
+} from "../src/authoring-skills.js";
 import { workflowRunEventsUri } from "../src/workflow-resources.js";
 import { WorkflowPermissionBroker } from "../src/workflow-permissions.js";
 import { makeRunner, okRunner } from "./_harness.js";
@@ -28,6 +35,38 @@ interface RawJsonRpcResponse {
   id: number;
   result?: Record<string, unknown>;
   error?: { code: number; message: string };
+}
+
+async function rawModernRequest(
+  url: string,
+  id: number,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<RawJsonRpcResponse> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "mcp-protocol-version": "2026-07-28",
+      "mcp-method": method,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method,
+      params: {
+        ...params,
+        _meta: {
+          [PROTOCOL_VERSION_META_KEY]: "2026-07-28",
+          [CLIENT_INFO_META_KEY]: { name: "raw-modern-test", version: "1" },
+          [CLIENT_CAPABILITIES_META_KEY]: {},
+        },
+      },
+    }),
+  });
+  assert.match(response.headers.get("content-type") ?? "", /application\/json/);
+  return await response.json() as RawJsonRpcResponse;
 }
 
 async function rawModernToolCall(
@@ -97,10 +136,18 @@ async function exerciseEra(
     if (mode === "modern") {
       const discovered = await connected.client.discover();
       assert.ok(discovered.capabilities.extensions?.[EXTENSION_ID]);
+      assert.deepEqual(
+        discovered.capabilities.extensions?.[SKILLS_EXTENSION_ID],
+        { directoryRead: true },
+      );
+      await connected.client.request(
+        { method: SKILLS_LIST_METHOD, params: {} },
+        skillsListResultSchema,
+      );
     }
     const listed = await connected.client.listTools();
     const tools = listed.tools.map((tool) => tool.name).sort();
-    assert.deepEqual(tools, ["docs", "repl", "workflow", "workflow-events", "workflow-runs"]);
+    assert.deepEqual(tools, ["repl", "workflow", "workflow-events", "workflow-runs"]);
     const workflow = listed.tools.find((tool) => tool.name === "workflow");
     assert.ok(workflow);
     const panel = await connected.client.readResource({
@@ -129,6 +176,23 @@ test("one daemon serves legacy sessions and modern 2026-07-28 requests through t
   try {
     const legacy = await exerciseEra("legacy", daemon.url, projectDir);
     const modern = await exerciseEra("modern", daemon.url, projectDir);
+    const modernSkillResults = await Promise.all([
+      rawModernRequest(daemon.url, 2, SKILLS_LIST_METHOD, {}),
+      rawModernRequest(daemon.url, 3, SKILLS_GET_METHOD, {
+        uri: "skill://agentprism-workflow-authoring/SKILL.md",
+      }),
+      rawModernRequest(daemon.url, 4, DIRECTORY_READ_METHOD, {
+        uri: "skill://agentprism-workflow-authoring",
+      }),
+    ]);
+    for (const result of modernSkillResults) {
+      assert.equal(result.error, undefined);
+      assert.equal(
+        result.result?.resultType,
+        "complete",
+        "modern Skills Extension results carry the SEP result discriminator on the wire",
+      );
+    }
     assert.deepEqual(modern.tools, legacy.tools);
     assert.deepEqual(
       modern.workflowInputSchema,
@@ -512,7 +576,7 @@ test("legacy and modern requests both keep the Apps surface capability-gated", a
         const connected = await connectHttp(daemon.url, { protocolMode, uiCapability });
         try {
           const listed = await connected.client.listTools();
-          assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), ["docs", "repl", "workflow"]);
+          assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), ["repl", "workflow"]);
           assert.equal(listed.tools.find((tool) => tool.name === "workflow")?._meta, undefined);
           const directAppCall = await connected.client.callTool({
             name: "workflow-events",

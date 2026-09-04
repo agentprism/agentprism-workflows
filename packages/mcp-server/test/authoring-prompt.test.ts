@@ -11,7 +11,7 @@ test("prompts/list advertises the compact author-workflow task frame", async () 
     assert.equal(prompts.length, 1);
     const prompt = prompts[0]!;
     assert.equal(prompt.name, "author-workflow");
-    assert.match(prompt.description ?? "", /select only the version-matched/);
+    assert.match(prompt.description ?? "", /version-matched Agent Skill/);
     const taskArg = prompt.arguments?.find((argument) => argument.name === "task");
     assert.ok(taskArg);
     assert.notEqual(taskArg.required, true);
@@ -20,7 +20,7 @@ test("prompts/list advertises the compact author-workflow task frame", async () 
   }
 });
 
-test("prompts/get frames the task and directs selective protocol-native discovery", async () => {
+test("prompts/get frames the task and directs host-controlled skill activation", async () => {
   const { client, dispose } = await connect(okRunner());
   try {
     const result = await client.getPrompt({
@@ -29,13 +29,14 @@ test("prompts/get frames the task and directs selective protocol-native discover
     });
     assert.equal(result.messages.length, 1);
     const text = String(result.messages[0]!.content.type === "text" ? result.messages[0]!.content.text : "");
-    assert.match(text, /docs.*workflow\/quickstart/);
-    assert.match(text, /read only the related workflow topics needed/);
+    assert.match(text, /skill:\/\/agentprism-workflow-authoring\/SKILL\.md/);
+    assert.match(text, /host's skill-loading path/);
+    assert.match(text, /supporting references needed/);
     assert.match(text, /action:"config"/);
     assert.match(text, /mocked dry run/);
     assert.match(text, /Find flaky tests and fix them/);
     assert.ok(Buffer.byteLength(text, "utf8") < 2_000, "prompt frames the task without injecting all docs");
-    assert.doesNotMatch(text, /repl\/api-reference|# Workflow script reference|\| `keepSession` \|/);
+    assert.doesNotMatch(text, /# Workflow agent API reference|\| `keepSession` \||skill:\/\/agentprism-repl-orchestration/i);
   } finally {
     await dispose();
   }
@@ -69,7 +70,7 @@ test("prompt registration includes only core tools and app-only monitor queries"
     const { tools } = await client.listTools();
     assert.deepEqual(
       tools.map((tool) => tool.name).sort(),
-      ["docs", "repl", "workflow", "workflow-events", "workflow-runs"],
+      ["repl", "workflow", "workflow-events", "workflow-runs"],
     );
   } finally {
     await dispose();

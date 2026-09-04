@@ -50,7 +50,7 @@ function request(id: number, method: string, params?: unknown): string {
   return `${JSON.stringify({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) })}\n`;
 }
 
-test("the bundled stdio server initializes once and advertises docs/workflow/repl", { timeout: 30_000 }, async () => {
+test("the bundled stdio server initializes once and serves workflow/repl plus authoring skills", { timeout: 30_000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "automatalabs-workflows-mcp-bundle-"));
   const child = spawn(process.execPath, [MCP_BUNDLE], {
     cwd: REPOSITORY_ROOT,
@@ -148,6 +148,8 @@ test("the bundled stdio server initializes once and advertises docs/workflow/rep
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
     child.stdin.write(request(2, "tools/list", {}));
     const toolsList = await waitForResponse(2);
+    child.stdin.write(request(3, "skills/list", {}));
+    const skillsList = await waitForResponse(3);
 
     // Keep collecting briefly: a cli.ts bundle starts the server twice and can otherwise
     // pass if the test stops at the first matching response.
@@ -156,22 +158,33 @@ test("the bundled stdio server initializes once and advertises docs/workflow/rep
 
     const initializeResult = initialize.result as {
       serverInfo?: { name?: unknown; version?: unknown };
+      capabilities?: { extensions?: Record<string, unknown> };
     };
     assert.equal(initializeResult.serverInfo?.name, "agentprism-workflow");
     assert.equal(initializeResult.serverInfo?.version, MCP_PACKAGE.version);
+    assert.deepEqual(
+      initializeResult.capabilities?.extensions?.["io.modelcontextprotocol/skills"],
+      { directoryRead: true },
+    );
 
     const toolsResult = toolsList.result as { tools?: Array<{ name?: unknown }> };
-    for (const name of ["docs", "workflow", "repl"]) {
-      assert.ok(toolsResult.tools?.some((tool) => tool.name === name), `${name} tool was not advertised`);
-    }
+    assert.deepEqual(toolsResult.tools?.map((tool) => tool.name).sort(), ["repl", "workflow"]);
+    const skillsResult = skillsList.result as { skills?: Array<{ uri?: unknown }> };
+    assert.deepEqual(
+      skillsResult.skills?.map((skill) => skill.uri).sort(),
+      [
+        "skill://agentprism-repl-orchestration/SKILL.md",
+        "skill://agentprism-workflow-authoring/SKILL.md",
+      ],
+    );
     // The workflow tool registers per-session in oninitialized (capability negotiation), so the
     // SDK legitimately emits notifications/tools/list_changed after initialize. Responses must
     // still be exactly one initialize and one tools/list — a double-started server would answer
     // each request twice — and every id-less frame must be that one notification kind.
     assert.deepEqual(
       frames.filter((frame) => frame.id !== undefined).map((frame) => frame.id),
-      [1, 2],
-      `expected exactly one initialize and one tools/list response; frames=${JSON.stringify(frames)}`,
+      [1, 2, 3],
+      `expected exactly one response per initialize, tools/list, and skills/list; frames=${JSON.stringify(frames)}`,
     );
     for (const frame of frames.filter((candidate) => candidate.id === undefined)) {
       assert.equal(

@@ -39,7 +39,7 @@
     }
   },
   "scripts": {
-    "build": "node ../../scripts/ensure-run-monitor-html.mjs && tsc -b && node scripts/bundle-mcp-server.mjs && node ../../scripts/check-workflows-bundle-deps.mjs",
+    "build": "node ../../scripts/ensure-authoring-skills.mjs && node ../../scripts/ensure-run-monitor-html.mjs && tsc -b && node scripts/bundle-mcp-server.mjs && node ../../scripts/check-workflows-bundle-deps.mjs",
     "typecheck": "tsc -p tsconfig.test.json --noEmit",
     "test": "tsx --test \"test/**/*.test.ts\"",
     "prepublishOnly": "pnpm run build"

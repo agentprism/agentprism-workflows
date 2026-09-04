@@ -5,6 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "../src/mcp-apps.js";
+import { SKILLS_EXTENSION_ID } from "../src/authoring-skills.js";
 import { makeProjectDir, startDaemon } from "./_http-harness.js";
 import { okRunner } from "./_harness.js";
 
@@ -23,8 +24,9 @@ test("released SDK v1 client retains the sessionful legacy end-to-end path", asy
   );
   try {
     await client.connect(transport);
+    assert.deepEqual(client.getServerCapabilities()?.extensions?.[SKILLS_EXTENSION_ID], { directoryRead: true });
     const tools = await client.listTools();
-    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["docs", "repl", "workflow", "workflow-events", "workflow-runs"]);
+    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["repl", "workflow", "workflow-events", "workflow-runs"]);
     const result = await client.callTool({
       name: "workflow",
       arguments: { action: "run", script: SCRIPT, projectDir: makeProjectDir("released-v1-client") },

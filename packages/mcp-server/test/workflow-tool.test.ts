@@ -142,18 +142,18 @@ test("tool registration: one `workflow` tool advertises config plus the run life
   const { client, dispose } = await connect(okRunner(), { listTools: true });
   try {
     const { tools } = await client.listTools();
-    // The model-facing surface is selective `docs`, `workflow`, and `repl` (the persistent
-    // workspace tool), plus app-only event and run-list queries (visibility
+    // The model-facing tools are `workflow` and `repl` (the persistent workspace tool), plus
+    // app-only event and run-list queries (visibility
     // ["app"] — Apps hosts keep them out of the model's tool loop; see app-ui.ts).
     assert.deepEqual(
       tools.map((candidate) => candidate.name).sort(),
-      ["docs", "repl", "workflow", "workflow-events", "workflow-runs"],
+      ["repl", "workflow", "workflow-events", "workflow-runs"],
     );
     const tool = tools.find((candidate) => candidate.name === "workflow");
     assert.ok(tool, "the workflow tool is registered");
     assert.equal(tool.title, "Run and manage deterministic agent workflows");
-    assert.match(tool.description ?? "", /workflow\/quickstart/);
-    assert.match(tool.description ?? "", /workflow\/run-lifecycle/);
+    assert.match(tool.description ?? "", /skill:\/\/agentprism-workflow-authoring\/SKILL\.md/);
+    assert.match(tool.description ?? "", /skill-loading path/);
     assert.match(tool.description ?? "", /status for an immediate snapshot/);
     assert.doesNotMatch(tool.description ?? "", /action:\"(?:inspect|await)\"/);
     assert.doesNotMatch(tool.description ?? "", /parallel\(|Minimal script|first statement|agent option keys/);

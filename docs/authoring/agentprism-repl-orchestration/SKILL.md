@@ -1,3 +1,8 @@
+---
+name: agentprism-repl-orchestration
+description: Drive AgentPrism's persistent MCP REPL for interactive multi-agent orchestration. Use for incremental evals, persistent bindings and agent handles, polling, steering, queueing, cancellation, checkpoints, workspace inspection, restore, and reset.
+---
+
 # REPL orchestration: quickstart
 
 **Context:** JavaScript sent to the MCP `repl` tool. This is not workflow-script code: REPL `agent()` takes `(modelSpec, task, options?)`, top-level `return` is a syntax error, and named bindings persist between calls.
@@ -67,7 +72,12 @@ Agent options are exactly `schema`, `cwd`, `configOptions`, and `mode`. Unknown 
 
 ## What to read next
 
-- `repl/state-and-bindings` — persistence, completion values, polling, and output.
-- `repl/agent-handles` — `agent()` options, failures, and handle identity.
-- `repl/steering-queueing-and-cancellation` — strict active-turn control and durable future turns.
-- `repl/api-reference` — every guest global and tool action.
+Read only the references needed for the task:
+
+- [`references/state-and-bindings.md`](references/state-and-bindings.md) — persistence, completion values, polling, and output.
+- [`references/agent-handles.md`](references/agent-handles.md) — `agent()` options, failures, and handle identity.
+- [`references/steering-queueing-and-cancellation.md`](references/steering-queueing-and-cancellation.md) — strict active-turn control and durable future turns.
+- [`references/checkpoints-and-introspection.md`](references/checkpoints-and-introspection.md) — durable checkpoints and workspace inspection.
+- [`references/persistence-and-reset.md`](references/persistence-and-reset.md) — snapshot restoration, disconnect behavior, and reset.
+- [`references/api-reference.md`](references/api-reference.md) — every guest global and tool action.
+- [`references/examples.md`](references/examples.md) — interactive orchestration examples.

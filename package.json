@@ -11,7 +11,7 @@
     "test:scripts": "node --test scripts/test/*.test.mjs",
     "generate:acp-backends-manifest": "tsx scripts/generate-acp-backends-manifest.ts",
     "check:acp-backends-manifest": "tsx scripts/generate-acp-backends-manifest.ts --check",
-    "generate:authoring-docs": "node scripts/generate-authoring-docs.mjs",
+    "generate:authoring-skills": "node scripts/generate-authoring-skills.mjs",
     "sync:codex-acp": "node scripts/sync-codex-acp.mjs",
     "changeset": "changeset",
     "version": "changeset version",
@@ -26,7 +26,8 @@
     "@changesets/cli": "^2.31.0",
     "@types/node": "^22.10.0",
     "tsx": "^4.22.4",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "yaml": "^2.9.0"
   },
   "pnpm": {
     "overrides": {

@@ -1,12 +1,13 @@
 // The `author-workflow` MCP prompt is a user-controlled convenience that frames an authoring
+// task and points the assistant at the version-matched workflow Agent Skill. It deliberately does
+// not embed the skill or bypass the host's skill activation and approval path.
 import type { McpServer } from "@modelcontextprotocol/server";
-
-// task and points the assistant at the selective, version-matched `docs` tool. It deliberately
-// does not inject the complete optional skill or every API topic into one context window.
 import { z } from "zod";
-export const AUTHORING_PROMPT_NAME = "author-workflow";
 
-/** Assemble a compact task frame. The agent chooses only the documentation topics it needs. */
+export const AUTHORING_PROMPT_NAME = "author-workflow";
+export const WORKFLOW_AUTHORING_SKILL_URI = "skill://agentprism-workflow-authoring/SKILL.md";
+
+/** Assemble a compact task frame. The agent loads only the skill references it needs. */
 export function buildAuthoringPromptText(task?: string): string {
   const trimmed = task?.trim();
   const taskSection = trimmed
@@ -15,9 +16,9 @@ export function buildAuthoringPromptText(task?: string): string {
   return [
     "# Author an AgentPrism workflow",
     "",
-    "Use the connected `docs` tool for version-matched authoring guidance. Read topic `workflow/quickstart` first, then read only the related workflow topics needed for this task; do not load every topic. Workflow scripts and REPL evals have different `agent()` signatures, so use only `workflow/*` topics here.",
+    `Activate the connected server's Agent Skill at \`${WORKFLOW_AUTHORING_SKILL_URI}\` through the host's skill-loading path. Follow its workflow-script guidance and read only the supporting references needed for this task. Do not use the separate REPL skill: workflow scripts and REPL evals have different \`agent()\` signatures and lifecycle semantics.`,
     "",
-    "When the script pins a model, mode, or configOptions, call the `workflow` tool with `action:\"config\"` first; after choosing a model, use `modelSpecs` to read its exact option domain. Read the harness-owned mode names and descriptions before pinning an exact advertised id. Trusted autonomous implementation/review uses advertised Claude `bypassPermissions` or Codex `agent`; Claude `auto` uses a model classifier and may request permission. The run action automatically performs static validation, a mocked dry run, and routed no-prompt config checks before admission. Correct any direct rejection diagnostic and re-run.",
+    "When the script pins a model, mode, or configOptions, call the `workflow` tool with `action:\"config\"` first; after choosing a model, use `modelSpecs` to read its exact option domain. Read the harness-owned mode names and descriptions before pinning an advertised id. The run action automatically performs static validation, a mocked dry run, and routed no-prompt config checks before admission. Correct any direct rejection diagnostic and re-run.",
     "",
     taskSection,
     "",
@@ -31,11 +32,11 @@ export function registerAuthoringPrompt(mcp: McpServer): void {
     {
       title: "Author an AgentPrism workflow script",
       description:
-        "Frame a workflow-authoring task and direct the assistant to select only the version-matched " +
-        "workflow documentation topics it needs through the `docs` tool.",
+        "Frame a workflow-authoring task and direct the assistant to activate the connected " +
+        "server's version-matched Agent Skill.",
       argsSchema: z.object({
-              task: z.string().optional().describe("What the workflow should accomplish (optional)."),
-            }),
+        task: z.string().optional().describe("What the workflow should accomplish (optional)."),
+      }),
     },
     ({ task }) => ({
       messages: [

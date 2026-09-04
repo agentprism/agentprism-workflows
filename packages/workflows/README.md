@@ -998,22 +998,13 @@ globals documented by the ambient `dsl.d.ts`.)
 
 ---
 
-## Skill for AI agents that write workflows
+## Authoring guidance for MCP agents
 
-The repository publishes an **agent skill** — a self-contained, backend-agnostic authoring guide
-in the standard `SKILL.md` format — at
-[`skills/agentprism-workflow-authoring/`](https://github.com/agentprism/agentprism-workflows/tree/main/skills/agentprism-workflow-authoring).
-Install it into whatever coding agent you use (Claude Code, Codex, Cursor, OpenCode, …) with the
-[skills](https://skills.sh) CLI:
-
-```bash
-npx skills add agentprism/agentprism-workflows
-```
-
-It teaches the full script DSL: routing each `agent()` call to a different ACP backend inside one
-script, structured outputs across all backends, `checkpoint()` gates, worktree isolation, and
-the determinism rules that make runs resumable. `reference.md` alongside it holds
-the exhaustive option tables.
+The MCP server bundled in this package publishes version-matched workflow and REPL Agent Skills
+through the accepted SEP-2640 Skills Extension. A skills-aware host discovers
+`skill://agentprism-workflow-authoring/SKILL.md`, activates it through its own approval path, and
+reads supporting references lazily through MCP resources. The concise canonical sources live under
+[`docs/authoring/`](https://github.com/agentprism/agentprism-workflows/tree/main/docs/authoring).
 
 ---
 

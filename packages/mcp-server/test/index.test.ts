@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 // Same-package unit test: relative ../src import. The composition-root entry is import-safe
 // (it only starts the stdio server when run as the process entry point).
 import {
-  AUTHORING_DOC_TOPIC_IDS,
-  DOCS_TOOL_NAME,
+  AUTHORING_SKILL_URIS,
+  SKILLS_EXTENSION_ID,
   createWorkflowServer,
   EVENTS_RESOURCE_MIME_TYPE,
   WORKFLOW_RUN_EVENTS_SCHEMA_VERSION,
@@ -15,9 +15,11 @@ import {
 
 test("@automatalabs/mcp-server public entry is reachable via ../src", () => {
   assert.equal(typeof createWorkflowServer, "function");
-  assert.equal(DOCS_TOOL_NAME, "docs");
-  assert.ok(AUTHORING_DOC_TOPIC_IDS.includes("workflow/quickstart"));
-  assert.ok(AUTHORING_DOC_TOPIC_IDS.includes("repl/api-reference"));
+  assert.equal(SKILLS_EXTENSION_ID, "io.modelcontextprotocol/skills");
+  assert.deepEqual(AUTHORING_SKILL_URIS, [
+    "skill://agentprism-workflow-authoring/SKILL.md",
+    "skill://agentprism-repl-orchestration/SKILL.md",
+  ]);
   assert.equal(EVENTS_RESOURCE_MIME_TYPE, "application/json");
   assert.equal(WORKFLOW_RUN_EVENTS_SCHEMA_VERSION, 1);
   assert.equal(workflowRunEventsUri("run-one"), "workflow://runs/run-one/events");
