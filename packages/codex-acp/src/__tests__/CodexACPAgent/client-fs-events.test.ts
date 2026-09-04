@@ -93,7 +93,7 @@ describe('CodexEventHandler - client fs capabilities', () => {
     it('reads file content through the client when fs.readTextFile is advertised', async () => {
         // The file exists only in the client (e.g. an unsaved editor buffer) — not on disk.
         const clientFiles = new Map<string, string>([[filePath, oldFileContent]]);
-        const mockFixture = createCodexMockTestFixture(undefined, {
+        const mockFixture = createCodexMockTestFixture(undefined, undefined, {
             acpRequestHandler: (method, params) => {
                 if (method !== acp.methods.client.fs.readTextFile) return undefined;
                 const { path } = params as acp.ReadTextFileRequest;
@@ -115,7 +115,7 @@ describe('CodexEventHandler - client fs capabilities', () => {
 
     it('falls back to a local read when the client read fails', async () => {
         mockDiskFileContent(filePath, oldFileContent);
-        const mockFixture = createCodexMockTestFixture(undefined, {
+        const mockFixture = createCodexMockTestFixture(undefined, undefined, {
             acpRequestHandler: (method) => {
                 if (method !== acp.methods.client.fs.readTextFile) return undefined;
                 throw acp.RequestError.internalError('client read failed');
@@ -133,7 +133,7 @@ describe('CodexEventHandler - client fs capabilities', () => {
     it('reads from disk when the client does not advertise fs.readTextFile', async () => {
         mockDiskFileContent(filePath, oldFileContent);
         const clientReads: string[] = [];
-        const mockFixture = createCodexMockTestFixture(undefined, {
+        const mockFixture = createCodexMockTestFixture(undefined, undefined, {
             acpRequestHandler: (method, params) => {
                 if (method !== acp.methods.client.fs.readTextFile) return undefined;
                 clientReads.push((params as acp.ReadTextFileRequest).path);

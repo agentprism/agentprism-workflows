@@ -68,6 +68,7 @@ describe('CodexACPAgent - initialize', () => {
                         baseInstructions: true,
                         developerInstructions: true,
                     },
+                    authStatus: {},
                 },
             },
             authMethods: getCodexAuthMethods(),
@@ -86,7 +87,7 @@ describe('CodexACPAgent - initialize', () => {
                 jetbrains: {
                     air: {
                         version: 1,
-                        capabilities: ["sessionFailure", "agentFileChangeReport", "nativeSubagentSessions"],
+                        capabilities: ["sessionFailure", "agentFileChangeReport", "nativeSubagentSessions", "asyncTasks"],
                     },
                 },
             },
