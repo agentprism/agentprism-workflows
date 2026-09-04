@@ -342,11 +342,14 @@ budget or idle watchdog. An attempt remains live until it completes, fails, or t
 cancels its call or run. Protocol startup, cancellation-grace, cleanup, lease, and transport bounds
 remain fixed implementation safety controls; they are not configurable agent work budgets.
 
-**Configuration elicitation is task-legible and canonical.** Before a new run is admitted, each
-observed agent occurrence shows its phase title/detail, label, and a bounded credential-redacted
-task/prompt preview. The user can therefore see what each selected model will do. Accepted form
-values are validated against the live catalog and converted into the canonical effective snapshot
-described below; private form scaffolding is not persisted.
+**Configuration elicitation fills unresolved models and is canonical.** Before a new run is admitted,
+mock execution resolves per-call, agent-definition, tier, phase, and meta models. A form-capable
+client is asked only about observed calls whose effective model remains unresolved. Explicit and
+inherited model/mode/config values are preserved, including backend-only model specs; optional
+mode/config omissions use backend defaults and do not trigger a form. Each unresolved occurrence
+shows its phase title/detail, label, and a bounded credential-redacted task/prompt preview. Accepted
+form values are validated against the live catalog and combined with authored configurations into
+the complete canonical effective snapshot described below; private form scaffolding is not persisted.
 
 **Exact result discovery is separate from observability.** Completed runs with a persisted JSON
 value expose `workflow://runs/{runId}/result`, distinct from the immutable `/script` resource and the

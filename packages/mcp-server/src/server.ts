@@ -2819,7 +2819,12 @@ export function createWorkflowServer(
         let agentConfigurations: ExecOptions["agentConfigurations"];
         let agentConfigurationElicited = false;
         const canConfigureAgents = supportsFormElicitation(toolCatalog.clientCapabilities(ctx));
-        if (canConfigureAgents && (routingDiscovery.dryRun?.agentCalls.length ?? 0) > 0) {
+        // Discovery has already resolved per-call, agentType, tier, phase, and meta models.
+        // Optional mode/config omissions use backend defaults and do not require user input.
+        const needsAgentConfiguration = routingDiscovery.dryRun?.agentCalls.some(
+          (call) => call.model === undefined,
+        ) === true;
+        if (canConfigureAgents && needsAgentConfiguration) {
           const configuredHarnesses = [
             ...(probeRunner.listBackends?.() ?? []),
             ...Object.keys(backendsGate.backends ?? {}),
@@ -2891,7 +2896,7 @@ export function createWorkflowServer(
         } else if (requestState?.flow === "agent-configuration") {
           throw new ProtocolError(
             ProtocolErrorCode.InvalidParams,
-            "Invalid workflow agent-configuration retry: the workflow no longer has an observed agent call",
+            "Invalid workflow agent-configuration retry: the workflow no longer has an unresolved agent model",
           );
         }
 

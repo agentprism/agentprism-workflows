@@ -69,6 +69,7 @@ export interface WorkflowAgentConfigurationPlan {
   /** Binds modern multi-round-trip input to this exact discovered form/catalog. */
   selectionHash: string;
   callIndexes: number[];
+  /** Complete occurrence map: accepted selections plus preserved authored configurations. */
   parse(content: Record<string, unknown>): Record<number, WorkflowAgentConfiguration>;
 }
 
@@ -218,7 +219,7 @@ function unavailableSummary(harnesses: readonly ValidateHarnessOptions[]): strin
 }
 
 /**
- * Build one flat MCP form for every dry-run-observed agent call. MCP form schemas permit
+ * Build one flat MCP form for dry-run-observed calls with no resolved model. MCP form schemas permit
  * primitive properties only, so provider-specific fields are prefixed per occurrence and
  * ignored unless that provider is selected for the call.
  */
@@ -227,7 +228,7 @@ export function buildWorkflowAgentConfigurationPlan(
   calls: readonly ValidatedAgentCall[],
   harnesses: readonly ValidateHarnessOptions[],
 ): WorkflowAgentConfigurationPlan | undefined {
-  const configurableCalls = [...calls];
+  const configurableCalls = calls.filter((call) => call.model === undefined);
   if (configurableCalls.length === 0) return undefined;
 
   const routes = routeChoices(harnesses);
@@ -282,7 +283,7 @@ export function buildWorkflowAgentConfigurationPlan(
     mode: "form",
     title: "Configure workflow agents",
     message: [
-      "Choose the provider and model for each agent call before execution.",
+      "Choose the provider and model for each agent call with no resolved model before execution.",
       "Optional provider fields are applied only when that provider is selected; leave them empty to use that provider's defaults.",
       "",
       ...callLines,
@@ -303,6 +304,16 @@ export function buildWorkflowAgentConfigurationPlan(
     callIndexes: configurableCalls.map((call) => call.index),
     parse(content) {
       const configurations: Record<number, WorkflowAgentConfiguration> = {};
+      // Strict admission and continuation need every observed occurrence, including calls
+      // that were already configured and therefore never appeared in the form.
+      for (const call of calls) {
+        if (call.model === undefined) continue;
+        configurations[call.index] = {
+          model: call.model,
+          ...(call.mode === undefined ? {} : { mode: call.mode }),
+          ...(call.configOptions === undefined ? {} : { configOptions: { ...call.configOptions } }),
+        };
+      }
       for (const call of callFields) {
         const selected = content[call.routeField];
         if (typeof selected !== "string") {
