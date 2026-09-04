@@ -1,5 +1,13 @@
 # @automatalabs/workflows
 
+## 1.1.3
+
+### Patch Changes
+
+- Updated dependencies [3a3932c]
+  - @automatalabs/acp-agents@1.1.1
+  - @automatalabs/repl-engine@0.4.18
+
 ## 1.1.2
 
 ### Patch Changes
