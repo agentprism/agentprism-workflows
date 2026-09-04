@@ -105,6 +105,11 @@
       "sha": "5552cef60fd60d3c7f8ad2ae8cefea401addeb37",
       "imported": "2026-09-03",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (fix: report complete status usage and limits (#463))"
+    },
+    {
+      "sha": "432a4594a396448db6c2e7772a5851ab68b71ef2",
+      "imported": "2026-09-04",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (build(deps): bump openai/codex-action (#432))"
     }
   ]
 }

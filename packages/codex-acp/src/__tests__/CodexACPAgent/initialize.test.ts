@@ -101,7 +101,7 @@ describe('CodexACPAgent - initialize', () => {
 
         const result = await agent.initialize(params);
 
-        expect(result.agentCapabilities?._meta).toEqual(customAgentCapabilities);
+        expect(result.agentCapabilities?._meta).toEqual({...customAgentCapabilities, authStatus: {}});
         expect(result.agentCapabilities?._meta?.[CUSTOM_CAPABILITY_NAMESPACE]).toEqual({
             outputSchema: true,
             baseInstructions: true,
