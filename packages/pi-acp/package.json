@@ -1,6 +1,6 @@
 {
   "name": "@automatalabs/pi-acp",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22.19.0"
