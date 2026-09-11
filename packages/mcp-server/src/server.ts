@@ -345,6 +345,9 @@ function addInspectionResourceFields<Status extends WorkflowRunStatus, Fields ex
     },
     ...fields,
   };
+  // The engine's replay-eligibility diagnostic is SDK surface; MCP inspection stays the bounded
+  // documented field set, and a revised continuation reports its per-call decisions on the result.
+  delete (projected as { replayEligibility?: unknown }).replayEligibility;
   const activityProjection = projected as Status & Fields & {
     latestActivity?: WorkflowRunLatestActivity[];
   };
@@ -1637,8 +1640,25 @@ export function createWorkflowServer(
         }
         let reserved = needsReservation;
         try {
+          // The run's script file is the editable working copy: a changed file continues as a
+          // validated revision, an unchanged or missing one continues the persisted script.
+          let revision: { script: string; revised: boolean } = { script: persisted?.script ?? "", revised: false };
+          if (persisted) {
+            try {
+              revision = await lifecycle.prepareRevision(input.runId, persisted, { signal: ctx.mcpReq.signal });
+            } catch (error) {
+              if (isPreparationCancelled(error)) {
+                throw new ProtocolError(ProtocolErrorCode.InternalError, "Workflow continuation was cancelled before admission; nothing was continued.");
+              }
+              if (error instanceof WorkflowPreparationRejected) {
+                return { content: [{ type: "text", text: `Workflow run ${input.runId} was not continued: ${error.message}` }], isError: true };
+              }
+              throw error;
+            }
+          }
           const started = await manager.continueRun(input.runId, {
             agent: runner, maxAgents: input.maxAgents,
+            ...(revision.revised ? { script: revision.script } : {}),
             onMissingAgentConfiguration: () => missingRoutingDiagnostics(probeRunner, context.projectDir, persisted?.admission?.scriptBackends),
             concurrency: input.concurrency, agentRetries: input.agentRetries, checkpointReplies: input.checkpointReplies,
           });
@@ -1652,10 +1672,11 @@ export function createWorkflowServer(
               ...(outcome === undefined ? {} : { outcome }),
             }, inspectionRetentionMetadata(manager, input.runId, status));
             const informational = ["running", "terminal", "checkpoint-required", "auth-required"].includes(started.reason);
-            const requiresFreshRun = ["admission-missing", "admission-invalid", "admission-uncovered"].includes(started.reason);
+            const requiresFreshRun = ["admission-missing", "admission-invalid", "admission-uncovered", "backends-changed"].includes(started.reason);
             return { structuredContent: { ...projected },
               content: [{ type: "text", text: `Workflow run ${input.runId} was not continued: ${started.reason}.` +
                 (requiresFreshRun ? " Please start a fresh run." : "") +
+                (started.reason === "script-invalid" ? " Fix the run's script file, then resume again." : "") +
                 (started.resolvedCheckpoints?.length ? `\n${JSON.stringify(started.resolvedCheckpoints)}` : "") }], isError: !informational };
           }
           context.activeRuns.track(input.runId, started.promise);
@@ -1667,7 +1688,9 @@ export function createWorkflowServer(
               status: state.status, scriptSource: "stored", scriptUri: scriptResources.scriptUri(input.runId),
               scriptPath: scriptResources.scriptPath(input.runId),
               eventsUri: scriptResources.availableEventsUri(input.runId), limits: state.limits },
-            content: [{ type: "text", text: `Continuation accepted for workflow run ${input.runId}. Use status to inspect it; use result after completion.` },
+            content: [{ type: "text", text: `Continuation accepted for workflow run ${input.runId}${
+              revision.revised ? " with the revised script: unchanged calls replay from the journal, changed calls run live" : ""
+            }. Use status to inspect it; use result after completion.` },
               ...scriptContentBlocks(scriptResources, input.runId), ...eventsContentBlocks(scriptResources, input.runId)], isError: false };
         } finally { if (reserved) context.activeRuns.releaseReservation(); }
       }

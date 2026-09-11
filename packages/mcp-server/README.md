@@ -367,8 +367,7 @@ request is cancelled rather than partially exposed. Owner loss invalidates the o
 a successor cannot reconstruct it. Setup and checkpoints, in contrast, are durable waits.
 
 An `AUTH_REQUIRED` pause reports `reason:"auth_required"` and `outcome.authContext`. Configure the
-named backend's credentials out of band, then call `action:"resume"` with the same `runId`. Continuation uses the immutable stored script, args, cwd, immutable routing inputs,
-journal, event stream, cumulative usage, and checkpoint answers; it never accepts edited input.
+named backend's credentials out of band, then call `action:"resume"` with the same `runId`. Continuation keeps the run's args, cwd, immutable routing inputs, journal, event stream, cumulative usage, and checkpoint answers; resume itself accepts no replacement inputs. The script is re-read from the run's file: an unchanged or missing file continues the persisted script, and a changed file is a revision. A revision is validated exactly like a new run (structure, mocked dry run, routed probes), may declare only backends the run's setup already approved, and then continues with an identity-matched replay of this run's own journal: calls whose prompt and inputs are unchanged replay without provider usage, edited or new calls and everything the revision reorders run live. The acknowledgement's `continuation.scriptRevised:true` marks such a generation, the persisted record adopts the revised text, and `scriptRevisions` lists every accepted revision. A revision that does not parse, fails validation, or widens backend approval is a tool execution error that changes nothing; fix the file and resume again.
 Historical records without current admission or explicit checkpoint provenance remain readable
 where supported but refuse continuation/reuse clearly; start a fresh run.
 
@@ -389,7 +388,8 @@ The script resource is a `file://` URI naming the one file a run recorded as its
 copy written for an inline script, or the exact `scriptPath` the caller supplied. `scriptUri` and
 `scriptPath` in run, resume, status, and outcome responses name that location. `resources/read`
 returns the file's current UTF-8 text with MIME type `text/javascript`, so an edit made after
-admission is visible immediately; the admitted text that executes stays in the persisted record.
+admission is visible immediately. The admitted text keeps executing until a `resume` reads the
+changed file back as a validated revision; the persisted record always holds the text that executes.
 Only a file some run recorded is addressable: an arbitrary `file://` URI, or an unowned file inside
 the store, is not a resource. The result resource returns `JSON.stringify` of the authoritative
 persisted authored result with MIME type `application/json`, works for any persisted run in the

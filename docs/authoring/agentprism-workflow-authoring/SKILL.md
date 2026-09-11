@@ -112,8 +112,12 @@ Continue an incomplete run in place; do not resend `script` or `args`:
 ```
 
 The response keeps the same `runId` without exposing an execution-attempt identity. It reuses the
-admitted script, args, immutable routing inputs, journal, event stream, cumulative usage, and
-durable checkpoint decisions. Use `status` on that same ID, then `result` after completion.
+run's args, immutable routing inputs, journal, event stream, cumulative usage, and durable
+checkpoint decisions, and re-reads the script from the run's file (`scriptPath`): an unchanged file
+continues the admitted text, an edited file is validated like a new run and continues with an
+identity-matched replay (unchanged calls replay, edited or new calls run live; `continuation.scriptRevised`).
+A revision may not declare backends the setup never approved. Use `status` on that same ID, then
+`result` after completion.
 Pause with `{ action:"pause", runId:"RUN_ID" }` to let executing agents finish and journal before the run pauses; stop with `{ action:"stop", runId:"RUN_ID" }` to interrupt it now. Both leave a run that `resume` continues from its journal. Once a run is admitted, client disconnection leaves it owned by the server; process loss preserves durable state for later inspection/recovery.
 
 ## What to read next

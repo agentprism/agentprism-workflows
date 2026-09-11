@@ -163,6 +163,7 @@ export type {
   RunLeaseOwner,
   PersistedRunState,
   WorkflowScriptOrigin,
+  WorkflowScriptRevision,
   PersistedAgentState,
   PersistedResumeFormat,
   PersistedResumeCandidate,

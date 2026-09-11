@@ -543,7 +543,7 @@ return await checkpoint("Continue?", { kind: "confirm", timeoutMs: 5 });`;
   }
 });
 
-test("modern checkpoint continuation uses stored source after scriptPath changes", async () => {
+test("modern checkpoint continuation runs the revised scriptPath file", async () => {
   const daemon = await startDaemon(okRunner());
   const projectDir = makeProjectDir("dual-era-script-path-drift");
   const connected = await connectHttp(daemon.url, { protocolMode: "modern" });
@@ -557,20 +557,23 @@ return await checkpoint("Continue?", { kind: "confirm" });`;
     } });
     const runId = String(structured(accepted)?.runId);
     await waitForRun(connected.client, runId);
-    writeFileSync(scriptPath, `export const meta = { name: "mutated", description: "must not execute" }; return "mutated";`, "utf8");
+    // The caller's file is the run's editable script: a change is a validated revision that the
+    // continuation executes, with the answered checkpoint carried by the seed even though the
+    // revision no longer asks it.
+    writeFileSync(scriptPath, `export const meta = { name: "revised", description: "the edit executes" }; return "revised";`, "utf8");
     const resumed = await connected.client.callTool({ name: "workflow", arguments: {
       action: "resume", runId, checkpointReplies: { 0: true },
     } });
+    assert.equal(resumed.isError, false, JSON.stringify(resumed.content));
     assert.equal(structured(resumed)?.accepted, true);
     assert.equal(structured(resumed)?.scriptSource, "stored");
+    assert.equal(structured(resumed)?.continuation?.scriptRevised, true);
     await waitForRun(connected.client, runId, (run) => run.status === "completed");
     const exact = await connected.client.callTool({ name: "workflow", arguments: { action: "result", runId } });
-    assert.equal(structured(exact)?.chunk, "true");
-    // The resource is the caller's own file, so it shows the edit; the admitted script that ran
-    // is the stored record the continuation used.
+    assert.equal(structured(exact)?.chunk, JSON.stringify("revised"));
     const source = await connected.client.readResource({ uri: String(structured(accepted)?.scriptUri) });
     assert.equal(String(structured(accepted)?.scriptUri), pathToFileURL(scriptPath).href);
-    assert.match((source.contents[0] as { text: string }).text, /mutated/);
+    assert.match((source.contents[0] as { text: string }).text, /revised/);
   } finally {
     await connected.dispose();
     await daemon.close();

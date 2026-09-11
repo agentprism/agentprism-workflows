@@ -153,12 +153,23 @@ export interface PersistedRunLineageTombstone {
  */
 export type WorkflowScriptOrigin = { kind: "inline" } | { kind: "path"; path: string };
 
+/** One accepted script revision: the continuation generation that first ran the revised text. */
+export interface WorkflowScriptRevision {
+  generation: number;
+  /** SHA-256 of the revised script text. */
+  scriptHash: string;
+  revisedAt: string;
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
+  /** The text that executes: the admitted script, or the latest accepted revision. */
   script: string;
   /** Recorded at admission; absent on runs created before script origins were tracked. */
   scriptOrigin?: WorkflowScriptOrigin;
+  /** Every continuation that ran a revised script, oldest first. */
+  scriptRevisions?: WorkflowScriptRevision[];
   args?: unknown;
   /** The persisted args value was not a faithful pre-execution strict-JSON snapshot. */
   argsUnreplayable?: true;

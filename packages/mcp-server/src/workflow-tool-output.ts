@@ -290,6 +290,7 @@ const setupSchema = z.discriminatedUnion("state", [
 const continuationSchema = z.object({
   generation: z.number().int().positive(),
   replayedPrefix: z.number().int().nonnegative(),
+  scriptRevised: z.literal(true).optional(),
   resolvedCheckpoints: z.array(z.object({
     callIndex: z.number().int().nonnegative(),
     outcome: z.enum(["accepted", "same", "different"]),

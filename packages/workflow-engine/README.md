@@ -181,7 +181,10 @@ then matches completed results by exact path/hash or unique hash+input fingerpri
 halt without a result are persisted as engine interruption rows; non-result seed blockers make those
 occurrences run live without letting an identical result sibling become spuriously unique. Any
 uncertain, ambiguous, or mismatched call runs live. Same-ID `manager.resume(runId)` and
-manual `resumeJournal` remain permanently legacy positional paths. Full types, reports, reason
+manual `resumeJournal` remain permanently legacy positional paths. A same-run continuation given
+`exec.script` that differs from the persisted text runs that revision through the identity matcher
+against the run's own terminal state (`continuation.scriptRevised`, `scriptRevisions`); a revision
+must parse and may declare only backends the admission approved. Full types, reports, reason
 catalogs, and checkpoint source-index rules are in the
 [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
 

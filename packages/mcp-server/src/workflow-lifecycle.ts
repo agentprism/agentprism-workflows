@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import {
   isValidationAbortError, parseWorkflowScript, redactText, validateWorkflowScript, validationAbortError,
@@ -274,6 +274,90 @@ export class WorkflowLifecycle {
       clearTimeout(timer);
       control.signal?.removeEventListener("abort", onCallerAbort);
       if (reserved) this.context.activeRuns.releaseReservation();
+    }
+  }
+
+  /**
+   * Read the run's script file back for a continuation. An unchanged or missing file continues
+   * the persisted script. A changed file is a revision: it is validated exactly like a new run
+   * (structure, mocked dry run, routed probes) and may declare only backends the run's admission
+   * already approved, so no continuation can widen what the host accepted at setup.
+   */
+  async prepareRevision(
+    runId: string,
+    persisted: PersistedRunState,
+    control: Pick<WorkflowPreparationControl, "signal"> = {},
+  ): Promise<{ script: string; revised: boolean }> {
+    const persistence = this.context.manager.getPersistence();
+    const location = persistence.scriptLocation?.(runId);
+    if (location === undefined || !existsSync(location)) return { script: persisted.script, revised: false };
+    let current: string;
+    try {
+      current = persistence.readScript!(runId);
+    } catch (error) {
+      throw new WorkflowPreparationRejected(
+        `The run's script file could not be read: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (current === persisted.script) return { script: current, revised: false };
+
+    let meta: ReturnType<typeof parseWorkflowScript>["meta"];
+    try {
+      meta = parseWorkflowScript(current).meta;
+    } catch (error) {
+      throw new WorkflowPreparationRejected(
+        `The revised script at ${location} does not parse: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const approved = persisted.admission?.scriptBackends ?? {};
+    for (const [name, config] of Object.entries(meta.backends ?? {})) {
+      const approvedConfig = approved[name];
+      if (approvedConfig === undefined || backendKey(name, config) !== backendKey(name, approvedConfig)) {
+        throw new WorkflowPreparationRejected(
+          `The revised script declares backend "${name}", which this run's setup never approved. A continuation cannot widen backend approval; start a fresh run to approve it.`,
+        );
+      }
+    }
+
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, WORKFLOW_PREPARATION_BOUND_MS);
+    timer.unref?.();
+    const onCallerAbort = () => controller.abort();
+    if (control.signal?.aborted) controller.abort();
+    else control.signal?.addEventListener("abort", onCallerAbort, { once: true });
+    try {
+      let preflight: Awaited<ReturnType<typeof validateWorkflowScript>>;
+      try {
+        preflight = await validateWorkflowScript(current, {
+          args: persisted.args, cwd: persisted.effectiveCwd ?? this.context.projectDir,
+          maxAgents: persisted.limits?.maxAgents, timeoutMs: 30_000,
+          defaultModel: persisted.admission?.defaultModel,
+          requireAgentConfiguration: true, signal: controller.signal,
+          probeRunner: this.probeRunner, loadSavedWorkflow: (name) => this.context.manager.resolveSavedWorkflow(name),
+        });
+      } catch (error) {
+        if (isValidationAbortError(error)) {
+          if (timedOut) throw new WorkflowPreparationRejected(`Revised script validation exceeded ${WORKFLOW_PREPARATION_BOUND_MS} ms; nothing was continued.`);
+          throw validationAbortError();
+        }
+        throw error;
+      }
+      if (!preflight.ok) {
+        const diagnostic = validationText(preflight);
+        throw new WorkflowPreparationRejected(`The revised script at ${location} failed validation.\n${
+          preflight.dryRun?.missingAgentConfiguration !== undefined
+            ? `${diagnostic}\n\n${await missingRoutingDiagnostics(this.probeRunner, this.context.projectDir, meta.backends)}`
+            : diagnostic
+        }`);
+      }
+      return { script: current, revised: true };
+    } finally {
+      clearTimeout(timer);
+      control.signal?.removeEventListener("abort", onCallerAbort);
     }
   }
 

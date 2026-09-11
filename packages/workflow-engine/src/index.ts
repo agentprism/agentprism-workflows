@@ -51,6 +51,7 @@ export {
   type RunStatus,
   type PersistedRunState,
   type WorkflowScriptOrigin,
+  type WorkflowScriptRevision,
   type PersistedAgentState,
   type PersistedResumeFormat,
   type PersistedResumeCandidate,

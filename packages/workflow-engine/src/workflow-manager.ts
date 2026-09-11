@@ -10,7 +10,7 @@
  * try/catch.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import type {
@@ -57,6 +57,7 @@ import {
   type RunPersistence,
   type RunStatus,
   type WorkflowScriptOrigin,
+  type WorkflowScriptRevision,
 } from "./run-persistence.js";
 import {
   admitResumeSource,
@@ -117,6 +118,7 @@ export interface ManagedRun {
   /** The real script, kept so the run can be resumed. */
   script: string;
   scriptOrigin?: WorkflowScriptOrigin;
+  scriptRevisions?: WorkflowScriptRevision[];
   args?: unknown;
   /** True when managed.args is a faithful strict-JSON pre-execution snapshot. */
   argsSnapshotOk: boolean;
@@ -262,7 +264,11 @@ export type WorkflowContinuationRefusalReason =
   | "admission-invalid"
   | "checkpoint-required"
   | "checkpoint-mismatch"
-  | "auth-required";
+  | "auth-required"
+  /** The revised script does not parse (a `meta` or structure error). */
+  | "script-invalid"
+  /** The revised script declares a backend the run's admission never approved. */
+  | "backends-changed";
 
 export type WorkflowContinuationStart =
   | {
@@ -313,6 +319,13 @@ export interface ExecOptions {
    * listRuns()/resume() are unaffected by the per-run directory's lifetime.
    */
   cwd?: string;
+  /**
+   * Same-run continuation only: the script text read back from the run's file. When it differs
+   * from the persisted script, the continuation runs the revision with an identity-matched replay
+   * of this run's own journal (unchanged calls replay, the rest run live). A revision must parse
+   * and may declare only backends the run's admission already approved.
+   */
+  script?: string;
   /** Replay these journaled agent results for the unchanged prefix (resume). */
   resumeJournal?: Map<number, JournalEntry>;
   /** Load this persisted run as the source for a new managed execution. */
@@ -540,6 +553,27 @@ function isContinuationSession(
     isOptionalString(value, "phase") &&
     typeof value.keptOpen === "boolean"
   );
+}
+
+function hashScriptText(script: string): string {
+  return createHash("sha256").update(script, "utf8").digest("hex");
+}
+
+/**
+ * A revision may keep or drop approved backends but never introduce or alter one: approval was
+ * given for exact commands. Without a routing admission the declaration is inert either way.
+ */
+function revisionKeepsApprovedBackends(
+  declared: Record<string, WorkflowBackendConfig> | undefined,
+  approved: Record<string, WorkflowBackendConfig> | undefined,
+): boolean {
+  if (!declared || Object.keys(declared).length === 0 || approved === undefined) return true;
+  return Object.entries(declared).every(([name, config]) => {
+    const approvedConfig = approved[name];
+    if (approvedConfig === undefined) return false;
+    const left = canonicalStrictJson(config);
+    return left !== undefined && left === canonicalStrictJson(approvedConfig);
+  });
 }
 
 function runReason(status: RunStatus, error: WorkflowError | undefined): string | undefined {
@@ -2779,6 +2813,7 @@ export class WorkflowManager extends EventEmitter {
       // in workflow run storage — protect via directory permissions, not blanking.
       script: managed.script,
       ...(managed.scriptOrigin ? { scriptOrigin: managed.scriptOrigin } : {}),
+      ...(managed.scriptRevisions ? { scriptRevisions: managed.scriptRevisions } : {}),
       args: managed.args,
       argsUnreplayable: managed.argsUnreplayable,
       // The per-run working directory, so resume() re-runs in the SAME place.
@@ -3240,10 +3275,31 @@ export class WorkflowManager extends EventEmitter {
       };
     }
 
+    // A revised script (the run's editable file changed since admission) continues through an
+    // identity-matched replay of this run's own terminal state: unchanged calls replay, changed
+    // calls and everything the revision reorders run live. Structure and backend approval are
+    // checked before anything is persisted for the new generation.
+    const revision = exec.script !== undefined && exec.script !== persisted.script ? exec.script : undefined;
+    let revisionMeta: WorkflowMeta | undefined;
+    if (revision !== undefined) {
+      try {
+        revisionMeta = parseWorkflowScript(revision).meta;
+      } catch {
+        this.persistence.releaseRunLease(lease);
+        publication.lease = undefined;
+        return { accepted: false, reason: "script-invalid" };
+      }
+      if (!revisionKeepsApprovedBackends(revisionMeta.backends, persisted.admission?.scriptBackends)) {
+        this.persistence.releaseRunLease(lease);
+        publication.lease = undefined;
+        return { accepted: false, reason: "backends-changed" };
+      }
+    }
+
     const controller = new AbortController();
     let meta: WorkflowMeta | undefined;
     try {
-      meta = parseWorkflowScript(persisted.script).meta;
+      meta = revision !== undefined ? revisionMeta : parseWorkflowScript(persisted.script).meta;
     } catch {
       // A previously-valid script that no longer parses still resumes by journal;
       // the snapshot name carries the run identity.
@@ -3278,8 +3334,9 @@ export class WorkflowManager extends EventEmitter {
       },
       controller,
       startedAt: new Date(persisted.startedAt),
-      script: persisted.script,
+      script: revision ?? persisted.script,
       ...(persisted.scriptOrigin ? { scriptOrigin: persisted.scriptOrigin } : {}),
+      ...(persisted.scriptRevisions ? { scriptRevisions: persisted.scriptRevisions } : {}),
       args: capturedArgs.ok ? capturedArgs.clone : persisted.args,
       argsSnapshotOk: capturedArgs.ok,
       ...(persisted.argsUnreplayable || !capturedArgs.ok ? { argsUnreplayable: true as const } : {}),
@@ -3320,9 +3377,33 @@ export class WorkflowManager extends EventEmitter {
       eventLogIncomplete: publication.eventLogIncomplete,
     };
     managed.preparedContinuation = this.buildPreparedContinuation(persisted);
+    const generation = (persisted.continuation?.generation ?? 0) + 1;
+
+    let revisedExecution: ManagerResumeExecution | undefined;
+    if (revision !== undefined) {
+      // The new generation starts with an empty journal and manifest; the identity seed built
+      // from this run's own terminal state supplies every replayable call, and a durable
+      // checkpoint reply reaches its call through that seed instead of a synthetic journal row.
+      managed.journal = [];
+      managed.calls = [];
+      managed.scriptRevisions = [
+        ...(persisted.scriptRevisions ?? []),
+        { generation, scriptHash: hashScriptText(revision), revisedAt: new Date().toISOString() },
+      ];
+      try {
+        revisedExecution = this.prepareManagedResume(managed, persisted, {
+          resumePolicy: "auto",
+          ...(exec.checkpointReplies === undefined ? {} : { checkpointReplies: exec.checkpointReplies }),
+        });
+      } catch (error) {
+        this.persistence.releaseRunLease(lease);
+        publication.lease = undefined;
+        throw error;
+      }
+    }
 
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
-    if (checkpointReplies.accepted) {
+    if (checkpointReplies.accepted && revision === undefined) {
       const syntheticEntry = checkpointReplies.accepted;
       resumeJournal.set(syntheticEntry.index, syntheticEntry);
       // Cached entries are replayed without firing onAgentJournal, so seed and persist this
@@ -3348,11 +3429,12 @@ export class WorkflowManager extends EventEmitter {
       managed.calls.push(answeredCall);
     }
     const continuation: WorkflowContinuationResult = deepFreeze({
-      generation: (persisted.continuation?.generation ?? 0) + 1,
+      generation,
       replayedPrefix: contiguousJournalPrefix(managed.journal, runId),
       ...(checkpointReplies.resolutions.length === 0
         ? {}
         : { resolvedCheckpoints: checkpointReplies.resolutions }),
+      ...(revision === undefined ? {} : { scriptRevised: true as const }),
     });
     managed.continuation = continuation;
     try {
@@ -3371,7 +3453,7 @@ export class WorkflowManager extends EventEmitter {
     // Run in the background; executeRun records status/errors on the managed run.
     // Preserve the original promise for callers while preventing an ignored resume
     // from becoming an unhandled rejection.
-    const promise = this.executeRun(managed, persisted.script, {
+    const promise = this.executeRun(managed, managed.script, {
       agent: exec.agent,
       maxAgents: managed.limits?.maxAgents,
       concurrency: managed.limits?.concurrency,
@@ -3382,13 +3464,13 @@ export class WorkflowManager extends EventEmitter {
       confirm: exec.confirm,
       onNestedWorkflow: exec.onNestedWorkflow,
       onMissingAgentConfiguration: exec.onMissingAgentConfiguration,
-      resumeJournal,
-    }, checkpointReplies.accepted
+      ...(revisedExecution ? {} : { resumeJournal }),
+    }, revisedExecution ?? (checkpointReplies.accepted
       ? {
           resumeJournal,
           injectedCheckpointReplies: new Set([checkpointReplies.accepted.index]),
         }
-      : { resumeJournal });
+      : { resumeJournal }));
     promise.catch(() => {});
     return { accepted: true, runId, continuation, promise };
   }

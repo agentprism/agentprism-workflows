@@ -47,9 +47,10 @@ From an ask like that, the agent picks the primitives — `gate()` fix-loops wit
 ### Durable runs — same-ID continuation
 
 Scripts run in a deterministic realm and every `agent()` and `checkpoint()` result is journaled.
-MCP `{ action:"resume", runId }` continues that exact run ID with its persisted script, args,
-immutable routing inputs, journal, event stream, cumulative usage, and durable
-checkpoint decisions. It never creates a child execution or accepts edited script/args replay.
+MCP `{ action:"resume", runId }` continues that exact run ID with its args, immutable routing
+inputs, journal, event stream, cumulative usage, and durable checkpoint decisions. The script is
+re-read from the run's file: an edited file continues as a validated revision whose unchanged calls
+replay and whose edited calls run live. It never creates a child execution or accepts args replay.
 Exact journal hits rebuild state without current provider usage. Provider quota and authentication
 walls pause the run; an eligible interrupted ACP call can reattach to the recorded session and
 charge only new usage.
@@ -503,8 +504,8 @@ return { applied: true, implementation };
 
 After the pause, send `{ "action":"resume", "runId":"…", "checkpointReplies":{ "1":true } }`
 using the exact call index from `checkpointContext`. The response retains the same run ID. Its
-script, args, immutable routing inputs, journal, event stream, and cumulative usage remain
-attached to that identity. The first strict-JSON checkpoint answer is durable before continuation;
+args, immutable routing inputs, journal, event stream, and cumulative usage remain attached to
+that identity, and the script file is re-read (an edit continues as a validated revision). The first strict-JSON checkpoint answer is durable before continuation;
 identical repeats are idempotent and later conflicts cannot replace it.
 
 Retain every returned `runId`. Before guessing why a run paused or failed, read its safe status,
