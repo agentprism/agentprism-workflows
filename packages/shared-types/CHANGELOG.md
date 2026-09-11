@@ -1,5 +1,12 @@
 # @automatalabs/shared-types
 
+## 2.2.0
+
+### Minor Changes
+
+- fef6ac6: Stopped runs resume, and a `pause` action drains executing work before pausing. A stopped (`aborted`) run is no longer terminal for continuation: `resume` replays its journal and re-runs the interrupted calls. `WorkflowManager.pause(runId)` now requests a pause instead of interrupting: agent calls already executing finish and journal, nothing new is admitted, queued calls settle as interrupted rows, and the run pauses with `reason: "requested"` (new `WorkflowErrorCode.PAUSE_REQUESTED` and `paused` event reason). The MCP `workflow` tool gains `action: "pause"`, routed to the live execution owner like agent cancellation, answering `pauseRequested`/`paused` after a bounded wait for executing agents.
+- fef6ac6: Resume re-reads the run's script file and continues an edited script as a validated revision. `ExecOptions.script` on a same-run continuation with text that differs from the persisted script parses the revision, refuses backends the admission never approved (`backends-changed`) or text that does not parse (`script-invalid`), and continues through an identity-matched replay of the run's own journal: unchanged calls replay, edited or new calls run live. The persisted record adopts the revised text, records `scriptRevisions`, and marks the generation with `continuation.scriptRevised`. The MCP `resume` action reads the run's `file://` script back, validates a changed file exactly like a new run, and reports refusals as tool execution errors that change nothing; MCP inspection no longer projects the engine's `replayEligibility` diagnostic.
+
 ## 2.1.0
 
 ### Minor Changes
