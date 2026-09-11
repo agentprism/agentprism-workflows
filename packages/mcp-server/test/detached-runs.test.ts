@@ -1,4 +1,4 @@
-import { waitForRun, runAndObserve } from "./_harness.js";
+import { scriptFileUri, waitForRun, runAndObserve } from "./_harness.js";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -100,7 +100,8 @@ test("run acknowledges an admitted run and status is an immediate cumulative sna
     assert.equal(ack.status, "running");
     assert.equal(ack.result, undefined);
     assert.equal(ack.scriptSource, "inline");
-    assert.equal(ack.scriptUri, `workflow://runs/${acceptedRunId}/script`);
+    assert.equal(ack.scriptUri, scriptFileUri(acceptedRunId));
+    assert.equal(typeof ack.scriptPath, "string", "the editable script path accompanies its file URI");
     assert.equal(ack.eventsUri, `workflow://runs/${acceptedRunId}/events`);
     assert.deepEqual(ack.limits, EXPECTED_LIMITS);
     await waitUntil(() => controlled.calls.length === 1, "the first agent starts in the background");

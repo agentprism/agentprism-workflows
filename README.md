@@ -403,7 +403,7 @@ including those waiting for setup.
 
 Status is an immediate observation with setup, pending permissions, bounded call/activity/log tails,
 and terminal `outcome`. Use the App or events resource for continuous progress. Completed status
-links the exact `/result` separately from `/script` and `/events`. JSON up to 4,096 UTF-8 bytes is
+links the exact `/result` separately from the script file and `/events`. JSON up to 4,096 UTF-8 bytes is
 also rendered in text; larger values are retrieved by resource read or bounded `action:"result"`
 pages. Failed/aborted status remains a successful read.
 

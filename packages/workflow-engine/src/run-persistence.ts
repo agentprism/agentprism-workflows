@@ -4,7 +4,9 @@
 
 import {
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -144,10 +146,19 @@ export interface PersistedRunLineageTombstone {
   deletedAt: string;
 }
 
+/**
+ * Where a run's script came from and where its editable working copy lives. An inline script
+ * is copied into the run store (`<runsDir>/<runId>.script.js`); a path script stays at the
+ * caller's absolute path. `scriptLocation` resolves either to the one file a host may edit.
+ */
+export type WorkflowScriptOrigin = { kind: "inline" } | { kind: "path"; path: string };
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
   script: string;
+  /** Recorded at admission; absent on runs created before script origins were tracked. */
+  scriptOrigin?: WorkflowScriptOrigin;
   args?: unknown;
   /** The persisted args value was not a faithful pre-execution strict-JSON snapshot. */
   argsUnreplayable?: true;
@@ -271,6 +282,21 @@ export interface RunPersistence {
   validateRunLease?(lease: RunLease): boolean;
   /** Get runs directory path. */
   getRunsDir(): string;
+  /**
+   * Absolute path of the editable script file for runId: the recorded path origin, or the store's
+   * inline copy (also for records without a recorded origin, so a read fails clearly instead of
+   * guessing). Undefined when the run is unknown.
+   */
+  scriptLocation?(runId: string): string | undefined;
+  /** Write (or rewrite) the store's inline copy of an admitted script; atomic per file. */
+  writeInlineScript?(runId: string, script: string): void;
+  /** Remove the store's inline copy (best-effort), for an admission that failed after the copy was written. */
+  discardInlineScript?(runId: string): void;
+  /**
+   * Read the current text at the run's script location. Bounded to 1 MiB and regular files;
+   * a missing, oversized, or non-regular file fails with PERSISTENCE_ERROR.
+   */
+  readScript?(runId: string): string;
 }
 
 export interface RunLease {
@@ -326,6 +352,44 @@ export interface RunPersistenceOptions {
   leaseOwnerId?: string;
 }
 
+const MAX_SCRIPT_FILE_BYTES = 1_048_576;
+
+/** The store's inline copy of a run's script, next to its persisted record. */
+export function inlineScriptFile(runsDir: string, runId: string): string {
+  return join(runsDir, `${runId}.script.js`);
+}
+
+/**
+ * Read a script file through one descriptor: open non-blocking so a FIFO or device can never
+ * hang the reader, check the descriptor itself, then read it. Uses the real filesystem — the
+ * script location is the host's file, not a store record.
+ */
+export function readBoundedScriptFile(location: string, runId: string): string {
+  const fail = (detail: string): never => {
+    throw new WorkflowError(
+      `script for run ${runId} is unavailable at ${location}: ${detail}`,
+      WorkflowErrorCode.PERSISTENCE_ERROR,
+      { recoverable: false },
+    );
+  };
+  let descriptor: number;
+  try {
+    descriptor = openSync(location, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+  try {
+    const stat = fstatSync(descriptor);
+    if (!stat.isFile()) return fail("not a regular file");
+    if (stat.size > MAX_SCRIPT_FILE_BYTES) return fail(`exceeds ${MAX_SCRIPT_FILE_BYTES} bytes`);
+    const script = readFileSync(descriptor, "utf8");
+    if (Buffer.byteLength(script, "utf8") > MAX_SCRIPT_FILE_BYTES) return fail(`exceeds ${MAX_SCRIPT_FILE_BYTES} bytes`);
+    return script;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 export function createRunPersistence(
   cwd: string,
   fsOverride?: Partial<FsLayer>,
@@ -370,6 +434,7 @@ export function createRunPersistence(
   const legacyRunPath = (runId: string) => runPath(legacyRunsDir, runId);
   const lockPath = (dir: string, runId: string) => join(dir, `${runId}.lock`);
   const lineagePath = (dir: string, runId: string) => join(dir, `${runId}.lineage`);
+  const inlineScriptPath = (runId: string) => inlineScriptFile(runsDir, runId);
   const primaryLockPath = (runId: string) => lockPath(runsDir, runId);
   const legacyLockPath = (runId: string) => lockPath(legacyRunsDir, runId);
   const primaryLineagePath = (runId: string) => lineagePath(runsDir, runId);
@@ -521,6 +586,11 @@ export function createRunPersistence(
           _renameSync(`${path}.tmp`, path);
           wroteTombstone = true;
         }
+        try {
+          _unlinkSync(inlineScriptPath(runId));
+        } catch {
+          // No inline copy (a path run, or an older record): nothing to remove.
+        }
         for (const path of candidateRunPaths(runId)) {
           try {
             if (_existsSync(path)) {
@@ -662,6 +732,35 @@ export function createRunPersistence(
       return validLockOwner(existing, lease.runId, primaryRunPath(lease.runId)) &&
         existing.token === lease.token &&
         (lease.ownerId === undefined || existing.ownerId === lease.ownerId);
+    },
+
+    scriptLocation(runId: string): string | undefined {
+      const state = loadState(runId);
+      if (!state) return undefined;
+      return state.scriptOrigin?.kind === "path" ? state.scriptOrigin.path : inlineScriptPath(runId);
+    },
+
+    discardInlineScript(runId: string): void {
+      try {
+        _unlinkSync(inlineScriptPath(runId));
+      } catch {
+        // Nothing to discard.
+      }
+    },
+
+    writeInlineScript(runId: string, script: string): void {
+      ensureDir();
+      const path = inlineScriptPath(runId);
+      _writeFileSync(`${path}.tmp`, script);
+      _renameSync(`${path}.tmp`, path);
+    },
+
+    readScript(runId: string): string {
+      const location = this.scriptLocation!(runId);
+      if (location === undefined) {
+        throw new WorkflowError(`run ${runId} is unknown`, WorkflowErrorCode.PERSISTENCE_ERROR, { recoverable: false });
+      }
+      return readBoundedScriptFile(location, runId);
     },
 
     getRunsDir(): string {

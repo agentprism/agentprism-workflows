@@ -99,7 +99,6 @@ import {
   RESULT_RESOURCE_MIME_TYPE,
   WorkflowScriptResources,
   workflowResultUri,
-  workflowScriptUri,
 } from "./workflow-resources.js";
 import { requireDurableStoppedRun } from "./workflow-stop.js";
 import {
@@ -490,6 +489,7 @@ function persistedOutcome(
   persisted: PersistedRunState,
   status: WorkflowRunStatus,
   eventsUri: string | undefined,
+  scriptUri: string,
 ): WorkflowExecutionOutcome {
   if (status.status === "pending" || status.status === "running") {
     throw new TypeError(`Terminal workflow outcome cannot have status ${status.status}`);
@@ -506,7 +506,7 @@ function persistedOutcome(
     checkpointContext: persisted.checkpointContext,
     ...(persisted.fallbacks === undefined ? {} : { fallbacks: persisted.fallbacks }),
     ...(persisted.checkpointsTaken === undefined ? {} : { checkpointsTaken: persisted.checkpointsTaken }),
-    scriptUri: workflowScriptUri(persisted.runId),
+    scriptUri,
     ...(eventsUri === undefined ? {} : { eventsUri }),
     ...(status.status === "completed" && persisted.result !== undefined
       ? { resultUri: workflowResultUri(persisted.runId) }
@@ -528,17 +528,17 @@ function terminalOutcome(
   const eventsUri = resources.availableEventsUri(runId);
   if (live?.status === status.status) {
     return toWorkflowExecutionOutcome(live, {
-      scriptUri: workflowScriptUri(runId),
+      scriptUri: resources.scriptUri(runId),
       ...(resultUri === undefined ? {} : { resultUri }),
       ...(eventsUri === undefined ? {} : { eventsUri }),
     });
   }
-  if (persisted?.status === status.status) return persistedOutcome(persisted, status, eventsUri);
+  if (persisted?.status === status.status) return persistedOutcome(persisted, status, eventsUri, resources.scriptUri(runId));
   // Another process can settle or continue the run between synchronous reads. Keep
   // the inspected status and its bounded facts; the next poll supplies newer details.
   if (status.status === "pending" || status.status === "running") return undefined;
   return {
-    runId, status: status.status, scriptUri: workflowScriptUri(runId),
+    runId, status: status.status, scriptUri: resources.scriptUri(runId),
     ...(eventsUri === undefined ? {} : { eventsUri }),
     ...(status.limits === undefined ? {} : { limits: status.limits }),
     logTail: status.logTail,
@@ -1160,7 +1160,7 @@ export function createWorkflowServer(
         const projected = addInspectionResourceFields(
           status,
           {
-            scriptUri: workflowScriptUri(parsedInput.runId),
+            scriptUri: scriptResources.scriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId, status.status),
             ...latestActivityFields(scriptResources, parsedInput.runId, status),
             pendingPermissions,
@@ -1257,7 +1257,7 @@ export function createWorkflowServer(
           const projected = addInspectionResourceFields(
             status,
             {
-              scriptUri: workflowScriptUri(parsedInput.runId),
+              scriptUri: scriptResources.scriptUri(parsedInput.runId),
               ...resultResourceFields(scriptResources, parsedInput.runId, status.status),
               ...latestActivityFields(scriptResources, parsedInput.runId, status),
               ...(cancellationOutcome === undefined ? {} : { outcome: cancellationOutcome }),
@@ -1308,7 +1308,7 @@ export function createWorkflowServer(
                 const projected = addInspectionResourceFields(
                   pendingStatus,
                   {
-                    scriptUri: workflowScriptUri(parsedInput.runId),
+                    scriptUri: scriptResources.scriptUri(parsedInput.runId),
                     ...resultResourceFields(scriptResources, parsedInput.runId, pendingStatus.status),
                     ...latestActivityFields(scriptResources, parsedInput.runId, pendingStatus),
                     stopped: false as const,
@@ -1393,7 +1393,7 @@ export function createWorkflowServer(
         const projected = addInspectionResourceFields(
           status,
           {
-            scriptUri: workflowScriptUri(parsedInput.runId),
+            scriptUri: scriptResources.scriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId, status.status),
             ...latestActivityFields(scriptResources, parsedInput.runId, status),
             stopped,
@@ -1471,7 +1471,7 @@ export function createWorkflowServer(
             ...(tokenUsage === undefined ? {} : { tokenUsage }),
             pendingPermissions,
             setup: workflowSetup(manager.getPersistence().load(parsedInput.runId)),
-            scriptUri: workflowScriptUri(parsedInput.runId),
+            scriptUri: scriptResources.scriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId, status.status),
             ...latestActivityFields(scriptResources, parsedInput.runId, status),
           },
@@ -1508,7 +1508,7 @@ export function createWorkflowServer(
         const state = manager.getPersistence().load(parsedInput.runId)!;
         return {
           structuredContent: { action: "setup-response", runId: parsedInput.runId, setupId: parsedInput.setupId,
-            status: state.status, scriptUri: workflowScriptUri(parsedInput.runId),
+            status: state.status, scriptUri: scriptResources.scriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId, state.status), setup: workflowSetup(state) },
           content: [{ type: "text", text: `Setup response recorded for workflow run ${parsedInput.runId}.` }],
           isError: false,
@@ -1534,7 +1534,7 @@ export function createWorkflowServer(
             if (!status) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No workflow run found for ${input.runId}`);
             const outcome = isTerminalStatus(status.status) ? terminalOutcome(manager, scriptResources, input.runId, status) : undefined;
             const projected = addInspectionResourceFields(status, {
-              scriptUri: workflowScriptUri(input.runId), ...resultResourceFields(scriptResources, input.runId, status.status),
+              scriptUri: scriptResources.scriptUri(input.runId), ...resultResourceFields(scriptResources, input.runId, status.status),
               setup: workflowSetup(manager.getPersistence().load(input.runId)),
               ...(outcome === undefined ? {} : { outcome }),
             }, inspectionRetentionMetadata(manager, input.runId, status));
@@ -1551,7 +1551,8 @@ export function createWorkflowServer(
           const state = manager.getPersistence().load(input.runId)!;
           return { structuredContent: { action: "resume", accepted: true, runId: input.runId,
               continuation: started.continuation,
-              status: state.status, scriptSource: "stored", scriptUri: workflowScriptUri(input.runId),
+              status: state.status, scriptSource: "stored", scriptUri: scriptResources.scriptUri(input.runId),
+              scriptPath: scriptResources.scriptPath(input.runId),
               eventsUri: scriptResources.availableEventsUri(input.runId), limits: state.limits },
             content: [{ type: "text", text: `Continuation accepted for workflow run ${input.runId}. Use status to inspect it; use result after completion.` },
               ...scriptContentBlocks(scriptResources, input.runId), ...eventsContentBlocks(scriptResources, input.runId)], isError: false };
@@ -1588,7 +1589,8 @@ export function createWorkflowServer(
       return {
         structuredContent: { action: "run", accepted: true, runId: outcome.runId,
           status: state.status, scriptSource: parsedInput.script === undefined ? "path" : "inline",
-          scriptUri: workflowScriptUri(outcome.runId), eventsUri: scriptResources.availableEventsUri(outcome.runId),
+          scriptUri: scriptResources.scriptUri(outcome.runId), scriptPath: scriptResources.scriptPath(outcome.runId),
+          eventsUri: scriptResources.availableEventsUri(outcome.runId),
           limits: state.limits, setup: workflowSetup(state) },
         content: [{ type: "text", text: summary },
           ...scriptContentBlocks(scriptResources, outcome.runId), ...eventsContentBlocks(scriptResources, outcome.runId)],
@@ -1619,7 +1621,7 @@ export function createWorkflowServer(
       if (context) workflowLifecycle(context, runner).recover(runId);
       const state = context?.manager.getPersistence().load(runId);
       if (!state) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No accepted workflow run found for ${runId}`);
-      return { runId, status: state.status, scriptUri: workflowScriptUri(runId), eventsUri: scriptResources.availableEventsUri(runId) };
+      return { runId, status: state.status, scriptUri: scriptResources.scriptUri(runId), eventsUri: scriptResources.availableEventsUri(runId) };
     },
     notification: (request) => {
       if (!projects.storeFor(request.runId)) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No workflow run found for ${request.runId}`);

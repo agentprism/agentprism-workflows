@@ -42,6 +42,7 @@ import type {
 } from "@automatalabs/shared-types";
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
 import { preview, recomputeWorkflowSnapshot, type WorkflowSnapshot } from "./display.js";
+import { isAbsolute } from "node:path";
 import { errorMessage, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { captureRunEnvironment, type RunEnvironmentIdentity } from "./run-environment.js";
 import { isRunEnvironmentIdentity } from "./resume-identity.js";
@@ -55,6 +56,7 @@ import {
   type RunLease,
   type RunPersistence,
   type RunStatus,
+  type WorkflowScriptOrigin,
 } from "./run-persistence.js";
 import {
   admitResumeSource,
@@ -112,6 +114,7 @@ export interface ManagedRun {
   startedAt: Date;
   /** The real script, kept so the run can be resumed. */
   script: string;
+  scriptOrigin?: WorkflowScriptOrigin;
   args?: unknown;
   /** True when managed.args is a faithful strict-JSON pre-execution snapshot. */
   argsSnapshotOk: boolean;
@@ -287,6 +290,8 @@ interface RegisteredAgentAttempt extends WorkflowAgentAttemptControl {
 export interface ExecOptions {
   /** Caller-minted run id. Collision checks happen under the run lease. */
   runId?: string;
+  /** Where the script came from; an inline origin gets a working copy in the run store. */
+  scriptOrigin?: WorkflowScriptOrigin;
   /** Marks this run as an isolation execution from its initial save onward. */
   executionMode?: PersistedRunState["executionMode"];
   /** Non-git environment label reported in replay provenance diagnostics only. */
@@ -826,6 +831,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private validateNewRunOptions(exec: ExecOptions, journaling: boolean): void {
+    validateScriptOrigin(exec.scriptOrigin);
     const hasSource = exec.resumeFromRunId !== undefined;
     if (hasSource && (typeof exec.resumeFromRunId !== "string" || exec.resumeFromRunId.length === 0)) {
       throw this.scriptValidationError("resumeFromRunId must be a non-empty string");
@@ -1406,6 +1412,7 @@ export class WorkflowManager extends EventEmitter {
         managed.calls = latestRows(exec.resumeCalls);
       }
       this.runs.set(managed.runId, managed);
+      this.writeInlineScriptCopy(managed);
       if (managed.journaling && (source || managed.admission || exec.resumeJournal)) {
         this.persistRunOrThrow(managed);
       } else {
@@ -1413,6 +1420,7 @@ export class WorkflowManager extends EventEmitter {
       }
       return { managed, resumeExecution };
     } catch (error) {
+      if (identity) this.persistence.discardInlineScript?.(identity.runId);
       if (identity) this.persistence.releaseRunLease(identity.lease);
       if (identity) this.runs.delete(identity.runId);
       throw error;
@@ -1456,10 +1464,12 @@ export class WorkflowManager extends EventEmitter {
       managed.preparation = preparation;
       managed.preparationRevision = 0;
       managed.setupResponses = mergeWorkflowSetupResponses(undefined, preparation.responses);
+      this.writeInlineScriptCopy(managed);
       this.persistRunOrThrow(managed);
       this.runs.set(runId, managed);
       return { runId };
     } catch (error) {
+      this.persistence.discardInlineScript?.(runId);
       this.persistence.releaseRunLease(lease);
       this.runs.delete(runId);
       throw error;
@@ -1491,6 +1501,7 @@ export class WorkflowManager extends EventEmitter {
       const preparation = captureWorkflowPreparation(persisted.preparation);
       const managed = this.createManaged(persisted.script, persisted.args, true, {
         cwd: persisted.cwd,
+        scriptOrigin: persisted.scriptOrigin,
         maxAgents: persisted.limits?.maxAgents,
         concurrency: persisted.limits?.concurrency,
         agentRetries: persisted.limits?.agentRetries,
@@ -1757,6 +1768,9 @@ export class WorkflowManager extends EventEmitter {
       controller: new AbortController(),
       startedAt,
       script,
+      // Every journaled run keeps an editable working copy of its script in the run store unless
+      // the caller recorded the script's own path as its origin.
+      ...(exec.scriptOrigin ? { scriptOrigin: exec.scriptOrigin } : journaling ? { scriptOrigin: { kind: "inline" as const } } : {}),
       args: capturedArgs.ok ? capturedArgs.clone : args,
       argsSnapshotOk: capturedArgs.ok,
       ...(!capturedArgs.ok ? { argsUnreplayable: true as const } : {}),
@@ -1792,6 +1806,23 @@ export class WorkflowManager extends EventEmitter {
       lease: identity.lease,
       ...(journaling ? { eventStreamId: generateEventStreamId(), eventSeq: 0 } : {}),
     };
+  }
+
+  /**
+   * Materialize the store's working copy of an inline script before the run record is saved, so
+   * a persisted run always has its editable file; a failed copy fails the admission.
+   */
+  private writeInlineScriptCopy(managed: ManagedRun): void {
+    if (managed.scriptOrigin?.kind !== "inline" || !managed.journaling) return;
+    try {
+      this.persistence.writeInlineScript?.(managed.runId, managed.script);
+    } catch (error) {
+      throw new WorkflowError(
+        `failed to write the script copy for ${managed.runId}: ${errorMessage(error)}`,
+        WorkflowErrorCode.PERSISTENCE_ERROR,
+        { recoverable: false },
+      );
+    }
   }
 
   private resolveJournaling(exec: ExecOptions): boolean {
@@ -2732,6 +2763,7 @@ export class WorkflowManager extends EventEmitter {
       // Persist the real script + journal so the run can be resumed. Runs live
       // in workflow run storage — protect via directory permissions, not blanking.
       script: managed.script,
+      ...(managed.scriptOrigin ? { scriptOrigin: managed.scriptOrigin } : {}),
       args: managed.args,
       argsUnreplayable: managed.argsUnreplayable,
       // The per-run working directory, so resume() re-runs in the SAME place.
@@ -3235,6 +3267,7 @@ export class WorkflowManager extends EventEmitter {
       controller,
       startedAt: new Date(persisted.startedAt),
       script: persisted.script,
+      ...(persisted.scriptOrigin ? { scriptOrigin: persisted.scriptOrigin } : {}),
       args: capturedArgs.ok ? capturedArgs.clone : persisted.args,
       argsSnapshotOk: capturedArgs.ok,
       ...(persisted.argsUnreplayable || !capturedArgs.ok ? { argsUnreplayable: true as const } : {}),
@@ -3727,6 +3760,23 @@ export class WorkflowManager extends EventEmitter {
    */
   getPersistence(): RunEventPersistence {
     return this.persistence;
+  }
+}
+
+function validateScriptOrigin(origin: WorkflowScriptOrigin | undefined): void {
+  if (origin === undefined) return;
+  const invalid = () => new WorkflowError(
+    'scriptOrigin must be { kind: "inline" } or { kind: "path", path: <absolute path> }',
+    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    { recoverable: false },
+  );
+  if (origin === null || typeof origin !== "object") throw invalid();
+  if (origin.kind === "inline") {
+    if (Object.keys(origin).length !== 1) throw invalid();
+    return;
+  }
+  if (origin.kind !== "path" || typeof origin.path !== "string" || !isAbsolute(origin.path) || Object.keys(origin).length !== 2) {
+    throw invalid();
   }
 }
 

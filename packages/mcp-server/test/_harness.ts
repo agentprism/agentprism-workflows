@@ -13,12 +13,14 @@ import { Client } from "@modelcontextprotocol/client";
 //   - HOME isolation so WorkflowManager run persistence (which lives under
 //     ~/.agentprism/workflows/projects/<key>/runs, see workflow-paths.ts) writes into
 //     a throwaway temp dir instead of the developer's real home.
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "../src/mcp-apps.js";
 import type { AgentRunner, RunOptions } from "@automatalabs/shared-types";
+import type { PersistedRunState, RunPersistence } from "@automatalabs/workflows";
 
 import { createWorkflowServer } from "../src/index.js";
 import type { WorkflowPermissionBroker } from "../src/workflow-permissions.js";
@@ -199,6 +201,45 @@ export async function runAndObserve(client: Pick<Client, "callTool">, input: Rec
   assert.equal(accepted.isError, false, textOf(accepted));
   assert.equal(structured(accepted)?.accepted, true, "run must acknowledge asynchronous acceptance");
   return await waitForRun(client, String(structured(accepted)?.runId));
+}
+
+/** The `file://` URI of an inline run's store script copy (next to its persisted record). */
+export function scriptFileUri(runId: string): string {
+  const record = persistedRunFile(runId);
+  assert.ok(record, `no persisted record for ${runId}`);
+  return pathToFileURL(record.replace(/\.json$/, ".script.js")).href;
+}
+
+/**
+ * Script-file seams for an in-memory test store. The MCP server requires every admitted run to
+ * have a script file, so a memory persistence keeps its inline copies as real files under `dir`
+ * (the store's own layout is irrelevant to the server; only the recorded location matters).
+ */
+export function inlineScriptSeams(
+  dir: string,
+  load: (runId: string) => PersistedRunState | null,
+): Required<Pick<RunPersistence, "scriptLocation" | "writeInlineScript" | "discardInlineScript" | "readScript">> {
+  const inlinePath = (runId: string) => join(dir, `${runId}.script.js`);
+  return {
+    scriptLocation(runId) {
+      const state = load(runId);
+      if (!state) return undefined;
+      return state.scriptOrigin?.kind === "path" ? state.scriptOrigin.path : inlinePath(runId);
+    },
+    writeInlineScript(runId, script) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(`${inlinePath(runId)}.tmp`, script);
+      renameSync(`${inlinePath(runId)}.tmp`, inlinePath(runId));
+    },
+    discardInlineScript(runId) {
+      if (existsSync(inlinePath(runId))) unlinkSync(inlinePath(runId));
+    },
+    readScript(runId) {
+      const location = this.scriptLocation(runId);
+      if (location === undefined) throw new Error(`run ${runId} is unknown`);
+      return readFileSync(location, "utf8");
+    },
+  };
 }
 
 /** Locate one isolated persisted run fixture without exposing a production persistence path. */

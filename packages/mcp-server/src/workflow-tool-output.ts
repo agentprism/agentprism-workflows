@@ -309,9 +309,9 @@ const inspectionRequired = [
 
 const terminalStatuses = ["paused", "completed", "failed", "aborted"] as const;
 const nonterminalStatuses = ["pending", "running"] as const;
-const commonOutputFields = ["runId", "status", "scriptUri", "resultUri", "eventsUri", "limits"] as const;
+const commonOutputFields = ["runId", "status", "scriptUri", "scriptPath", "resultUri", "eventsUri", "limits"] as const;
 const runOutputRequired = ["runId", "status", "scriptUri"] as const;
-const acceptanceFields = ["runId", "status", "scriptUri", "eventsUri", "limits", "action", "accepted", "continuation", "setup", "scriptSource"] as const;
+const acceptanceFields = ["runId", "status", "scriptUri", "scriptPath", "eventsUri", "limits", "action", "accepted", "continuation", "setup", "scriptSource"] as const;
 const executionDetailFields = [
   "result",
   "tokenUsage",
@@ -426,6 +426,7 @@ export const workflowToolOutputShape = z
     ...executionDetailsShape,
     scriptSource: scriptSourceSchema.optional(),
     scriptUri: z.string().optional(),
+    scriptPath: z.string().optional(),
     resultUri: z.string().optional(),
     eventsUri: z.string().optional(),
     workflowName: runStatusShape.workflowName.optional(),
@@ -633,7 +634,10 @@ export interface WorkflowScriptResourceFields {
 
 export interface WorkflowExecutionScriptResourceFields {
   scriptSource: WorkflowScriptSource;
+  /** `file://` URI of the run's editable script: the store copy of an inline script, or the caller's scriptPath. */
   scriptUri: string;
+  /** Absolute path behind scriptUri. */
+  scriptPath?: string;
   eventsUri: string;
 }
 

@@ -304,7 +304,7 @@ test("the full MCP feature surface works through the shim: prompts, resources, d
   assert.equal((exact.structuredContent as { chunk: string }).chunk, '"alpha"');
 
   // Resources: the admitted script is listed and readable verbatim.
-  const scriptUri = `workflow://runs/${runId}/script`;
+  const scriptUri = String((answered.structuredContent as { scriptUri: string }).scriptUri);
   const listed = await session.client.listResources();
   assert.ok(listed.resources.some((resource) => resource.uri === scriptUri));
   const read = await session.client.readResource({ uri: scriptUri });

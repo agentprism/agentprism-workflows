@@ -1,4 +1,4 @@
-import { runAndObserve, waitForRun } from "./_harness.js";
+import { runAndObserve, scriptFileUri, waitForRun } from "./_harness.js";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -60,7 +60,7 @@ test("completed status exposes a distinct durable result resource to content-fir
   try {
     const completed = await runAndObserve(client, { action: "run", script });
     const runId = String(structured(completed)?.runId);
-    const scriptUri = `workflow://runs/${runId}/script`;
+    const scriptUri = scriptFileUri(runId);
     const resultUri = `workflow://runs/${runId}/result`;
     const eventsUri = `workflow://runs/${runId}/events`;
 

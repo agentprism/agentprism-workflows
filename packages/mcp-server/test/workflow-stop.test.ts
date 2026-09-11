@@ -1,9 +1,10 @@
-import { runAndObserve, waitForRun } from "./_harness.js";
+import { inlineScriptSeams, runAndObserve, waitForRun } from "./_harness.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import type { RunOptions } from "@automatalabs/shared-types";
 import {
@@ -81,6 +82,7 @@ function faultablePersistence(root: string): {
       if (leases.get(lease.runId) === lease.token) leases.delete(lease.runId);
     },
     getRunsDir: () => root,
+    ...inlineScriptSeams(join(root, "scripts"), (runId) => records.get(runId) ?? null),
   };
   return {
     persistence,
@@ -190,7 +192,7 @@ test("stop durably aborts a asynchronous run, publishes stopped, and retains its
     });
     const runId = runIdOf(accepted);
     assert.deepEqual(links(accepted).map((link) => link.uri), [
-      `workflow://runs/${runId}/script`,
+      pathToFileURL(scriptPath).href,
       `workflow://runs/${runId}/events`,
     ]);
     await waitUntil(() => controlled.calls.length === 1, "the first agent should start");
@@ -209,7 +211,7 @@ test("stop durably aborts a asynchronous run, publishes stopped, and retains its
     assert.match(textOf(stopped), /snapshot is final for run fate/i);
     assert.match(textOf(stopped), /Agent-session cancellation may still be winding down/i);
     assert.deepEqual(links(stopped).map((link) => link.uri), [
-      `workflow://runs/${runId}/script`,
+      pathToFileURL(scriptPath).href,
       `workflow://runs/${runId}/events`,
     ]);
 
@@ -227,7 +229,7 @@ test("stop durably aborts a asynchronous run, publishes stopped, and retains its
         .some((record) => record.event?.type === "stopped"),
       "the durable event log should contain stopped",
     );
-    const resource = await client.readResource({ uri: `workflow://runs/${runId}/script` });
+    const resource = await client.readResource({ uri: pathToFileURL(scriptPath).href });
     assert.equal(resource.contents[0] && "text" in resource.contents[0] ? resource.contents[0].text : undefined, original);
 
     const snapshot = await client.callTool({

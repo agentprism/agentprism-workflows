@@ -82,7 +82,8 @@ test("run scripts are listed and readable as resources over HTTP", async () => {
     const runId = structured(result)?.runId as string;
     assert.ok(runId);
 
-    const uri = `workflow://runs/${runId}/script`;
+    const uri = String(structured(result)?.scriptUri);
+    assert.ok(uri.startsWith("file://"), "the script resource is the run's file");
     const listed = await session.client.listResources();
     assert.ok(
       listed.resources.some((resource) => resource.uri === uri),

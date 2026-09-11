@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import {
   CLIENT_CAPABILITIES_META_KEY,
   CLIENT_INFO_META_KEY,
@@ -565,8 +566,11 @@ return await checkpoint("Continue?", { kind: "confirm" });`;
     await waitForRun(connected.client, runId, (run) => run.status === "completed");
     const exact = await connected.client.callTool({ name: "workflow", arguments: { action: "result", runId } });
     assert.equal(structured(exact)?.chunk, "true");
-    const source = await connected.client.readResource({ uri: `workflow://runs/${runId}/script` });
-    assert.equal((source.contents[0] as { text: string }).text, original);
+    // The resource is the caller's own file, so it shows the edit; the admitted script that ran
+    // is the stored record the continuation used.
+    const source = await connected.client.readResource({ uri: String(structured(accepted)?.scriptUri) });
+    assert.equal(String(structured(accepted)?.scriptUri), pathToFileURL(scriptPath).href);
+    assert.match((source.contents[0] as { text: string }).text, /mutated/);
   } finally {
     await connected.dispose();
     await daemon.close();

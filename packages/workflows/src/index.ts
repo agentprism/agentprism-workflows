@@ -162,6 +162,7 @@ export type {
   RunPersistenceOptions,
   RunLeaseOwner,
   PersistedRunState,
+  WorkflowScriptOrigin,
   PersistedAgentState,
   PersistedResumeFormat,
   PersistedResumeCandidate,

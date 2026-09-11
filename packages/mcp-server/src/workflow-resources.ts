@@ -16,6 +16,8 @@ import {
   truncateUtf8,
 } from "@automatalabs/workflows";
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
+import { basename, dirname } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { singleStoreRouter, type RunStoreRouter } from "./project-registry.js";
 
 import type { WorkflowRunLatestActivity } from "./workflow-tool-output.js";
@@ -26,7 +28,6 @@ export const SCRIPT_RESOURCE_LIST_LIMIT = 50;
 export const EVENTS_RESOURCE_MIME_TYPE = "application/json";
 export const WORKFLOW_RUN_EVENTS_SCHEMA_VERSION = 1 as const;
 
-const SCRIPT_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/script$/;
 const RESULT_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/result$/;
 const EVENTS_URI_PATTERN = /^workflow:\/\/runs\/([a-z0-9]+-[a-z0-9]+)\/events(?:\?([^#]*))?$/;
 const STREAM_ID_PATTERN = /^[0-9a-f]{32}$/;
@@ -36,12 +37,26 @@ function resourceNotFound(uri: string): never {
   throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Workflow resource not found: ${uri}`);
 }
 
-export function workflowScriptUri(runId: string): string {
-  return `workflow://runs/${runId}/script`;
+const INLINE_SCRIPT_SUFFIX = ".script.js";
+
+/** The `file://` URI of a run's editable script: its store copy, or the caller's `scriptPath`. */
+export function workflowScriptFileUri(location: string): string {
+  return pathToFileURL(location).href;
 }
 
-export function workflowRunIdFromScriptUri(uri: string): string | undefined {
-  return SCRIPT_URI_PATTERN.exec(uri)?.[1];
+function scriptFilePath(uri: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "file:") return undefined;
+  try {
+    return fileURLToPath(url);
+  } catch {
+    return undefined;
+  }
 }
 
 export function workflowResultUri(runId: string): string {
@@ -181,6 +196,10 @@ export class WorkflowScriptResources {
   private readonly detachRunDeleted: () => void;
   private readonly detachRunEventPersisted: () => void;
   private readonly subscriptions = new Set<string>();
+  /** Subscribed script file URIs by run, so a deleted run drops its subscription without a lookup. */
+  private readonly scriptSubscriptions = new Map<string, string>();
+  /** Script URIs whose run was deleted while subscribed: unsubscribe stays idempotent for them. */
+  private readonly deletedScriptUris = new Set<string>();
   private readonly externalReaders = new Map<
     string,
     {
@@ -193,7 +212,12 @@ export class WorkflowScriptResources {
   private readonly silentDeletionRunIds = new Set<string>();
 
   private readonly onRunDeleted = ({ runId }: { runId: string }): void => {
-    this.subscriptions.delete(workflowScriptUri(runId));
+    for (const [uri, owner] of [...this.scriptSubscriptions]) {
+      if (owner !== runId) continue;
+      this.scriptSubscriptions.delete(uri);
+      this.subscriptions.delete(uri);
+      this.deletedScriptUris.add(uri);
+    }
     this.subscriptions.delete(workflowResultUri(runId));
     this.closeEventSubscription(workflowRunEventsUri(runId));
     this.deletedRunIds.add(runId);
@@ -457,12 +481,57 @@ export class WorkflowScriptResources {
     return [...latest.values()].sort((left, right) => left.cursor - right.cursor);
   }
 
+  /** Absolute path of the run's editable script file; undefined for an unknown run. */
+  scriptPath(runId: string): string | undefined {
+    return this.persistenceFor(runId)?.scriptLocation?.(runId);
+  }
+
+  /** The `file://` URI of the run's editable script. The run must exist and its store must keep script files. */
+  scriptUri(runId: string): string {
+    const persistence = this.persistenceFor(runId);
+    if (persistence && !persistence.scriptLocation) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InternalError,
+        `The run store for ${runId} keeps no script files; every run served by this server needs one.`,
+      );
+    }
+    const location = persistence?.scriptLocation?.(runId);
+    if (location === undefined) {
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No workflow run found for ${runId}`);
+    }
+    return workflowScriptFileUri(location);
+  }
+
+  /**
+   * Map a script file URI back to the run that owns that location. Only a file a run recorded as
+   * its script is addressable: an inline copy inside a known store, or a run's exact `scriptPath`.
+   * Any other path, including an unowned file inside the store, is not a resource.
+   */
+  private runIdForScriptUri(uri: string): string | undefined {
+    const path = scriptFilePath(uri);
+    if (path === undefined) return undefined;
+    for (const context of this.router.stores()) {
+      const persistence = context.manager.getPersistence();
+      const name = basename(path);
+      if (dirname(path) === persistence.getRunsDir() && name.endsWith(INLINE_SCRIPT_SUFFIX)) {
+        const runId = name.slice(0, -INLINE_SCRIPT_SUFFIX.length);
+        if (persistence.scriptLocation?.(runId) === path) return runId;
+        continue;
+      }
+      for (const state of persistence.list()) {
+        if (state.scriptOrigin?.kind === "path" && state.scriptOrigin.path === path) return state.runId;
+      }
+    }
+    return undefined;
+  }
+
   scriptLink(runId: string): ResourceLink | undefined {
     const state = this.loadState(runId);
-    if (!state) return undefined;
+    const location = this.scriptPath(runId);
+    if (!state || location === undefined) return undefined;
     return {
       type: "resource_link",
-      uri: workflowScriptUri(runId),
+      uri: workflowScriptFileUri(location),
       name: `${state.workflowName} script (${runId})`,
       description: `workflow script · ${state.status} · started ${state.startedAt}`,
       mimeType: SCRIPT_RESOURCE_MIME_TYPE,
@@ -480,29 +549,26 @@ export class WorkflowScriptResources {
   private registerProtocolSurface(): void {
     this.mcp.registerResource(
       "workflow-run-script",
-      new ResourceTemplate("workflow://runs/{runId}/script", {
+      new ResourceTemplate("file://{+path}", {
         list: () => ({
-          resources: this.recentRuns().map((state) => ({
-            uri: workflowScriptUri(state.runId),
-            name: `${state.workflowName} script (${state.runId})`,
-            description: `workflow script · ${state.status} · started ${state.startedAt}`,
-            mimeType: SCRIPT_RESOURCE_MIME_TYPE,
-          })),
+          resources: this.recentRuns().flatMap((state) => {
+            const location = this.scriptPath(state.runId);
+            return location === undefined ? [] : [{
+              uri: workflowScriptFileUri(location),
+              name: `${state.workflowName} script (${state.runId})`,
+              description: `workflow script · ${state.status} · started ${state.startedAt}`,
+              mimeType: SCRIPT_RESOURCE_MIME_TYPE,
+            }];
+          }),
         }),
-        complete: {
-          runId: (partial) =>
-            this.recentRuns()
-              .map((state) => state.runId)
-              .filter((runId) => runId.startsWith(partial)),
-        },
       }),
       {
         title: "Workflow run scripts",
         description:
-          "Immutable admitted workflow scripts. Listing is discovery-only and contains at most the 50 newest runs by startedAt; direct workflow://runs/{runId}/script reads are unbounded.",
+          "Each run's editable script file: the store copy of an inline script, or the caller's scriptPath. Listing is discovery-only and contains at most the 50 newest runs by startedAt; only files a run recorded as its script are readable.",
         mimeType: SCRIPT_RESOURCE_MIME_TYPE,
       },
-      (uri) => this.readResource(uri.toString()),
+      (uri) => this.readScriptResource(uri.toString()),
     );
 
     this.mcp.registerResource(
@@ -575,9 +641,10 @@ export class WorkflowScriptResources {
         if (external.available !== undefined && !external.available(ctx)) resourceNotFound(uri);
         return external.read();
       }
+      if (uri.startsWith("file:")) return this.readScriptResource(uri);
       if (uri.includes("/events")) return this.readEventsResource(uri);
       if (workflowRunIdFromResultUri(uri)) return this.readResultResource(uri);
-      return this.readResource(uri);
+      resourceNotFound(uri);
     });
 
     this.mcp.server.setRequestHandler('resources/subscribe', (request, ctx) => {
@@ -589,10 +656,11 @@ export class WorkflowScriptResources {
         if (external.available !== undefined && !external.available(ctx)) resourceNotFound(uri);
         return {};
       }
-      const runId = workflowRunIdFromScriptUri(uri);
-      if (runId) {
-        if (!this.loadState(runId)) resourceNotFound(uri);
+      if (uri.startsWith("file:")) {
+        const runId = this.runIdForScriptUri(uri);
+        if (!runId) resourceNotFound(uri);
         this.subscriptions.add(uri);
+        this.scriptSubscriptions.set(uri, runId);
         return {};
       }
       const resultRunId = workflowRunIdFromResultUri(uri);
@@ -614,7 +682,13 @@ export class WorkflowScriptResources {
         if (external.available !== undefined && !external.available(ctx)) resourceNotFound(uri);
         return {};
       }
-      const runId = workflowRunIdFromScriptUri(uri) ?? workflowRunIdFromResultUri(uri);
+      if (uri.startsWith("file:")) {
+        if (!this.subscriptions.has(uri) && !this.deletedScriptUris.has(uri) && !this.runIdForScriptUri(uri)) resourceNotFound(uri);
+        this.subscriptions.delete(uri);
+        this.scriptSubscriptions.delete(uri);
+        return {};
+      }
+      const runId = workflowRunIdFromResultUri(uri);
       if (runId) {
         if (
           !this.loadState(runId) &&
@@ -830,19 +904,29 @@ export class WorkflowScriptResources {
     };
   }
 
-  private readResource(uri: string): {
+  /** Serve the current text of a run's script file, never an arbitrary path. */
+  private readScriptResource(uri: string): {
     contents: Array<{ uri: string; mimeType: string; text: string }>;
   } {
-    const runId = workflowRunIdFromScriptUri(uri);
+    const runId = this.runIdForScriptUri(uri);
     if (!runId) resourceNotFound(uri);
-    const state = this.loadState(runId);
-    if (!state) resourceNotFound(uri);
+    const persistence = this.persistenceFor(runId);
+    if (!persistence?.readScript) resourceNotFound(uri);
+    let text: string;
+    try {
+      text = persistence.readScript(runId);
+    } catch (error) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        `Workflow script for ${runId} is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     return {
       contents: [
         {
-          uri: workflowScriptUri(runId),
+          uri: this.scriptUri(runId),
           mimeType: SCRIPT_RESOURCE_MIME_TYPE,
-          text: state.script,
+          text,
         },
       ],
     };

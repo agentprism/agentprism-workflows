@@ -1608,6 +1608,17 @@ function withRunEventsInternal(persistence: RunPersistence, fs: ResolvedEventFs)
     getRunsDir() {
       return persistence.getRunsDir();
     },
+    // Script storage is a capability of the underlying store: the file-backed persistence keeps
+    // an inline script next to its run record, while a store without these seams simply has no
+    // script file, and the manager records only the origin.
+    ...(persistence.scriptLocation ? { scriptLocation: (runId: string) => persistence.scriptLocation!(runId) } : {}),
+    ...(persistence.writeInlineScript
+      ? { writeInlineScript: (runId: string, script: string) => persistence.writeInlineScript!(runId, script) }
+      : {}),
+    ...(persistence.discardInlineScript
+      ? { discardInlineScript: (runId: string) => persistence.discardInlineScript!(runId) }
+      : {}),
+    ...(persistence.readScript ? { readScript: (runId: string) => persistence.readScript!(runId) } : {}),
     appendEvent,
     readEvents,
     watchEvents,

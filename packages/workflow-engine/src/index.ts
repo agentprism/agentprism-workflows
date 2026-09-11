@@ -50,6 +50,7 @@ export {
   type RunLeaseOwner,
   type RunStatus,
   type PersistedRunState,
+  type WorkflowScriptOrigin,
   type PersistedAgentState,
   type PersistedResumeFormat,
   type PersistedResumeCandidate,

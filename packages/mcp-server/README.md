@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-An **[MCP](https://modelcontextprotocol.io) server** for asynchronous execution, bounded status observation, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tools are **`workflow`** for the strict config/run/resume/setup-response/status/result/permissions-response/stop lifecycle and **`repl`** for persistent interactive orchestration. Version-matched guidance for both is published through the SEP-2640 MCP Skills Extension. Apps-capable clients also get the dedicated `workflow_monitor` launcher. App-only `workflow-events`, `workflow-runs`, and `workflow-notifications` tools feed the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enter the model's tool loop. The `workflow` tool discovers its live backend catalog with `action:"config"` and durably accepts each script before slow preparation and validates it before live execution. Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes with `action:"resume"` after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
+An **[MCP](https://modelcontextprotocol.io) server** for asynchronous execution, bounded status observation, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tools are **`workflow`** for the strict config/run/resume/setup-response/status/result/permissions-response/stop lifecycle and **`repl`** for persistent interactive orchestration. Version-matched guidance for both is published through the SEP-2640 MCP Skills Extension. Apps-capable clients also get the dedicated `workflow_monitor` launcher. App-only `workflow-events`, `workflow-runs`, and `workflow-notifications` tools feed the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enter the model's tool loop. The `workflow` tool discovers its live backend catalog with `action:"config"` and durably accepts each script before slow preparation and validates it before live execution. Scripts may be supplied inline or by absolute server-side path, and every admitted run exposes its script file as an MCP `file://` resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes with `action:"resume"` after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
 This package is a **thin MCP adapter**. The `workflow` tool's real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, and resume — lives in **[`@automatalabs/workflows`](../workflows)**; the `repl` tool's real work — the persistent QuickJS-in-WASM VM, the subagent broker, the CDP-style previewer, and the enveloped-snapshot store — lives in **[`@automatalabs/repl-engine`](../repl-engine)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool over a per-project `WorkflowManager` and the `repl` tool over a per-project QuickJS VM, and serves them over stdin/stdout.
 
@@ -241,7 +241,7 @@ of `script` and `scriptPath`. There are no aliases or completion-wait controls.
 
 | Field | Actions | Contract |
 | --- | --- | --- |
-| `script`, `scriptPath` | run | Raw JavaScript or an absolute server-side regular-file path, exactly one. First statement: `export const meta = { name, description, phases? }`. The accepted UTF-8 snapshot is at most 1 MiB and immutable. |
+| `script`, `scriptPath` | run | Raw JavaScript or an absolute server-side regular-file path, exactly one. First statement: `export const meta = { name, description, phases? }`. The accepted UTF-8 text is at most 1 MiB. An inline script is copied into the run store as `{runId}.script.js`; a `scriptPath` run records the path. The admitted text is what executes. |
 | `projectDir` | config, run | Absolute project directory, required on the shared daemon; defaults to the server's project under `--in-process`. Other actions locate the project through `runId`. |
 | `args` | run | Strict-JSON script input, immutable after admission. |
 | `maxAgents`, `concurrency`, `agentRetries` | run, resume | Runtime limits; default agent cap 1000, concurrency clamped to 16, retries clamped to 3. Resolved limits are returned. |
@@ -297,7 +297,8 @@ type WorkflowOperationAccepted = {
   runId: string;
   status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
   scriptSource: "inline" | "path" | "stored";
-  scriptUri: string;
+  scriptUri: string; // file:// URI of the run's script file
+  scriptPath: string; // the same location as an absolute path
   eventsUri: string;
   limits: { maxAgents: number; concurrency: number; agentRetries: number };
   setup?: WorkflowSetup;
@@ -375,25 +376,31 @@ Full status, outcome, and response fields are documented in the [API reference](
 
 ## Run resources
 
-Every admitted manager run has an immutable, persistence-backed script resource, and every
-completed run with a persisted JSON value has an immutable exact-result resource:
+Every admitted run has an editable script file resource, and every completed run with a persisted
+JSON value has an immutable exact-result resource:
 
 ```text
-workflow://runs/{runId}/script
+file:///…/runs/{runId}.script.js   (an inline script: the store's copy next to the run record)
+file:///absolute/scriptPath        (a scriptPath run: the caller's own file)
 workflow://runs/{runId}/result
 ```
 
-`resources/read` returns the exact UTF-8 script snapshotted at admission with MIME type
-`text/javascript`, or `JSON.stringify` of the authoritative persisted authored result with MIME type
-`application/json`. This applies equally to inline and `scriptPath` delivery and works for any
-persisted run in the project namespace, across MCP sessions and server processes. The original path
-is not persisted or re-read. A result read fails closed while the run is nonterminal, or when a
-paused/failed/aborted/completed-without-value run has no exact authored result. A run record deletion
-removes both resources; stopping a run does not.
+The script resource is a `file://` URI naming the one file a run recorded as its script: the store
+copy written for an inline script, or the exact `scriptPath` the caller supplied. `scriptUri` and
+`scriptPath` in run, resume, status, and outcome responses name that location. `resources/read`
+returns the file's current UTF-8 text with MIME type `text/javascript`, so an edit made after
+admission is visible immediately; the admitted text that executes stays in the persisted record.
+Only a file some run recorded is addressable: an arbitrary `file://` URI, or an unowned file inside
+the store, is not a resource. The result resource returns `JSON.stringify` of the authoritative
+persisted authored result with MIME type `application/json`, works for any persisted run in the
+project namespace across MCP sessions and server processes, and fails closed while the run is
+nonterminal or when a paused/failed/aborted/completed-without-value run has no exact authored
+result. Deleting a run record removes its store copy and both resources; a caller's `scriptPath`
+file is never touched. Stopping a run removes nothing.
 
 The server advertises and implements `resources: { subscribe: true, listChanged: true }`.
-Subscriptions are process-local. Script and completed-result content are immutable, so
-`notifications/resources/updated` never fires for them. `notifications/resources/list_changed`
+Subscriptions are process-local. The server does not watch script files, and completed-result
+content is immutable, so `notifications/resources/updated` never fires for either. `notifications/resources/list_changed`
 fires when a run is admitted, when a completed result becomes available, and when a run record is
 deleted; deletion also drops those URIs' subscriptions.
 Unsubscribing after that deletion (including a deletion race) is an idempotent empty success for a
@@ -446,11 +453,11 @@ content strings are credential-redacted and capped at 512 UTF-8 bytes. Query URI
 serving a silently incomplete transcript. See the [API contract](../../docs/api.md#mcp-live-events-resource).
 
 Run/resume acknowledgements contain clearly labelled `resource_link` blocks for the newly admitted
-script and its durable events stream, and structured `scriptUri`/`eventsUri` fields. Status,
+script file and its durable events stream, and structured `scriptUri`/`scriptPath`/`eventsUri` fields. Status,
 permission-response, stop, terminal outcome, and result-retrieval responses repeat `eventsUri` and
 the events link whenever that stream exists; legacy rows may omit them. Completed
 status results also carry `resultUri` and a clearly labelled exact result link. Status,
-permission-response, and stop responses link only the exact run's immutable script. Every URI is
+permission-response, and stop responses link only the exact run's script file. Every URI is
 also present in structured output. Lower-level SDK ancestry is not projected through MCP.
 
 Clients need MCP protocol revision **2025-06-18 or newer** to consume `resource_link` content

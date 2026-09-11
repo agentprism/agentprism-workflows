@@ -154,9 +154,8 @@ export {
   parseWorkflowRunEventsUri,
   workflowRunEventsUri,
   workflowRunIdFromResultUri,
-  workflowRunIdFromScriptUri,
   workflowResultUri,
-  workflowScriptUri,
+  workflowScriptFileUri,
 } from "./workflow-resources.js";
 export type {
   ParsedWorkflowRunEventsUri,

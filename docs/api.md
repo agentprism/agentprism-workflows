@@ -756,6 +756,17 @@ normally. Watchers stay open across lifecycle events because the same run may re
 closed on deletion, generation replacement, corruption, or inconsistency instead of following a
 different stream.
 
+#### MCP script file resource
+
+Every admitted run exposes its script as a `file://` resource: the store copy `{runId}.script.js`
+written next to the run record for an inline script, or the caller's own `scriptPath` file. Run,
+resume, status, and outcome responses name it as `scriptUri` and `scriptPath`, and `resources/list`
+enumerates one entry per persisted run. Reads return the file's current UTF-8 text with MIME type
+`text/javascript`, so an edit made after admission is visible immediately; the admitted text that
+executes is kept in the run record. Only a file some persisted run recorded is addressable: any other
+`file://` URI, including an unowned file inside the store, is rejected. Deleting a run removes its
+store copy; a caller's `scriptPath` file is never modified or removed.
+
 #### MCP exact workflow result resource
 
 For every completed run with a persisted authored JSON value, the MCP server exposes
@@ -1436,7 +1447,7 @@ of `script` and `scriptPath`. There are no aliases or completion-wait controls.
 
 | Field | Actions | Contract |
 | --- | --- | --- |
-| `script`, `scriptPath` | run | Raw JavaScript or an absolute server-side regular-file path, exactly one. First statement: `export const meta = { name, description, phases? }`. The accepted UTF-8 snapshot is at most 1 MiB and immutable. |
+| `script`, `scriptPath` | run | Raw JavaScript or an absolute server-side regular-file path, exactly one. First statement: `export const meta = { name, description, phases? }`. The accepted UTF-8 text is at most 1 MiB. An inline script is copied into the run store as `{runId}.script.js`; a `scriptPath` run records the path. The admitted text is what executes. |
 | `projectDir` | config, run | Absolute project directory, required on the shared daemon; defaults to the server's project under `--in-process`. Other actions locate the project through `runId`. |
 | `args` | run | Strict-JSON script input, immutable after admission. |
 | `maxAgents`, `concurrency`, `agentRetries` | run, resume | Runtime limits; default agent cap 1000, concurrency clamped to 16, retries clamped to 3. Resolved limits are returned. |
@@ -1486,7 +1497,8 @@ type WorkflowOperationAccepted = {
   runId: string;
   status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
   scriptSource: "inline" | "path" | "stored";
-  scriptUri: string;
+  scriptUri: string; // file:// URI of the run's script file
+  scriptPath: string; // the same location as an absolute path
   eventsUri: string;
   limits: { maxAgents: number; concurrency: number; agentRetries: number };
   setup?: WorkflowSetup;
@@ -1567,7 +1579,8 @@ The MCP additions and response discriminators are:
 
 ```ts
 interface WorkflowScriptResourceFields {
-  scriptUri: string;
+  scriptUri: string; // file:// URI of the run's script file
+  scriptPath?: string; // the same location as an absolute path
   resultUri?: string; // completed authored JSON only
   eventsUri?: string; // absent for historical rows without a durable stream
 }

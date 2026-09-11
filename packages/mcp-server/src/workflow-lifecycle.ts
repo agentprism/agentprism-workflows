@@ -242,7 +242,11 @@ export class WorkflowLifecycle {
       progress?.(2, PREPARATION_STEPS, "workflow script validated");
       throwIfAborted();
 
-      const exec = { maxAgents: limits.maxAgents, concurrency: limits.concurrency, agentRetries: limits.agentRetries };
+      const exec = {
+        maxAgents: limits.maxAgents, concurrency: limits.concurrency, agentRetries: limits.agentRetries,
+        // An inline script gets its editable copy in the run store; a path script stays at the caller's file.
+        scriptOrigin: input.script !== undefined ? { kind: "inline" as const } : { kind: "path" as const, path: input.scriptPath! },
+      };
       const pending = pendingBackendApproval(backends, []);
       if (pending) {
         const data: PreparationData = { approvedKeys: [], responses: {}, pendingBackendKey: pending.key, setup: pending.request };
