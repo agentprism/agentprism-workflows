@@ -201,7 +201,7 @@ test("one daemon serves legacy sessions and modern 2026-07-28 requests through t
       "legacy and modern discovery publish the same discriminated workflow schema",
     );
     const published = modern.workflowInputSchema as { oneOf?: unknown[]; properties?: unknown };
-    assert.equal(published.oneOf?.length, 8);
+    assert.equal(published.oneOf?.length, 9);
     assert.equal(published.properties, undefined, "neither transport regresses to the flat field superset");
     assert.equal(legacy.status, "completed");
     assert.equal(modern.status, "completed");

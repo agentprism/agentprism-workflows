@@ -435,7 +435,7 @@ test("ordinary maximum-cardinality projections for every persisted variant fit o
       ...origin,
       record: { index: 0, kind: "agent", hash: "hash", label: text, outcome: "error", origin: "runner", error: errorRecord },
     },
-    { type: "paused", ...origin },
+    { type: "paused", ...origin, reason: "requested", error, errorRecord },
     { type: "paused", ...origin, reason: "usage_limit", error, errorRecord, resetHint: text },
     { type: "error", ...origin, error, errorRecord },
     { type: "stopped", ...origin },

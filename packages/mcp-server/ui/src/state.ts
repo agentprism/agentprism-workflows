@@ -96,6 +96,9 @@ export function pausedBanner(event: PausedEvent): string {
   if (event.reason === "usage_limit") {
     return `Paused: usage limit reached${event.resetHint ? ` — ${event.resetHint}` : ""}.`;
   }
+  if (event.reason === "requested") {
+    return "Paused by request: executing agents finished and nothing new started. Resume when ready.";
+  }
   return "Paused.";
 }
 

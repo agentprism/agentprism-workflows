@@ -71,7 +71,7 @@ function branchSnapshot(schema: JsonObject): JsonObject {
   };
 }
 
-test("canonical schema publishes eight strict action branches and matches the committed snapshot", async () => {
+test("canonical schema publishes nine strict action branches and matches the committed snapshot", async () => {
   assert.deepEqual(Object.keys(workflowToolInputBranches), [
     "config",
     "run",
@@ -81,6 +81,7 @@ test("canonical schema publishes eight strict action branches and matches the co
     "result",
     "permissions-response",
     "stop",
+    "pause",
   ]);
   const published = object(
     await workflowToolInputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" }),
@@ -88,7 +89,7 @@ test("canonical schema publishes eight strict action branches and matches the co
   assert.deepEqual(Object.keys(published), ["$schema", "oneOf", "type"]);
   const oneOf = published.oneOf;
   assert.ok(Array.isArray(oneOf));
-  assert.equal(oneOf.length, 8);
+  assert.equal(oneOf.length, 9);
   const actual = {
     $schema: published.$schema,
     type: published.type,

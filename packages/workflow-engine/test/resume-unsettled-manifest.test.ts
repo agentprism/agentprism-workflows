@@ -159,7 +159,7 @@ describe("resume manifests for unsettled calls", () => {
     }
   });
 
-  it("persists dense interrupted rows for auth, checkpoint, host pause, stop, and external abort halts", async () => {
+  it("persists dense interrupted rows for auth, checkpoint, stop, and external abort halts", async () => {
     const dirs = tempDirs();
     try {
       const scenarios: Array<{
@@ -167,11 +167,6 @@ describe("resume manifests for unsettled calls", () => {
         script: string;
         halt: (manager: WorkflowManager, runId: string) => void;
       }> = [
-        {
-          name: "host-pause",
-          script: parallelScript(["pending-0", "pending-1"], "host-pause"),
-          halt: (manager, runId) => { assert.equal(manager.pause(runId), true); },
-        },
         {
           name: "host-stop",
           script: parallelScript(["pending-0", "pending-1"], "host-stop"),

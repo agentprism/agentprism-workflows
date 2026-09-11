@@ -912,8 +912,13 @@ export function projectRunEventForPersistence(
       projected = { type: "callRecord", ...origin(), record: projectCallRecord(event.record, state) };
       break;
     case "paused":
-      if (event.reason === undefined) {
-        projected = { type: "paused", ...origin() };
+      if (event.reason === "requested") {
+        projected = {
+          type: "paused",
+          ...origin(),
+          reason: "requested",
+          errorRecord: projectRecordedError(event.errorRecord, state),
+        };
       } else if (event.reason === "usage_limit") {
         projected = {
           type: "paused",

@@ -75,6 +75,7 @@ import type {
   WorkflowResultRetrieval,
   WorkflowRunLatestActivity,
   WorkflowStatusToolResult,
+  WorkflowPauseResult,
   WorkflowStopPendingResult,
   WorkflowStopResult,
 } from "./workflow-tool-output.js";
@@ -138,8 +139,8 @@ export const SERVER_INSTRUCTIONS = [
     "the host's skill-loading path, then read only the supporting resources it references as needed.",
   "• workflow — DETERMINISTIC BATCH orchestration. Use action:\"run\" with a JavaScript workflow " +
     "script that fans out agent() subagents and optional checkpoint() gates. Run and resume always return " +
-    "a durable runId for bounded status, permissions-response, result, and stop calls; resume continues " +
-    "the exact run from its durable admission and journal. action:\"config\" discovers the live backend " +
+    "a durable runId for bounded status, permissions-response, result, pause, and stop calls; resume continues " +
+    "the exact run (paused or stopped) from its durable admission and journal. action:\"config\" discovers the live backend " +
     "and model option catalog. Every agent call must resolve an explicit model route (backend-only routes are valid). Accepted runs prepare durably; custom backends require approval. Checkpoints always require an explicit answer.",
   "• repl — INTERACTIVE STATEFUL orchestration. A persistent per-project JavaScript VM driven with " +
     "action:\"eval\". Named bindings, pending subagent handles, queued turns, checkpoints, and `_` " +
@@ -166,6 +167,19 @@ function isTerminalStatus(status: WorkflowRunStatus["status"]): boolean {
 
 function isAlreadyTerminalForStop(status: WorkflowRunStatus["status"]): boolean {
   return status === "completed" || status === "failed" || status === "aborted";
+}
+
+/** How long a pause request waits for executing agents to finish before answering with `running`. */
+export const WORKFLOW_PAUSE_SETTLE_WAIT_MS = 2_000;
+
+async function waitForPauseSettlement(manager: WorkflowManager, runId: string, ms: number): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const live = manager.getRun(runId);
+    const status = live ? live.status : manager.getPersistence().load(runId)?.status;
+    if (status !== "running") return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 async function pendingPermissionsForRun(
@@ -439,6 +453,24 @@ function formatPendingStopSummary(result: WorkflowStopPendingResult): string {
       ? "No live execution owner is currently discoverable; a later lease holder will apply the intent."
       : `Execution owner: daemon pid ${owner.pid}${owner.version ? ` v${owner.version}` : ""}` +
         `${owner.lameDuck ? " (draining)" : ""}.`,
+  );
+  return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
+}
+
+function formatPauseSummary(result: WorkflowPauseResult): string {
+  const lines = inspectionSummaryLines(result);
+  lines.splice(
+    2,
+    0,
+    result.paused
+      ? result.pauseRequested
+        ? "Pause is durably complete: executing agents finished and journaled, nothing new started. Edit the script file if needed, then resume with the same runId."
+        : "No pause was initiated because this run was already paused; resume with the same runId when ready."
+      : result.pauseRequested
+        ? "Pause requested: agents already executing are finishing and will journal; nothing new starts. Poll status until it reports paused, then resume with the same runId."
+        : result.status === "running"
+          ? "Pause could not be delivered: the run is running but no live execution owner accepted the request. Retry pause, or stop the run."
+          : `This run settled as ${result.status} before it could pause; nothing is executing.`,
   );
   return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
 }
@@ -745,6 +777,11 @@ function formatStatusSummary(result: WorkflowStatusToolResult): string {
         `Call the workflow tool with action="resume", runId="${result.runId}", and ` +
           `checkpointReplies={ "${checkpoint.callIndex}": <decision> }.`,
       );
+    } else if (result.reason === "requested") {
+      lines.push(
+        `This run paused by request: executing agents finished and journaled, nothing new started. ` +
+          `Edit its script file if needed, then call the workflow tool with action="resume" and runId="${result.runId}".`,
+      );
     } else {
       lines.push(
         `Call the workflow tool with action="resume" and runId="${result.runId}" to continue from its journal.`,
@@ -935,6 +972,7 @@ export function createWorkflowServer(
       input.action === "resume" ||
       input.action === "result" ||
       input.action === "stop" ||
+      input.action === "pause" ||
       input.action === "permissions-response" ||
       input.action === "setup-response"
     ) {
@@ -977,7 +1015,7 @@ export function createWorkflowServer(
     description:
         "Validate, run, resume, observe, and control deterministic JavaScript agent workflows. " +
         "Use config before pinning live model, mode, or config-option ids. run validates explicit script or scriptPath content inside the request (cancel the request to abandon it) and returns once execution has started; resume continues the exact runId from durable state. " +
-        "Use status for an immediate snapshot, result for exact completed JSON, permissions-response for a pending ACP choice, and stop for a run or one live call. " +
+        "Use status for an immediate snapshot, result for exact completed JSON, permissions-response for a pending ACP choice, pause to let executing agents finish and journal before the run pauses, and stop to interrupt a run or one live call; resume continues a paused or stopped run. " +
         (requireProjectDir
           ? "Config and run require an absolute projectDir on this shared daemon. "
           : "Config and run may omit projectDir on this single-project server. ") +
@@ -1182,6 +1220,81 @@ export function createWorkflowServer(
               annotations: { audience: ["assistant"] },
             },
             ...resultContentBlocks(scriptResources, parsedInput.runId, false, status.status),
+            ...scriptContentBlocks(scriptResources, parsedInput.runId),
+            ...eventsContentBlocks(scriptResources, parsedInput.runId),
+          ],
+          isError: false,
+        };
+      }
+
+      if (parsedInput.action === "pause") {
+        if (!manager.getRun(parsedInput.runId)) {
+          manager.reconcileExternallyDeadRun(parsedInput.runId);
+        }
+        const persisted = manager.getPersistence().load(parsedInput.runId);
+        if (!persisted) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
+          );
+        }
+        if (persisted.status === "pending") {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            `Workflow run "${parsedInput.runId}" is waiting for setup and has not started executing; answer its setup request or stop it instead of pausing.`,
+          );
+        }
+        if (isAlreadyTerminalForStop(persisted.status)) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            `Workflow run "${parsedInput.runId}" is already terminal (${persisted.status}); nothing is executing to pause. Resume it to continue from its journal.`,
+          );
+        }
+        let pauseRequested = false;
+        if (persisted.status === "running") {
+          if (manager.getRun(parsedInput.runId)) {
+            pauseRequested = manager.pause(parsedInput.runId);
+          } else if (options.runControl) {
+            pauseRequested = await options.runControl.pause(manager, parsedInput.runId);
+            // An owner that no longer runs it, or none at all: reconcile an orphaned run to its
+            // interrupted pause rather than reporting a request nobody holds.
+            if (!pauseRequested) manager.reconcileExternallyDeadRun(parsedInput.runId);
+          } else {
+            throw new ProtocolError(
+              ProtocolErrorCode.InvalidParams,
+              `Workflow run "${parsedInput.runId}" is persisted as running, but there is nothing live to pause in this server process.`,
+            );
+          }
+          if (pauseRequested) await waitForPauseSettlement(manager, parsedInput.runId, WORKFLOW_PAUSE_SETTLE_WAIT_MS);
+        }
+        const inspectionOptions = {
+          lastN: parsedInput.lastN,
+          labelGlob: parsedInput.labelGlob,
+          logLines: parsedInput.logLines,
+        };
+        const status = manager.inspectRun(parsedInput.runId, inspectionOptions);
+        if (!status || status.status === "pending") {
+          throw new ProtocolError(
+            ProtocolErrorCode.InternalError,
+            `Workflow pause did not produce a snapshot for runId "${parsedInput.runId}".`,
+          );
+        }
+        const projected = addInspectionResourceFields(
+          status,
+          {
+            scriptUri: scriptResources.scriptUri(parsedInput.runId),
+            ...resultResourceFields(scriptResources, parsedInput.runId, status.status),
+            ...latestActivityFields(scriptResources, parsedInput.runId, status),
+            pauseRequested,
+            paused: status.status === "paused",
+          },
+          inspectionRetentionMetadata(manager, parsedInput.runId, status),
+        );
+        const result: WorkflowPauseResult = { ...projected, status: status.status };
+        return {
+          structuredContent: { ...result },
+          content: [
+            { type: "text", text: formatPauseSummary(result) },
             ...scriptContentBlocks(scriptResources, parsedInput.runId),
             ...eventsContentBlocks(scriptResources, parsedInput.runId),
           ],

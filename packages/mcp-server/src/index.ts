@@ -20,7 +20,7 @@ import { createWorkflowServer, type WorkflowServer } from "./server.js";
 import { workflowRunEventsUri } from "./workflow-resources.js";
 import { WorkflowPermissionBroker } from "./workflow-permissions.js";
 
-export { ActiveRunRegistry, createWorkflowServer, MAX_ACTIVE_RUNS } from "./server.js";
+export { ActiveRunRegistry, createWorkflowServer, MAX_ACTIVE_RUNS, WORKFLOW_PAUSE_SETTLE_WAIT_MS } from "./server.js";
 export { WorkflowPermissionBroker } from "./workflow-permissions.js";
 export type {
   WorkflowPendingPermission,
@@ -51,6 +51,7 @@ export type {
   WorkflowSetupResponseToolInput,
   WorkflowResultToolInput,
   WorkflowStatusToolInput,
+  WorkflowPauseToolInput,
   WorkflowStopToolInput,
   WorkflowToolInput,
 } from "./workflow-tool-input.js";
@@ -71,6 +72,7 @@ export type {
   WorkflowScriptResourceFields,
   WorkflowScriptSource,
   WorkflowStatusToolResult,
+  WorkflowPauseResult,
   WorkflowStopPendingResult,
   WorkflowStopResult,
   WorkflowToolResult,

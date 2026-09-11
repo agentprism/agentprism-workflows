@@ -122,6 +122,12 @@ export interface SharedRuntime {
   agentOccurrenceCount?: number;
   /** An unanswered checkpoint cannot be converted into approval by catching its signal. */
   pendingCheckpoint?: WorkflowError;
+  /** The root run's host pause request, visible to every nested workflow() engine. */
+  pauseSignal?: AbortSignal;
+  /** Set once a pause request refused an admission; catching it cannot keep the run going. */
+  pendingPause?: WorkflowError;
+  /** Root-wide count of allocated calls that have not settled, so a pause can drain them. */
+  liveCalls?: { count: number; waiters: Set<() => void> };
   limiter: <T>(fn: () => Promise<T>) => Promise<T>;
   agentCount: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
@@ -177,6 +183,12 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
   signal?: AbortSignal;
+  /**
+   * Host pause request. Once it fires, agent calls already executing finish and journal, no new
+   * agent()/checkpoint() is admitted (queued calls settle as interrupted rows), and the run
+   * settles with PAUSE_REQUESTED instead of a result. Ignored while `signal` is aborted.
+   */
+  pauseSignal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
   /** Whether to persist logs to disk. Default: true */
@@ -634,7 +646,10 @@ export async function runWorkflow<T = unknown>(
     tokenUsage: copyTokenUsageBaseline(options.tokenUsageBaseline),
     depth: 0,
     nestedSeq: 0,
+    ...(options.pauseSignal ? { pauseSignal: options.pauseSignal } : {}),
   };
+  const pauseSignal = shared.pauseSignal;
+  const liveCalls = (shared.liveCalls ??= { count: 0, waiters: new Set() });
   const resumeActivity = shared.resumeActivity ?? {
     active: 0,
     invalid: false,
@@ -727,12 +742,43 @@ export async function runWorkflow<T = unknown>(
     { once: true },
   );
 
-  const throwIfAborted = () => {
+  // A pause request is a gate, not a cancellation: nothing already executing is interrupted, but
+  // every later admission (and every queued attempt) refuses with PAUSE_REQUESTED. Like a pending
+  // checkpoint, the refusal is remembered so a script that catches it cannot keep the run going.
+  const pauseRequested = () => pauseSignal?.aborted === true && !signal.aborted;
+  const pauseError = () =>
+    (shared.pendingPause ??= new WorkflowError(
+      "workflow paused by host request: executing agent calls finished, nothing new was admitted",
+      WorkflowErrorCode.PAUSE_REQUESTED,
+      { recoverable: false },
+    ));
+  // Resolves once every allocated call in the root run and its nested engines has settled.
+  const drainLiveCalls = (): Promise<void> =>
+    liveCalls.count === 0 ? Promise.resolve() : new Promise((resolve) => liveCalls.waiters.add(resolve));
+  const noteCallUnsettled = () => {
+    liveCalls.count += 1;
+  };
+  const noteCallSettled = () => {
+    liveCalls.count -= 1;
+    if (liveCalls.count > 0) return;
+    const waiters = [...liveCalls.waiters];
+    liveCalls.waiters.clear();
+    for (const resolve of waiters) resolve();
+  };
+
+  // Halt gate for work that already produced a value: a stop or a pending checkpoint discards
+  // it, a pause request does not (the finished call is exactly what a pause preserves).
+  const throwIfHalted = () => {
     if (signal.aborted) {
       abortSignaled = true;
       throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
     }
     if (shared.pendingCheckpoint) throw shared.pendingCheckpoint;
+  };
+  // Admission gate: additionally refuses to start anything new once a pause is requested.
+  const throwIfAborted = () => {
+    throwIfHalted();
+    if (pauseRequested()) throw pauseError();
   };
 
   const reportTerminalObserverError = (observer: string, error: unknown) => {
@@ -1128,7 +1174,10 @@ export async function runWorkflow<T = unknown>(
       >,
     ): WorkflowCallRecord => {
       if (settled) return settled;
-      if (interrupt) unsettledCallInterruptions.delete(interrupt);
+      if (interrupt) {
+        unsettledCallInterruptions.delete(interrupt);
+        noteCallSettled();
+      }
       settled = appendCallRecord({
         index: callIndex,
         kind: "agent",
@@ -1188,11 +1237,17 @@ export async function runWorkflow<T = unknown>(
 
     interrupt = () => {
       if (settled) return;
-      const error = new WorkflowError(
-        `agent "${label}" interrupted because workflow execution halted`,
-        WorkflowErrorCode.WORKFLOW_ABORTED,
-        { recoverable: true, agentLabel: label },
-      );
+      const error = pauseRequested()
+        ? new WorkflowError(
+            `agent "${label}" was not started because the workflow paused by host request`,
+            WorkflowErrorCode.PAUSE_REQUESTED,
+            { recoverable: false, agentLabel: label },
+          )
+        : new WorkflowError(
+            `agent "${label}" interrupted because workflow execution halted`,
+            WorkflowErrorCode.WORKFLOW_ABORTED,
+            { recoverable: true, agentLabel: label },
+          );
       const errorRecord = projectRecordedError(error);
       settle({
         outcome: "error",
@@ -1218,7 +1273,8 @@ export async function runWorkflow<T = unknown>(
       }
     };
     unsettledCallInterruptions.set(interrupt, legacyResumeSafety === "declared-read-only");
-    if (signal.aborted) {
+    noteCallUnsettled();
+    if (signal.aborted || pauseRequested()) {
       interrupt();
       throwIfAborted();
     }
@@ -1563,7 +1619,7 @@ export async function runWorkflow<T = unknown>(
               }
             }
 
-            throwIfAborted();
+            throwIfHalted();
             if (isEmptyTextAgentResult(result, agentOptions.schema)) {
               throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
                 recoverable: true,
@@ -1652,6 +1708,12 @@ export async function runWorkflow<T = unknown>(
               emitFailure(error, attemptsRan > 0 ? "runner" : "engine", "error", slot, true);
               throw error;
             }
+            if (pauseRequested()) {
+              // Either the attempt was refused at its start, or it failed while a pause was
+              // pending and must not retry now. Both are interrupted rows that run again on resume.
+              emitFailure(error, attemptsRan > 0 ? "runner" : "engine", "error", slot, true);
+              throw pauseError();
+            }
 
             const workflowError = wrapError(error, { agentLabel: label });
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
@@ -1686,7 +1748,7 @@ export async function runWorkflow<T = unknown>(
         return null;
       } catch (error) {
         if (!settled) {
-          emitFailure(error, attemptsRan > 0 ? "runner" : "engine", "error", undefined, signal.aborted);
+          emitFailure(error, attemptsRan > 0 ? "runner" : "engine", "error", undefined, signal.aborted || pauseRequested());
         }
         throw error;
       } finally {
@@ -1706,6 +1768,8 @@ export async function runWorkflow<T = unknown>(
       reportJournal?: boolean;
     }): Promise<unknown> => {
       await Promise.resolve();
+      // A halt that lands here must still settle this allocation: nothing downstream will.
+      if (signal.aborted || pauseRequested()) interrupt?.();
       throwIfAborted();
       emitAgentStart();
       const recordedSession = input.entry.session ? cloneTelemetry(input.entry.session) : undefined;
@@ -2346,7 +2410,10 @@ export async function runWorkflow<T = unknown>(
       >,
     ): WorkflowCallRecord => {
       if (settled) return settled;
-      if (interrupt) unsettledCallInterruptions.delete(interrupt);
+      if (interrupt) {
+        unsettledCallInterruptions.delete(interrupt);
+        noteCallSettled();
+      }
       settled = appendCallRecord({
         index: callIndex,
         kind: "checkpoint",
@@ -2359,11 +2426,17 @@ export async function runWorkflow<T = unknown>(
     };
     interrupt = () => {
       if (settled) return;
-      const error = new WorkflowError(
-        `checkpoint "${promptText}" interrupted because workflow execution halted`,
-        WorkflowErrorCode.WORKFLOW_ABORTED,
-        { recoverable: true },
-      );
+      const error = pauseRequested()
+        ? new WorkflowError(
+            `checkpoint "${promptText}" was not asked because the workflow paused by host request`,
+            WorkflowErrorCode.PAUSE_REQUESTED,
+            { recoverable: false },
+          )
+        : new WorkflowError(
+            `checkpoint "${promptText}" interrupted because workflow execution halted`,
+            WorkflowErrorCode.WORKFLOW_ABORTED,
+            { recoverable: true },
+          );
       settle({
         outcome: "error",
         origin: "engine",
@@ -2372,7 +2445,8 @@ export async function runWorkflow<T = unknown>(
       });
     };
     unsettledCallInterruptions.set(interrupt, false);
-    if (signal.aborted) {
+    noteCallUnsettled();
+    if (signal.aborted || pauseRequested()) {
       interrupt();
       throwIfAborted();
     }
@@ -2693,6 +2767,7 @@ export async function runWorkflow<T = unknown>(
       let reply: unknown;
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let onAbort: (() => void) | undefined;
+      let onPause: (() => void) | undefined;
       try {
         const answer = options.confirm(promptText, capturedCheckpointOptions, {
           callIndex,
@@ -2704,6 +2779,11 @@ export async function runWorkflow<T = unknown>(
           onAbort = () => reject(new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true }));
           signal.addEventListener("abort", onAbort, { once: true });
           if (signal.aborted) onAbort();
+          // A pause request unwinds a waiting question the same way a stop does; the pending
+          // checkpoint keeps its durable context and is asked again on resume.
+          onPause = () => reject(pauseError());
+          pauseSignal?.addEventListener("abort", onPause, { once: true });
+          if (pauseRequested()) onPause();
           if (checkpointTimeoutMs !== undefined) timeout = setTimeout(() => reject(waiting()), checkpointTimeoutMs);
         });
         reply = await Promise.race([answer, interruption]);
@@ -2715,9 +2795,10 @@ export async function runWorkflow<T = unknown>(
       } finally {
         if (timeout !== undefined) clearTimeout(timeout);
         if (onAbort) signal.removeEventListener("abort", onAbort);
+        if (onPause) pauseSignal?.removeEventListener("abort", onPause);
       }
       if (reply === undefined) throw waiting();
-      throwIfAborted();
+      throwIfHalted();
       let replySnapshot: unknown;
       try {
         replySnapshot = strictSnapshot(reply, `checkpoint "${promptText}" reply`);
@@ -2750,7 +2831,7 @@ export async function runWorkflow<T = unknown>(
       guardTerminal("onCheckpointTaken", () => options.onCheckpointTaken?.(checkpointTaken));
       return reply;
     } catch (error) {
-      const aborted = signal.aborted;
+      const aborted = signal.aborted || pauseRequested();
       settle({
         outcome: "error",
         origin: aborted ? "engine" : origin,
@@ -2839,8 +2920,16 @@ export async function runWorkflow<T = unknown>(
     result = await Promise.race([scriptPromise, tripwire.tripped]);
     await tripwire.drain();
     if (shared.pendingCheckpoint) throw shared.pendingCheckpoint;
+    if (shared.pendingPause) throw shared.pendingPause;
   } catch (error) {
     scriptFailed = true;
+    if (shared.pendingPause && !signal.aborted) {
+      // A pause unwind: let every executing call finish and journal before settling. Late floats
+      // from the already-unwound script are swallowed rather than tripping a second failure.
+      tripwire.retire();
+      await drainLiveCalls();
+      throw shared.pendingPause;
+    }
     // A WorkflowError crossing the script boundary keeps its classification (abort,
     // usage limit, tripwire). Anything else IS the script crashing — label it SCRIPT_ERROR,
     // never WORKFLOW_ABORTED (nobody cancelled anything).

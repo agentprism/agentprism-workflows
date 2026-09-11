@@ -95,7 +95,7 @@ manager.on("agentEvent", (e) => ui.stream(e.runId, e));  // live token-level ACP
 const { runId, promise } = manager.startInBackground(script, args, { cwd: worktreePath });
 // ... later:
 await manager.cancelAgentCall(runId, 7); // settle one in-flight agent null; run stays live
-manager.stop(runId);                    // whole-run terminal abort
+manager.stop(runId);                    // whole-run interruption; the aborted run can resume
 ```
 
 ---
@@ -184,9 +184,10 @@ approval journals. Historical artifacts remain readable where supported without 
 | `inspectRun(runId, options?)` | `WorkflowRunStatus \| undefined` | Synchronous, live-first safe projection; falls back to project-scoped persistence. A cold `pending`/`running` dead-owner row may be lease-reconciled to `paused` / `interrupted`; other rows are not changed. |
 | `reconcileExternallyDeadRun(runId)` | `PersistedRunState \| undefined` | Lease-safe single-run reconciliation used by cold host preflights. Skips manager-owned runs, non-`pending`/`running` states, live owners, and all writes when the manager default is `journaling: false`. |
 | `cancelAgentCall(runId, callIndex)` | `Promise<WorkflowAgentCallCancellation>` | Cancels one uniquely matching in-flight attempt, bypasses retries, and resolves after its `AGENT_CANCELLED` call record and `agentEnd` state are durable. The run signal and `abortSignaled` remain untouched. Misses and duplicate scoped indexes throw with the current call-index/label list. |
-| `pause(runId)` | `boolean` | Aborts in-flight work; journal preserved; resumable. |
-| `stop(runId)` | `boolean` | Whole-run terminal abort. The same run ID cannot resume in place, but its retained journal can be the source of a new `resumeFromRunId` execution. |
-| `resume(runId, exec?)` | `Promise<boolean>` | Same-ID recovery of a paused/failed run using historical positional replay. Reloads the persisted script/args/cwd, rejects `resumeFromRunId`/`resumePolicy`, emits no resume report, and permanently marks the artifact legacy. Requires journaling. |
+| `pause(runId)` | `boolean` | Requests a pause of a run this manager is executing: agent calls already executing finish and journal, nothing new is admitted (queued calls settle as interrupted rows), and the run settles as `paused` with `reason: "requested"`. Idempotent while pending; `false` when the run is not running here. |
+| `pausePending(runId)` | `boolean` | Whether a pause request is registered for a run this manager is still executing. |
+| `stop(runId)` | `boolean` | Whole-run interruption: in-flight work is cancelled and recorded as interrupted rows, and the run settles as `aborted`. The same run ID can `resume()` from its journal, and its retained journal can also seed a new `resumeFromRunId` execution. |
+| `resume(runId, exec?)` | `Promise<boolean>` | Same-ID recovery of a paused, failed, or aborted run using historical positional replay. Reloads the persisted script/args/cwd, rejects `resumeFromRunId`/`resumePolicy`, emits no resume report, and permanently marks the artifact legacy. Requires journaling. |
 | `resumeInBackground(runId, exec?)` | `Promise<{ accepted, promise? }>` | Same-ID `resume()` plus the settlement handle: when accepted, `promise` is the resumed execution's completion promise (same contract as `startInBackground`'s — rejects on failure/pause, side-channel catch attached). The facade manager holds a per-execution `exec.agent` event bridge until it settles. |
 | `continueRun(runId, exec?)` | `Promise<WorkflowContinuationStart>` | Strict same-ID continuation used by MCP. Requires a valid versioned canonical admission snapshot, inherits all semantic inputs, accepts runtime controls/checkpoint replies only, and returns a bounded refusal reason instead of guessing missing metadata. |
 | `getRun(runId)` | `ManagedRun \| undefined` | Live in-memory state incl. `status`, `snapshot`, `error`. |
@@ -1422,6 +1423,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `providerUsageLimitContext` and a synthesized `resetHint` when a reset instant is available. |
 | `AUTH_REQUIRED` | no | Agent demanded auth (`-32000`) → the run **pauses** (`reason: "auth_required"`, journaled, resumable), carries the non-secret `authContext`; `resume()` re-arms via `runner.auth.canResume`. |
 | `CHECKPOINT_REQUIRED` | no | `checkpoint()` has no explicit answer → the run **pauses** with non-secret `checkpointContext`; resume with `checkpointReplies` or a live `confirm`. |
+| `PAUSE_REQUESTED` | no | A host asked for a pause → executing agent calls finish and journal, nothing new is admitted (queued calls become interrupted rows), and the run **pauses** with `reason: "requested"`; resume the same journal. Catching it in-script cannot keep the run going. |
 | `AGENT_LIMIT_EXCEEDED` | no | The run's agent-call limit was reached. |
 | `AGENT_EXECUTION_ERROR` | yes | Other agent-level failure (refusal/truncation are non-recoverable variants). |
 | `PERSISTENCE_ERROR`, `UNKNOWN` | no | Storage / unexpected host-level failure. |
@@ -1452,11 +1454,11 @@ of `script` and `scriptPath`. There are no aliases or completion-wait controls.
 | `args` | run | Strict-JSON script input, immutable after admission. |
 | `maxAgents`, `concurrency`, `agentRetries` | run, resume | Runtime limits; default agent cap 1000, concurrency clamped to 16, retries clamped to 3. Resolved limits are returned. |
 | `harnesses`, `modelSpecs`, `modelFilter` | config | Optional backend names, exact routed models, and bounded model substring or `/regex/` filter for no-prompt discovery. |
-| `runId` | resume, setup-response, status, result, permissions-response, stop | Exact persisted identity, matching `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. Resume continues the exact run ID. |
+| `runId` | resume, setup-response, status, result, permissions-response, pause, stop | Exact persisted identity, matching `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. Resume continues the exact run ID, including a paused or stopped one. |
 | `checkpointReplies` | resume | Map `checkpointContext.callIndex` to the explicit kind-valid JSON answer. The first durable answer wins. |
 | `setupId`, `response` | setup-response | Exact pending setup UUID, with `{ action:"accept", content:{...} }`, `{ action:"decline" }`, or `{ action:"cancel" }`. Accept content must satisfy the persisted `requestedSchema`. |
 | `permissionId`, `response` | permissions-response | Exact pending UUID and `{ outcome:{ outcome:"selected", optionId } }` or `{ outcome:{ outcome:"cancelled" } }`. Only an advertised option ID is accepted; response `_meta` is forbidden. |
-| `lastN`, `labelGlob`, `logLines` | status, stop | Bounded inspection: latest 1–50 calls (default 20), case-sensitive whole-label glob, and 0–50 log lines (default 20). |
+| `lastN`, `labelGlob`, `logLines` | status, pause, stop | Bounded inspection: latest 1–50 calls (default 20), case-sensitive whole-label glob, and 0–50 log lines (default 20). |
 | `offset`, `maxBytes` | result | Exact UTF-8 JSON paging: offset defaults to zero; maxBytes is 4–16,384 (default 16,384). Continue at the previous `endOffset`. |
 | `callIndex` | stop | Cancel one uniquely matching live agent; its slot resolves to `null` with `AGENT_CANCELLED`, while siblings continue. |
 | `forceOwner` | whole-run stop | Explicitly permit termination of a superseded owner after identity revalidation; may interrupt sibling runs. Forbidden with `callIndex`. |
@@ -1666,8 +1668,13 @@ interface WorkflowResultRetrieval {
 
 `permissions-response` returns the current run inspection/resource fields plus
 `permissionResponse:{permissionId,runId,callIndex,outcome,respondedAt}` and remaining
-`pendingPermissions`. A final whole-stop response has terminal status plus `stopped` and
-`alreadyTerminal`. A bounded pending-stop response has pending/running status, both flags false,
+`pendingPermissions`. `pause` returns the inspection fields plus `pauseRequested` (the request
+reached the live execution owner in this call) and `paused` (the run is durably paused now); it
+waits up to two seconds for executing agents to finish, and a `running` answer with
+`pauseRequested:true` settles on its own, observable through status. An already paused run is a
+no-op observation; a terminal or setup-parked run is an error. A final whole-stop response has
+terminal status plus `stopped` and `alreadyTerminal`. A stopped (`aborted`) run resumes from its
+journal. A bounded pending-stop response has pending/running status, both flags false,
 and `control:{state:"pending",operationId,requestedAt,owner?}`. Owner diagnostics include PID,
 instance/version, lame-duck state, active-run count, and control protocol when available. Targeted
 stop returns the continuing run's current inspection. These observations never carry a new-run
@@ -1695,10 +1702,17 @@ included in completed status text; larger values use resource reads or result pa
 - **Observation and recovery.** Status never waits for work or collects an answer. A cold accepted
   preparation is recovered under its lease and preserves pending setup IDs. An interrupted admitted
   execution becomes paused/interrupted for explicit resume. A live lease is never stolen on timeout.
+- **Pause.** A pause request goes to the live execution owner; there is nothing to record cold.
+  Agents already executing finish and journal, nothing new starts, queued calls settle as
+  interrupted rows, and the run settles as `paused` with `reason:"requested"`. The response
+  carries `pauseRequested` and `paused` after a two-second wait for executing agents; a `running`
+  answer settles on its own. Resume continues from the journal. A run whose owner died is
+  reconciled to its interrupted pause instead.
 - **Stop.** Whole-run stop is location independent: it records a durable intent and forwards to the
   lease owner. Final success requires durable aborted state and a matching stopped event. A bounded
   control wait may return `control.state:"pending"` with an operation ID. Repeated terminal stop is
-  a successful no-op. Targeted agent cancellation needs a live owner and is not fabricated cold.
+  a successful no-op. A stopped (`aborted`) run is not final: resume replays its journal and re-runs
+  the interrupted calls. Targeted agent cancellation needs a live owner and is not fabricated cold.
 - **Process lifetime.** Disconnect, shim kill, and session eviction leave daemon-owned work alive.
   A successor routes setup replies, permission replies, and stop/cancel control to a predecessor
   still holding the lease. Owner process exit can interrupt work; `--in-process` ends with its own

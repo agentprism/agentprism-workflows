@@ -167,6 +167,21 @@
           "additionalProperties": false
         }
       ]
+    },
+    {
+      "action": "pause",
+      "properties": [
+        "action",
+        "runId",
+        "lastN",
+        "labelGlob",
+        "logLines"
+      ],
+      "required": [
+        "action",
+        "runId"
+      ],
+      "additionalProperties": false
     }
   ]
 }

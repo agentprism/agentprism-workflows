@@ -369,6 +369,8 @@ const variantOutputFields = [
   "stopped",
   "alreadyTerminal",
   "control",
+  "pauseRequested",
+  "paused",
   "pendingPermissions",
   "permissionResponse",
   "latestActivity",
@@ -442,6 +444,8 @@ export const workflowToolOutputShape = z
     stopped: z.boolean().optional(),
     alreadyTerminal: z.boolean().optional(),
     control: stopControlSchema.optional(),
+    pauseRequested: z.boolean().optional(),
+    paused: z.boolean().optional(),
     pendingPermissions: z.array(pendingPermissionSchema).optional(),
     permissionResponse: permissionAcknowledgementSchema.optional(),
     mimeType: z.literal("application/json").optional(),
@@ -493,6 +497,15 @@ export const workflowToolOutputShape = z
         value.alreadyTerminal === false &&
         (value.status === "pending" || value.status === "running") &&
         hasOnlyFields(value, [...inspectionFields, "stopped", "alreadyTerminal", "control"]);
+    } else if (has("pauseRequested") || has("paused")) {
+      valid =
+        runCommonComplete &&
+        inspectionComplete &&
+        has("pauseRequested") &&
+        has("paused") &&
+        value.status !== "pending" &&
+        value.paused === (value.status === "paused") &&
+        hasOnlyFields(value, [...inspectionFields, "pauseRequested", "paused"]);
     } else if (has("stopped") || has("alreadyTerminal")) {
       valid =
         runCommonComplete &&
@@ -573,6 +586,12 @@ export const workflowToolOutputShape = z
         required: [...runOutputRequired, ...inspectionRequired, "stopped", "alreadyTerminal"],
         properties: { status: { enum: ["completed", "failed", "aborted"] } },
         ...forbidsOutside([...inspectionFields, "stopped", "alreadyTerminal"]),
+      },
+      {
+        title: "Workflow pause acknowledgement",
+        required: [...runOutputRequired, ...inspectionRequired, "pauseRequested", "paused"],
+        properties: { status: { enum: ["running", "paused", "completed", "failed", "aborted"] } },
+        ...forbidsOutside([...inspectionFields, "pauseRequested", "paused"]),
       },
       {
         title: "Workflow stop pending",
@@ -742,6 +761,18 @@ export interface WorkflowStopPendingResult extends WorkflowRunStatus, WorkflowSc
   control: z.infer<typeof stopControlSchema>;
 }
 
+/**
+ * Pause acknowledgement. `pauseRequested` says the request reached the live execution owner in
+ * this call; `paused` says the run is durably paused now. A pending request (`running`) settles
+ * once every executing agent call has finished; observe it with status.
+ */
+export interface WorkflowPauseResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
+  latestActivity?: WorkflowRunLatestActivity[];
+  status: "running" | "paused" | "completed" | "failed" | "aborted";
+  pauseRequested: boolean;
+  paused: boolean;
+}
+
 export type WorkflowToolResult<T = unknown> =
   | WorkflowResultRetrieval
   | WorkflowConfigToolResult
@@ -750,7 +781,8 @@ export type WorkflowToolResult<T = unknown> =
   | WorkflowStatusToolResult<T>
   | WorkflowPermissionResponseResult
   | WorkflowStopResult
-  | WorkflowStopPendingResult;
+  | WorkflowStopPendingResult
+  | WorkflowPauseResult;
 
 export function toWorkflowExecutionOutcome<T>(
   run: WorkflowRunResult<T>,

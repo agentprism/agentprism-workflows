@@ -343,7 +343,7 @@ inputs.
 
 | Param | Type | Notes |
 |---|---|---|
-| `action` | `"config" \| "run" \| "resume" \| "status" \| "result" \| "permissions-response" \| "stop"` | Required canonical discriminator. `resume` continues the exact run ID; `status` is an immediate observation. |
+| `action` | `"config" \| "run" \| "resume" \| "status" \| "result" \| "permissions-response" \| "pause" \| "stop"` | Required canonical discriminator. `resume` continues the exact run ID, including a paused or stopped one; `status` is an immediate observation; `pause` lets executing agents finish before the run pauses; `stop` interrupts. |
 | `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for resume/status/result/permissions-response/stop. |
 | `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for resume/status/result/permissions-response/stop. |
 | `projectDir` | absolute path string | Config/run: project-sensitive discovery cwd and the run's project store/default cwd. Required for both on the shared daemon; defaults to the server's project under `--in-process`. Resume locates the project from its source `runId`. |
@@ -356,7 +356,7 @@ inputs.
 | `concurrency` | number | **Clamped** to 16 (not rejected). |
 | `agentRetries` | number | **Clamped** to 3. |
 | `checkpointReplies` | object | Resume only: map this run's `checkpointContext.callIndex` to a strict-JSON decision. The durable first answer wins. |
-| `runId` | string | Required for resume/status/result/permissions-response/stop. Resume input and output use this same ID. |
+| `runId` | string | Required for resume/status/result/permissions-response/pause/stop. Resume input and output use this same ID. |
 | `permissionId` | UUID string | Permissions-response only: opaque pending request id returned by status. |
 | `response` | setup/permission answer | Setup-response: `{ action:"accept", content:{...} }`, `{ action:"decline" }`, or `{ action:"cancel" }`. Permissions-response: `{ outcome:{ outcome:"selected", optionId } }` using an exact advertised option, or `{ outcome:{ outcome:"cancelled" } }`. |
 | `callIndex` | integer | Stop only: cancel exactly that one in-flight agent call (its slot settles to `null` with `AGENT_CANCELLED`) without aborting the run. Forbidden for every other action. |

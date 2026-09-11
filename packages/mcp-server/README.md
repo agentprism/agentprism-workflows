@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-An **[MCP](https://modelcontextprotocol.io) server** for asynchronous execution, bounded status observation, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tools are **`workflow`** for the strict config/run/resume/setup-response/status/result/permissions-response/stop lifecycle and **`repl`** for persistent interactive orchestration. Version-matched guidance for both is published through the SEP-2640 MCP Skills Extension. Apps-capable clients also get the dedicated `workflow_monitor` launcher. App-only `workflow-events`, `workflow-runs`, and `workflow-notifications` tools feed the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enter the model's tool loop. The `workflow` tool discovers its live backend catalog with `action:"config"` and durably accepts each script before slow preparation and validates it before live execution. Scripts may be supplied inline or by absolute server-side path, and every admitted run exposes its script file as an MCP `file://` resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes with `action:"resume"` after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
+An **[MCP](https://modelcontextprotocol.io) server** for asynchronous execution, bounded status observation, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tools are **`workflow`** for the strict config/run/resume/setup-response/status/result/permissions-response/stop/pause lifecycle and **`repl`** for persistent interactive orchestration. Version-matched guidance for both is published through the SEP-2640 MCP Skills Extension. Apps-capable clients also get the dedicated `workflow_monitor` launcher. App-only `workflow-events`, `workflow-runs`, and `workflow-notifications` tools feed the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enter the model's tool loop. The `workflow` tool discovers its live backend catalog with `action:"config"` and durably accepts each script before slow preparation and validates it before live execution. Scripts may be supplied inline or by absolute server-side path, and every admitted run exposes its script file as an MCP `file://` resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes with `action:"resume"` after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
 This package is a **thin MCP adapter**. The `workflow` tool's real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, and resume — lives in **[`@automatalabs/workflows`](../workflows)**; the `repl` tool's real work — the persistent QuickJS-in-WASM VM, the subagent broker, the CDP-style previewer, and the enveloped-snapshot store — lives in **[`@automatalabs/repl-engine`](../repl-engine)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool over a per-project `WorkflowManager` and the `repl` tool over a per-project QuickJS VM, and serves them over stdin/stdout.
 
@@ -246,11 +246,11 @@ of `script` and `scriptPath`. There are no aliases or completion-wait controls.
 | `args` | run | Strict-JSON script input, immutable after admission. |
 | `maxAgents`, `concurrency`, `agentRetries` | run, resume | Runtime limits; default agent cap 1000, concurrency clamped to 16, retries clamped to 3. Resolved limits are returned. |
 | `harnesses`, `modelSpecs`, `modelFilter` | config | Optional backend names, exact routed models, and bounded model substring or `/regex/` filter for no-prompt discovery. |
-| `runId` | resume, setup-response, status, result, permissions-response, stop | Exact persisted identity, matching `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. Resume continues the exact run ID. |
+| `runId` | resume, setup-response, status, result, permissions-response, pause, stop | Exact persisted identity, matching `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. Resume continues the exact run ID, including a paused or stopped one. |
 | `checkpointReplies` | resume | Map `checkpointContext.callIndex` to the explicit kind-valid JSON answer. The first durable answer wins. |
 | `setupId`, `response` | setup-response | Exact pending setup UUID, with `{ action:"accept", content:{...} }`, `{ action:"decline" }`, or `{ action:"cancel" }`. Accept content must satisfy the persisted `requestedSchema`. |
 | `permissionId`, `response` | permissions-response | Exact pending UUID and `{ outcome:{ outcome:"selected", optionId } }` or `{ outcome:{ outcome:"cancelled" } }`. Only an advertised option ID is accepted; response `_meta` is forbidden. |
-| `lastN`, `labelGlob`, `logLines` | status, stop | Bounded inspection: latest 1–50 calls (default 20), case-sensitive whole-label glob, and 0–50 log lines (default 20). |
+| `lastN`, `labelGlob`, `logLines` | status, pause, stop | Bounded inspection: latest 1–50 calls (default 20), case-sensitive whole-label glob, and 0–50 log lines (default 20). |
 | `offset`, `maxBytes` | result | Exact UTF-8 JSON paging: offset defaults to zero; maxBytes is 4–16,384 (default 16,384). Continue at the previous `endOffset`. |
 | `callIndex` | stop | Cancel one uniquely matching live agent; its slot resolves to `null` with `AGENT_CANCELLED`, while siblings continue. |
 | `forceOwner` | whole-run stop | Explicitly permit termination of a superseded owner after identity revalidation; may interrupt sibling runs. Forbidden with `callIndex`. |
@@ -483,10 +483,17 @@ client `resources` capability to gate these server-offered primitives.
 - **Observation and recovery.** Status never waits for work or collects an answer. A cold accepted
   preparation is recovered under its lease and preserves pending setup IDs. An interrupted admitted
   execution becomes paused/interrupted for explicit resume. A live lease is never stolen on timeout.
+- **Pause.** A pause request goes to the live execution owner; there is nothing to record cold.
+  Agents already executing finish and journal, nothing new starts, queued calls settle as
+  interrupted rows, and the run settles as `paused` with `reason:"requested"`. The response
+  carries `pauseRequested` and `paused` after a two-second wait for executing agents; a `running`
+  answer settles on its own. Resume continues from the journal. A run whose owner died is
+  reconciled to its interrupted pause instead.
 - **Stop.** Whole-run stop is location independent: it records a durable intent and forwards to the
   lease owner. Final success requires durable aborted state and a matching stopped event. A bounded
   control wait may return `control.state:"pending"` with an operation ID. Repeated terminal stop is
-  a successful no-op. Targeted agent cancellation needs a live owner and is not fabricated cold.
+  a successful no-op. A stopped (`aborted`) run is not final: resume replays its journal and re-runs
+  the interrupted calls. Targeted agent cancellation needs a live owner and is not fabricated cold.
 - **Process lifetime.** Disconnect, shim kill, and session eviction leave daemon-owned work alive.
   A successor routes setup replies, permission replies, and stop/cancel control to a predecessor
   still holding the lease. Owner process exit can interrupt work; `--in-process` ends with its own
@@ -748,10 +755,10 @@ await serveStdio(({ era }) => createWorkflowServer(runner, { protocolEra: era, p
 The REPL-specific exports are `replToolInputShape` / `replToolOutputShape` (the tool's Zod input/output schemas), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). Other workflow-side exports include the individual-validator catalog `workflowToolInputShape`, canonical `workflowToolInputBranches` / `workflowToolCanonicalInputSchema`, strict `workflowToolInputSchema` / `parseWorkflowToolInput`,
 `clampWorkflowInput`,
 `CreateWorkflowServerOptions`,
-`WorkflowExecuteToolInput`, `WorkflowResumeToolInput`, `WorkflowSetupResponseToolInput`, `WorkflowStatusToolInput`, `WorkflowPermissionResponseToolInput`, `WorkflowStopToolInput`,
+`WorkflowExecuteToolInput`, `WorkflowResumeToolInput`, `WorkflowSetupResponseToolInput`, `WorkflowStatusToolInput`, `WorkflowPermissionResponseToolInput`, `WorkflowStopToolInput`, `WorkflowPauseToolInput`,
 `WorkflowExecutionOutcome`, `WorkflowOperationAccepted`, `WorkflowSetupResponseResult`,
 `WorkflowRunLatestActivity`,
-`WorkflowStatusToolResult`, `WorkflowPermissionResponseResult`, `WorkflowStopResult`,
+`WorkflowStatusToolResult`, `WorkflowPermissionResponseResult`, `WorkflowStopResult`, `WorkflowPauseResult`,
 `WorkflowToolResult`, `WorkflowPermissionBroker`, `WorkflowPendingPermission`, `MAX_ACTIVE_RUNS`,
 `workflowToolOutputShape` / `toWorkflowExecutionOutcome`,
 `createProgressReporter`, `installMcpServerLifecycle` / `SHUTDOWN_DEADLINE_MS`, and lifecycle

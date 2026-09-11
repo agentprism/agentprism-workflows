@@ -111,6 +111,8 @@ export interface ManagedRun {
   result?: WorkflowRunResult;
   error?: WorkflowError;
   controller: AbortController;
+  /** Fires when a host asks this execution to pause; created lazily so an early request is kept. */
+  pauseController?: AbortController;
   startedAt: Date;
   /** The real script, kept so the run can be resumed. */
   script: string;
@@ -546,6 +548,7 @@ function runReason(status: RunStatus, error: WorkflowError | undefined): string 
   if (error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT) return "usage_limit";
   if (error?.code === WorkflowErrorCode.AUTH_REQUIRED) return "auth_required";
   if (error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED) return "checkpoint_required";
+  if (error?.code === WorkflowErrorCode.PAUSE_REQUESTED) return "requested";
   return error?.message;
 }
 
@@ -2106,6 +2109,7 @@ export class WorkflowManager extends EventEmitter {
         onMissingAgentConfiguration: exec.onMissingAgentConfiguration,
         agentsDir: managed.agentsDir,
         signal: managed.controller.signal,
+        pauseSignal: (managed.pauseController ??= new AbortController()).signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
         maxAgents,
@@ -2353,11 +2357,12 @@ export class WorkflowManager extends EventEmitter {
         error instanceof WorkflowError
           ? error
           : new WorkflowError(errorMessage(error), WorkflowErrorCode.UNKNOWN, { recoverable: false });
-      // Three recoverable-by-external-action fault codes checkpoint the run as PAUSED (not failed),
+      // Four recoverable-by-external-action fault codes checkpoint the run as PAUSED (not failed),
       // so resume() replays the journaled prefix instead of restarting from scratch (§2.12):
       //  - PROVIDER_USAGE_LIMIT: a provider quota refills over time.
       //  - AUTH_REQUIRED: a host completes an auth step.
       //  - CHECKPOINT_REQUIRED: a host supplies the pending durable checkpoint decision.
+      //  - PAUSE_REQUESTED: a host asked for the pause and resumes when it is ready.
       // All are recoverable:false, so the retry ladder skips them.
       const authPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.AUTH_REQUIRED;
@@ -2365,9 +2370,11 @@ export class WorkflowManager extends EventEmitter {
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
       const checkpointPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.CHECKPOINT_REQUIRED;
-      const paused = usageLimitPaused || authPaused || checkpointPaused;
+      const requestPaused =
+        !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PAUSE_REQUESTED;
+      const paused = usageLimitPaused || authPaused || checkpointPaused || requestPaused;
       if (managed.controller.signal.aborted) {
-        // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
+        // Intentional stop (host signal) — preserve the status set by stop()
         if (managed.status === "running") {
           managed.status = "aborted";
         }
@@ -2400,14 +2407,22 @@ export class WorkflowManager extends EventEmitter {
                 errorRecord,
                 checkpointContext: workflowError.checkpointContext,
               })
-            : this.createRunEvent("paused", {
-                runId: managed.runId,
-                scope: managed.runId,
-                reason: "usage_limit",
-                error: workflowError,
-                errorRecord,
-                resetHint: workflowError.resetHint,
-              });
+            : requestPaused
+              ? this.createRunEvent("paused", {
+                  runId: managed.runId,
+                  scope: managed.runId,
+                  reason: "requested",
+                  error: workflowError,
+                  errorRecord,
+                })
+              : this.createRunEvent("paused", {
+                  runId: managed.runId,
+                  scope: managed.runId,
+                  reason: "usage_limit",
+                  error: workflowError,
+                  errorRecord,
+                  resetHint: workflowError.resetHint,
+                });
         publish(pausedEvent, {
           beforeLive: () => {
             this.persistRun(managed);
@@ -2805,7 +2820,7 @@ export class WorkflowManager extends EventEmitter {
       // Why a pause happened, so the navigator / a future cold start can show it and
       // re-arm resume (§2.12). Selector switches on the paused run's error code:
       // AUTH_REQUIRED -> "auth_required", PROVIDER_USAGE_LIMIT -> "usage_limit",
-      // CHECKPOINT_REQUIRED -> "checkpoint_required".
+      // CHECKPOINT_REQUIRED -> "checkpoint_required", PAUSE_REQUESTED -> "requested".
       pauseReason:
         managed.status === "paused"
           ? managed.error?.code === WorkflowErrorCode.AUTH_REQUIRED
@@ -2814,7 +2829,9 @@ export class WorkflowManager extends EventEmitter {
               ? "usage_limit"
               : managed.error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED
                 ? "checkpoint_required"
-                : undefined
+                : managed.error?.code === WorkflowErrorCode.PAUSE_REQUESTED
+                  ? "requested"
+                  : undefined
           : undefined,
       // resetHint stays usage-limit-only.
       resetHint:
@@ -2900,27 +2917,24 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * Pause a running workflow.
+   * Ask a running workflow to pause. Agent calls already executing finish and journal, nothing
+   * new is admitted (queued calls settle as interrupted rows that run again on resume), and the
+   * run then settles as `paused` with reason "requested" and a `paused` event. Returns true when
+   * the request is registered with a run this manager is executing, including a repeat request
+   * while one is pending; false when the run is not running here. `stop()` remains the immediate
+   * interruption.
    */
   pause(runId: string): boolean {
     const managed = this.runs.get(runId);
-    if (managed?.status !== "running") return false;
-
-    managed.controller.abort();
-    this.liveAgentObservability.finishRun(managed);
-    managed.status = "paused";
-    this.publishRunEvent(
-      managed,
-      this.createRunEvent("paused", { runId, scope: runId }),
-      () => this.persistRun(managed),
-      {
-        afterLive: () => {
-          this.persistRun(managed);
-          this.releaseRunLease(managed);
-        },
-      },
-    );
+    if (managed?.status !== "running" || managed.preparation !== undefined) return false;
+    (managed.pauseController ??= new AbortController()).abort();
     return true;
+  }
+
+  /** Whether a pause request is registered for a run this manager is still executing. */
+  pausePending(runId: string): boolean {
+    const managed = this.runs.get(runId);
+    return managed?.status === "running" && managed.pauseController?.signal.aborted === true;
   }
 
   /**
@@ -2986,8 +3000,8 @@ export class WorkflowManager extends EventEmitter {
         return { accepted: false, reason: "not-continuable" };
       }
     }
-    // Guard: refuse to resume a run that is already running, or one that was
-    // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
+    // Guard: refuse to resume a run that is already running. Paused, failed, and stopped
+    // (aborted) runs can restart from their journal; only completed runs are final.
     const active = this.runs.get(runId);
     if (active?.journaling === false) throw new Error("journaling disabled for this run");
     if (!this.resolveJournaling(exec)) throw new Error("journaling disabled for this run");
@@ -3004,8 +3018,6 @@ export class WorkflowManager extends EventEmitter {
           : { resolvedCheckpoints: classified.resolutions }),
       };
     }
-    if (active?.status === "aborted") return { accepted: false, reason: "terminal" };
-
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) {
       // A concurrent owner may already have durably committed this checkpoint reply. Read-only
@@ -3020,7 +3032,7 @@ export class WorkflowManager extends EventEmitter {
         accepted: false,
         reason: settledReply && durable?.status === "running"
           ? "running"
-          : settledReply && (durable?.status === "completed" || durable?.status === "aborted")
+          : settledReply && durable?.status === "completed"
             ? "terminal"
             : "owned-elsewhere",
         ...(classified.resolutions.length === 0
@@ -3056,7 +3068,7 @@ export class WorkflowManager extends EventEmitter {
           : { resolvedCheckpoints: checkpointReplies.resolutions }),
       };
     }
-    if (persisted.status === "completed" || persisted.status === "aborted") {
+    if (persisted.status === "completed") {
       this.persistence.releaseRunLease(lease);
       return {
         accepted: false,

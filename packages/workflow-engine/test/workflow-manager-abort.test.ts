@@ -276,24 +276,22 @@ return { a, b }`;
 test(
   "stop on paused run transitions to aborted",
   withTempCwd(async (cwd) => {
-    const da = deferredAgent();
-    const manager = new WorkflowManager({ cwd, agent: da.runner });
+    const agent = perCallDeferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
     manager.on("error", () => {});
-    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    // Pause first
-    const paused = manager.pause(runId);
-    assert.equal(paused, true);
+    // Pause while agent a executes: it finishes and journals, then b is refused.
+    assert.equal(manager.pause(runId), true);
+    agent.resolve(0, "a-done");
+    await promise.catch(() => {});
     assert.equal(manager.getRun(runId)?.status, "paused");
 
     // Then stop the paused run
     const stopped = manager.stop(runId);
     assert.equal(stopped, true);
     assert.equal(manager.getRun(runId)?.status, "aborted", "paused run should become aborted after stop");
-
-    da.resolve("done");
-    await promise.catch(() => {});
   }),
 );
 
@@ -353,15 +351,28 @@ test(
       pausedEvent = ev;
     });
 
-    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
     await new Promise((r) => setTimeout(r, 20));
-    manager.pause(runId);
+    assert.equal(manager.pause(runId), true);
+    assert.equal(pausedEvent, null, "the request alone does not pause: agent a is still executing");
+    assert.equal(manager.getRun(runId)?.status, "running");
+    assert.equal(manager.pausePending(runId), true);
 
-    assert.ok(pausedEvent, "paused event should fire");
-    assert.equal(pausedEvent?.runId, runId);
-
-    da.resolve("done");
+    da.resolve("a-done");
     await promise.catch(() => {});
+
+    assert.ok(pausedEvent, "paused event fires once the executing agent finished");
+    assert.equal(pausedEvent?.runId, runId);
+    assert.equal((pausedEvent as { reason?: string } | null)?.reason, "requested");
+    assert.equal(manager.getRun(runId)?.status, "paused");
+    assert.equal(manager.pausePending(runId), false);
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.pauseReason, "requested");
+    assert.equal(persisted?.reason, "requested");
+    assert.equal(persisted?.errorCode, WorkflowErrorCode.PAUSE_REQUESTED);
+    assert.equal(persisted?.journal?.length, 1, "the executing agent journaled before the pause settled");
+    assert.equal(persisted?.calls?.length, 1, "the refused second admission was never allocated");
+    assert.equal(persisted?.calls?.[0]?.outcome, "result");
   }),
 );
 
@@ -384,20 +395,146 @@ test(
 );
 
 test(
-  "pause returns false for already-paused run",
+  "pause is idempotent while pending and returns false once the run is paused",
   withTempCwd(async (cwd) => {
     const da = deferredAgent();
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
-    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    manager.pause(runId);
-    const secondPause = manager.pause(runId);
-    assert.equal(secondPause, false, "second pause on same run should return false");
+    assert.equal(manager.pause(runId), true);
+    assert.equal(manager.pause(runId), true, "a repeat request while pending is the same request");
 
-    da.resolve("done");
+    da.resolve("a-done");
     await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "paused");
+    assert.equal(manager.pause(runId), false, "nothing is running once the run is paused");
+  }),
+);
+
+test(
+  "a pause requested before any call pauses immediately without executing anything",
+  withTempCwd(async (cwd) => {
+    const agent = perCallDeferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+    // Execution is deferred to the next macrotask; the request lands before the script starts.
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "paused");
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.journal?.length ?? 0, 0);
+    assert.equal(persisted?.calls?.length ?? 0, 0, "an admission refused before allocation leaves no row");
+    assert.equal(persisted?.pauseReason, "requested");
+
+    // Resume runs everything live.
+    assert.equal(await manager.resume(runId), true);
+    await new Promise((r) => setTimeout(r, 20));
+    agent.resolve(0, "a");
+    await new Promise((r) => setTimeout(r, 20));
+    agent.resolve(1, "b");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(manager.getRun(runId)?.status, "completed");
+    assert.equal(JSON.stringify(manager.getRun(runId)?.result?.result), JSON.stringify({ a: "a", b: "b" }));
+  }),
+);
+
+test(
+  "a pause lets executing parallel calls finish and refuses the queued ones, which run again on resume",
+  withTempCwd(async (cwd) => {
+    const agent = perCallDeferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'fan_out', description: 'three parallel agents' }
+return await parallel([
+  () => agent('one', { label: 'one' }),
+  () => agent('two', { label: 'two' }),
+  () => agent('three', { label: 'three' }),
+])`;
+    const { runId, promise } = manager.startInBackground(script, undefined, { concurrency: 2 });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(manager.getRun(runId)?.callsAllocated, 3, "all three are allocated, two execute, one queues");
+
+    assert.equal(manager.pause(runId), true);
+    agent.resolve(0, "one-done");
+    agent.resolve(1, "two-done");
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "paused");
+
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.deepEqual(
+      persisted?.journal?.map((entry) => entry.index).sort(),
+      [0, 1],
+      "both executing calls journaled their results",
+    );
+    const queued = persisted?.calls?.find((call) => call.index === 2);
+    assert.equal(queued?.aborted, true, "the queued call never started and is recorded as interrupted");
+    assert.equal(queued?.error?.code, WorkflowErrorCode.PAUSE_REQUESTED);
+
+    assert.equal(await manager.resume(runId), true);
+    await new Promise((r) => setTimeout(r, 30));
+    agent.resolve(2, "three-done");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(manager.getRun(runId)?.status, "completed");
+    assert.equal(JSON.stringify(manager.getRun(runId)?.result?.result), JSON.stringify(["one-done", "two-done", "three-done"]));
+  }),
+);
+
+test(
+  "a script that catches the pause signal still pauses instead of completing",
+  withTempCwd(async (cwd) => {
+    const agent = perCallDeferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'swallow', description: 'catches the pause' }
+const a = await agent('first', { label: 'a' })
+let b = 'skipped'
+try { b = await agent('second', { label: 'b' }) } catch (error) { log('caught ' + String(error)) }
+return { a, b }`;
+    const { runId, promise } = manager.startInBackground(script);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(manager.pause(runId), true);
+    agent.resolve(0, "a-done");
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "paused", "catching PAUSE_REQUESTED cannot keep the run going");
+    assert.ok(manager.getRun(runId)?.snapshot.logs.some((line) => line.includes("caught WorkflowError: workflow paused by host request")));
+  }),
+);
+
+test(
+  "a stopped run resumes from its journal and re-runs the interrupted call",
+  withTempCwd(async (cwd) => {
+    const agent = perCallDeferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+    await new Promise((r) => setTimeout(r, 20));
+    agent.resolve(0, "a-done");
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Stop while agent b executes: it is interrupted, the run is aborted, and b's result is lost.
+    assert.equal(manager.stop(runId), true);
+    agent.resolve(1, "lost");
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "aborted");
+    let persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "aborted");
+    assert.equal(persisted?.abortSignaled, true);
+    assert.equal(persisted?.journal?.length, 1);
+
+    // Resume: a replays, b runs live with a fresh runner call.
+    assert.equal(await manager.resume(runId), true);
+    assert.equal(manager.getRun(runId)?.status, "running");
+    await new Promise((r) => setTimeout(r, 30));
+    agent.resolve(2, "b-done");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(manager.getRun(runId)?.status, "completed");
+    assert.equal(JSON.stringify(manager.getRun(runId)?.result?.result), JSON.stringify({ a: "a-done", b: "b-done" }));
+    persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "completed");
+    assert.equal(persisted?.abortSignaled, undefined, "the stop marker does not outlive the continuation");
   }),
 );
 
@@ -406,38 +543,32 @@ test(
 test(
   "resume full cycle: pause then resume then complete",
   withTempCwd(async (cwd) => {
-    const da = deferredAgent();
-    const manager = new WorkflowManager({ cwd, agent: da.runner });
+    const agent = perCallDeferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
     manager.on("error", () => {});
 
-    const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
+    const { runId, promise: origPromise } = manager.startInBackground(twoAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    // Pause while the deferred agent is in-flight
-    const paused = manager.pause(runId);
-    assert.equal(paused, true);
+    // Pause while agent a executes; it finishes and journals, b is refused.
+    assert.equal(manager.pause(runId), true);
+    agent.resolve(0, "a-done");
+    await origPromise.catch(() => {});
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // Resume — replays journal (empty for single-agent that never completed) and
-    // re-runs the live agent with a fresh (non-aborted) controller.
+    // Resume — a replays from the journal, b runs live.
     const resumed = await manager.resume(runId);
     assert.equal(resumed, true, "resume should succeed");
-
-    // The resumed run should be running
     assert.equal(manager.getRun(runId)?.status, "running", "resumed run should be running");
 
-    // Resolve the deferred agent so the resumed run's agent completes
-    da.resolve("resumed-done");
-
-    // The original promise will reject (its controller was aborted). Suppress it.
-    await origPromise.catch(() => {});
-
-    // Wait for the resumed run to complete
+    await new Promise((r) => setTimeout(r, 30));
+    agent.resolve(1, "resumed-done");
     await new Promise((r) => setTimeout(r, 50));
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed", "resumed run should complete successfully");
-    assert.equal(finalRun?.result?.result?.a, "resumed-done", "resumed run should have the agent result");
+    assert.equal(finalRun?.result?.result?.a, "a-done", "agent a replayed from the journal");
+    assert.equal(finalRun?.result?.result?.b, "resumed-done", "agent b ran live after resume");
 
     // The run should also appear in listRuns as completed
     const persisted = manager.listRuns().find((r) => r.runId === runId);
@@ -466,13 +597,9 @@ return { a, b }`;
     agent.resolve(0, "first-result");
     await new Promise((r) => setTimeout(r, 30));
 
-    // Pause while agent 2 is still in-flight.
-    const paused = manager.pause(runId);
-    assert.equal(paused, true, "run pauses while agent 2 is in-flight");
-    assert.equal(manager.getRun(runId)?.status, "paused");
-
-    // Release the original's in-flight agent 2 so the aborted original settles. Its
-    // result is NOT journaled — throwIfAborted fires before the journal write.
+    // Stop while agent 2 is still in-flight: it is interrupted and its result is lost.
+    assert.equal(manager.stop(runId), true, "run stops while agent 2 is in-flight");
+    assert.equal(manager.getRun(runId)?.status, "aborted");
     agent.resolve(1);
     await origPromise.catch(() => {});
 
@@ -523,12 +650,12 @@ test(
 
     const { runId, promise: originalPromise } = manager.startInBackground(oneAgentScript);
     await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(manager.pause(runId), true);
-    agent.resolve(0, "original-finished-after-pause");
+    assert.equal(manager.stop(runId), true);
+    agent.resolve(0, "original-finished-after-stop");
     await originalPromise.catch(() => {});
 
     const resumed = await manager.resumeInBackground(runId);
-    if (!resumed.accepted) assert.fail("paused run should be accepted for background resume");
+    if (!resumed.accepted) assert.fail("stopped run should be accepted for background resume");
     assert.equal(manager.getRun(runId)?.status, "running");
 
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -757,11 +884,13 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
 
-    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    // Pause
+    // Pause: the executing agent finishes first.
     manager.pause(runId);
+    da.resolve("a-done");
+    await promise.catch(() => {});
     let persisted = manager.listRuns().find((r) => r.runId === runId);
     assert.equal(persisted?.status, "paused", "listRuns should show paused status");
 
@@ -769,9 +898,6 @@ test(
     manager.stop(runId);
     persisted = manager.listRuns().find((r) => r.runId === runId);
     assert.equal(persisted?.status, "aborted", "listRuns should show aborted status after stop");
-
-    da.resolve("done");
-    await promise.catch(() => {});
   }),
 );
 
@@ -790,17 +916,16 @@ test(
       resumedEvent = ev;
     });
 
-    // Track resumed event on the pause→resume cycle
+    // Track resumed event on the stop→resume cycle
     const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
-    manager.pause(runId);
+    manager.stop(runId);
+    da.resolve("done");
+    await origPromise.catch(() => {});
     await manager.resume(runId);
 
     assert.ok(resumedEvent, "resumed event should fire on resume");
     assert.equal(resumedEvent?.runId, runId);
-
-    da.resolve("done");
-    await origPromise.catch(() => {});
 
     // Now test error event on abort. runSync settles to a terminal aborted result;
     // the 'error' event still fires.

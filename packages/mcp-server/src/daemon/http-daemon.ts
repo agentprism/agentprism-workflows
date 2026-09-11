@@ -233,7 +233,7 @@ function isInternalRunControlRequest(value: unknown): value is InternalRunContro
     typeof row.runId !== "string" ||
     !/^[a-z0-9]+-[a-z0-9]+$/.test(row.runId)
   ) return false;
-  if (row.action === "stop" || row.action === "list-permissions") {
+  if (row.action === "stop" || row.action === "pause" || row.action === "list-permissions") {
     return keys.join(",") === "action,operationId,runId";
   }
   if (row.action === "respond-permission") {

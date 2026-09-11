@@ -43,17 +43,17 @@ test("tool discovery exposes asynchronous lifecycle separately from the dedicate
     assert.ok((workflow.description ?? "").length < 1200);
     assert.doesNotMatch(JSON.stringify(workflow.inputSchema), /background|foreground|startInBackground|agentTimeoutMs|agentIdleTimeoutMs/);
     const branches = workflow.inputSchema.oneOf as Array<Record<string, unknown>>;
-    assert.equal(branches.length, 8);
+    assert.equal(branches.length, 9);
     const action = (variant: Record<string, unknown>): unknown => {
       const variants = variant.oneOf as Array<Record<string, unknown>> | undefined;
       return variants ? action(variants[0]) : field(field(variant.properties, "action"), "const");
     };
-    assert.deepEqual(branches.map(action), ["config", "run", "resume", "setup-response", "status", "result", "permissions-response", "stop"]);
+    assert.deepEqual(branches.map(action), ["config", "run", "resume", "setup-response", "status", "result", "permissions-response", "stop", "pause"]);
     assert.ok(workflow.outputSchema);
     const properties = Object.keys(field(workflow.outputSchema, "properties") ?? {});
     for (const name of ["accepted", "continuation", "setup", "outcome", "pendingPermissions"]) assert.ok(properties.includes(name));
     for (const retired of ["validation", "interaction", "background", "requestId", "duplicate"]) assert.equal(properties.includes(retired), false);
-    assert.equal((field(workflow.outputSchema, "oneOf") as unknown[]).length, 8);
+    assert.equal((field(workflow.outputSchema, "oneOf") as unknown[]).length, 9);
   } finally { await dispose(); }
 });
 

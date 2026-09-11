@@ -265,6 +265,15 @@ const callStopInputSchema = z
   .strict();
 const stopInputSchema = z.xor([wholeRunStopInputSchema, callStopInputSchema]);
 
+const pauseInputSchema = z
+  .object({
+    action: z.literal("pause").describe(
+      "Ask the run's execution owner to pause: executing agents finish and journal, nothing new starts, and the run becomes resumable.",
+    ),
+    ...inspectionShape,
+  })
+  .strict();
+
 /** The canonical action branches; run and stop contain structural sub-variants. */
 export const workflowToolInputBranches = {
   config: configInputSchema,
@@ -275,6 +284,7 @@ export const workflowToolInputBranches = {
   result: resultInputSchema,
   "permissions-response": permissionResponseInputSchema,
   stop: stopInputSchema,
+  pause: pauseInputSchema,
 } as const;
 
 export const workflowToolCanonicalInputSchema = z.xor([
@@ -286,6 +296,7 @@ export const workflowToolCanonicalInputSchema = z.xor([
   workflowToolInputBranches.result,
   workflowToolInputBranches["permissions-response"],
   workflowToolInputBranches.stop,
+  workflowToolInputBranches.pause,
 ]).meta({ type: "object" });
 
 /** Runtime and discovery use the same strict canonical schema. */
@@ -361,6 +372,11 @@ type WorkflowStopToolInputBase = WorkflowRunInspectionOptions & {
 export type WorkflowStopToolInput = WorkflowStopToolInputBase &
   ({ callIndex: number; forceOwner?: never } | { callIndex?: never; forceOwner?: boolean });
 
+export type WorkflowPauseToolInput = WorkflowRunInspectionOptions & {
+  action: "pause";
+  runId: string;
+};
+
 export type WorkflowToolInput =
   | WorkflowConfigToolInput
   | WorkflowExecuteToolInput
@@ -369,7 +385,8 @@ export type WorkflowToolInput =
   | WorkflowStatusToolInput
   | WorkflowResultToolInput
   | WorkflowPermissionResponseToolInput
-  | WorkflowStopToolInput;
+  | WorkflowStopToolInput
+  | WorkflowPauseToolInput;
 
 export interface ParseWorkflowToolInputOptions {
   /** Require projectDir for config/run on the shared multi-project daemon. */
@@ -427,6 +444,7 @@ export function parseWorkflowToolInput(
     case "permissions-response":
     case "setup-response":
     case "stop":
+    case "pause":
       return input;
   }
 }

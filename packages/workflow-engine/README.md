@@ -307,8 +307,11 @@ or `injected` from `checkpointReplies`. Pausing checkpoints are omitted. Both
 arrays are absent when empty, stay outside call hashes, and are deliberately excluded from
 `WorkflowRunStatus`.
 
-The manager treats `PROVIDER_USAGE_LIMIT`, `AUTH_REQUIRED`, and `CHECKPOINT_REQUIRED` as resumable
-pause conditions rather than failed runs. An authentication pause uses `reason: "auth_required"`
+The manager treats `PROVIDER_USAGE_LIMIT`, `AUTH_REQUIRED`, `CHECKPOINT_REQUIRED`, and
+`PAUSE_REQUESTED` as resumable pause conditions rather than failed runs. `pause(runId)` raises the
+last one: agent calls already executing finish and journal, nothing new is admitted, queued calls
+settle as interrupted rows, and the run pauses with `reason:"requested"`. `stop(runId)` interrupts
+in-flight work instead and settles the run as `aborted`; both continue with `resume(runId)`. An authentication pause uses `reason: "auth_required"`
 and carries only the non-secret `authContext`; complete authentication through the injected runner,
 then resume the same journal. Every unanswered checkpoint persists `reason:"checkpoint_required"`
 and non-secret `checkpointContext`. Answer with `ExecOptions.checkpointReplies[callIndex]`, or

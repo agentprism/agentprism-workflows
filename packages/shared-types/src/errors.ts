@@ -25,6 +25,10 @@ export enum WorkflowErrorCode {
   /** A durable checkpoint needs a human reply. The manager pauses the run and persists the
    *  non-secret `checkpointContext` so a host can collect and journal the decision on resume. */
   CHECKPOINT_REQUIRED = "CHECKPOINT_REQUIRED",
+  /** A host requested a pause. Agent calls already executing finish and journal, nothing new is
+   *  admitted, and the run settles as paused with `reason: "requested"`. Non-recoverable: resume
+   *  the same journal. Catching it inside the script cannot keep the run going. */
+  PAUSE_REQUESTED = "PAUSE_REQUESTED",
   SCRIPT_VALIDATION_ERROR = "SCRIPT_VALIDATION_ERROR",
   /** The workflow SCRIPT crashed at runtime: an uncaught throw or an unhandled promise
    *  rejection inside the script body. Distinct from WORKFLOW_ABORTED (someone cancelled the
