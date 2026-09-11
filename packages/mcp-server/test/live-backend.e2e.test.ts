@@ -36,6 +36,15 @@ const LIVE = process.env.AGENTPRISM_LIVE_E2E === "1";
 const SKIP: string | false = LIVE
   ? false
   : "gated live-backend e2e — set AGENTPRISM_LIVE_E2E=1 (with creds) to run";
+// Codex legs are opt-in on top of the live gate: Codex plan or API credits are not guaranteed on
+// developer machines, so the pre-push hook does not depend on them. Run them before touching the
+// codex backend or the codex-acp fork.
+const CODEX_LIVE = LIVE && process.env.AGENTPRISM_LIVE_E2E_CODEX === "1";
+const SKIP_CODEX: string | false = CODEX_LIVE
+  ? false
+  : LIVE
+    ? "Codex live legs are opt-in — set AGENTPRISM_LIVE_E2E_CODEX=1 with Codex credits to run"
+    : SKIP;
 
 // The REAL built shell entry (composition root that injects createAcpRunner). `pnpm test`
 // builds first; running this suite directly requires a prior `pnpm build`.
@@ -541,7 +550,7 @@ test("live-backend e2e: claude drives schema'd structured output with single-pro
 });
 
 test("live-backend e2e: codex npm package drives schema'd structured output with single-process pooling reuse", {
-  skip: SKIP,
+  skip: SKIP_CODEX,
   timeout: 300_000,
 }, async () => {
   assert.ok(existsSync(SERVER_ENTRY), `built server entry missing — run \`pnpm build\` first: ${SERVER_ENTRY}`);
@@ -653,7 +662,7 @@ test("live workflow config discovery: no-prompt catalogs create no run and inval
   }
 });
 
-test("live REPL queue smoke: Claude, Codex, OpenCode, and Pi continue one session through broker-owned FIFO prompts", {
+test("live REPL queue smoke: Claude, OpenCode, Pi, and (when opted in) Codex continue one session through broker-owned FIFO prompts", {
   skip: SKIP,
   timeout: 600_000,
 }, async () => {
@@ -668,16 +677,16 @@ test("live REPL queue smoke: Claude, Codex, OpenCode, and Pi continue one sessio
     cwd: projectDir,
   });
   const client = new Client({ name: "live-repl-queue", version: "0.0.0" }, { capabilities: {} });
-  const specs = {
+  const specs: Record<string, string> = {
     claude: CLAUDE_E2E_MODEL,
-    codex: "codex",
+    ...(CODEX_LIVE ? { codex: "codex" } : {}),
     opencode: OPENCODE_E2E_MODEL,
     pi: `pi/${PI_E2E_MODEL}`,
-  } as const;
-  const names = Object.keys(specs) as Array<keyof typeof specs>;
+  };
+  const names = Object.keys(specs);
   const suffix = `${Date.now().toString(36)}_${process.pid}`;
-  const handleName = (name: keyof typeof specs): string => `live_${name}_${suffix}`;
-  const queueName = (name: keyof typeof specs): string => `queued_${name}_${suffix}`;
+  const handleName = (name: string): string => `live_${name}_${suffix}`;
+  const queueName = (name: string): string => `queued_${name}_${suffix}`;
   const lastLine = (value: unknown): string =>
     typeof value === "string" ? (value.trim().split("\n").at(-1)?.trim() ?? "") : "";
   try {

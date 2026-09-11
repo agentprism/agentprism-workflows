@@ -83,7 +83,7 @@ if ! node scripts/check-acp-deps.mjs; then
   exit 1
 fi
 
-echo "pre-push: building workspace, then LIVE backend + Claude/Codex steering e2e (real agents, real tokens; ~60-120s)..." >&2
+echo "pre-push: building workspace, then LIVE backend (Claude, OpenCode, pi) + Claude steering e2e (real agents, real tokens; ~60-120s; Codex legs are opt-in via AGENTPRISM_LIVE_E2E_CODEX=1)..." >&2
 pnpm build >/dev/null 2>&1
 
 # The full runner output is tee'd to a log, and on failure the failing-test section is
@@ -111,7 +111,7 @@ if ! AGENTPRISM_LIVE_E2E=1 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8 timeout 
   fi
   echo "" >&2
   echo "  Full log: $E2E_LOG" >&2
-  echo "  Check agent auth (claude / codex / opencode login, ~/.pi/agent/auth.json)." >&2
+  echo "  Check agent auth (claude / opencode login, ~/.pi/agent/auth.json; codex only when AGENTPRISM_LIVE_E2E_CODEX=1)." >&2
   echo "  A leg stalling with slow turns usually means an expired OAuth session — re-login and retry." >&2
   exit 1
 fi
