@@ -11,7 +11,15 @@ import { createAcpRunner } from "../src/index.js";
 const LIVE = process.env.AGENTPRISM_LIVE_E2E === "1";
 const SKIP: string | false = LIVE
   ? false
-  : "gated live steering e2e — set AGENTPRISM_LIVE_E2E=1 with Claude and Codex credentials";
+  : "gated live steering e2e — set AGENTPRISM_LIVE_E2E=1 with Claude credentials";
+// The Codex leg is opt-in on top of the live gate: Codex plan or API credits are not guaranteed
+// on developer machines, so the pre-push hook does not depend on it.
+const CODEX_LIVE = LIVE && process.env.AGENTPRISM_LIVE_E2E_CODEX === "1";
+const SKIP_CODEX: string | false = CODEX_LIVE
+  ? false
+  : LIVE
+    ? "Codex live leg is opt-in — set AGENTPRISM_LIVE_E2E_CODEX=1 with Codex credits to run"
+    : SKIP;
 
 const OUTCOMES = ["injected", "startedNewTurn", "failed", "promptRequired"] as const;
 
@@ -82,6 +90,6 @@ test("live steering e2e: Claude advertises and accepts native session steering",
 }, () => steerLiveBackend("claude"));
 
 test("live steering e2e: Codex advertises and accepts native session steering", {
-  skip: SKIP,
+  skip: SKIP_CODEX,
   timeout: 90_000,
 }, () => steerLiveBackend("codex"));
