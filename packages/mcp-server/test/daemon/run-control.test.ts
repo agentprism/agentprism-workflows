@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -410,6 +409,67 @@ test("a successor-side controller resolves the lease owner and forwards whole-ru
   }
 });
 
+test("a successor-side controller forwards a pause to the owner, which drains the executing call and pauses", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "agentprism-control-pause-"));
+  const controlled = controlledRunner();
+  const ownerInstanceId = "predecessor-pause-owner";
+  const owner = await createDaemon({
+    runner: controlled.runner,
+    port: 0,
+    ownInstanceId: ownerInstanceId,
+    log: () => undefined,
+  });
+  writeDaemonInfo({
+    name: DAEMON_NAME,
+    version: "0.99.0",
+    pid: process.pid,
+    port: owner.port,
+    url: owner.url,
+    startedAt: owner.startedAt,
+    envFingerprint: envFingerprint(),
+    instanceId: ownerInstanceId,
+    controlUrl: owner.controlUrl,
+    controlProtocol: 1,
+  });
+  try {
+    const ownerManager = owner.projects.getOrCreate(cwd).manager;
+    const twoCalls = [
+      'export const meta = { model: "claude", name: "daemon-route-pause", description: "daemon route pause" };',
+      'await agent("block", { label: "block" });',
+      'return await agent("never", { label: "never" });',
+    ].join("\n");
+    const started = ownerManager.startInBackground(twoCalls, undefined, { runId: "crossgeneration-pause" });
+    await controlled.ready;
+
+    const successorProjects = new WorkflowProjectRegistry(controlled.runner, { leaseOwnerId: "successor-pause-instance" });
+    const successorManager = successorProjects.getOrCreate(cwd).manager;
+    const successorControl = new DaemonRunControl({
+      projects: successorProjects,
+      ownPid: process.pid,
+      ownInstanceId: "successor-pause-instance",
+      key: loadOrCreateRunControlKey(),
+      log: () => undefined,
+    });
+    assert.equal(await successorControl.pause(successorManager, started.runId), true);
+    assert.equal(ownerManager.pausePending(started.runId), true, "the owner holds the pause request");
+    assert.equal(successorManager.getPersistence().load(started.runId)?.status, "running", "the executing call is still finishing");
+
+    controlled.resolve("blocked result");
+    await started.promise.catch(() => undefined);
+    const persisted = successorManager.getPersistence().load(started.runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.pauseReason, "requested");
+    assert.equal(persisted?.journal?.length, 1, "the executing call journaled before the pause settled");
+
+    assert.equal(await successorControl.pause(successorManager, started.runId), false, "nothing is running any more");
+  } finally {
+    controlled.resolve("cleanup");
+    clearDaemonInfo(process.pid);
+    await owner.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("a lost setup forwarding acknowledgement preserves one durable answer and one execution", async () => {
   let calls = 0;
   const runner = makeRunner(() => { calls++; return "once"; });
@@ -423,7 +483,7 @@ test("a lost setup forwarding acknowledgement preserves one durable answer and o
   });
   try {
     const accepted = await session.client.callTool({ name: "workflow", arguments: {
-      action: "run", requestId: randomUUID(), projectDir: cwd,
+      action: "run", projectDir: cwd,
       script: 'export const meta = { model: "claude", name: "setup-once", description: "lost setup reply", backends: { custom: { command: "fixture" } } }; return await agent("work", { model: "custom" });',
     } });
     const runId = String(structured(accepted)?.runId);

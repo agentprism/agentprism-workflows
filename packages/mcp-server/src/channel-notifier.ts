@@ -59,7 +59,7 @@ function noticeForRecord(runId: string, record: RunEventLogRecord): RunNotice | 
       const checkpoint = event.reason === "checkpoint_required" ? event.checkpointContext : undefined;
       const backendId = event.reason === "auth_required" ? event.authContext?.backendId : undefined;
       return pausedNotice(runId, {
-        // The engine's manual pause carries no reason; the App shows it the same way.
+        // Rows written by the earlier interrupting pause carry no reason; show them as manual.
         reason: event.reason ?? "manual",
         ...(checkpoint === undefined ? {} : { checkpoint }),
         ...(backendId === undefined ? {} : { backendId }),

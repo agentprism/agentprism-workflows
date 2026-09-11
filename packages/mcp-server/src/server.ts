@@ -38,7 +38,11 @@ import type {
   WorkflowRunStatus,
 } from "@automatalabs/workflows";
 import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
-import { boundWorkflowRequest, workflowLifecycle, workflowOperation, workflowSetup } from "./workflow-lifecycle.js";
+import {
+  boundWorkflowRequest, isPreparationCancelled, WorkflowPreparationRejected, workflowLifecycle, workflowSetup,
+  type WorkflowPreparationOutcome,
+} from "./workflow-lifecycle.js";
+import { createProgressReporter } from "./progress.js";
 import { CLAUDE_CHANNEL_CAPABILITY, ClaudeChannelNotifier } from "./channel-notifier.js";
 import {
   createEvalBreakChannel,
@@ -71,6 +75,7 @@ import type {
   WorkflowResultRetrieval,
   WorkflowRunLatestActivity,
   WorkflowStatusToolResult,
+  WorkflowPauseResult,
   WorkflowStopPendingResult,
   WorkflowStopResult,
 } from "./workflow-tool-output.js";
@@ -95,7 +100,6 @@ import {
   RESULT_RESOURCE_MIME_TYPE,
   WorkflowScriptResources,
   workflowResultUri,
-  workflowScriptUri,
 } from "./workflow-resources.js";
 import { requireDurableStoppedRun } from "./workflow-stop.js";
 import {
@@ -135,8 +139,8 @@ export const SERVER_INSTRUCTIONS = [
     "the host's skill-loading path, then read only the supporting resources it references as needed.",
   "• workflow — DETERMINISTIC BATCH orchestration. Use action:\"run\" with a JavaScript workflow " +
     "script that fans out agent() subagents and optional checkpoint() gates. Run and resume always return " +
-    "a durable runId for bounded status, permissions-response, result, and stop calls; resume continues " +
-    "the exact run from its durable admission and journal. action:\"config\" discovers the live backend " +
+    "a durable runId for bounded status, permissions-response, result, pause, and stop calls; resume continues " +
+    "the exact run (paused or stopped) from its durable admission and journal. action:\"config\" discovers the live backend " +
     "and model option catalog. Every agent call must resolve an explicit model route (backend-only routes are valid). Accepted runs prepare durably; custom backends require approval. Checkpoints always require an explicit answer.",
   "• repl — INTERACTIVE STATEFUL orchestration. A persistent per-project JavaScript VM driven with " +
     "action:\"eval\". Named bindings, pending subagent handles, queued turns, checkpoints, and `_` " +
@@ -163,6 +167,19 @@ function isTerminalStatus(status: WorkflowRunStatus["status"]): boolean {
 
 function isAlreadyTerminalForStop(status: WorkflowRunStatus["status"]): boolean {
   return status === "completed" || status === "failed" || status === "aborted";
+}
+
+/** How long a pause request waits for executing agents to finish before answering with `running`. */
+export const WORKFLOW_PAUSE_SETTLE_WAIT_MS = 2_000;
+
+async function waitForPauseSettlement(manager: WorkflowManager, runId: string, ms: number): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const live = manager.getRun(runId);
+    const status = live ? live.status : manager.getPersistence().load(runId)?.status;
+    if (status !== "running") return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 async function pendingPermissionsForRun(
@@ -328,6 +345,9 @@ function addInspectionResourceFields<Status extends WorkflowRunStatus, Fields ex
     },
     ...fields,
   };
+  // The engine's replay-eligibility diagnostic is SDK surface; MCP inspection stays the bounded
+  // documented field set, and a revised continuation reports its per-call decisions on the result.
+  delete (projected as { replayEligibility?: unknown }).replayEligibility;
   const activityProjection = projected as Status & Fields & {
     latestActivity?: WorkflowRunLatestActivity[];
   };
@@ -440,6 +460,24 @@ function formatPendingStopSummary(result: WorkflowStopPendingResult): string {
   return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
 }
 
+function formatPauseSummary(result: WorkflowPauseResult): string {
+  const lines = inspectionSummaryLines(result);
+  lines.splice(
+    2,
+    0,
+    result.paused
+      ? result.pauseRequested
+        ? "Pause is durably complete: executing agents finished and journaled, nothing new started. Edit the script file if needed, then resume with the same runId."
+        : "No pause was initiated because this run was already paused; resume with the same runId when ready."
+      : result.pauseRequested
+        ? "Pause requested: agents already executing are finishing and will journal; nothing new starts. Poll status until it reports paused, then resume with the same runId."
+        : result.status === "running"
+          ? "Pause could not be delivered: the run is running but no live execution owner accepted the request. Retry pause, or stop the run."
+          : `This run settled as ${result.status} before it could pause; nothing is executing.`,
+  );
+  return truncateUtf8(lines.join("\n"), 8_192, "…[text truncated]");
+}
+
 function formatAgentCancellationSummary(
   status: WorkflowRunStatus,
   cancellation: WorkflowAgentCallCancellation,
@@ -486,6 +524,7 @@ function persistedOutcome(
   persisted: PersistedRunState,
   status: WorkflowRunStatus,
   eventsUri: string | undefined,
+  scriptUri: string,
 ): WorkflowExecutionOutcome {
   if (status.status === "pending" || status.status === "running") {
     throw new TypeError(`Terminal workflow outcome cannot have status ${status.status}`);
@@ -502,7 +541,7 @@ function persistedOutcome(
     checkpointContext: persisted.checkpointContext,
     ...(persisted.fallbacks === undefined ? {} : { fallbacks: persisted.fallbacks }),
     ...(persisted.checkpointsTaken === undefined ? {} : { checkpointsTaken: persisted.checkpointsTaken }),
-    scriptUri: workflowScriptUri(persisted.runId),
+    scriptUri,
     ...(eventsUri === undefined ? {} : { eventsUri }),
     ...(status.status === "completed" && persisted.result !== undefined
       ? { resultUri: workflowResultUri(persisted.runId) }
@@ -524,17 +563,17 @@ function terminalOutcome(
   const eventsUri = resources.availableEventsUri(runId);
   if (live?.status === status.status) {
     return toWorkflowExecutionOutcome(live, {
-      scriptUri: workflowScriptUri(runId),
+      scriptUri: resources.scriptUri(runId),
       ...(resultUri === undefined ? {} : { resultUri }),
       ...(eventsUri === undefined ? {} : { eventsUri }),
     });
   }
-  if (persisted?.status === status.status) return persistedOutcome(persisted, status, eventsUri);
+  if (persisted?.status === status.status) return persistedOutcome(persisted, status, eventsUri, resources.scriptUri(runId));
   // Another process can settle or continue the run between synchronous reads. Keep
   // the inspected status and its bounded facts; the next poll supplies newer details.
   if (status.status === "pending" || status.status === "running") return undefined;
   return {
-    runId, status: status.status, scriptUri: workflowScriptUri(runId),
+    runId, status: status.status, scriptUri: resources.scriptUri(runId),
     ...(eventsUri === undefined ? {} : { eventsUri }),
     ...(status.limits === undefined ? {} : { limits: status.limits }),
     logTail: status.logTail,
@@ -741,6 +780,11 @@ function formatStatusSummary(result: WorkflowStatusToolResult): string {
         `Call the workflow tool with action="resume", runId="${result.runId}", and ` +
           `checkpointReplies={ "${checkpoint.callIndex}": <decision> }.`,
       );
+    } else if (result.reason === "requested") {
+      lines.push(
+        `This run paused by request: executing agents finished and journaled, nothing new started. ` +
+          `Edit its script file if needed, then call the workflow tool with action="resume" and runId="${result.runId}".`,
+      );
     } else {
       lines.push(
         `Call the workflow tool with action="resume" and runId="${result.runId}" to continue from its journal.`,
@@ -931,6 +975,7 @@ export function createWorkflowServer(
       input.action === "resume" ||
       input.action === "result" ||
       input.action === "stop" ||
+      input.action === "pause" ||
       input.action === "permissions-response" ||
       input.action === "setup-response"
     ) {
@@ -972,8 +1017,8 @@ export function createWorkflowServer(
     title: "Run and manage deterministic agent workflows",
     description:
         "Validate, run, resume, observe, and control deterministic JavaScript agent workflows. " +
-        "Use config before pinning live model, mode, or config-option ids; run validates explicit script or scriptPath content; resume continues the exact runId from durable state. " +
-        "Use status for an immediate snapshot, result for exact completed JSON, permissions-response for a pending ACP choice, and stop for a run or one live call. " +
+        "Use config before pinning live model, mode, or config-option ids. run validates explicit script or scriptPath content inside the request (cancel the request to abandon it) and returns once execution has started; resume continues the exact runId from durable state. " +
+        "Use status for an immediate snapshot, result for exact completed JSON, permissions-response for a pending ACP choice, pause to let executing agents finish and journal before the run pauses, and stop to interrupt a run or one live call; resume continues a paused or stopped run. " +
         (requireProjectDir
           ? "Config and run require an absolute projectDir on this shared daemon. "
           : "Config and run may omit projectDir on this single-project server. ") +
@@ -1156,7 +1201,7 @@ export function createWorkflowServer(
         const projected = addInspectionResourceFields(
           status,
           {
-            scriptUri: workflowScriptUri(parsedInput.runId),
+            scriptUri: scriptResources.scriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId, status.status),
             ...latestActivityFields(scriptResources, parsedInput.runId, status),
             pendingPermissions,
@@ -1178,6 +1223,81 @@ export function createWorkflowServer(
               annotations: { audience: ["assistant"] },
             },
             ...resultContentBlocks(scriptResources, parsedInput.runId, false, status.status),
+            ...scriptContentBlocks(scriptResources, parsedInput.runId),
+            ...eventsContentBlocks(scriptResources, parsedInput.runId),
+          ],
+          isError: false,
+        };
+      }
+
+      if (parsedInput.action === "pause") {
+        if (!manager.getRun(parsedInput.runId)) {
+          manager.reconcileExternallyDeadRun(parsedInput.runId);
+        }
+        const persisted = manager.getPersistence().load(parsedInput.runId);
+        if (!persisted) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            `No workflow run found for runId "${parsedInput.runId}" in this server's project-scoped run store.`,
+          );
+        }
+        if (persisted.status === "pending") {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            `Workflow run "${parsedInput.runId}" is waiting for setup and has not started executing; answer its setup request or stop it instead of pausing.`,
+          );
+        }
+        if (isAlreadyTerminalForStop(persisted.status)) {
+          throw new ProtocolError(
+            ProtocolErrorCode.InvalidParams,
+            `Workflow run "${parsedInput.runId}" is already terminal (${persisted.status}); nothing is executing to pause. Resume it to continue from its journal.`,
+          );
+        }
+        let pauseRequested = false;
+        if (persisted.status === "running") {
+          if (manager.getRun(parsedInput.runId)) {
+            pauseRequested = manager.pause(parsedInput.runId);
+          } else if (options.runControl) {
+            pauseRequested = await options.runControl.pause(manager, parsedInput.runId);
+            // An owner that no longer runs it, or none at all: reconcile an orphaned run to its
+            // interrupted pause rather than reporting a request nobody holds.
+            if (!pauseRequested) manager.reconcileExternallyDeadRun(parsedInput.runId);
+          } else {
+            throw new ProtocolError(
+              ProtocolErrorCode.InvalidParams,
+              `Workflow run "${parsedInput.runId}" is persisted as running, but there is nothing live to pause in this server process.`,
+            );
+          }
+          if (pauseRequested) await waitForPauseSettlement(manager, parsedInput.runId, WORKFLOW_PAUSE_SETTLE_WAIT_MS);
+        }
+        const inspectionOptions = {
+          lastN: parsedInput.lastN,
+          labelGlob: parsedInput.labelGlob,
+          logLines: parsedInput.logLines,
+        };
+        const status = manager.inspectRun(parsedInput.runId, inspectionOptions);
+        if (!status || status.status === "pending") {
+          throw new ProtocolError(
+            ProtocolErrorCode.InternalError,
+            `Workflow pause did not produce a snapshot for runId "${parsedInput.runId}".`,
+          );
+        }
+        const projected = addInspectionResourceFields(
+          status,
+          {
+            scriptUri: scriptResources.scriptUri(parsedInput.runId),
+            ...resultResourceFields(scriptResources, parsedInput.runId, status.status),
+            ...latestActivityFields(scriptResources, parsedInput.runId, status),
+            pauseRequested,
+            paused: status.status === "paused",
+          },
+          inspectionRetentionMetadata(manager, parsedInput.runId, status),
+        );
+        const result: WorkflowPauseResult = { ...projected, status: status.status };
+        return {
+          structuredContent: { ...result },
+          content: [
+            { type: "text", text: formatPauseSummary(result) },
             ...scriptContentBlocks(scriptResources, parsedInput.runId),
             ...eventsContentBlocks(scriptResources, parsedInput.runId),
           ],
@@ -1253,7 +1373,7 @@ export function createWorkflowServer(
           const projected = addInspectionResourceFields(
             status,
             {
-              scriptUri: workflowScriptUri(parsedInput.runId),
+              scriptUri: scriptResources.scriptUri(parsedInput.runId),
               ...resultResourceFields(scriptResources, parsedInput.runId, status.status),
               ...latestActivityFields(scriptResources, parsedInput.runId, status),
               ...(cancellationOutcome === undefined ? {} : { outcome: cancellationOutcome }),
@@ -1304,7 +1424,7 @@ export function createWorkflowServer(
                 const projected = addInspectionResourceFields(
                   pendingStatus,
                   {
-                    scriptUri: workflowScriptUri(parsedInput.runId),
+                    scriptUri: scriptResources.scriptUri(parsedInput.runId),
                     ...resultResourceFields(scriptResources, parsedInput.runId, pendingStatus.status),
                     ...latestActivityFields(scriptResources, parsedInput.runId, pendingStatus),
                     stopped: false as const,
@@ -1389,7 +1509,7 @@ export function createWorkflowServer(
         const projected = addInspectionResourceFields(
           status,
           {
-            scriptUri: workflowScriptUri(parsedInput.runId),
+            scriptUri: scriptResources.scriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId, status.status),
             ...latestActivityFields(scriptResources, parsedInput.runId, status),
             stopped,
@@ -1467,7 +1587,7 @@ export function createWorkflowServer(
             ...(tokenUsage === undefined ? {} : { tokenUsage }),
             pendingPermissions,
             setup: workflowSetup(manager.getPersistence().load(parsedInput.runId)),
-            scriptUri: workflowScriptUri(parsedInput.runId),
+            scriptUri: scriptResources.scriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId, status.status),
             ...latestActivityFields(scriptResources, parsedInput.runId, status),
           },
@@ -1504,7 +1624,7 @@ export function createWorkflowServer(
         const state = manager.getPersistence().load(parsedInput.runId)!;
         return {
           structuredContent: { action: "setup-response", runId: parsedInput.runId, setupId: parsedInput.setupId,
-            status: state.status, scriptUri: workflowScriptUri(parsedInput.runId),
+            status: state.status, scriptUri: scriptResources.scriptUri(parsedInput.runId),
             ...resultResourceFields(scriptResources, parsedInput.runId, state.status), setup: workflowSetup(state) },
           content: [{ type: "text", text: `Setup response recorded for workflow run ${parsedInput.runId}.` }],
           isError: false,
@@ -1514,15 +1634,31 @@ export function createWorkflowServer(
         lifecycle.recover(parsedInput.runId);
         const input = clampWorkflowInput(parsedInput);
         const persisted = manager.getPersistence().load(input.runId);
-        const knownOperation = persisted?.continuationOperations?.some((operation) => operation.id === input.requestId) === true;
-        const needsReservation = !knownOperation && !context.activeRuns.has(input.runId);
+        const needsReservation = !context.activeRuns.has(input.runId);
         if (needsReservation && !context.activeRuns.reserve()) {
           throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Workflow limit reached (4 active or preparing runs)");
         }
         let reserved = needsReservation;
         try {
+          // The run's script file is the editable working copy: a changed file continues as a
+          // validated revision, an unchanged or missing one continues the persisted script.
+          let revision: { script: string; revised: boolean } = { script: persisted?.script ?? "", revised: false };
+          if (persisted) {
+            try {
+              revision = await lifecycle.prepareRevision(input.runId, persisted, { signal: ctx.mcpReq.signal });
+            } catch (error) {
+              if (isPreparationCancelled(error)) {
+                throw new ProtocolError(ProtocolErrorCode.InternalError, "Workflow continuation was cancelled before admission; nothing was continued.");
+              }
+              if (error instanceof WorkflowPreparationRejected) {
+                return { content: [{ type: "text", text: `Workflow run ${input.runId} was not continued: ${error.message}` }], isError: true };
+              }
+              throw error;
+            }
+          }
           const started = await manager.continueRun(input.runId, {
-            agent: runner, operation: workflowOperation(input), maxAgents: input.maxAgents,
+            agent: runner, maxAgents: input.maxAgents,
+            ...(revision.revised ? { script: revision.script } : {}),
             onMissingAgentConfiguration: () => missingRoutingDiagnostics(probeRunner, context.projectDir, persisted?.admission?.scriptBackends),
             concurrency: input.concurrency, agentRetries: input.agentRetries, checkpointReplies: input.checkpointReplies,
           });
@@ -1531,42 +1667,69 @@ export function createWorkflowServer(
             if (!status) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No workflow run found for ${input.runId}`);
             const outcome = isTerminalStatus(status.status) ? terminalOutcome(manager, scriptResources, input.runId, status) : undefined;
             const projected = addInspectionResourceFields(status, {
-              scriptUri: workflowScriptUri(input.runId), ...resultResourceFields(scriptResources, input.runId, status.status),
+              scriptUri: scriptResources.scriptUri(input.runId), ...resultResourceFields(scriptResources, input.runId, status.status),
               setup: workflowSetup(manager.getPersistence().load(input.runId)),
               ...(outcome === undefined ? {} : { outcome }),
             }, inspectionRetentionMetadata(manager, input.runId, status));
             const informational = ["running", "terminal", "checkpoint-required", "auth-required"].includes(started.reason);
-            const requiresFreshRun = ["admission-missing", "admission-invalid", "admission-uncovered"].includes(started.reason);
+            const requiresFreshRun = ["admission-missing", "admission-invalid", "admission-uncovered", "backends-changed"].includes(started.reason);
             return { structuredContent: { ...projected },
               content: [{ type: "text", text: `Workflow run ${input.runId} was not continued: ${started.reason}.` +
                 (requiresFreshRun ? " Please start a fresh run." : "") +
+                (started.reason === "script-invalid" ? " Fix the run's script file, then resume again." : "") +
                 (started.resolvedCheckpoints?.length ? `\n${JSON.stringify(started.resolvedCheckpoints)}` : "") }], isError: !informational };
           }
-          if (!started.duplicate) {
-            context.activeRuns.track(input.runId, started.promise);
-            reserved = false;
-          }
+          context.activeRuns.track(input.runId, started.promise);
+          reserved = false;
           channel?.watch(input.runId);
           const state = manager.getPersistence().load(input.runId)!;
-          return { structuredContent: { action: "resume", accepted: true, runId: input.runId, requestId: input.requestId,
-              duplicate: started.duplicate === true, continuation: started.continuation,
-              status: state.status, scriptSource: "stored", scriptUri: workflowScriptUri(input.runId),
+          return { structuredContent: { action: "resume", accepted: true, runId: input.runId,
+              continuation: started.continuation,
+              status: state.status, scriptSource: "stored", scriptUri: scriptResources.scriptUri(input.runId),
+              scriptPath: scriptResources.scriptPath(input.runId),
               eventsUri: scriptResources.availableEventsUri(input.runId), limits: state.limits },
-            content: [{ type: "text", text: `Continuation accepted for workflow run ${input.runId}. Use status to inspect it; use result after completion.` },
+            content: [{ type: "text", text: `Continuation accepted for workflow run ${input.runId}${
+              revision.revised ? " with the revised script: unchanged calls replay from the journal, changed calls run live" : ""
+            }. Use status to inspect it; use result after completion.` },
               ...scriptContentBlocks(scriptResources, input.runId), ...eventsContentBlocks(scriptResources, input.runId)], isError: false };
         } finally { if (reserved) context.activeRuns.releaseReservation(); }
       }
-      const accepted = lifecycle.accept(parsedInput);
-      const state = manager.getPersistence().load(accepted.runId)!;
-      scriptResources.notifyRunAdmitted(accepted.runId);
-      channel?.watch(accepted.runId);
+      // Preparation (source read, static parse, mock dry run, live probes) runs inside this
+      // request. Nothing is persisted until it succeeds: a validation failure is a tool execution
+      // error and a cancelled request leaves no run behind. Only a declared backend awaiting
+      // approval parks the validated run in durable setup before execution starts.
+      let outcome: WorkflowPreparationOutcome;
+      try {
+        outcome = await lifecycle.prepare(parsedInput, {
+          signal: ctx.mcpReq.signal,
+          progress: createProgressReporter(ctx),
+          // Register interest before execution or a setup announcement can race ahead of it.
+          onAdmitted: (runId) => {
+            scriptResources.notifyRunAdmitted(runId);
+            channel?.watch(runId);
+          },
+        });
+      } catch (error) {
+        if (isPreparationCancelled(error)) {
+          throw new ProtocolError(ProtocolErrorCode.InternalError, "Workflow run was cancelled before admission; nothing was started.");
+        }
+        if (error instanceof WorkflowPreparationRejected) {
+          return { content: [{ type: "text", text: `Workflow run was not started: ${error.message}` }], isError: true };
+        }
+        throw error;
+      }
+      const state = manager.getPersistence().load(outcome.runId)!;
+      const summary = outcome.setup
+        ? `Workflow run ${outcome.runId} validated and is waiting for setup: answer status.setup.request with setup-response to start it.`
+        : `Workflow run ${outcome.runId} started. Use workflow_monitor with this runId to open its panel, or status for checkpoints, permissions, and completion.`;
       return {
-        structuredContent: { action: "run", accepted: true, runId: accepted.runId, requestId: parsedInput.requestId,
-          duplicate: accepted.duplicate, status: state.status, scriptSource: parsedInput.script === undefined ? "path" : "inline",
-          scriptUri: workflowScriptUri(accepted.runId), eventsUri: scriptResources.availableEventsUri(accepted.runId),
+        structuredContent: { action: "run", accepted: true, runId: outcome.runId,
+          status: state.status, scriptSource: parsedInput.script === undefined ? "path" : "inline",
+          scriptUri: scriptResources.scriptUri(outcome.runId), scriptPath: scriptResources.scriptPath(outcome.runId),
+          eventsUri: scriptResources.availableEventsUri(outcome.runId),
           limits: state.limits, setup: workflowSetup(state) },
-        content: [{ type: "text", text: `Workflow run ${accepted.runId} accepted. Preparation and execution continue independently. Use workflow_monitor with this runId to open its panel, or status for setup, checkpoints, permissions, and completion. Retry a lost acknowledgement with the same requestId.` },
-          ...scriptContentBlocks(scriptResources, accepted.runId), ...eventsContentBlocks(scriptResources, accepted.runId)],
+        content: [{ type: "text", text: summary },
+          ...scriptContentBlocks(scriptResources, outcome.runId), ...eventsContentBlocks(scriptResources, outcome.runId)],
         isError: false,
       };
   };
@@ -1577,7 +1740,13 @@ export function createWorkflowServer(
   // tools/call, and over the stdio shim those arrive as independent HTTP POSTs), so gating
   // the tool on that notification let a client's very first request reach a server with
   // nothing registered: an empty tools/list, or a tool-not-found result on the first call.
-  mcp.registerTool("workflow", workflowToolConfig, (args, ctx) => boundWorkflowRequest(Promise.resolve(workflowToolHandler(args, ctx))));
+  mcp.registerTool("workflow", workflowToolConfig, (args, ctx) => {
+    // run and resume prepare inside the request under the preparation ceiling and the request's
+    // own cancellation signal; every observation action keeps the short transport bound.
+    const action = (args as { action?: unknown } | undefined)?.action;
+    const work = Promise.resolve(workflowToolHandler(args, ctx));
+    return action === "run" || action === "resume" ? work : boundWorkflowRequest(work);
+  });
 
   // Register the Apps union once. tools/list, direct app-only calls, and the fixed UI resource
   // are projected from the current request's capabilities; no modern request inherits another
@@ -1588,7 +1757,7 @@ export function createWorkflowServer(
       if (context) workflowLifecycle(context, runner).recover(runId);
       const state = context?.manager.getPersistence().load(runId);
       if (!state) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No accepted workflow run found for ${runId}`);
-      return { runId, status: state.status, scriptUri: workflowScriptUri(runId), eventsUri: scriptResources.availableEventsUri(runId) };
+      return { runId, status: state.status, scriptUri: scriptResources.scriptUri(runId), eventsUri: scriptResources.availableEventsUri(runId) };
     },
     notification: (request) => {
       if (!projects.storeFor(request.runId)) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No workflow run found for ${request.runId}`);

@@ -11,6 +11,13 @@ const SCRIPT = [
   'return await agent("block");',
 ].join("\n");
 
+/** Two sequential calls: a pause requested during the first settles once it finishes. */
+const TWO_CALL_SCRIPT = [
+  'export const meta = { name: "lease-pause", description: "lease pause" };',
+  'await agent("block");',
+  'return await agent("never");',
+].join("\n");
+
 function controlledRunner() {
   let resolve!: (value: string) => void;
   let markStarted!: () => void;
@@ -68,9 +75,12 @@ test("a manager cold-stops a lease-free paused run and appends one durable stopp
   const controlled = controlledRunner();
   const owner = new WorkflowManager({ cwd, persistenceRoot, leaseOwnerId: "owner-generation-a", agent: controlled.runner });
   try {
-    const started = owner.startInBackground(SCRIPT, undefined, { runId: "cold-stop" });
+    const started = owner.startInBackground(TWO_CALL_SCRIPT, undefined, { runId: "cold-stop" });
     await controlled.ready;
     assert.equal(owner.pause(started.runId), true);
+    controlled.resolve("done");
+    await started.promise.catch(() => undefined);
+    assert.equal(owner.getPersistence().load(started.runId)?.status, "paused");
 
     const fresh = new WorkflowManager({ cwd, persistenceRoot, leaseOwnerId: "owner-generation-b" });
     const stopped = fresh.stopPersistedRun(started.runId);

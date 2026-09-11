@@ -112,11 +112,11 @@ export interface RunCallRecordPayload extends RunEventOrigin {
   record: WorkflowCallRecord;
 }
 
-/** `pause(runId)` keeps today's minimal payload: absence of `reason` means manual pause. */
-export interface RunManualPausedPayload extends RunEventOrigin {
-  reason?: never;
-  error?: never;
-  errorRecord?: never;
+/** A host asked for a pause: executing calls finished and journaled, nothing new was admitted. */
+export interface RunRequestedPausedPayload extends RunEventOrigin {
+  reason: "requested";
+  error: WorkflowError;
+  errorRecord: WorkflowRecordedError;
   resetHint?: never;
   authContext?: never;
   checkpointContext?: never;
@@ -151,7 +151,7 @@ export interface RunCheckpointPausedPayload extends RunEventOrigin {
 }
 
 export type RunPausedPayload =
-  | RunManualPausedPayload
+  | RunRequestedPausedPayload
   | RunUsageLimitPausedPayload
   | RunAuthPausedPayload
   | RunCheckpointPausedPayload;
@@ -302,6 +302,20 @@ export interface PersistedRunCompletePayload extends RunEventOrigin {
   summary: PersistedRunCompleteSummary;
 }
 
+/** Rows written by the earlier interrupting `pause()`, which recorded no reason. Never produced now. */
+export interface PersistedRunUnreasonedPausedPayload extends RunEventOrigin {
+  reason?: never;
+  errorRecord?: never;
+  resetHint?: never;
+  authContext?: never;
+  checkpointContext?: never;
+}
+
+export interface PersistedRunRequestedPausedPayload extends RunEventOrigin {
+  reason: "requested";
+  errorRecord: RunEventErrorProjection;
+}
+
 export interface PersistedRunUsageLimitPausedPayload extends RunEventOrigin {
   reason: "usage_limit";
   errorRecord: RunEventErrorProjection;
@@ -321,7 +335,8 @@ export interface PersistedRunCheckpointPausedPayload extends RunEventOrigin {
 }
 
 export type PersistedRunPausedPayload =
-  | RunManualPausedPayload
+  | PersistedRunUnreasonedPausedPayload
+  | PersistedRunRequestedPausedPayload
   | PersistedRunUsageLimitPausedPayload
   | PersistedRunAuthPausedPayload
   | PersistedRunCheckpointPausedPayload;

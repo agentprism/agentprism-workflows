@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { connect, makeRunner, persistedRunFile, runAndObserve, structured, textOf, waitForRun } from "./_harness.js";
@@ -22,12 +21,12 @@ for (const protocolMode of ["legacy", "modern"] as const) {
     const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
     process.env.AGENTPRISM_DEFAULT_BACKEND = "codex";
     try {
-      const result = await runAndObserve(connected.client, {
-        projectDir: makeProjectDir(`explicit-routing-${protocolMode}`),
+      const result = await connected.client.callTool({ name: "workflow", arguments: {
+        action: "run", projectDir: makeProjectDir(`explicit-routing-${protocolMode}`),
         script: 'export const meta = { name:"missing-route", description:"explicit routing", phases:[{title:"Review"}] }; phase("Review"); return agent("work", {label:"reviewer"});',
-      });
-      assert.equal(structured(result)?.status, "failed", textOf(result));
-      assert.equal(structured(result)?.setup, undefined);
+      } });
+      assert.equal(result.isError, true, "a missing route is rejected before any run exists");
+      assert.equal(structured(result)?.runId, undefined);
       assert.match(textOf(result), /reviewer/);
       assert.match(textOf(result), /Review/);
       assert.match(textOf(result), /no configured model route/);
@@ -36,8 +35,6 @@ for (const protocolMode of ["legacy", "modern"] as const) {
       assert.match(textOf(result), /modelSpecs/);
       assert.equal(dispatches, 0);
       assert.deepEqual(connected.elicitations, []);
-      const persisted = JSON.parse(readFileSync(persistedRunFile(String(structured(result)?.runId))!, "utf8"));
-      assert.equal(persisted.admission, undefined);
     } finally {
       if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
       else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
@@ -169,10 +166,12 @@ test("authored options are validated against the exact selected model before adm
   });
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
-    for (const strategy of ["a-only", "b-only"]) {
-      const result = await runAndObserve(client, { script: `export const meta = {name:"exact-model", description:"model-specific options"}; return agent("work", {model:"codex/b", configOptions:{strategy:"${strategy}"}});` });
-      assert.equal(structured(result)?.status, strategy === "a-only" ? "failed" : "completed", textOf(result));
-    }
+    const script = (strategy: string) => `export const meta = {name:"exact-model", description:"model-specific options"}; return agent("work", {model:"codex/b", configOptions:{strategy:"${strategy}"}});`;
+    const rejected = await client.callTool({ name: "workflow", arguments: { action: "run", script: script("a-only") } });
+    assert.equal(rejected.isError, true, "an option the selected model does not advertise is rejected before admission");
+    assert.match(textOf(rejected), /a-only/);
+    const result = await runAndObserve(client, { script: script("b-only") });
+    assert.equal(structured(result)?.status, "completed", textOf(result));
     assert.equal(dispatches, 1);
     assert.ok(probes.includes("codex/b"));
   } finally { await dispose(); }
@@ -191,7 +190,7 @@ test("continuation preserves routing without repeating discovery or consulting a
     const probeCount = probes;
     runner.probeConfigOptions = async () => { throw new Error("continuation must not discover"); };
     const runId = String(structured(result)?.runId);
-    const resumed = await client.callTool({name:"workflow", arguments:{action:"resume", requestId:randomUUID(), runId, checkpointReplies:{1:true}}});
+    const resumed = await client.callTool({name:"workflow", arguments:{action:"resume", runId, checkpointReplies:{1:true}}});
     assert.equal(resumed.isError, false, textOf(resumed));
     const completed = await waitForRun(client, runId);
     assert.equal(structured(completed)?.status, "completed", textOf(completed));
@@ -221,16 +220,15 @@ test("missing-route discovery probes concurrently, aborts unavailable backends, 
   });
   const {client, dispose} = await connect(runner, {listTools:true});
   try {
-    const accepted = await client.callTool({name:"workflow", arguments:{action:"run", requestId:randomUUID(),
+    const pending = client.callTool({name:"workflow", arguments:{action:"run",
       script:'export const meta = {name:"partial-discovery", description:"one healthy backend"}; return agent("work", {label:"missing"});'}});
-    const runId = String(structured(accepted)?.runId);
     await Promise.race([healthy, new Promise<never>((_, reject) => {
       const timer = setTimeout(() => reject(new Error("healthy backend was queued behind a stalled backend")), 1_000);
       timer.unref();
     })]);
     assert.deepEqual(probes, ["claude", "codex", "pi"]);
-    const result = await waitForRun(client, runId);
-    assert.equal(structured(result)?.status, "failed", textOf(result));
+    const result = await pending;
+    assert.equal(result.isError, true, "a missing route is rejected before any run exists");
     assert.match(textOf(result), /pi\/direct\/ready/);
     assert.match(textOf(result), /timed out|timeout/i);
     assert.deepEqual(aborted.sort(), ["claude", "codex"]);
@@ -241,39 +239,40 @@ test("wildcard discovery selectors cannot dispatch as model routes", async () =>
   let dispatches = 0;
   const {client, dispose} = await connect(makeRunner(() => {dispatches++; return "unexpected";}));
   try {
-    const result = await runAndObserve(client, {script:'export const meta = {name:"wildcard", description:"browse selectors"}; return agent("work", {model:"opencode/openrouter/*"});'});
-    assert.equal(structured(result)?.status, "failed", textOf(result));
+    const result = await client.callTool({ name: "workflow", arguments: { action: "run", script: 'export const meta = {name:"wildcard", description:"browse selectors"}; return agent("work", {model:"opencode/openrouter/*"});' } });
+    assert.equal(result.isError, true, "a wildcard selector is rejected before any run exists");
     assert.match(textOf(result), /discovery selector/);
     assert.match(textOf(result), /exact model route/);
     assert.equal(dispatches, 0);
   } finally { await dispose(); }
 });
 
-test("cold status retains actionable routing discovery without probing again", async () => {
+test("missing-route diagnostics are bounded, come from live discovery, and leave no run behind", async () => {
+  let probes = 0;
   const runner = Object.assign(makeRunner(() => assert.fail("missing route must not dispatch")), {
     listBackends: () => ["codex"],
     async probeConfigOptions() {
+      probes++;
       return {backendId:"codex", modes:null, options:[{id:"model", name:"Model", type:"select" as const,
         currentValue:"ready", options:[{value:"ready", name:"Ready"}]}]};
     },
   });
-  const first = await connect(runner, {listTools:true});
-  let runId: string;
+  const script = 'export const meta = {name:"cold-missing", description:"durable diagnostics"}; return agent("work", {label:"cold-worker"});';
+  const {client, dispose} = await connect(runner, {listTools:true});
   try {
-    const result = await runAndObserve(first.client, {script:'export const meta = {name:"cold-missing", description:"durable diagnostics"}; return agent("work", {label:"cold-worker"});'});
-    runId = String(structured(result)?.runId);
-    assert.equal(structured(result)?.status, "failed", textOf(result));
-  } finally { await first.dispose(); }
-  runner.probeConfigOptions = async () => { throw new Error("status must not probe"); };
-  const cold = await connect(runner, {listTools:true});
-  try {
-    const result = await cold.client.callTool({name:"workflow", arguments:{action:"status", runId}});
-    assert.equal(result.isError, false, textOf(result));
-    assert.equal(structured(result)?.status, "failed");
+    const result = await client.callTool({name:"workflow", arguments:{action:"run", script}});
+    assert.equal(result.isError, true, "a missing route is rejected before any run exists");
+    assert.equal(structured(result)?.runId, undefined);
     assert.match(textOf(result), /cold-worker/);
     assert.match(textOf(result), /codex\/ready/);
-    assert.match(String(structured(result)?.reason), /modelSpecs/);
+    assert.match(textOf(result), /modelSpecs/);
+    assert.ok(probes >= 1);
     assert.ok(Buffer.byteLength(textOf(result), "utf8") <= 8_192);
-    assert.ok(Buffer.byteLength(JSON.stringify(structured(result)), "utf8") <= 24_576);
-  } finally { await cold.dispose(); }
+    const probesBefore = probes;
+    runner.probeConfigOptions = async () => { throw new Error("discovery offline"); };
+    const again = await client.callTool({name:"workflow", arguments:{action:"run", script}});
+    assert.equal(again.isError, true);
+    assert.equal(probes, probesBefore, "a rejected preparation retains nothing a later attempt could reuse");
+    assert.match(textOf(again), /discovery offline/);
+  } finally { await dispose(); }
 });

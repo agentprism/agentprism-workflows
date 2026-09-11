@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { setTimeout } from "node:timers/promises";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createWorkflowServer } from "../src/index.js";
@@ -28,8 +27,7 @@ for (const scenario of cases) {
     try {
       await client.listTools();
       const accepted = await client.callTool({ name: "workflow", arguments: {
-        action: "run", requestId: randomUUID(),
-        script: `export const meta = { name: "explicit-${scenario.kind}", description: "durable answer" };\nreturn await checkpoint("Choose", ${JSON.stringify(scenario.options)});`,
+        action: "run", script: `export const meta = { name: "explicit-${scenario.kind}", description: "durable answer" };\nreturn await checkpoint("Choose", ${JSON.stringify(scenario.options)});`,
       } });
       assert.equal(accepted.isError, false, textOf(accepted));
       assert.equal(structured(accepted)?.accepted, true);
@@ -48,7 +46,7 @@ for (const scenario of cases) {
       assert.equal(inlineRequests, 0, "form capability never opens an inline checkpoint request");
 
       const resumed = await client.callTool({ name: "workflow", arguments: {
-        action: "resume", requestId: randomUUID(), runId, checkpointReplies: { "0": scenario.answer },
+        action: "resume", runId, checkpointReplies: { "0": scenario.answer },
       } });
       assert.equal(resumed.isError, false, textOf(resumed));
       assert.equal(structured(resumed)?.accepted, true);

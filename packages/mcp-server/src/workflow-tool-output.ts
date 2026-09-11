@@ -290,6 +290,7 @@ const setupSchema = z.discriminatedUnion("state", [
 const continuationSchema = z.object({
   generation: z.number().int().positive(),
   replayedPrefix: z.number().int().nonnegative(),
+  scriptRevised: z.literal(true).optional(),
   resolvedCheckpoints: z.array(z.object({
     callIndex: z.number().int().nonnegative(),
     outcome: z.enum(["accepted", "same", "different"]),
@@ -309,9 +310,9 @@ const inspectionRequired = [
 
 const terminalStatuses = ["paused", "completed", "failed", "aborted"] as const;
 const nonterminalStatuses = ["pending", "running"] as const;
-const commonOutputFields = ["runId", "status", "scriptUri", "resultUri", "eventsUri", "limits"] as const;
+const commonOutputFields = ["runId", "status", "scriptUri", "scriptPath", "resultUri", "eventsUri", "limits"] as const;
 const runOutputRequired = ["runId", "status", "scriptUri"] as const;
-const acceptanceFields = ["runId", "status", "scriptUri", "eventsUri", "limits", "action", "accepted", "requestId", "duplicate", "continuation", "setup", "scriptSource"] as const;
+const acceptanceFields = ["runId", "status", "scriptUri", "scriptPath", "eventsUri", "limits", "action", "accepted", "continuation", "setup", "scriptSource"] as const;
 const executionDetailFields = [
   "result",
   "tokenUsage",
@@ -363,12 +364,14 @@ const stopControlSchema = z.object({
 const variantOutputFields = [
   ...executionDetailFields,
   "scriptSource",
-  "accepted", "requestId", "duplicate", "continuation", "setup", "setupId",
+  "accepted", "continuation", "setup", "setupId",
   ...inspectionFields,
   "outcome",
   "stopped",
   "alreadyTerminal",
   "control",
+  "pauseRequested",
+  "paused",
   "pendingPermissions",
   "permissionResponse",
   "latestActivity",
@@ -411,8 +414,6 @@ export const workflowToolOutputShape = z
     action: z.enum(["run", "resume", "setup-response", "config", "result"]).optional(),
     ok: z.boolean().optional(),
     accepted: z.literal(true).optional(),
-    requestId: workflowToolInputShape.requestId.optional(),
-    duplicate: z.boolean().optional(),
     continuation: continuationSchema.optional(),
     setupId: z.string().uuid().optional(),
     setup: setupSchema.optional(),
@@ -428,6 +429,7 @@ export const workflowToolOutputShape = z
     ...executionDetailsShape,
     scriptSource: scriptSourceSchema.optional(),
     scriptUri: z.string().optional(),
+    scriptPath: z.string().optional(),
     resultUri: z.string().optional(),
     eventsUri: z.string().optional(),
     workflowName: runStatusShape.workflowName.optional(),
@@ -443,6 +445,8 @@ export const workflowToolOutputShape = z
     stopped: z.boolean().optional(),
     alreadyTerminal: z.boolean().optional(),
     control: stopControlSchema.optional(),
+    pauseRequested: z.boolean().optional(),
+    paused: z.boolean().optional(),
     pendingPermissions: z.array(pendingPermissionSchema).optional(),
     permissionResponse: permissionAcknowledgementSchema.optional(),
     mimeType: z.literal("application/json").optional(),
@@ -475,7 +479,7 @@ export const workflowToolOutputShape = z
         hasOnlyExactFields(value, ["action", "ok", "harnessOptions", "omittedHarnesses", "models", "authoringSummary"]);
     } else if (value.action === "run" || value.action === "resume") {
       valid = runCommonComplete && has("eventsUri") && has("limits") && has("scriptSource") &&
-        value.accepted === true && has("requestId") && has("duplicate") &&
+        value.accepted === true &&
         (value.action === "resume" ? has("continuation") : !has("continuation")) &&
         hasOnlyExactFields(value, acceptanceFields);
     } else if (value.action === "setup-response") {
@@ -494,6 +498,15 @@ export const workflowToolOutputShape = z
         value.alreadyTerminal === false &&
         (value.status === "pending" || value.status === "running") &&
         hasOnlyFields(value, [...inspectionFields, "stopped", "alreadyTerminal", "control"]);
+    } else if (has("pauseRequested") || has("paused")) {
+      valid =
+        runCommonComplete &&
+        inspectionComplete &&
+        has("pauseRequested") &&
+        has("paused") &&
+        value.status !== "pending" &&
+        value.paused === (value.status === "paused") &&
+        hasOnlyFields(value, [...inspectionFields, "pauseRequested", "paused"]);
     } else if (has("stopped") || has("alreadyTerminal")) {
       valid =
         runCommonComplete &&
@@ -536,7 +549,7 @@ export const workflowToolOutputShape = z
       },
       {
         title: "Workflow operation acceptance",
-        required: [...runOutputRequired, "action", "accepted", "requestId", "duplicate", "eventsUri", "scriptSource", "limits"],
+        required: [...runOutputRequired, "action", "accepted", "eventsUri", "scriptSource", "limits"],
         properties: { action: { enum: ["run", "resume"] }, accepted: { const: true } },
         ...forbidsExactOutside(acceptanceFields),
         if: { properties: { action: { const: "resume" } } },
@@ -574,6 +587,12 @@ export const workflowToolOutputShape = z
         required: [...runOutputRequired, ...inspectionRequired, "stopped", "alreadyTerminal"],
         properties: { status: { enum: ["completed", "failed", "aborted"] } },
         ...forbidsOutside([...inspectionFields, "stopped", "alreadyTerminal"]),
+      },
+      {
+        title: "Workflow pause acknowledgement",
+        required: [...runOutputRequired, ...inspectionRequired, "pauseRequested", "paused"],
+        properties: { status: { enum: ["running", "paused", "completed", "failed", "aborted"] } },
+        ...forbidsOutside([...inspectionFields, "pauseRequested", "paused"]),
       },
       {
         title: "Workflow stop pending",
@@ -635,7 +654,10 @@ export interface WorkflowScriptResourceFields {
 
 export interface WorkflowExecutionScriptResourceFields {
   scriptSource: WorkflowScriptSource;
+  /** `file://` URI of the run's editable script: the store copy of an inline script, or the caller's scriptPath. */
   scriptUri: string;
+  /** Absolute path behind scriptUri. */
+  scriptPath?: string;
   eventsUri: string;
 }
 
@@ -658,8 +680,6 @@ export interface WorkflowExecutionOutcome<T = unknown> {
 
 interface WorkflowOperationAcceptedBase extends WorkflowExecutionScriptResourceFields {
   accepted: true;
-  requestId: string;
-  duplicate: boolean;
   runId: string;
   status: WorkflowRunStatus["status"];
   limits: WorkflowRunLimits;
@@ -742,6 +762,18 @@ export interface WorkflowStopPendingResult extends WorkflowRunStatus, WorkflowSc
   control: z.infer<typeof stopControlSchema>;
 }
 
+/**
+ * Pause acknowledgement. `pauseRequested` says the request reached the live execution owner in
+ * this call; `paused` says the run is durably paused now. A pending request (`running`) settles
+ * once every executing agent call has finished; observe it with status.
+ */
+export interface WorkflowPauseResult extends WorkflowRunStatus, WorkflowScriptResourceFields {
+  latestActivity?: WorkflowRunLatestActivity[];
+  status: "running" | "paused" | "completed" | "failed" | "aborted";
+  pauseRequested: boolean;
+  paused: boolean;
+}
+
 export type WorkflowToolResult<T = unknown> =
   | WorkflowResultRetrieval
   | WorkflowConfigToolResult
@@ -750,7 +782,8 @@ export type WorkflowToolResult<T = unknown> =
   | WorkflowStatusToolResult<T>
   | WorkflowPermissionResponseResult
   | WorkflowStopResult
-  | WorkflowStopPendingResult;
+  | WorkflowStopPendingResult
+  | WorkflowPauseResult;
 
 export function toWorkflowExecutionOutcome<T>(
   run: WorkflowRunResult<T>,

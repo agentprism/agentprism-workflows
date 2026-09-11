@@ -32,7 +32,7 @@ const scriptPathSchema = z
   .string()
   .min(1)
   .refine((value) => isAbsolute(value), "scriptPath must be an absolute path")
-  .describe("Run only: absolute server-side script path, read once at admission.");
+  .describe("Run only: absolute server-side script path, read when the run is admitted.");
 const projectDirSchema = z
   .string()
   .min(1)
@@ -77,10 +77,6 @@ const checkpointRepliesSchema = z
     z.unknown(),
   )
   .describe("Resume only: checkpoint decisions keyed by this run's checkpoint call index.");
-const requestIdSchema = z
-  .string()
-  .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/, "requestId must contain 1..128 identifier characters")
-  .describe("Run/resume retry identity. Reuse for an identical retry; use a fresh ID for a new operation.");
 const setupIdSchema = z.string().uuid().describe("Exact pending setup request ID from status.setup.request.id.");
 const setupResponseSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("accept"), content: z.record(z.string(), z.unknown()) }).strict(),
@@ -153,7 +149,6 @@ export const workflowToolInputShape = {
   concurrency: concurrencySchema,
   agentRetries: agentRetriesSchema,
   checkpointReplies: checkpointRepliesSchema,
-  requestId: requestIdSchema,
   setupId: setupIdSchema,
   runId: runIdSchema,
   permissionId: permissionIdSchema,
@@ -178,7 +173,6 @@ const configInputSchema = z
   .strict();
 
 const executionOptionsShape = {
-  requestId: requestIdSchema,
   projectDir: projectDirSchema.optional(),
   args: argsSchema.optional(),
   maxAgents: maxAgentsSchema.optional(),
@@ -188,14 +182,14 @@ const executionOptionsShape = {
 
 const runInlineInputSchema = z
   .object({
-    action: z.literal("run").describe("Validate and execute explicit workflow content."),
+    action: z.literal("run").describe("Validate explicit workflow content, then start it once preparation succeeds."),
     script: scriptSchema,
     ...executionOptionsShape,
   })
   .strict();
 const runPathInputSchema = z
   .object({
-    action: z.literal("run").describe("Validate and execute explicit workflow content."),
+    action: z.literal("run").describe("Validate explicit workflow content, then start it once preparation succeeds."),
     scriptPath: scriptPathSchema,
     ...executionOptionsShape,
   })
@@ -209,7 +203,6 @@ const resumeInputSchema = z
   .object({
     action: z.literal("resume").describe("Continue this exact run using its durable inputs and configuration."),
     runId: runIdSchema,
-    requestId: requestIdSchema,
     maxAgents: maxAgentsSchema.optional(),
     concurrency: concurrencySchema.optional(),
     agentRetries: agentRetriesSchema.optional(),
@@ -272,6 +265,15 @@ const callStopInputSchema = z
   .strict();
 const stopInputSchema = z.xor([wholeRunStopInputSchema, callStopInputSchema]);
 
+const pauseInputSchema = z
+  .object({
+    action: z.literal("pause").describe(
+      "Ask the run's execution owner to pause: executing agents finish and journal, nothing new starts, and the run becomes resumable.",
+    ),
+    ...inspectionShape,
+  })
+  .strict();
+
 /** The canonical action branches; run and stop contain structural sub-variants. */
 export const workflowToolInputBranches = {
   config: configInputSchema,
@@ -282,6 +284,7 @@ export const workflowToolInputBranches = {
   result: resultInputSchema,
   "permissions-response": permissionResponseInputSchema,
   stop: stopInputSchema,
+  pause: pauseInputSchema,
 } as const;
 
 export const workflowToolCanonicalInputSchema = z.xor([
@@ -293,6 +296,7 @@ export const workflowToolCanonicalInputSchema = z.xor([
   workflowToolInputBranches.result,
   workflowToolInputBranches["permissions-response"],
   workflowToolInputBranches.stop,
+  workflowToolInputBranches.pause,
 ]).meta({ type: "object" });
 
 /** Runtime and discovery use the same strict canonical schema. */
@@ -300,7 +304,6 @@ export const workflowToolInputSchema = workflowToolCanonicalInputSchema;
 
 interface WorkflowExecuteToolInputBase {
   action: "run";
-  requestId: string;
   /** Absolute project directory selecting the run store and default execution cwd. */
   projectDir?: string;
   args?: unknown;
@@ -321,7 +324,6 @@ export interface WorkflowResumeToolInput {
   action: "resume";
   /** The exact persisted run to continue. */
   runId: string;
-  requestId: string;
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
@@ -370,6 +372,11 @@ type WorkflowStopToolInputBase = WorkflowRunInspectionOptions & {
 export type WorkflowStopToolInput = WorkflowStopToolInputBase &
   ({ callIndex: number; forceOwner?: never } | { callIndex?: never; forceOwner?: boolean });
 
+export type WorkflowPauseToolInput = WorkflowRunInspectionOptions & {
+  action: "pause";
+  runId: string;
+};
+
 export type WorkflowToolInput =
   | WorkflowConfigToolInput
   | WorkflowExecuteToolInput
@@ -378,7 +385,8 @@ export type WorkflowToolInput =
   | WorkflowStatusToolInput
   | WorkflowResultToolInput
   | WorkflowPermissionResponseToolInput
-  | WorkflowStopToolInput;
+  | WorkflowStopToolInput
+  | WorkflowPauseToolInput;
 
 export interface ParseWorkflowToolInputOptions {
   /** Require projectDir for config/run on the shared multi-project daemon. */
@@ -436,6 +444,7 @@ export function parseWorkflowToolInput(
     case "permissions-response":
     case "setup-response":
     case "stop":
+    case "pause":
       return input;
   }
 }

@@ -4,7 +4,9 @@
 
 import {
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -42,8 +44,6 @@ import type { RunEnvironmentIdentity } from "./run-environment.js";
 import { withRunEventsUsingFs, type RunEventPersistence } from "./run-event-persistence.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 import type {
-  PersistedWorkflowContinuationOperation,
-  WorkflowOperationIdentity,
   WorkflowPreparation,
 } from "./workflow-preparation.js";
 
@@ -144,14 +144,32 @@ export interface PersistedRunLineageTombstone {
   runId: string;
   sourceRunId?: string;
   deletedAt: string;
-  /** Content-free acceptance identity prevents a lost-response retry from recreating deleted work. */
-  acceptanceOperation?: WorkflowOperationIdentity;
+}
+
+/**
+ * Where a run's script came from and where its editable working copy lives. An inline script
+ * is copied into the run store (`<runsDir>/<runId>.script.js`); a path script stays at the
+ * caller's absolute path. `scriptLocation` resolves either to the one file a host may edit.
+ */
+export type WorkflowScriptOrigin = { kind: "inline" } | { kind: "path"; path: string };
+
+/** One accepted script revision: the continuation generation that first ran the revised text. */
+export interface WorkflowScriptRevision {
+  generation: number;
+  /** SHA-256 of the revised script text. */
+  scriptHash: string;
+  revisedAt: string;
 }
 
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
+  /** The text that executes: the admitted script, or the latest accepted revision. */
   script: string;
+  /** Recorded at admission; absent on runs created before script origins were tracked. */
+  scriptOrigin?: WorkflowScriptOrigin;
+  /** Every continuation that ran a revised script, oldest first. */
+  scriptRevisions?: WorkflowScriptRevision[];
   args?: unknown;
   /** The persisted args value was not a faithful pre-execution strict-JSON snapshot. */
   argsUnreplayable?: true;
@@ -172,15 +190,11 @@ export interface PersistedRunState {
   environment?: RunEnvironmentIdentity;
   /** Required by same-ID continuation; deliberately absent on pre-contract runs. */
   admission?: PersistedRunAdmission;
-  /** Immutable initial acceptance identity, committed together with the pending run. */
-  acceptanceOperation?: WorkflowOperationIdentity;
   /** Host-owned preparation survives request/session/process loss before execution admission. */
   preparation?: WorkflowPreparation;
   preparationRevision?: number;
   /** Accepted host setup response hashes survive removal of the preparation envelope. */
   setupResponses?: Record<string, string>;
-  /** Durable accepted continuation identities; these entries are never silently evicted. */
-  continuationOperations?: PersistedWorkflowContinuationOperation[];
   continuation?: WorkflowContinuationResult;
   resume?: PersistedResumeFormat;
   /** Immediate run named by resumeFromRunId, written once by the engine at admission. */
@@ -260,8 +274,6 @@ export interface RunPersistence {
   save(state: PersistedRunState): void;
   /** Load a persisted run by ID. */
   load(runId: string): PersistedRunState | null;
-  /** Detect an existing but unreadable identity without treating corrupt acceptance as new work. */
-  hasRunArtifact?(runId: string): boolean;
   /** List all persisted runs. */
   list(): PersistedRunState[];
   /** Delete a persisted run. */
@@ -281,6 +293,21 @@ export interface RunPersistence {
   validateRunLease?(lease: RunLease): boolean;
   /** Get runs directory path. */
   getRunsDir(): string;
+  /**
+   * Absolute path of the editable script file for runId: the recorded path origin, or the store's
+   * inline copy (also for records without a recorded origin, so a read fails clearly instead of
+   * guessing). Undefined when the run is unknown.
+   */
+  scriptLocation?(runId: string): string | undefined;
+  /** Write (or rewrite) the store's inline copy of an admitted script; atomic per file. */
+  writeInlineScript?(runId: string, script: string): void;
+  /** Remove the store's inline copy (best-effort), for an admission that failed after the copy was written. */
+  discardInlineScript?(runId: string): void;
+  /**
+   * Read the current text at the run's script location. Bounded to 1 MiB and regular files;
+   * a missing, oversized, or non-regular file fails with PERSISTENCE_ERROR.
+   */
+  readScript?(runId: string): string;
 }
 
 export interface RunLease {
@@ -336,6 +363,44 @@ export interface RunPersistenceOptions {
   leaseOwnerId?: string;
 }
 
+const MAX_SCRIPT_FILE_BYTES = 1_048_576;
+
+/** The store's inline copy of a run's script, next to its persisted record. */
+export function inlineScriptFile(runsDir: string, runId: string): string {
+  return join(runsDir, `${runId}.script.js`);
+}
+
+/**
+ * Read a script file through one descriptor: open non-blocking so a FIFO or device can never
+ * hang the reader, check the descriptor itself, then read it. Uses the real filesystem — the
+ * script location is the host's file, not a store record.
+ */
+export function readBoundedScriptFile(location: string, runId: string): string {
+  const fail = (detail: string): never => {
+    throw new WorkflowError(
+      `script for run ${runId} is unavailable at ${location}: ${detail}`,
+      WorkflowErrorCode.PERSISTENCE_ERROR,
+      { recoverable: false },
+    );
+  };
+  let descriptor: number;
+  try {
+    descriptor = openSync(location, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+  try {
+    const stat = fstatSync(descriptor);
+    if (!stat.isFile()) return fail("not a regular file");
+    if (stat.size > MAX_SCRIPT_FILE_BYTES) return fail(`exceeds ${MAX_SCRIPT_FILE_BYTES} bytes`);
+    const script = readFileSync(descriptor, "utf8");
+    if (Buffer.byteLength(script, "utf8") > MAX_SCRIPT_FILE_BYTES) return fail(`exceeds ${MAX_SCRIPT_FILE_BYTES} bytes`);
+    return script;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 export function createRunPersistence(
   cwd: string,
   fsOverride?: Partial<FsLayer>,
@@ -380,6 +445,7 @@ export function createRunPersistence(
   const legacyRunPath = (runId: string) => runPath(legacyRunsDir, runId);
   const lockPath = (dir: string, runId: string) => join(dir, `${runId}.lock`);
   const lineagePath = (dir: string, runId: string) => join(dir, `${runId}.lineage`);
+  const inlineScriptPath = (runId: string) => inlineScriptFile(runsDir, runId);
   const primaryLockPath = (runId: string) => lockPath(runsDir, runId);
   const legacyLockPath = (runId: string) => lockPath(legacyRunsDir, runId);
   const primaryLineagePath = (runId: string) => lineagePath(runsDir, runId);
@@ -400,13 +466,6 @@ export function createRunPersistence(
         } catch {
           // corrupt candidate -> fall through to the next candidate
           continue;
-        }
-        if (candidate !== path && (state.acceptanceOperation !== undefined || state.continuationOperations !== undefined)) {
-          throw new WorkflowError(
-            `run ${runId} cannot recover acceptance or continuation from an older backup; the current operation record is unreadable`,
-            WorkflowErrorCode.PERSISTENCE_ERROR,
-            { recoverable: false },
-          );
         }
         return state;
       }
@@ -499,11 +558,6 @@ export function createRunPersistence(
       return loadState(runId);
     },
 
-    hasRunArtifact(runId: string): boolean {
-      return candidateRunPaths(runId).some((path) => _existsSync(path) || _existsSync(`${path}.bak`)) ||
-        candidateLineagePaths(runId).some((path) => _existsSync(path));
-    },
-
     list(): PersistedRunState[] {
       const byRunId = new Map<string, PersistedRunState>();
       for (const dir of [runsDir, legacyRunsDir]) {
@@ -537,12 +591,16 @@ export function createRunPersistence(
             runId,
             ...(sourceRunId ? { sourceRunId } : {}),
             deletedAt: new Date().toISOString(),
-            ...(state.acceptanceOperation ? { acceptanceOperation: state.acceptanceOperation } : {}),
           };
           const path = primaryLineagePath(runId);
           _writeFileSync(`${path}.tmp`, JSON.stringify(tombstone, null, 2));
           _renameSync(`${path}.tmp`, path);
           wroteTombstone = true;
+        }
+        try {
+          _unlinkSync(inlineScriptPath(runId));
+        } catch {
+          // No inline copy (a path run, or an older record): nothing to remove.
         }
         for (const path of candidateRunPaths(runId)) {
           try {
@@ -608,7 +666,6 @@ export function createRunPersistence(
             runId,
             ...(value.sourceRunId === undefined ? {} : { sourceRunId: value.sourceRunId }),
             deletedAt: value.deletedAt,
-            ...(value.acceptanceOperation ? { acceptanceOperation: value.acceptanceOperation } : {}),
           };
         } catch {
           // corrupt candidate -> fall through to the next candidate
@@ -686,6 +743,35 @@ export function createRunPersistence(
       return validLockOwner(existing, lease.runId, primaryRunPath(lease.runId)) &&
         existing.token === lease.token &&
         (lease.ownerId === undefined || existing.ownerId === lease.ownerId);
+    },
+
+    scriptLocation(runId: string): string | undefined {
+      const state = loadState(runId);
+      if (!state) return undefined;
+      return state.scriptOrigin?.kind === "path" ? state.scriptOrigin.path : inlineScriptPath(runId);
+    },
+
+    discardInlineScript(runId: string): void {
+      try {
+        _unlinkSync(inlineScriptPath(runId));
+      } catch {
+        // Nothing to discard.
+      }
+    },
+
+    writeInlineScript(runId: string, script: string): void {
+      ensureDir();
+      const path = inlineScriptPath(runId);
+      _writeFileSync(`${path}.tmp`, script);
+      _renameSync(`${path}.tmp`, path);
+    },
+
+    readScript(runId: string): string {
+      const location = this.scriptLocation!(runId);
+      if (location === undefined) {
+        throw new WorkflowError(`run ${runId} is unknown`, WorkflowErrorCode.PERSISTENCE_ERROR, { recoverable: false });
+      }
+      return readBoundedScriptFile(location, runId);
     },
 
     getRunsDir(): string {

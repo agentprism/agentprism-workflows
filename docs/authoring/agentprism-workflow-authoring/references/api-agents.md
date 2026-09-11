@@ -27,7 +27,8 @@ Returns the agent's final assistant text, or the schema-validated object when `s
 
 Agent attempts have no model-facing wall-clock or idle timeout. They remain live until they complete,
 fail, or the host explicitly cancels the call or run. Same-ID MCP continuation may apply new runtime
-limits, but it cannot change the persisted script, args, or immutable routing inputs.
+limits and picks up an edited script file as a validated revision, but it cannot change the args or
+immutable routing inputs, and a revision cannot widen backend approval.
 
 ## Model specs & routing
 

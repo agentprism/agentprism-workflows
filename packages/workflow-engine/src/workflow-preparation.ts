@@ -1,14 +1,5 @@
-import { createHash } from "node:crypto";
-import { resolve } from "node:path";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { cloneFrozenStrictJson } from "./strict-json.js";
-import type { WorkflowContinuationResult } from "@automatalabs/shared-types";
-
-/** Caller-owned retry identity. The fingerprint covers the operation's semantic input. */
-export interface WorkflowOperationIdentity {
-  id: string;
-  fingerprint: string;
-}
 
 /** Engine-persisted, host-interpreted setup state. No transport or backend types cross this seam. */
 export interface WorkflowPreparation {
@@ -19,48 +10,21 @@ export interface WorkflowPreparation {
   responses?: Record<string, string>;
 }
 
-export interface PersistedWorkflowContinuationOperation extends WorkflowOperationIdentity {
-  acceptedAt: string;
-  continuation: WorkflowContinuationResult;
-}
-
-/** Identities are never evicted: exceeding this limit refuses a new continuation. */
-export const MAX_WORKFLOW_CONTINUATION_OPERATIONS = 4_096;
+/** Receipts are never evicted: exceeding this limit refuses a new setup answer. */
+export const MAX_WORKFLOW_SETUP_RESPONSES = 4_096;
 export const MAX_WORKFLOW_PREPARATION_BYTES = 1_048_576;
 
 function invalid(message: string): WorkflowError {
   return new WorkflowError(message, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
 }
 
-export function captureWorkflowOperation(operation: WorkflowOperationIdentity): WorkflowOperationIdentity {
+/** A setup receipt pairs the host's request id with a lowercase SHA-256 of the answer content. */
+function assertSetupReceipt(id: string, fingerprint: string): void {
   if (
-    operation === null || typeof operation !== "object" ||
-    typeof operation.id !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(operation.id) ||
-    typeof operation.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(operation.fingerprint) ||
-    Object.keys(operation).some((key) => key !== "id" && key !== "fingerprint")
+    typeof id !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(id) ||
+    typeof fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(fingerprint)
   ) {
-    throw invalid("workflow operation requires a bounded id and a lowercase SHA-256 fingerprint");
-  }
-  return Object.freeze({ id: operation.id, fingerprint: operation.fingerprint });
-}
-
-export function acceptedWorkflowRunId(projectDir: string, operation: WorkflowOperationIdentity): string {
-  const captured = captureWorkflowOperation(operation);
-  const hash = createHash("sha256")
-    .update(JSON.stringify(["workflow-acceptance-v1", resolve(projectDir), captured.id]))
-    .digest("hex");
-  // A compact 128-bit identifier fits the existing public run-id vocabulary without
-  // looking like an opaque credential in status/event projections. The full operation
-  // fingerprint remains durable, so any identifier collision fails as a conflict.
-  return `r-${BigInt(`0x${hash.slice(0, 32)}`).toString(36)}`;
-}
-
-export function assertWorkflowOperationMatches(
-  recorded: WorkflowOperationIdentity | undefined,
-  operation: WorkflowOperationIdentity,
-): void {
-  if (!recorded || recorded.id !== operation.id || recorded.fingerprint !== operation.fingerprint) {
-    throw invalid(`workflow operation conflict: request identity "${operation.id}" already has different semantic input`);
+    throw invalid("workflow setup receipt requires a bounded id and a lowercase SHA-256 fingerprint");
   }
 }
 
@@ -100,15 +64,15 @@ export function mergeWorkflowSetupResponses(
       throw invalid("workflow setup response receipts must be a strict-JSON record");
     }
     for (const [id, fingerprint] of Object.entries(responses)) {
-      captureWorkflowOperation({ id, fingerprint });
+      assertSetupReceipt(id, fingerprint);
       if (Object.hasOwn(merged, id) && merged[id] !== fingerprint) {
         throw invalid(`workflow setup response conflict: request "${id}" was already answered`);
       }
       Object.defineProperty(merged, id, { value: fingerprint, enumerable: true, configurable: true });
     }
   }
-  if (Object.keys(merged).length > MAX_WORKFLOW_CONTINUATION_OPERATIONS) {
-    throw invalid(`workflow setup response limit ${MAX_WORKFLOW_CONTINUATION_OPERATIONS} reached`);
+  if (Object.keys(merged).length > MAX_WORKFLOW_SETUP_RESPONSES) {
+    throw invalid(`workflow setup response limit ${MAX_WORKFLOW_SETUP_RESPONSES} reached`);
   }
   return Object.freeze(merged);
 }

@@ -396,6 +396,8 @@ return { count: args.count, answer }`,
     assert.ok(collision instanceof WorkflowError);
     assert.equal(collision.code, WorkflowErrorCode.PERSISTENCE_ERROR);
     assert.match(collision.message, /run id already exists: shared-id/);
+    // Background execution begins on the next macrotask; the agent is dispatched shortly after.
+    while (finish === undefined) await new Promise((resolve) => setImmediate(resolve));
     finish("done");
     assert.equal((await started.promise).status, "completed");
   });

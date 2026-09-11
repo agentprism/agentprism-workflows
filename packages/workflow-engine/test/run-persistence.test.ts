@@ -51,12 +51,17 @@ return 'done'`;
 
 function deferredAgent() {
   let resolveRun: ((value: unknown) => void) | undefined;
+  let early: { value: unknown } | undefined;
   return {
+    // Background execution starts on the next macrotask, so a value supplied before the runner
+    // is reached is handed over as soon as the agent is dispatched.
     resolve(value: unknown = "ok") {
-      resolveRun?.(value);
+      if (resolveRun) resolveRun(value);
+      else early = { value };
     },
     runner: {
       async run() {
+        if (early) return early.value;
         return new Promise((resolve) => {
           resolveRun = resolve;
         });

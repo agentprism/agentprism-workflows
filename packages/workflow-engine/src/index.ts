@@ -38,11 +38,9 @@ export {
   type PersistedRunStopResult,
 } from "./workflow-manager.js";
 export {
-  MAX_WORKFLOW_CONTINUATION_OPERATIONS,
+  MAX_WORKFLOW_SETUP_RESPONSES,
   MAX_WORKFLOW_PREPARATION_BYTES,
-  type WorkflowOperationIdentity,
   type WorkflowPreparation,
-  type PersistedWorkflowContinuationOperation,
 } from "./workflow-preparation.js";
 export {
   createRunPersistence,
@@ -52,6 +50,8 @@ export {
   type RunLeaseOwner,
   type RunStatus,
   type PersistedRunState,
+  type WorkflowScriptOrigin,
+  type WorkflowScriptRevision,
   type PersistedAgentState,
   type PersistedResumeFormat,
   type PersistedResumeCandidate,
@@ -238,6 +238,8 @@ export {
   type PersistedRunJournalEntry,
   type PersistedRunJournalPayload,
   type PersistedRunPausedPayload,
+  type PersistedRunRequestedPausedPayload,
+  type PersistedRunUnreasonedPausedPayload,
   type PersistedRunUsageLimitPausedPayload,
   type RunAgentEndEvent,
   type RunAgentEndPayload,
@@ -271,7 +273,7 @@ export {
   type RunJournalPayload,
   type RunLogEvent,
   type RunLogPayload,
-  type RunManualPausedPayload,
+  type RunRequestedPausedPayload,
   type RunPausedEvent,
   type RunPausedPayload,
   type RunPhaseEvent,

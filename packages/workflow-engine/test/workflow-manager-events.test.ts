@@ -179,34 +179,38 @@ test("append failure marks the snapshot incomplete once without changing the out
   });
 });
 
-test("manual pause settles live-only, and warm stop reacquires and revalidates the lease", async () => {
+test("a requested pause settles after the executing call, and warm stop reacquires and revalidates the lease", async () => {
   await withPersistenceDirs(async ({ cwd, root }) => {
     const entered = deferred<void>();
+    const finish = deferred<string>();
     const runner: AgentRunner = {
-      async run(_prompt, options) {
+      async run() {
         entered.resolve();
-        return await new Promise((_resolve, reject) => {
-          options?.signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
-        });
+        return await finish.promise;
       },
     };
     const manager = new WorkflowManager({ cwd, persistenceRoot: root, agent: runner });
     let liveErrors = 0;
     manager.on("error", () => liveErrors++);
-    const background = manager.startInBackground(script(`return await agent('hold', { label: 'hold' })`));
+    const background = manager.startInBackground(
+      script(`await agent('hold', { label: 'hold' })
+return await agent('next', { label: 'next' })`),
+    );
     await entered.promise;
 
     assert.equal(manager.pause(background.runId), true);
-    const paused = manager.getPersistence().load(background.runId);
+    assert.equal(manager.getPersistence().load(background.runId)?.status, "running", "the executing call is still finishing");
+    finish.resolve("held");
     await assert.rejects(background.promise);
-    assert.deepEqual(manager.getPersistence().load(background.runId), paused);
-    assert.equal(liveErrors, 1);
-    assert.equal(
-      manager.getPersistence().readEvents(background.runId, { limit: 1_000 }).events.some(
-        (record) => record.event.type === "error",
-      ),
-      false,
-    );
+    const paused = manager.getPersistence().load(background.runId);
+    assert.equal(paused?.status, "paused");
+    assert.equal(paused?.pauseReason, "requested");
+    assert.equal(paused?.journal?.length, 1, "the executing call journaled before the pause");
+    assert.equal(liveErrors, 0, "a requested pause is not an error");
+    const pausedRecords = manager.getPersistence().readEvents(background.runId, { limit: 1_000 }).events;
+    assert.equal(pausedRecords.some((record) => record.event.type === "error"), false);
+    const pausedEvent = pausedRecords.find((record) => record.event.type === "paused")?.event;
+    assert.equal(pausedEvent?.type === "paused" ? pausedEvent.reason : undefined, "requested");
 
     const competitor = createRunPersistence(cwd, undefined, { persistenceRoot: root });
     const competingLease = competitor.acquireRunLease(background.runId);
@@ -456,7 +460,7 @@ const EXPECTED_EVENT_KEYS: Record<string, string[]> = {
   journal: ["entry", "runId", "scope"],
   callRecord: ["record", "runId", "scope"],
   complete: ["result", "runId", "scope"],
-  paused: ["runId", "scope"],
+  paused: ["error", "errorRecord", "reason", "runId", "scope"],
   error: ["error", "errorRecord", "runId", "scope"],
   stopped: ["runId", "scope"],
   resumed: ["runId", "scope"],
@@ -499,24 +503,27 @@ test("each manager event carries exactly its §2.2 payload key set", async () =>
     const failed = await errorManager.runSync(script(`throw new Error('boom')`, "error-events"));
     assert.equal(failed.status, "failed");
 
-    // Scenario 3 — a manual pause, then a warm stop of that same paused run.
+    // Scenario 3 — a requested pause, then a warm stop of that same paused run.
     const entered = deferred<void>();
+    const finish = deferred<string>();
     const holdManager = new WorkflowManager({
       cwd,
       persistenceRoot: root,
       agent: {
-        async run(_prompt, options) {
+        async run() {
           entered.resolve();
-          return await new Promise((_resolve, reject) => {
-            options?.signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
-          });
+          return await finish.promise;
         },
       },
     });
     const pauseStopKeys = captureEventKeys(holdManager, ["paused", "stopped"]);
-    const background = holdManager.startInBackground(script(`return await agent('hold', { label: 'hold' })`, "hold-events"));
+    const background = holdManager.startInBackground(
+      script(`await agent('hold', { label: 'hold' })
+return await agent('next', { label: 'next' })`, "hold-events"),
+    );
     await entered.promise;
     assert.equal(holdManager.pause(background.runId), true);
+    finish.resolve("held");
     await assert.rejects(background.promise);
     assert.equal(holdManager.stop(background.runId), true);
 

@@ -169,6 +169,8 @@ export interface WorkflowContinuationResult {
   generation: number;
   replayedPrefix: number;
   resolvedCheckpoints?: WorkflowCheckpointResolution[];
+  /** This generation runs a revised script: unchanged calls replay by identity, the rest run live. */
+  scriptRevised?: true;
 }
 
 /** One cached agent()/checkpoint() result, keyed by its deterministic call index

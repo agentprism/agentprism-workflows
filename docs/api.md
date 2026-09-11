@@ -95,7 +95,7 @@ manager.on("agentEvent", (e) => ui.stream(e.runId, e));  // live token-level ACP
 const { runId, promise } = manager.startInBackground(script, args, { cwd: worktreePath });
 // ... later:
 await manager.cancelAgentCall(runId, 7); // settle one in-flight agent null; run stays live
-manager.stop(runId);                    // whole-run terminal abort
+manager.stop(runId);                    // whole-run interruption; the aborted run can resume
 ```
 
 ---
@@ -148,6 +148,7 @@ Passed as the third argument to `startInBackground` / `runSync`, second to `resu
 | `checkpointReplies` | Durable-checkpoint answer channel. With `resumeFromRunId`, keys name call indexes in the **source** run; with same-ID `resume()` they name that persisted run's index. Values must be strict JSON. |
 | `onProgress` | Fires with the live `WorkflowSnapshot` on every progress event. |
 | `scriptBackends` | APPROVED script-declared custom backends (`meta.backends`). Omitting leaves them inert — approval belongs to the composition root. |
+| `script` | Same-run continuation only (`continueRun`/`resume`): the script text read back from the run's file. Identical text continues the persisted script; different text is a revision that must parse and may declare only backends the admission approved. The revision continues through an identity-matched replay of the run's own journal (`continuation.scriptRevised`, `scriptRevisions`); refusals are `script-invalid` and `backends-changed`. |
 | `resumeJournal` | Low-level legacy positional channel. Mutually exclusive with `resumeFromRunId`/`resumePolicy`; manual use permanently marks the result legacy. Prefer manager-owned `resumeFromRunId`. |
 
 Agent attempts have no model-facing wall-clock or idle timeout. They remain live until they complete,
@@ -184,9 +185,10 @@ approval journals. Historical artifacts remain readable where supported without 
 | `inspectRun(runId, options?)` | `WorkflowRunStatus \| undefined` | Synchronous, live-first safe projection; falls back to project-scoped persistence. A cold `pending`/`running` dead-owner row may be lease-reconciled to `paused` / `interrupted`; other rows are not changed. |
 | `reconcileExternallyDeadRun(runId)` | `PersistedRunState \| undefined` | Lease-safe single-run reconciliation used by cold host preflights. Skips manager-owned runs, non-`pending`/`running` states, live owners, and all writes when the manager default is `journaling: false`. |
 | `cancelAgentCall(runId, callIndex)` | `Promise<WorkflowAgentCallCancellation>` | Cancels one uniquely matching in-flight attempt, bypasses retries, and resolves after its `AGENT_CANCELLED` call record and `agentEnd` state are durable. The run signal and `abortSignaled` remain untouched. Misses and duplicate scoped indexes throw with the current call-index/label list. |
-| `pause(runId)` | `boolean` | Aborts in-flight work; journal preserved; resumable. |
-| `stop(runId)` | `boolean` | Whole-run terminal abort. The same run ID cannot resume in place, but its retained journal can be the source of a new `resumeFromRunId` execution. |
-| `resume(runId, exec?)` | `Promise<boolean>` | Same-ID recovery of a paused/failed run using historical positional replay. Reloads the persisted script/args/cwd, rejects `resumeFromRunId`/`resumePolicy`, emits no resume report, and permanently marks the artifact legacy. Requires journaling. |
+| `pause(runId)` | `boolean` | Requests a pause of a run this manager is executing: agent calls already executing finish and journal, nothing new is admitted (queued calls settle as interrupted rows), and the run settles as `paused` with `reason: "requested"`. Idempotent while pending; `false` when the run is not running here. |
+| `pausePending(runId)` | `boolean` | Whether a pause request is registered for a run this manager is still executing. |
+| `stop(runId)` | `boolean` | Whole-run interruption: in-flight work is cancelled and recorded as interrupted rows, and the run settles as `aborted`. The same run ID can `resume()` from its journal, and its retained journal can also seed a new `resumeFromRunId` execution. |
+| `resume(runId, exec?)` | `Promise<boolean>` | Same-ID recovery of a paused, failed, or aborted run using historical positional replay; with `exec.script` differing from the persisted text, continues the validated revision instead. Reloads the persisted script/args/cwd, rejects `resumeFromRunId`/`resumePolicy`, emits no resume report, and permanently marks the artifact legacy. Requires journaling. |
 | `resumeInBackground(runId, exec?)` | `Promise<{ accepted, promise? }>` | Same-ID `resume()` plus the settlement handle: when accepted, `promise` is the resumed execution's completion promise (same contract as `startInBackground`'s — rejects on failure/pause, side-channel catch attached). The facade manager holds a per-execution `exec.agent` event bridge until it settles. |
 | `continueRun(runId, exec?)` | `Promise<WorkflowContinuationStart>` | Strict same-ID continuation used by MCP. Requires a valid versioned canonical admission snapshot, inherits all semantic inputs, accepts runtime controls/checkpoint replies only, and returns a bounded refusal reason instead of guessing missing metadata. |
 | `getRun(runId)` | `ManagedRun \| undefined` | Live in-memory state incl. `status`, `snapshot`, `error`. |
@@ -755,6 +757,17 @@ backlog first, then follows appends as a pull-based `RunEventStream`; abort/`clo
 normally. Watchers stay open across lifecycle events because the same run may resume. They fail
 closed on deletion, generation replacement, corruption, or inconsistency instead of following a
 different stream.
+
+#### MCP script file resource
+
+Every admitted run exposes its script as a `file://` resource: the store copy `{runId}.script.js`
+written next to the run record for an inline script, or the caller's own `scriptPath` file. Run,
+resume, status, and outcome responses name it as `scriptUri` and `scriptPath`, and `resources/list`
+enumerates one entry per persisted run. Reads return the file's current UTF-8 text with MIME type
+`text/javascript`, so an edit made after admission is visible immediately; the admitted text that
+executes is kept in the run record. Only a file some persisted run recorded is addressable: any other
+`file://` URI, including an unowned file inside the store, is rejected. Deleting a run removes its
+store copy; a caller's `scriptPath` file is never modified or removed.
 
 #### MCP exact workflow result resource
 
@@ -1411,6 +1424,7 @@ One runtime class (from `@automatalabs/shared-types`, so `instanceof` holds acro
 | `PROVIDER_USAGE_LIMIT` | no | Quota/rate wall → the run **pauses** (journaled, resumable), carries `providerUsageLimitContext` and a synthesized `resetHint` when a reset instant is available. |
 | `AUTH_REQUIRED` | no | Agent demanded auth (`-32000`) → the run **pauses** (`reason: "auth_required"`, journaled, resumable), carries the non-secret `authContext`; `resume()` re-arms via `runner.auth.canResume`. |
 | `CHECKPOINT_REQUIRED` | no | `checkpoint()` has no explicit answer → the run **pauses** with non-secret `checkpointContext`; resume with `checkpointReplies` or a live `confirm`. |
+| `PAUSE_REQUESTED` | no | A host asked for a pause → executing agent calls finish and journal, nothing new is admitted (queued calls become interrupted rows), and the run **pauses** with `reason: "requested"`; resume the same journal. Catching it in-script cannot keep the run going. |
 | `AGENT_LIMIT_EXCEEDED` | no | The run's agent-call limit was reached. |
 | `AGENT_EXECUTION_ERROR` | yes | Other agent-level failure (refusal/truncation are non-recoverable variants). |
 | `PERSISTENCE_ERROR`, `UNKNOWN` | no | Storage / unexpected host-level failure. |
@@ -1436,17 +1450,16 @@ of `script` and `scriptPath`. There are no aliases or completion-wait controls.
 
 | Field | Actions | Contract |
 | --- | --- | --- |
-| `requestId` | run, resume | Required caller-generated retry identity, 1–128 characters matching `[A-Za-z0-9][A-Za-z0-9._:-]*`. Keep it and the complete input unchanged when retrying a lost acknowledgement. Use a new ID for a new operation. |
-| `script`, `scriptPath` | run | Raw JavaScript or an absolute server-side regular-file path, exactly one. First statement: `export const meta = { name, description, phases? }`. The accepted UTF-8 snapshot is at most 1 MiB and immutable. |
+| `script`, `scriptPath` | run | Raw JavaScript or an absolute server-side regular-file path, exactly one. First statement: `export const meta = { name, description, phases? }`. The accepted UTF-8 text is at most 1 MiB. An inline script is copied into the run store as `{runId}.script.js`; a `scriptPath` run records the path. The admitted text is what executes. |
 | `projectDir` | config, run | Absolute project directory, required on the shared daemon; defaults to the server's project under `--in-process`. Other actions locate the project through `runId`. |
-| `args` | run | Strict-JSON script input, immutable after acceptance. |
+| `args` | run | Strict-JSON script input, immutable after admission. |
 | `maxAgents`, `concurrency`, `agentRetries` | run, resume | Runtime limits; default agent cap 1000, concurrency clamped to 16, retries clamped to 3. Resolved limits are returned. |
 | `harnesses`, `modelSpecs`, `modelFilter` | config | Optional backend names, exact routed models, and bounded model substring or `/regex/` filter for no-prompt discovery. |
-| `runId` | resume, setup-response, status, result, permissions-response, stop | Exact persisted identity, matching `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. Resume continues the exact run ID. |
+| `runId` | resume, setup-response, status, result, permissions-response, pause, stop | Exact persisted identity, matching `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. Resume continues the exact run ID, including a paused or stopped one. |
 | `checkpointReplies` | resume | Map `checkpointContext.callIndex` to the explicit kind-valid JSON answer. The first durable answer wins. |
 | `setupId`, `response` | setup-response | Exact pending setup UUID, with `{ action:"accept", content:{...} }`, `{ action:"decline" }`, or `{ action:"cancel" }`. Accept content must satisfy the persisted `requestedSchema`. |
 | `permissionId`, `response` | permissions-response | Exact pending UUID and `{ outcome:{ outcome:"selected", optionId } }` or `{ outcome:{ outcome:"cancelled" } }`. Only an advertised option ID is accepted; response `_meta` is forbidden. |
-| `lastN`, `labelGlob`, `logLines` | status, stop | Bounded inspection: latest 1–50 calls (default 20), case-sensitive whole-label glob, and 0–50 log lines (default 20). |
+| `lastN`, `labelGlob`, `logLines` | status, pause, stop | Bounded inspection: latest 1–50 calls (default 20), case-sensitive whole-label glob, and 0–50 log lines (default 20). |
 | `offset`, `maxBytes` | result | Exact UTF-8 JSON paging: offset defaults to zero; maxBytes is 4–16,384 (default 16,384). Continue at the previous `endOffset`. |
 | `callIndex` | stop | Cancel one uniquely matching live agent; its slot resolves to `null` with `AGENT_CANCELLED`, while siblings continue. |
 | `forceOwner` | whole-run stop | Explicitly permit termination of a superseded owner after identity revalidation; may interrupt sibling runs. Forbidden with `callIndex`. |
@@ -1460,35 +1473,35 @@ Discover exact live model, mode, and config values before pinning them:
 Catalogs preserve raw mode IDs, names, descriptions, and `_meta`. For trusted work, choose
 Claude `bypassPermissions` or Codex `agent` when advertised. Claude `auto` uses a model classifier and may request permission.
 
-#### Durable acceptance and setup
+#### Preparation, admission, and setup
 
 ```json
 {
   "action":"run",
-  "requestId":"review-20260908-1",
   "projectDir":"/absolute/project",
   "script":"export const meta = { name: 'review', description: 'review the repository', model: 'codex' }; return await agent('Review the repo');"
 }
 ```
 
-The request validates its input and source structure, acquires the run lease, and durably records
-the immutable script, args, operation identity, limits, and preparation state before returning.
-Slow mock execution, backend probes, and human setup happen after this acknowledgement. Malformed
-source fails before acceptance; a later validation or preparation failure remains an inspectable
-failed run. A repeated `requestId` with the same input finds the original run even if a script file
-has changed or disappeared. Reusing it with different input fails without starting work.
+The request reads the source, checks its structure, runs the mocked dry run and the routed
+no-prompt probes, and only then admits execution under format-3 routing admission and returns.
+Nothing is persisted before admission: malformed source, a failed dry run, missing routing, and a
+full project are tool execution errors (`isError:true`) with no run behind them, and cancelling the
+request (closing the response stream, or `notifications/cancelled` on stdio) abandons preparation
+and releases capacity. A script that declares custom backends is validated the same way and then
+parked in durable setup (`status:"pending"`, `setup.request`) until `setup-response` approves it.
+When the request carries `_meta.progressToken`, preparation stages are reported as progress.
 
 An accepted response is always an acknowledgement, including when work finishes quickly:
 
 ```ts
 type WorkflowOperationAccepted = {
   accepted: true;
-  requestId: string;
-  duplicate: boolean;
   runId: string;
   status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
   scriptSource: "inline" | "path" | "stored";
-  scriptUri: string;
+  scriptUri: string; // file:// URI of the run's script file
+  scriptPath: string; // the same location as an absolute path
   eventsUri: string;
   limits: { maxAgents: number; concurrency: number; agentRetries: number };
   setup?: WorkflowSetup;
@@ -1541,7 +1554,7 @@ at 24,576 UTF-8 bytes and status text at 8,192; raw terminal outcome has no new 
 Every unanswered script checkpoint pauses with `reason:"checkpoint_required"`. Use the App or:
 
 ```json
-{ "action":"resume", "requestId":"review-answer-1", "runId":"mabc1234-k9x2pq", "checkpointReplies":{"1":true} }
+{ "action":"resume", "runId":"mabc1234-k9x2pq", "checkpointReplies":{"1":true} }
 ```
 
 Use the exact index from `outcome.checkpointContext`. Confirm replies must be boolean, input replies
@@ -1557,9 +1570,7 @@ request is cancelled rather than partially exposed. Owner loss invalidates the o
 a successor cannot reconstruct it. Setup and checkpoints, in contrast, are durable waits.
 
 An `AUTH_REQUIRED` pause reports `reason:"auth_required"` and `outcome.authContext`. Configure the
-named backend's credentials out of band, then call `action:"resume"` with a new `requestId` and the
-same `runId`. Continuation uses the immutable stored script, args, cwd, immutable routing inputs,
-journal, event stream, cumulative usage, and checkpoint answers; it never accepts edited input.
+named backend's credentials out of band, then call `action:"resume"` with the same `runId`. Continuation keeps the run's args, cwd, immutable routing inputs, journal, event stream, cumulative usage, and checkpoint answers; resume itself accepts no replacement inputs. The script is re-read from the run's file: an unchanged or missing file continues the persisted script, and a changed file is a revision. A revision is validated exactly like a new run (structure, mocked dry run, routed probes), may declare only backends the run's setup already approved, and then continues with an identity-matched replay of this run's own journal: calls whose prompt and inputs are unchanged replay without provider usage, edited or new calls and everything the revision reorders run live. The acknowledgement's `continuation.scriptRevised:true` marks such a generation, the persisted record adopts the revised text, and `scriptRevisions` lists every accepted revision. A revision that does not parse, fails validation, or widens backend approval is a tool execution error that changes nothing; fix the file and resume again.
 Historical records without current admission or explicit checkpoint provenance remain readable
 where supported but refuse continuation/reuse clearly; start a fresh run.
 
@@ -1570,7 +1581,8 @@ The MCP additions and response discriminators are:
 
 ```ts
 interface WorkflowScriptResourceFields {
-  scriptUri: string;
+  scriptUri: string; // file:// URI of the run's script file
+  scriptPath?: string; // the same location as an absolute path
   resultUri?: string; // completed authored JSON only
   eventsUri?: string; // absent for historical rows without a durable stream
 }
@@ -1656,8 +1668,13 @@ interface WorkflowResultRetrieval {
 
 `permissions-response` returns the current run inspection/resource fields plus
 `permissionResponse:{permissionId,runId,callIndex,outcome,respondedAt}` and remaining
-`pendingPermissions`. A final whole-stop response has terminal status plus `stopped` and
-`alreadyTerminal`. A bounded pending-stop response has pending/running status, both flags false,
+`pendingPermissions`. `pause` returns the inspection fields plus `pauseRequested` (the request
+reached the live execution owner in this call) and `paused` (the run is durably paused now); it
+waits up to two seconds for executing agents to finish, and a `running` answer with
+`pauseRequested:true` settles on its own, observable through status. An already paused run is a
+no-op observation; a terminal or setup-parked run is an error. A final whole-stop response has
+terminal status plus `stopped` and `alreadyTerminal`. A stopped (`aborted`) run resumes from its
+journal. A bounded pending-stop response has pending/running status, both flags false,
 and `control:{state:"pending",operationId,requestedAt,owner?}`. Owner diagnostics include PID,
 instance/version, lame-duck state, active-run count, and control protocol when available. Targeted
 stop returns the continuing run's current inspection. These observations never carry a new-run
@@ -1670,12 +1687,14 @@ included in completed status text; larger values use resource reads or result pa
 
 ### Request and run lifetimes
 
-- **Every run is asynchronous.** Run/resume requests acknowledge durable acceptance. Each lifecycle
-  request has a 45-second bound; each active preparation attempt has a 120-second bound. Human
-  setup and agent execution outlive individual requests. There is no workflow completion wait,
-  request-scoped progress stream, or request-abort ownership of accepted work.
-- **Capacity and retries.** At most four preparing or executing runs per project are active, with
-  no queue. Waiting setup consumes capacity. Failed/stopped/paused/completed work releases it.
+- **Preparation is synchronous; execution is not.** Run and Resume prepare inside the request under
+  a 120-second ceiling, honor request cancellation before admission, and report preparation
+  progress when a progress token is supplied. Observation requests have a 45-second bound. Human
+  setup and agent execution outlive individual requests; there is no workflow completion wait, and
+  cancellation after admission never stops an admitted run.
+- **Capacity.** At most four preparing or executing runs per project are active, with no queue.
+  Waiting setup consumes capacity. Rejected preparation and failed/stopped/paused/completed work
+  release it.
   Exact retries return the existing operation and do not consume another slot, even at capacity.
 - **Same-ID continuation.** Resume durably records its caller operation and generation under the
   run lease before executing. Lost-ack retries reuse that receipt; journal hits add no provider
@@ -1683,10 +1702,17 @@ included in completed status text; larger values use resource reads or result pa
 - **Observation and recovery.** Status never waits for work or collects an answer. A cold accepted
   preparation is recovered under its lease and preserves pending setup IDs. An interrupted admitted
   execution becomes paused/interrupted for explicit resume. A live lease is never stolen on timeout.
+- **Pause.** A pause request goes to the live execution owner; there is nothing to record cold.
+  Agents already executing finish and journal, nothing new starts, queued calls settle as
+  interrupted rows, and the run settles as `paused` with `reason:"requested"`. The response
+  carries `pauseRequested` and `paused` after a two-second wait for executing agents; a `running`
+  answer settles on its own. Resume continues from the journal. A run whose owner died is
+  reconciled to its interrupted pause instead.
 - **Stop.** Whole-run stop is location independent: it records a durable intent and forwards to the
   lease owner. Final success requires durable aborted state and a matching stopped event. A bounded
   control wait may return `control.state:"pending"` with an operation ID. Repeated terminal stop is
-  a successful no-op. Targeted agent cancellation needs a live owner and is not fabricated cold.
+  a successful no-op. A stopped (`aborted`) run is not final: resume replays its journal and re-runs
+  the interrupted calls. Targeted agent cancellation needs a live owner and is not fabricated cold.
 - **Process lifetime.** Disconnect, shim kill, and session eviction leave daemon-owned work alive.
   A successor routes setup replies, permission replies, and stop/cancel control to a predecessor
   still holding the lease. Owner process exit can interrupt work; `--in-process` ends with its own

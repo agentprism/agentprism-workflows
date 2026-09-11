@@ -67,11 +67,14 @@ export interface WorkflowRunControlRouter {
     input: { runId: string; permissionId: string; response: WorkflowPermissionDecisionResponse },
   ): Promise<WorkflowPermissionResponseAcknowledgement>;
   respondSetup(manager: WorkflowManager, input: WorkflowSetupResponseToolInput): Promise<void>;
+  /** Deliver a pause request to the run's live execution owner. Returns false when the owner no longer runs it. */
+  pause(manager: WorkflowManager, runId: string): Promise<boolean>;
 }
 
 export type InternalRunControlRequest =
   | { operationId: string; runId: string; action: "stop" }
   | { operationId: string; runId: string; action: "cancel-agent"; callIndex: number }
+  | { operationId: string; runId: string; action: "pause" }
   | { operationId: string; runId: string; action: "list-permissions" }
   | {
       operationId: string;
@@ -91,6 +94,7 @@ export type InternalRunControlRequest =
 export type InternalRunControlResponse =
   | { ok: true; outcome: "stopped" | "already-terminal" }
   | { ok: true; outcome: "agent-cancelled"; cancellation: WorkflowAgentCallCancellation }
+  | { ok: true; outcome: "pause-requested"; requested: boolean }
   | { ok: true; outcome: "permissions-listed"; permissions: WorkflowPendingPermission[] }
   | {
       ok: true;
@@ -275,6 +279,9 @@ export class DaemonRunControl implements WorkflowRunControlRouter {
         });
         return { ok: true, outcome: "setup-responded" };
       }
+      if (request.action === "pause") {
+        return { ok: true, outcome: "pause-requested", requested: manager.pause(request.runId) };
+      }
       if (request.action === "list-permissions") {
         return {
           ok: true,
@@ -360,6 +367,37 @@ export class DaemonRunControl implements WorkflowRunControlRouter {
         throw new ProtocolError(ProtocolErrorCode.InternalError, `Forced owner pid ${owner.pid} did not exit.`);
       }
     }
+  }
+
+  async pause(manager: WorkflowManager, runId: string): Promise<boolean> {
+    if (manager.getRun(runId)) return manager.pause(runId);
+    const owner = await this.resolveOwner(manager, runId);
+    if (!owner) return false;
+    if (!this.controlCapable(owner)) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        `${actionableOwnerMessage(runId, owner, "pause")} A pause is live execution state and requires a control-capable owner.`,
+      );
+    }
+    let response: InternalRunControlResponse;
+    try {
+      response = await this.post(owner, { operationId: randomUUID(), runId, action: "pause" });
+    } catch (error) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InternalError,
+        `${actionableOwnerMessage(runId, owner, "pause")} ${String(error)}`,
+      );
+    }
+    if (!response.ok || response.outcome !== "pause-requested") {
+      if (!response.ok && response.code === "NOT_OWNER") return false;
+      throw new ProtocolError(
+        response.ok || response.code === "INTERNAL_ERROR"
+          ? ProtocolErrorCode.InternalError
+          : ProtocolErrorCode.InvalidParams,
+        response.ok ? "Owner returned an invalid pause response." : response.message,
+      );
+    }
+    return response.requested;
   }
 
   async listPermissions(manager: WorkflowManager, runId: string): Promise<WorkflowPendingPermission[]> {

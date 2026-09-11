@@ -49,7 +49,7 @@ reach the host; keep evidence concise and never put credentials or other secrets
 | `choices` | `string[]` | For `kind: "select"`. |
 | `timeoutMs` | positive finite `number` | Deadline for an SDK host's live prompt; expiry leaves the checkpoint unanswered and pauses. |
 
-Every unanswered checkpoint pauses with non-secret `checkpointContext`. MCP exposes the pending question through status/monitor and accepts a separate bounded `{ action:"resume", requestId, runId, checkpointReplies:{ [context.callIndex]: decision } }`. An SDK host may collect an explicit answer with `ExecOptions.confirm`; a missing callback, `undefined`, non-JSON value, rejection, or interaction timeout pauses. Panel closure cannot answer or cancel a checkpoint. Explicit stop/cancellation remains available.
+Every unanswered checkpoint pauses with non-secret `checkpointContext`. MCP exposes the pending question through status/monitor and accepts a separate bounded `{ action:"resume", runId, checkpointReplies:{ [context.callIndex]: decision } }`. An SDK host may collect an explicit answer with `ExecOptions.confirm`; a missing callback, `undefined`, non-JSON value, rejection, or interaction timeout pauses. Panel closure cannot answer or cancel a checkpoint. Explicit stop/cancellation remains available.
 
 Replies must be strict JSON and are returned verbatim, including explicit `false`, `null`, or an empty string. The first decision stored under the run lease is authoritative forever: repeats are idempotent and conflicts are ignored. The only authored options are `kind`, `choices`, and `timeoutMs`; retired `headless` and `default` fields are rejected, including the former opt-in `headless:"pause"`.
 
@@ -65,8 +65,9 @@ Replies must be strict JSON and are returned verbatim, including explicit `false
 | `AGENT_LIMIT_EXCEEDED` | no | `maxAgents` cap hit. |
 | `AUTH_REQUIRED` | no | Backend needs authentication. `WorkflowManager` returns a resumable pause with `reason: "auth_required"` and redacted `authContext`; a direct runner throws. The host completes auth before resuming/retrying. |
 | `CHECKPOINT_REQUIRED` | no | No explicit answer is available. `WorkflowManager` returns `reason: "checkpoint_required"` plus non-secret `checkpointContext`; answer through `checkpointReplies` or an SDK live confirm. Catching the signal inside the script cannot bypass the gate. |
+| `PAUSE_REQUESTED` | no | The host asked for a pause. Executing calls finish and journal, nothing new is admitted, and `WorkflowManager` settles the run as paused with `reason: "requested"`; resume continues from the journal. Catching it cannot keep the run going. |
 | `SCRIPT_VALIDATION_ERROR` | no | Script failed parse/validation (bad meta, nondeterministic API, bad `meta.backends` shape). |
 | `SCRIPT_ERROR` | no | The script itself crashed (uncaught throw, floated rejection). |
-| `WORKFLOW_ABORTED` | — | Real cancellation (pause/stop/host signal) — never used for crashes. |
+| `WORKFLOW_ABORTED` | — | Real cancellation (stop/host signal) — never used for crashes. The stopped run can still resume from its journal. |
 
 `loopUntilDry` absorbs `AGENT_LIMIT_EXCEEDED` from its rounds and returns the partial result; everywhere else it propagates.

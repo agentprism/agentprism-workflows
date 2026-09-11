@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 // R0 acceptance (docs/roadmap/workflow-permission-model.md §R0): the daemon HTTP face must stay
 // responsive while its event-serving path drains a large journal. Two production daemon respawns
 // traced to watchEvents re-parsing the whole journal once per record yielded — a measured
@@ -52,7 +51,7 @@ test(
       // save cadence lags its append cadence.
       const created = await session.client.callTool({
         name: "workflow",
-        arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT, projectDir },
+        arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir },
       });
       assert.equal(created.isError ?? false, false, textOf(created));
       const runId = structured(created)?.runId as string;
@@ -83,7 +82,7 @@ test(
       // the event path is under load.
       const inflight = await session.client.callTool({
         name: "workflow",
-        arguments: { action: "run", requestId: randomUUID(), script: ONE_AGENT_SCRIPT, projectDir },
+        arguments: { action: "run", script: ONE_AGENT_SCRIPT, projectDir },
       });
       assert.equal(inflight.isError ?? false, false, textOf(inflight));
       const inflightRunId = structured(inflight)?.runId as string;

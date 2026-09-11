@@ -423,7 +423,6 @@ export class MockHost extends EventTarget {
       if (response.action !== "accept")
         this.store.emit(runId, { type: "stopped" });
     } else if (args.action === "resume") {
-      if (!args.requestId) throw new Error("Resume requires requestId");
       run.snapshot = { runId, status: "running" };
       this.store.emit(runId, { type: "resumed" });
     } else throw new Error(`Unsupported mock action ${String(args.action)}`);

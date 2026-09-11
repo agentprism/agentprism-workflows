@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -55,7 +54,7 @@ test("action resume continues the exact run with persisted inputs and admitted c
 
     const second = await client.callTool({
       name: "workflow",
-      arguments: { action: "resume", requestId: randomUUID(), runId },
+      arguments: { action: "resume", runId },
     });
     assert.equal(second.isError, false);
     assert.equal(structured(second)?.accepted, true);
@@ -77,8 +76,8 @@ test("resume rejects fields outside its exact public branch", async () => {
   const { client, dispose } = await connect(makeRunner(() => "ok"), { listTools: true });
   try {
     for (const arguments_ of [
-      { action: "resume", requestId: randomUUID(), runId: "source-1", script: RECOVERABLE_SCRIPT },
-      { action: "resume", requestId: randomUUID(), runId: "source-1", offset: 0 },
+      { action: "resume", runId: "source-1", script: RECOVERABLE_SCRIPT },
+      { action: "resume", runId: "source-1", offset: 0 },
       { action: "status", runId: "source-1", checkpointReplies: { "0": true } },
     ]) {
       const result = await client.callTool({ name: "workflow", arguments: arguments_ });
@@ -117,7 +116,7 @@ test("old persisted runs without canonical admission remain observable but requi
 
     const resumed = await client.callTool({
       name: "workflow",
-      arguments: { action: "resume", requestId: randomUUID(), runId },
+      arguments: { action: "resume", runId },
     });
     assert.equal(resumed.isError, true);
     assert.match(textOf(resumed), /admission-missing/);
@@ -147,7 +146,7 @@ test("corrupt canonical admission metadata fails closed without provider re-elic
 
     const resumed = await client.callTool({
       name: "workflow",
-      arguments: { action: "resume", requestId: randomUUID(), runId },
+      arguments: { action: "resume", runId },
     });
     assert.equal(resumed.isError, true);
     assert.match(textOf(resumed), /admission-invalid/);
@@ -173,7 +172,7 @@ test("old positional admission remains inspectable but cannot authorize continua
     await fs.writeFile(`${file}.bak`, JSON.stringify(state), "utf8");
     const inspected = await client.callTool({name:"workflow", arguments:{action:"status", runId}});
     assert.equal(inspected.isError, false, textOf(inspected));
-    const resumed = await client.callTool({name:"workflow", arguments:{action:"resume", requestId:randomUUID(), runId}});
+    const resumed = await client.callTool({name:"workflow", arguments:{action:"resume", runId}});
     assert.equal(resumed.isError, true, textOf(resumed));
     assert.match(textOf(resumed), /admission-invalid/);
     assert.match(textOf(resumed), /fresh run/);

@@ -1,10 +1,10 @@
-import { randomUUID } from "node:crypto";
-import { runAndObserve, waitForRun } from "./_harness.js";
+import { inlineScriptSeams, runAndObserve, scriptFileUri, waitForRun } from "./_harness.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import { InMemoryTransport, McpServer } from "@modelcontextprotocol/server";
 import type { ElicitResult } from "@modelcontextprotocol/server";
 import { Client } from "@modelcontextprotocol/client";
@@ -57,6 +57,11 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, message: s
   assert.fail(message);
 }
 
+/** The `file://` URI of an inline script copy inside a specific run store. */
+function inlineScriptUri(runsDir: string, runId: string): string {
+  return pathToFileURL(join(runsDir, `${runId}.script.js`)).href;
+}
+
 function saveFaultPersistence(
   root: string,
   failSave: (attempt: number, state: PersistedRunState) => boolean,
@@ -90,6 +95,7 @@ function saveFaultPersistence(
       if (leases.get(lease.runId) === lease.token) leases.delete(lease.runId);
     },
     getRunsDir: () => root,
+    ...inlineScriptSeams(join(root, "scripts"), (runId) => records.get(runId) ?? null),
   };
   let saveAttempts = 0;
   const acquiredRunIds: string[] = [];
@@ -108,6 +114,10 @@ function saveFaultPersistence(
     },
     releaseRunLease: (lease) => durable.releaseRunLease(lease),
     getRunsDir: () => durable.getRunsDir(),
+    scriptLocation: (runId) => durable.scriptLocation!(runId),
+    writeInlineScript: (runId, script) => durable.writeInlineScript!(runId, script),
+    discardInlineScript: (runId) => durable.discardInlineScript!(runId),
+    readScript: (runId) => durable.readScript!(runId),
   };
   return { persistence, durable, attempts: () => saveAttempts, acquiredRunIds };
 }
@@ -123,7 +133,7 @@ test("initialize advertises full resources capabilities and scriptPath snapshots
     const unreadablePath = join(dir, "missing.workflow.js");
     const unreadable = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), scriptPath: unreadablePath },
+      arguments: { action: "run", scriptPath: unreadablePath },
     });
     assert.equal(unreadable.isError, true);
     assert.match(
@@ -137,21 +147,27 @@ test("initialize advertises full resources capabilities and scriptPath snapshots
     );
     const result = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), scriptPath },
+      arguments: { action: "run", scriptPath },
     });
     const runId = String(structured(result)?.runId);
-    const uri = `workflow://runs/${runId}/script`;
+    const uri = pathToFileURL(scriptPath).href;
     assert.equal(result.isError, false);
     assert.equal(structured(result)?.scriptSource, "path");
-    assert.equal(structured(result)?.scriptUri, uri);
+    assert.equal(structured(result)?.scriptUri, uri, "a path run's resource is the caller's own file");
+    assert.equal(structured(result)?.scriptPath, scriptPath);
     assert.equal(structured(result)?.eventsUri, `workflow://runs/${runId}/events`);
     assert.deepEqual(resourceLinks(result).map((link) => link.uri), [
       uri,
       `workflow://runs/${runId}/events`,
     ]);
 
+    // The resource is the caller's live file, so an edit shows immediately; the admitted script
+    // that runs stays in the persisted record until a resume admits the edit.
     writeFileSync(scriptPath, `${NO_AGENT_SCRIPT}\n// later edit`, "utf8");
-    assert.equal(resourceText(await client.readResource({ uri })), NO_AGENT_SCRIPT);
+    assert.equal(resourceText(await client.readResource({ uri })), `${NO_AGENT_SCRIPT}\n// later edit`);
+    await waitForRun(client, runId);
+    const persisted = JSON.parse(readFileSync(persistedRunFile(runId)!, "utf8")) as { script: string };
+    assert.equal(persisted.script, NO_AGENT_SCRIPT);
   } finally {
     await dispose();
     rmSync(dir, { recursive: true, force: true });
@@ -170,7 +186,7 @@ test("admission readback preserves authored args and the original persisted scri
   try {
     const result = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script, args },
+      arguments: { action: "run", script, args },
     });
     assert.equal(structured(result)?.result, undefined);
     const observed = await waitForRun(client, String(structured(result)?.runId));
@@ -209,9 +225,8 @@ test("readback rejects a transient initial save failure before execution can res
     const result = await client.callTool({
       name: "workflow",
       arguments: {
-        action: "run", requestId: randomUUID(),
-        script: [
-          'export const meta = { name: "failed-admission", description: "must not execute" };',
+        action: "run", script: [
+          'export const meta = { name: "failed-admission", description: "must not execute", model: "claude" };',
           'return await agent("must not start");',
         ].join("\n"),
       },
@@ -222,7 +237,7 @@ test("readback rejects a transient initial save failure before execution can res
 
     const runId = fault.acquiredRunIds[0];
     assert.ok(runId);
-    const uri = `workflow://runs/${runId}/script`;
+    const uri = inlineScriptUri(root, runId);
     assert.equal(fault.attempts(), 1, "canonical admission is one critical atomic save");
     assert.equal(runnerCalls, 0);
     assert.equal(manager.getRun(runId), undefined);
@@ -254,7 +269,7 @@ test("a failed terminal snapshot save never advertises exact-result availability
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
 
   try {
-    const completed = await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT } });
+    const completed = await client.callTool({ name: "workflow", arguments: { action: "run", script: NO_AGENT_SCRIPT } });
     const runId = String(structured(completed)?.runId);
     assert.equal(structured(completed)?.accepted, true);
     await waitUntil(() => manager.getRun(runId)?.executionSettled === true, "failed final save must settle live execution");
@@ -303,8 +318,7 @@ test("a failed initial save cannot execute a checkpoint or leave a transport for
   client.setRequestHandler("elicitation/create", async () => { elicitations++; return { action: "decline" }; });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   try {
-    const failed = await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(),
-      script: 'export const meta = { name: "checkpoint", description: "pre-VM admission" }; return checkpoint("Ship?");' } });
+    const failed = await client.callTool({ name: "workflow", arguments: { action: "run", script: 'export const meta = { name: "checkpoint", description: "pre-VM admission" }; return checkpoint("Ship?");' } });
     assert.equal(failed.isError, true);
     assert.equal(failed.structuredContent, undefined);
     assert.equal(resourceLinks(failed).length, 0);
@@ -337,9 +351,8 @@ test("persistent acceptance failure never starts the runner and leaves no run, r
     const result = await client.callTool({
       name: "workflow",
       arguments: {
-        action: "run", requestId: randomUUID(),
-        script: [
-          'export const meta = { name: "failed-admission", description: "must not execute" };',
+        action: "run", script: [
+          'export const meta = { name: "failed-admission", description: "must not execute", model: "claude" };',
           'return await agent("must not start");',
         ].join("\n"),
       },
@@ -351,11 +364,11 @@ test("persistent acceptance failure never starts the runner and leaves no run, r
 
     const runId = fault.acquiredRunIds[0];
     assert.ok(runId);
-    const uri = `workflow://runs/${runId}/script`;
+    const uri = inlineScriptUri(root, runId);
     assert.equal(manager.getRun(runId), undefined);
     assert.equal(fault.durable.load(runId), null);
     assert.deepEqual(
-      (await client.listResources()).resources.filter((resource) => resource.uri.startsWith("workflow://")),
+      (await client.listResources()).resources.filter((resource) => resource.uri.startsWith("workflow://") || resource.uri.startsWith("file:")),
       [],
       "no run resources are listed (the static ui:// panel resource is always present)",
     );
@@ -389,7 +402,7 @@ test("persistent admission save failure returns no URI and cleans the run, resou
     await client.listTools();
     const result = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     assert.equal(result.isError, true);
     assert.equal(result.structuredContent, undefined);
@@ -401,11 +414,11 @@ test("persistent admission save failure returns no URI and cleans the run, resou
 
     const runId = fault.acquiredRunIds[0];
     assert.ok(runId);
-    const uri = `workflow://runs/${runId}/script`;
+    const uri = inlineScriptUri(root, runId);
     assert.equal(manager.getRun(runId), undefined);
     assert.equal(fault.durable.load(runId), null);
     assert.deepEqual(
-      (await client.listResources()).resources.filter((resource) => resource.uri.startsWith("workflow://")),
+      (await client.listResources()).resources.filter((resource) => resource.uri.startsWith("workflow://") || resource.uri.startsWith("file:")),
       [],
       "no run resources are listed (the static ui:// panel resource is always present)",
     );
@@ -437,11 +450,11 @@ test("concurrent inline and path results report source without persisting it int
   try {
     const inlinePromise = client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: TWO_AGENT_SCRIPT },
+      arguments: { action: "run", script: TWO_AGENT_SCRIPT },
     });
     const pathPromise = client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), scriptPath },
+      arguments: { action: "run", scriptPath },
     });
     await waitUntil(() => pending.length === 2, "both identical admissions should execute concurrently");
     pending.splice(0).forEach((resolve) => resolve());
@@ -524,12 +537,13 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
     const listed = await client.listResources();
     assert.equal(listed.resources.length, 150);
     const expectedNewest = runIds.slice(5).reverse();
-    const listedScripts = listed.resources.filter((resource) => resource.uri.endsWith("/script"));
+    const listedScripts = listed.resources.filter((resource) => resource.uri.startsWith("file:"));
     const listedResults = listed.resources.filter((resource) => resource.uri.endsWith("/result"));
     const listedEvents = listed.resources.filter((resource) => resource.uri.endsWith("/events"));
+    const runsDir = manager.getPersistence().getRunsDir();
     assert.deepEqual(
       listedScripts.map((resource) => resource.uri),
-      expectedNewest.map((runId) => `workflow://runs/${runId}/script`),
+      expectedNewest.map((runId) => inlineScriptUri(runsDir, runId)),
     );
     assert.deepEqual(
       listedResults.map((resource) => resource.uri),
@@ -542,7 +556,7 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
     assert.match(String(listedScripts[0]?.description), /^workflow script · completed · started /);
     assert.match(String(listedResults[0]?.description), /^exact workflow result · completed /);
     assert.equal(
-      resourceText(await client.readResource({ uri: `workflow://runs/${runIds[0]}/script` })),
+      resourceText(await client.readResource({ uri: inlineScriptUri(runsDir, runIds[0]!) })),
       NO_AGENT_SCRIPT.replace("no-agent", "resource-0"),
       "direct script reads remain available outside the bounded discovery list",
     );
@@ -553,18 +567,13 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
     );
 
     const newest = expectedNewest[0];
-    const completed = await client.complete({
-      ref: { type: "ref/resource", uri: "workflow://runs/{runId}/script" },
-      argument: { name: "runId", value: newest.slice(0, 8) },
-    });
-    assert.deepEqual(completed.completion.values, [newest]);
     const completedResult = await client.complete({
       ref: { type: "ref/resource", uri: "workflow://runs/{runId}/result" },
       argument: { name: "runId", value: newest.slice(0, 8) },
     });
     assert.deepEqual(completedResult.completion.values, [newest]);
 
-    const uri = `workflow://runs/${newest}/script`;
+    const uri = inlineScriptUri(runsDir, newest);
     const resultUri = `workflow://runs/${newest}/result`;
     await client.subscribeResource({ uri });
     await client.unsubscribeResource({ uri });
@@ -590,6 +599,16 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
       client.readResource({ uri: "workflow://runs/no-such/script" }),
       /resource not found/i,
     );
+    // Only a file a run recorded as its script is a resource: neither an arbitrary file nor an
+    // unowned file inside the store is readable, subscribable, or listed.
+    const stray = join(runsDir, "stray.script.js");
+    writeFileSync(stray, "export const meta = { name: 'stray', description: 'not a run' }; return 1;");
+    for (const foreign of [pathToFileURL("/etc/hostname").href, pathToFileURL(stray).href, inlineScriptUri(runsDir, "no-such")]) {
+      await assert.rejects(client.readResource({ uri: foreign }), /resource not found/i);
+      await assert.rejects(client.subscribeResource({ uri: foreign }), /resource not found/i);
+      await assert.rejects(client.unsubscribeResource({ uri: foreign }), /resource not found/i);
+    }
+    assert.equal((await client.listResources()).resources.some((resource) => resource.uri === pathToFileURL(stray).href), false);
     await assert.rejects(
       client.readResource({ uri: "not a uri" }),
       (error: unknown) => {
@@ -612,7 +631,7 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
     assert.deepEqual(await client.unsubscribeResource({ uri }), {});
     assert.deepEqual(await client.unsubscribeResource({ uri: resultUri }), {});
 
-    const racedUri = `workflow://runs/${runIds[0]}/script`;
+    const racedUri = inlineScriptUri(runsDir, runIds[0]!);
     await client.subscribeResource({ uri: racedUri });
     assert.equal(manager.deleteRun(runIds[0]!), true);
     assert.deepEqual(await client.unsubscribeResource({ uri: racedUri }), {});
@@ -639,10 +658,10 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
   try {
     const admitted = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     const runId = String(structured(admitted)?.runId);
-    const uri = `workflow://runs/${runId}/script`;
+    const uri = inlineScriptUri(manager.getPersistence().getRunsDir(), runId);
     await waitUntil(() => listChanged >= 2, "admission and completed-result availability should notify the resource list");
     await client.subscribeResource({ uri });
 
@@ -676,7 +695,7 @@ test("a fresh MCP session can retrieve a checkpoint script and continue that exa
   try {
     const accepted = await first.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script },
+      arguments: { action: "run", script },
     });
     runId = String(structured(accepted)?.runId);
     await waitUntil(async () => structured(await first.client.callTool({
@@ -689,7 +708,7 @@ test("a fresh MCP session can retrieve a checkpoint script and continue that exa
     });
     assert.equal(structured(paused)?.status, "paused");
     retrieved = resourceText(
-      await first.client.readResource({ uri: `workflow://runs/${runId}/script` }),
+      await first.client.readResource({ uri: scriptFileUri(runId) }),
     );
     assert.equal(retrieved, script);
   } finally {
@@ -701,8 +720,7 @@ test("a fresh MCP session can retrieve a checkpoint script and continue that exa
     const resumed = await second.client.callTool({
       name: "workflow",
       arguments: {
-        action: "resume", requestId: randomUUID(),
-        runId: runId!,
+        action: "resume", runId: runId!,
         checkpointReplies: { 0: true },
       },
     });
@@ -719,7 +737,7 @@ test("a fresh MCP session can retrieve a checkpoint script and continue that exa
     assert.equal((structured(coldAwait)?.outcome as Record<string, unknown>).scriptSource, undefined);
     assert.equal(
       (structured(coldAwait)?.outcome as Record<string, unknown>).scriptUri,
-      `workflow://runs/${resumedRunId}/script`,
+      scriptFileUri(resumedRunId),
     );
   } finally {
     await second.dispose();
@@ -732,7 +750,7 @@ test("cold status does not infer an admission-only script source", async () => {
   try {
     const result = await first.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     runId = String(structured(result)?.runId);
     await waitForRun(first.client, runId);

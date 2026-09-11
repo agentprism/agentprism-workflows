@@ -869,22 +869,21 @@ the daemon's full contract (discovery, project routing, idle shutdown, security 
 
 The bundled server exposes `workflow`, the separate `workflow_monitor` view entry on App-capable
 hosts, and `repl`; it has no auth tools. `workflow` has the strict
-config/run/resume/setup-response/status/result/permissions-response/stop lifecycle. Run and Resume
-require `requestId` and return bounded durable acknowledgements before execution completes. Retry
-the same ID and identical arguments after a lost acknowledgement; conflicting reuse fails. A new
-operation needs a fresh ID. Bounded source checks reject malformed input before acceptance;
-mock/probe failures and declined setup remain inspectable under the accepted run ID. Setup replies
-use its exact `setupId`; checkpoint and permission answers use separate bounded actions. No inline
-MCP interaction or transport request-state token owns workflow execution.
+config/run/resume/setup-response/status/result/permissions-response/stop lifecycle. Run prepares
+the script inside the request (structure checks, mocked dry run, routed probes, routing admission)
+and acknowledges only an admitted run; malformed input and validation failures are tool execution
+errors with no run behind them, and cancelling the request before admission persists nothing.
+Declared custom backends park the validated run in durable setup whose replies use the exact
+`setupId`; checkpoint and permission answers use separate bounded actions. No inline MCP
+interaction or transport request-state token owns workflow execution.
 
-Every workflow request is bounded at 45 seconds; autonomous preparation is bounded at 120 seconds
-per stage, excluding durable human waiting. Each project allows four active runs, including setup.
+Preparation is bounded at 120 seconds; observation requests are bounded at 45 seconds, excluding
+durable human waiting. Each project allows four active runs, including setup.
 Only `workflow_monitor` advertises the shared static UI resource. Its multi-run view survives a
 host replacing panels; non-App clients use Status, Result, and the same controls. Required-input
 and terminal notifications use available host capabilities with duplicate suppression; routine
 activity remains quiet. Panel closure and request timeout never stop an accepted run. Explicit
-Stop is durable; cold recovery preserves the source, setup receipts, checkpoint answers, and
-continuation retry identities. See the [lifecycle reference](../../docs/authoring/agentprism-workflow-authoring/references/run-lifecycle.md).
+Stop is durable; cold recovery preserves the source, setup receipts, and checkpoint answers. See the [lifecycle reference](../../docs/authoring/agentprism-workflow-authoring/references/run-lifecycle.md).
 
 The `repl` tool is a persistent QuickJS-in-WASM JavaScript REPL, **one VM per `projectDir`**
 (the same per-project model as `workflow`), for live, stateful subagent orchestration: workspace

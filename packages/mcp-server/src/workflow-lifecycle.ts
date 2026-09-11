@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import {
-  parseWorkflowScript, redactText, validateWorkflowScript,
+  isValidationAbortError, parseWorkflowScript, redactText, validateWorkflowScript, validationAbortError,
   type PersistedRunState, type WorkflowBackendConfig,
 } from "@automatalabs/workflows";
 import type { AgentRunner } from "@automatalabs/shared-types";
@@ -10,10 +10,12 @@ import type { ProjectContext } from "./project-registry.js";
 import { clampWorkflowInput, type WorkflowExecuteToolInput, type WorkflowSetupResponseToolInput } from "./workflow-tool-input.js";
 import { missingRoutingDiagnostics, validationText, workflowProbeRunner } from "./workflow-preflight.js";
 
-/** Every MCP request has a finite transport budget; human input is durable run state. */
+/** Every observation request has a finite transport budget; human input is durable run state. */
 export const WORKFLOW_REQUEST_BOUND_MS = 45_000;
+/** The server's own ceiling on one preparation (validation, dry run, live probes). */
 export const WORKFLOW_PREPARATION_BOUND_MS = 120_000;
 const MAX_SCRIPT_BYTES = 1_048_576;
+const PREPARATION_STEPS = 3;
 
 export interface WorkflowSetupRequest {
     id: string;
@@ -64,34 +66,64 @@ export function canonicalWorkflowJson(value: unknown): string {
     .map(([key, item]) => `${JSON.stringify(key)}:${canonicalWorkflowJson(item)}`).join(",")}}`;
 }
 
-export function workflowOperation(input: { requestId: string }): { id: string; fingerprint: string } {
-  return { id: input.requestId, fingerprint: createHash("sha256").update(canonicalWorkflowJson(input)).digest("hex") };
-}
-
 export async function boundWorkflowRequest<T>(operation: Promise<T>, ms = WORKFLOW_REQUEST_BOUND_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([operation, new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new ProtocolError(ProtocolErrorCode.InternalError,
-        "Workflow request deadline reached. Inspect status or retry with the same requestId; accepted work continues.")), ms);
+        "Workflow request deadline reached. Inspect status; accepted work continues.")), ms);
       timer.unref?.();
     })]);
   } finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
+/**
+ * Preparation refused the run before anything was persisted: unreadable source, a script that
+ * fails validation, or no admission capacity. Hosts report it as a tool execution error.
+ */
+export class WorkflowPreparationRejected extends Error {
+  override readonly name = "WorkflowPreparationRejected";
+}
+
+/** True when preparation stopped because the caller cancelled the request. */
+export function isPreparationCancelled(error: unknown): boolean {
+  return isValidationAbortError(error);
+}
+
+export interface WorkflowPreparationControl {
+  /** Caller cancellation (the MCP request signal). Nothing is persisted once it aborts. */
+  signal?: AbortSignal;
+  /** Stage progress for the request's progress token, when the client supplied one. */
+  progress?: (progress: number, total?: number, message?: string) => void;
+  /**
+   * Called synchronously as soon as the run exists (started, or parked in setup) and before any
+   * setup announcement, so the requesting session can register its interest in the run first.
+   */
+  onAdmitted?: (runId: string) => void;
+}
+
+export type WorkflowPreparationOutcome =
+  | { runId: string; setup?: undefined }
+  /** Validated, but parked in durable setup until the host answers the request. */
+  | { runId: string; setup: Extract<WorkflowSetup, { state: "input-required" }> };
+
 function readAcceptedScript(input: WorkflowExecuteToolInput): string {
   if (input.script !== undefined) {
-    if (Buffer.byteLength(input.script, "utf8") > MAX_SCRIPT_BYTES) throw new Error("Workflow script exceeds 1 MiB");
+    if (Buffer.byteLength(input.script, "utf8") > MAX_SCRIPT_BYTES) throw new WorkflowPreparationRejected("Workflow script exceeds 1 MiB");
     return input.script;
   }
-  // Open once and check the same descriptor before reading: never block on a FIFO/device or
-  // reread mutable path content after a lost acceptance acknowledgement.
-  const descriptor = openSync(input.scriptPath!, constants.O_RDONLY | constants.O_NONBLOCK);
+  // Open once and check the same descriptor before reading: never block on a FIFO/device.
+  let descriptor: number;
+  try {
+    descriptor = openSync(input.scriptPath!, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch (error) {
+    throw new WorkflowPreparationRejected(`scriptPath could not be opened: ${error instanceof Error ? error.message : String(error)}`);
+  }
   try {
     const stat = fstatSync(descriptor);
-    if (!stat.isFile() || stat.size > MAX_SCRIPT_BYTES) throw new Error("scriptPath must identify a regular file of at most 1 MiB");
+    if (!stat.isFile() || stat.size > MAX_SCRIPT_BYTES) throw new WorkflowPreparationRejected("scriptPath must identify a regular file of at most 1 MiB");
     const script = readFileSync(descriptor, "utf8");
-    if (Buffer.byteLength(script, "utf8") > MAX_SCRIPT_BYTES) throw new Error("Workflow script exceeds 1 MiB");
+    if (Buffer.byteLength(script, "utf8") > MAX_SCRIPT_BYTES) throw new WorkflowPreparationRejected("Workflow script exceeds 1 MiB");
     return script;
   } finally { closeSync(descriptor); }
 }
@@ -118,7 +150,32 @@ function backendKey(name: string, config: WorkflowBackendConfig): string {
   return createHash("sha256").update(canonicalWorkflowJson({ name, command: config.command, args: config.args ?? [], env: config.env ?? {} })).digest("hex");
 }
 
-/** Project-owned driver: it never captures an MCP request, abort signal, or transport. */
+function scriptBackendsAllowedByEnvironment(): boolean {
+  return ["1", "true"].includes(process.env.AGENTPRISM_ALLOW_SCRIPT_BACKENDS?.trim().toLowerCase() ?? "");
+}
+
+/** The first declared backend that still needs a host decision, as a durable setup request. */
+function pendingBackendApproval(
+  backends: Record<string, WorkflowBackendConfig> | undefined,
+  approvedKeys: readonly string[],
+): { key: string; request: WorkflowSetupRequest } | undefined {
+  if (scriptBackendsAllowedByEnvironment()) return undefined;
+  for (const [name, config] of Object.entries(backends ?? {})) {
+    const key = backendKey(name, config);
+    if (approvedKeys.includes(key)) continue;
+    return {
+      key,
+      request: {
+        id: randomUUID(), kind: "backend-approval", title: "Approve workflow backend",
+        message: `Workflow wants to spawn custom ACP backend "${name}":\n${redactText(`${config.command} ${(config.args ?? []).join(" ")}`).value}\nEnvironment: ${redactText(JSON.stringify(config.env ?? {})).value}. Approve this command?`,
+        requestedSchema: { type: "object", properties: { approve: { type: "boolean", title: "Approve" } }, required: ["approve"], additionalProperties: false },
+      },
+    };
+  }
+  return undefined;
+}
+
+/** Project-owned driver: it never captures an MCP request or transport beyond one preparation. */
 export class WorkflowLifecycle {
   private readonly driving = new Set<string>();
   private readonly probeRunner: ReturnType<typeof workflowProbeRunner>;
@@ -127,40 +184,180 @@ export class WorkflowLifecycle {
     this.probeRunner = workflowProbeRunner(runner);
   }
 
-  accept(input: WorkflowExecuteToolInput): { runId: string; duplicate: boolean } {
-    const operation = workflowOperation(input);
-    const existing = this.context.manager.findAcceptedRun(operation);
-    if (existing) {
-      this.recover(existing.runId);
-      return { runId: existing.runId, duplicate: true };
-    }
-    const script = readAcceptedScript(input);
-    // Bounded structural parsing precedes acceptance. Mock evaluation, live catalog probes,
-    // and human setup remain owned by the durable run created below.
-    parseWorkflowScript(script);
-    if (!this.context.activeRuns.reserve()) throw new Error("Workflow limit reached (4 active or preparing runs)");
+  /**
+   * Prepare a run inside the caller's request: read the source, validate it (static parse, mock
+   * dry run, live config probes), then either start execution or park the validated run in
+   * durable setup when a declared backend still needs approval. Nothing is persisted before that
+   * point, so a rejection or a cancellation leaves no run behind.
+   */
+  async prepare(input: WorkflowExecuteToolInput, control: WorkflowPreparationControl = {}): Promise<WorkflowPreparationOutcome> {
+    const { progress } = control;
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, WORKFLOW_PREPARATION_BOUND_MS);
+    timer.unref?.();
+    const onCallerAbort = () => controller.abort();
+    if (control.signal?.aborted) controller.abort();
+    else control.signal?.addEventListener("abort", onCallerAbort, { once: true });
+    const throwIfAborted = () => {
+      if (!controller.signal.aborted) return;
+      if (timedOut) throw new WorkflowPreparationRejected(`Workflow preparation exceeded ${WORKFLOW_PREPARATION_BOUND_MS} ms; nothing was started.`);
+      throw validationAbortError();
+    };
+
+    throwIfAborted();
+    if (!this.context.activeRuns.reserve()) throw new WorkflowPreparationRejected("Workflow limit reached (4 active or preparing runs)");
     let reserved = true;
     try {
-      const data: PreparationData = { approvedKeys: [], responses: {} };
-      const accepted = this.context.manager.prepareRun(script, input.args, {
-        ...clampWorkflowInput(input), agent: this.runner, operation,
-        preparation: { format: 1, state: "preparing", data, responses: data.responses },
-      });
-      if (!accepted.created) {
-        // Another process may win between the first lookup and durable acceptance. A
-        // duplicate receipt does not confer ownership or consume this daemon's slot.
-        this.context.activeRuns.releaseReservation();
-        reserved = false;
-        this.recover(accepted.runId);
-        return { runId: accepted.runId, duplicate: true };
+      const script = readAcceptedScript(input);
+      let meta: ReturnType<typeof parseWorkflowScript>["meta"];
+      try {
+        meta = parseWorkflowScript(script).meta;
+      } catch (error) {
+        throw new WorkflowPreparationRejected(error instanceof Error ? error.message : String(error));
       }
-      this.context.activeRuns.hold(accepted.runId);
+      progress?.(1, PREPARATION_STEPS, "workflow script parsed");
+      const limits = clampWorkflowInput(input);
+      const backends = meta.backends;
+      let preflight: Awaited<ReturnType<typeof validateWorkflowScript>>;
+      try {
+        preflight = await validateWorkflowScript(script, {
+          args: input.args, cwd: this.context.projectDir, maxAgents: limits.maxAgents, timeoutMs: 30_000,
+          requireAgentConfiguration: true, signal: controller.signal,
+          probeRunner: this.probeRunner, loadSavedWorkflow: (name) => this.context.manager.resolveSavedWorkflow(name),
+        });
+      } catch (error) {
+        if (isValidationAbortError(error)) throwIfAborted();
+        throw error;
+      }
+      if (!preflight.ok) {
+        const diagnostic = validationText(preflight);
+        throw new WorkflowPreparationRejected(preflight.dryRun?.missingAgentConfiguration !== undefined
+          ? `${diagnostic}\n\n${await missingRoutingDiagnostics(this.probeRunner, this.context.projectDir, backends)}`
+          : diagnostic);
+      }
+      progress?.(2, PREPARATION_STEPS, "workflow script validated");
+      throwIfAborted();
+
+      const exec = {
+        maxAgents: limits.maxAgents, concurrency: limits.concurrency, agentRetries: limits.agentRetries,
+        // An inline script gets its editable copy in the run store; a path script stays at the caller's file.
+        scriptOrigin: input.script !== undefined ? { kind: "inline" as const } : { kind: "path" as const, path: input.scriptPath! },
+      };
+      const pending = pendingBackendApproval(backends, []);
+      if (pending) {
+        const data: PreparationData = { approvedKeys: [], responses: {}, pendingBackendKey: pending.key, setup: pending.request };
+        const parked = this.context.manager.prepareRun(script, input.args, {
+          ...exec, agent: this.runner,
+          preparation: { format: 1, state: "input-required", data, responses: data.responses },
+        });
+        this.context.activeRuns.hold(parked.runId);
+        reserved = false;
+        control.onAdmitted?.(parked.runId);
+        for (const listener of setupRequiredListeners) listener({ runId: parked.runId, request: structuredClone(pending.request) });
+        return { runId: parked.runId, setup: { state: "input-required", request: pending.request } };
+      }
+      const started = this.context.manager.startInBackground(script, input.args, {
+        ...exec, agent: this.runner, requireAgentConfiguration: true,
+        onMissingAgentConfiguration: () => missingRoutingDiagnostics(this.probeRunner, this.context.projectDir, backends),
+        scriptBackends: backends,
+      });
+      this.context.activeRuns.track(started.runId, started.promise);
       reserved = false;
-      this.schedule(accepted.runId);
-      return { runId: accepted.runId, duplicate: !accepted.created };
-    } catch (error) {
+      control.onAdmitted?.(started.runId);
+      progress?.(PREPARATION_STEPS, PREPARATION_STEPS, "workflow run admitted");
+      return { runId: started.runId };
+    } finally {
+      clearTimeout(timer);
+      control.signal?.removeEventListener("abort", onCallerAbort);
       if (reserved) this.context.activeRuns.releaseReservation();
-      throw error;
+    }
+  }
+
+  /**
+   * Read the run's script file back for a continuation. An unchanged or missing file continues
+   * the persisted script. A changed file is a revision: it is validated exactly like a new run
+   * (structure, mocked dry run, routed probes) and may declare only backends the run's admission
+   * already approved, so no continuation can widen what the host accepted at setup.
+   */
+  async prepareRevision(
+    runId: string,
+    persisted: PersistedRunState,
+    control: Pick<WorkflowPreparationControl, "signal"> = {},
+  ): Promise<{ script: string; revised: boolean }> {
+    const persistence = this.context.manager.getPersistence();
+    const location = persistence.scriptLocation?.(runId);
+    if (location === undefined || !existsSync(location)) return { script: persisted.script, revised: false };
+    let current: string;
+    try {
+      current = persistence.readScript!(runId);
+    } catch (error) {
+      throw new WorkflowPreparationRejected(
+        `The run's script file could not be read: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (current === persisted.script) return { script: current, revised: false };
+
+    let meta: ReturnType<typeof parseWorkflowScript>["meta"];
+    try {
+      meta = parseWorkflowScript(current).meta;
+    } catch (error) {
+      throw new WorkflowPreparationRejected(
+        `The revised script at ${location} does not parse: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const approved = persisted.admission?.scriptBackends ?? {};
+    for (const [name, config] of Object.entries(meta.backends ?? {})) {
+      const approvedConfig = approved[name];
+      if (approvedConfig === undefined || backendKey(name, config) !== backendKey(name, approvedConfig)) {
+        throw new WorkflowPreparationRejected(
+          `The revised script declares backend "${name}", which this run's setup never approved. A continuation cannot widen backend approval; start a fresh run to approve it.`,
+        );
+      }
+    }
+
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, WORKFLOW_PREPARATION_BOUND_MS);
+    timer.unref?.();
+    const onCallerAbort = () => controller.abort();
+    if (control.signal?.aborted) controller.abort();
+    else control.signal?.addEventListener("abort", onCallerAbort, { once: true });
+    try {
+      let preflight: Awaited<ReturnType<typeof validateWorkflowScript>>;
+      try {
+        preflight = await validateWorkflowScript(current, {
+          args: persisted.args, cwd: persisted.effectiveCwd ?? this.context.projectDir,
+          maxAgents: persisted.limits?.maxAgents, timeoutMs: 30_000,
+          defaultModel: persisted.admission?.defaultModel,
+          requireAgentConfiguration: true, signal: controller.signal,
+          probeRunner: this.probeRunner, loadSavedWorkflow: (name) => this.context.manager.resolveSavedWorkflow(name),
+        });
+      } catch (error) {
+        if (isValidationAbortError(error)) {
+          if (timedOut) throw new WorkflowPreparationRejected(`Revised script validation exceeded ${WORKFLOW_PREPARATION_BOUND_MS} ms; nothing was continued.`);
+          throw validationAbortError();
+        }
+        throw error;
+      }
+      if (!preflight.ok) {
+        const diagnostic = validationText(preflight);
+        throw new WorkflowPreparationRejected(`The revised script at ${location} failed validation.\n${
+          preflight.dryRun?.missingAgentConfiguration !== undefined
+            ? `${diagnostic}\n\n${await missingRoutingDiagnostics(this.probeRunner, this.context.projectDir, meta.backends)}`
+            : diagnostic
+        }`);
+      }
+      return { script: current, revised: true };
+    } finally {
+      clearTimeout(timer);
+      control.signal?.removeEventListener("abort", onCallerAbort);
     }
   }
 
@@ -246,7 +443,7 @@ export class WorkflowLifecycle {
   private schedule(runId: string): void {
     if (this.driving.has(runId)) return;
     this.driving.add(runId);
-    // Cross the acceptance response boundary before beginning static/mock/probe work.
+    // Cross the setup-response boundary before beginning admission work.
     setImmediate(() => {
       const revision = this.context.manager.getPersistence().load(runId)?.preparationRevision;
       let failed = false;
@@ -270,6 +467,10 @@ export class WorkflowLifecycle {
     });
   }
 
+  /**
+   * Continue a parked run after a setup answer: ask for the next unapproved backend, or
+   * re-validate against the current routing state and admit execution on the same run ID.
+   */
   private async drive(runId: string): Promise<void> {
     const manager = this.context.manager;
     const state = manager.getPersistence().load(runId);
@@ -281,22 +482,14 @@ export class WorkflowLifecycle {
     // Timeout invalidates this entire driver generation. Late probe completion cannot admit it.
     let expired = false;
     const run = async () => {
-      const staticValidation = await validateWorkflowScript(script, { args: input.args, dryRun: false, requireAgentConfiguration: true });
-      if (!staticValidation.ok) throw new Error(validationText(staticValidation));
       const backends = parseWorkflowScript(script).meta.backends;
-      const allowed = ["1", "true"].includes(process.env.AGENTPRISM_ALLOW_SCRIPT_BACKENDS?.trim().toLowerCase() ?? "");
-      for (const [name, config] of Object.entries(backends ?? {})) {
-        const key = backendKey(name, config);
-        if (allowed || data.approvedKeys.includes(key)) continue;
-        data.pendingBackendKey = key;
-        data.setup = {
-          id: randomUUID(), kind: "backend-approval", title: "Approve workflow backend",
-          message: `Workflow wants to spawn custom ACP backend "${name}":\n${redactText(`${config.command} ${(config.args ?? []).join(" ")}`).value}\nEnvironment: ${redactText(JSON.stringify(config.env ?? {})).value}. Approve this command?`,
-          requestedSchema: { type: "object", properties: { approve: { type: "boolean", title: "Approve" } }, required: ["approve"], additionalProperties: false },
-        };
+      const pending = pendingBackendApproval(backends, data.approvedKeys);
+      if (pending) {
+        data.pendingBackendKey = pending.key;
+        data.setup = pending.request;
         if (expired) return;
         this.save(runId, data, revision);
-        for (const listener of setupRequiredListeners) listener({ runId, request: structuredClone(data.setup) });
+        for (const listener of setupRequiredListeners) listener({ runId, request: structuredClone(pending.request) });
         return;
       }
       const preflight = await validateWorkflowScript(script, {

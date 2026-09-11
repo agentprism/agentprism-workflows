@@ -653,6 +653,9 @@ function isPersistableInputEvent(value: unknown): value is PersistableEngineRunE
       if (!hasOwn(value, "reason")) {
         return hasNone(value, ["error", "errorRecord", "resetHint", "authContext", "checkpointContext"]);
       }
+      if (value.reason === "requested") {
+        return value.error instanceof WorkflowError && hasRequired(value, "errorRecord", (candidate) => isRecordedError(candidate, false)) && hasNone(value, ["resetHint", "authContext", "checkpointContext"]);
+      }
       if (value.reason === "usage_limit") {
         return value.error instanceof WorkflowError && hasRequired(value, "errorRecord", (candidate) => isRecordedError(candidate, false)) && hasOptional(value, "resetHint", isString) && hasNone(value, ["authContext", "checkpointContext"]);
       }
@@ -740,6 +743,9 @@ function isPersistedEvent(value: unknown): boolean {
       if (hasOwn(value, "error")) return false;
       if (!hasOwn(value, "reason")) {
         return hasNone(value, ["errorRecord", "resetHint", "authContext", "checkpointContext"]);
+      }
+      if (value.reason === "requested") {
+        return hasRequired(value, "errorRecord", (candidate) => isRecordedError(candidate, true)) && hasNone(value, ["resetHint", "authContext", "checkpointContext"]);
       }
       if (value.reason === "usage_limit") {
         return hasRequired(value, "errorRecord", (candidate) => isRecordedError(candidate, true)) && hasOptional(value, "resetHint", isProjectedText) && hasNone(value, ["authContext", "checkpointContext"]);
@@ -1608,6 +1614,17 @@ function withRunEventsInternal(persistence: RunPersistence, fs: ResolvedEventFs)
     getRunsDir() {
       return persistence.getRunsDir();
     },
+    // Script storage is a capability of the underlying store: the file-backed persistence keeps
+    // an inline script next to its run record, while a store without these seams simply has no
+    // script file, and the manager records only the origin.
+    ...(persistence.scriptLocation ? { scriptLocation: (runId: string) => persistence.scriptLocation!(runId) } : {}),
+    ...(persistence.writeInlineScript
+      ? { writeInlineScript: (runId: string, script: string) => persistence.writeInlineScript!(runId, script) }
+      : {}),
+    ...(persistence.discardInlineScript
+      ? { discardInlineScript: (runId: string) => persistence.discardInlineScript!(runId) }
+      : {}),
+    ...(persistence.readScript ? { readScript: (runId: string) => persistence.readScript!(runId) } : {}),
     appendEvent,
     readEvents,
     watchEvents,

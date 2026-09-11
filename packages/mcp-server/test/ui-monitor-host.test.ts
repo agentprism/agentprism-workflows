@@ -387,7 +387,7 @@ test(
         const retries = await evaluate<any[]>(
           "window.monitorHarness.hosts[0].calls.filter(call => call.arguments?.action === 'resume').map(call => call.arguments)",
         );
-        assert.equal(retries[0].requestId, retries[1].requestId);
+        assert.deepEqual(retries[1], retries[0], "a retried decision resends the identical resume input");
         assert.deepEqual(retries[0].checkpointReplies, { "1": true });
         assert.equal(retries[0].runId, "run-a");
         assert.equal("background" in retries[0], false);
@@ -404,10 +404,10 @@ test(
         await waitFor(
           "window.monitorHarness.hosts[0].calls.filter(call => call.arguments?.action === 'resume').length === 4",
         );
-        const afterOutage = await evaluate<string[]>(
-          "window.monitorHarness.hosts[0].calls.filter(call => call.arguments?.action === 'resume').map(call => call.arguments.requestId)",
+        const afterOutage = await evaluate<any[]>(
+          "window.monitorHarness.hosts[0].calls.filter(call => call.arguments?.action === 'resume').map(call => call.arguments)",
         );
-        assert.deepEqual(afterOutage, Array(4).fill(retries[0].requestId));
+        assert.deepEqual(afterOutage, Array(4).fill(retries[0]));
         await evaluate("window.monitorHarness.hosts[0].rejectAction = false");
         await click("No");
         await waitFor(

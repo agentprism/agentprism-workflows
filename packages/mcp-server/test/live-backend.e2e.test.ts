@@ -22,7 +22,6 @@ import { Client } from "@modelcontextprotocol/client";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -202,7 +201,7 @@ function resourceText(result: Awaited<ReturnType<Client["readResource"]>>): stri
 // The live transport retains its environment and observes the same durable lifecycle directly.
 async function acceptAndObserve(
   client: Client,
-  input: Json & { requestId: string },
+  input: Json,
   timeoutMs: number,
 ): Promise<ToolResult> {
   const deadline = Date.now() + timeoutMs;
@@ -216,16 +215,9 @@ async function acceptAndObserve(
   assert.equal(accepted.isError, false, JSON.stringify(accepted));
   const acknowledgement = asObject(accepted.structuredContent)!;
   assert.equal(acknowledgement.accepted, true, JSON.stringify(accepted));
-  assert.equal(acknowledgement.requestId, input.requestId);
   assert.equal(typeof acknowledgement.runId, "string");
   assert.equal(acknowledgement.result, undefined, "acceptance must not contain a completed result");
   const runId = acknowledgement.runId as string;
-
-  // A lost acknowledgement can be replayed without adding another run or live agent turn.
-  const retry = await call(request);
-  assert.equal(retry.isError, false, JSON.stringify(retry));
-  assert.equal(asObject(retry.structuredContent)?.runId, runId);
-  assert.equal(asObject(retry.structuredContent)?.duplicate, true);
 
   let last: ToolResult | undefined;
   while (Date.now() < deadline) {
@@ -379,7 +371,7 @@ async function runLiveBackend(backend: Backend): Promise<LiveOutcome> {
 
     poller = setInterval(pollOnce, 150);
 
-    const callPromise = acceptAndObserve(client, { requestId: randomUUID(), script, concurrency: 3 }, timeoutMs);
+    const callPromise = acceptAndObserve(client, { script, concurrency: 3 }, timeoutMs);
     const timeoutPromise = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => reject(new Error(`Workflow observation timed out after ${timeoutMs}ms`)), timeoutMs);
     });
@@ -611,23 +603,25 @@ test("live workflow config discovery: no-prompt catalogs create no run and inval
     assert.ok(rows.every((row) => Object.hasOwn(row, "modes")), `every successful row explicitly reports modes: ${JSON.stringify(rows)}`);
     assert.equal(rows.find((row) => row.backendId === "pi")?.modes, null, "Pi explicitly advertises no ACP session modes");
 
-    const guessedMode = await acceptAndObserve(client, {
-      requestId: randomUUID(),
-      projectDir,
-      script: [
-        'export const meta = { name: "live-pi-mode-rejection", description: "reject guessed mode before execution" };',
-        `return agent("x", { label: "pi-mode", model: ${JSON.stringify(`pi/${PI_E2E_MODEL}`)}, mode: "default" });`,
-      ].join("\n"),
-    }, 240_000);
-    assert.equal(guessedMode.isError, false, "status observes preparation failure without failing the observation request");
-    const rejected = guessedMode.structuredContent as Record<string, unknown>;
-    assert.equal(rejected.status, "failed");
-    assert.equal(typeof rejected.runId, "string", "the accepted source remains addressable after failed preparation");
-    assert.equal(asObject(rejected.outcome)?.status, "failed");
-    assert.match(JSON.stringify(rejected), /mode authored value \\"default\\" is not advertised/);
-    assert.match(JSON.stringify(rejected), /advertised modes: \(none advertised\)/);
-    assert.deepEqual((await readDurableEvents(client, rejected.runId as string)).filter(({ event }) => event.type === "agentStart"), [],
-      "an invalid mode must fail preparation before any live agent prompt");
+    // Preparation runs inside the request: an invalid mode is a tool execution error that
+    // persists no run, so nothing is ever addressable and no live agent prompt can start.
+    const guessedMode = await client.callTool({
+      name: "workflow",
+      arguments: {
+        action: "run",
+        projectDir,
+        script: [
+          'export const meta = { name: "live-pi-mode-rejection", description: "reject guessed mode before execution" };',
+          `return agent("x", { label: "pi-mode", model: ${JSON.stringify(`pi/${PI_E2E_MODEL}`)}, mode: "default" });`,
+        ].join("\n"),
+      },
+    }, { timeout: 240_000, maxTotalTimeout: 240_000 });
+    assert.equal(guessedMode.isError, true, JSON.stringify(guessedMode));
+    assert.equal(guessedMode.structuredContent, undefined, "a rejected preparation acknowledges no run");
+    const rejectedText = JSON.stringify(guessedMode.content);
+    assert.match(rejectedText, /Workflow run was not started/);
+    assert.match(rejectedText, /mode authored value \\"default\\" is not advertised/);
+    assert.match(rejectedText, /advertised modes: \(none advertised\)/);
 
     const exactPi = await client.callTool({
       name: "workflow",

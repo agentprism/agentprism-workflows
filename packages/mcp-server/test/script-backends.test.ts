@@ -1,7 +1,6 @@
 // Script-declared ACP commands require explicit, durable approval before any backend is opened.
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import type { RunOptions } from "@automatalabs/shared-types";
 import { connect, makeRunner, runAndObserve, structured, textOf, waitForRun } from "./_harness.js";
 
@@ -19,7 +18,7 @@ function capturingRunner() {
 afterEach(() => { delete process.env.AGENTPRISM_ALLOW_SCRIPT_BACKENDS; });
 
 async function pendingSetup(client: Parameters<typeof waitForRun>[0], script = SCRIPT_WITH_BACKENDS) {
-  const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(), script } });
+  const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", script } });
   assert.equal(accepted.isError, false, textOf(accepted));
   const runId = String(structured(accepted)?.runId);
   const waiting = await waitForRun(client, runId, (status) => (status.setup as { state?: string })?.state === "input-required");
@@ -100,7 +99,7 @@ test("scripts without custom backends need no approval and same-ID continuation 
     await conn.client.callTool({ name: "workflow", arguments: { action: "setup-response", runId, setupId: request.id, response: { action: "accept", content: { approve: true } } } });
     const paused = await waitForRun(conn.client, runId);
     const checkpoint = (structured(paused)?.outcome as { checkpointContext: { callIndex: number } }).checkpointContext;
-    const continued = await conn.client.callTool({ name: "workflow", arguments: { action: "resume", requestId: randomUUID(), runId,
+    const continued = await conn.client.callTool({ name: "workflow", arguments: { action: "resume", runId,
       checkpointReplies: { [checkpoint.callIndex]: true } } });
     assert.equal(continued.isError, false, textOf(continued));
     const completed = await waitForRun(conn.client, runId);

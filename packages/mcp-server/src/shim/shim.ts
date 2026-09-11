@@ -144,6 +144,8 @@ export async function runShim(options: RunShimOptions): Promise<void> {
   interface PendingRequest {
     transport: StreamableHTTPClientTransport;
     message: JSONRPCRequest;
+    /** Modern (2026-07-28) requests only: aborting closes the request's upstream response stream. */
+    abort?: AbortController;
   }
   const pending = new Map<string, PendingRequest>();
   const keyOf = (id: RequestId): string => `${typeof id}:${String(id)}`;
@@ -362,9 +364,14 @@ export async function runShim(options: RunShimOptions): Promise<void> {
       return;
     }
     const transport = http;
-    if (isJSONRPCRequest(message)) pending.set(keyOf(message.id), { transport, message });
+    // On Streamable HTTP 2026-07-28 the cancellation signal is closing the request's own
+    // response stream, so every modern request carries an abort controller that a client
+    // `notifications/cancelled` (the stdio signal) can trip. Legacy sessions forward the
+    // notification itself, as that era defines.
+    const abort = isJSONRPCRequest(message) && cachedInitialize === undefined ? new AbortController() : undefined;
+    if (isJSONRPCRequest(message)) pending.set(keyOf(message.id), { transport, message, ...(abort ? { abort } : {}) });
     try {
-      await transport.send(message);
+      await transport.send(message, abort ? { requestSignal: abort.signal } : undefined);
     } catch (error) {
       if (isRecoverableError(error)) {
         if (cachedInitialize !== undefined) {
@@ -428,9 +435,14 @@ export async function runShim(options: RunShimOptions): Promise<void> {
       const requestId = (message.params as { requestId?: unknown } | undefined)?.requestId;
       if (typeof requestId === "string" || typeof requestId === "number") {
         const key = keyOf(requestId);
+        const entry = pending.get(key);
         modernSubscriptions.delete(key);
         pending.delete(key);
+        entry?.abort?.abort();
       }
+      // Modern traffic has no client notifications: closing the stream above IS the
+      // cancellation. Only a legacy session forwards the frame.
+      if (cachedInitialize === undefined) return;
     }
     // Forward in the order the client sent. pumpSend is async, so firing each frame
     // without sequencing let consecutive frames race as concurrent POSTs and reach the

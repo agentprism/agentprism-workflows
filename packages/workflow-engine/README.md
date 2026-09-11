@@ -181,7 +181,10 @@ then matches completed results by exact path/hash or unique hash+input fingerpri
 halt without a result are persisted as engine interruption rows; non-result seed blockers make those
 occurrences run live without letting an identical result sibling become spuriously unique. Any
 uncertain, ambiguous, or mismatched call runs live. Same-ID `manager.resume(runId)` and
-manual `resumeJournal` remain permanently legacy positional paths. Full types, reports, reason
+manual `resumeJournal` remain permanently legacy positional paths. A same-run continuation given
+`exec.script` that differs from the persisted text runs that revision through the identity matcher
+against the run's own terminal state (`continuation.scriptRevised`, `scriptRevisions`); a revision
+must parse and may declare only backends the admission approved. Full types, reports, reason
 catalogs, and checkpoint source-index rules are in the
 [incremental resume API](../../docs/api.md#content-addressed-incremental-resume).
 
@@ -205,8 +208,8 @@ MCP enables `requireAgentConfiguration` for actual-call checks. The optional
 `onMissingAgentConfiguration({ label, phase? })` callback supplies diagnostics only and cannot route
 a call. SDK promise-based APIs and `executionAdmission` remain independently supported.
 
-Hosts that separate durable acceptance from execution use `prepareRun`, `claimPreparedRun`,
-`updatePreparation`, and `admitPreparedRun`. To finish setup without execution, call
+Hosts that park a validated run for setup before execution use `prepareRun`, `claimPreparedRun`,
+`updatePreparation`, and `admitPreparedRun`; `prepareRun` mints a fresh engine run identity. To finish setup without execution, call
 `settlePreparedRun(runId, "failed" | "aborted", error, { responses?, expectedRevision? })`.
 `responses` maps exact setup request IDs to their canonical response fingerprints; `expectedRevision`
 guards the observed preparation revision. The first mandatory save commits receipts and terminal
@@ -307,8 +310,11 @@ or `injected` from `checkpointReplies`. Pausing checkpoints are omitted. Both
 arrays are absent when empty, stay outside call hashes, and are deliberately excluded from
 `WorkflowRunStatus`.
 
-The manager treats `PROVIDER_USAGE_LIMIT`, `AUTH_REQUIRED`, and `CHECKPOINT_REQUIRED` as resumable
-pause conditions rather than failed runs. An authentication pause uses `reason: "auth_required"`
+The manager treats `PROVIDER_USAGE_LIMIT`, `AUTH_REQUIRED`, `CHECKPOINT_REQUIRED`, and
+`PAUSE_REQUESTED` as resumable pause conditions rather than failed runs. `pause(runId)` raises the
+last one: agent calls already executing finish and journal, nothing new is admitted, queued calls
+settle as interrupted rows, and the run pauses with `reason:"requested"`. `stop(runId)` interrupts
+in-flight work instead and settles the run as `aborted`; both continue with `resume(runId)`. An authentication pause uses `reason: "auth_required"`
 and carries only the non-secret `authContext`; complete authentication through the injected runner,
 then resume the same journal. Every unanswered checkpoint persists `reason:"checkpoint_required"`
 and non-secret `checkpointContext`. Answer with `ExecOptions.checkpointReplies[callIndex]`, or

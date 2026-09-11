@@ -1,6 +1,6 @@
 # @automatalabs/mcp-server
 
-An **[MCP](https://modelcontextprotocol.io) server** for asynchronous execution, bounded status observation, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tools are **`workflow`** for the strict config/run/resume/setup-response/status/result/permissions-response/stop lifecycle and **`repl`** for persistent interactive orchestration. Version-matched guidance for both is published through the SEP-2640 MCP Skills Extension. Apps-capable clients also get the dedicated `workflow_monitor` launcher. App-only `workflow-events`, `workflow-runs`, and `workflow-notifications` tools feed the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enter the model's tool loop. The `workflow` tool discovers its live backend catalog with `action:"config"` and durably accepts each script before slow preparation and validates it before live execution. Scripts may be supplied inline or by absolute server-side path, and every admitted script is also exposed as an immutable MCP resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes with `action:"resume"` after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
+An **[MCP](https://modelcontextprotocol.io) server** for asynchronous execution, bounded status observation, and in-place stopping of dynamic multi-agent workflows. Execution lives in a shared per-user **local daemon** (spec-compliant Streamable HTTP on loopback) so runs survive MCP clients killing their server processes; hosts connect through the bundled **stdio shim** (the default bin, zero config change) or directly over HTTP — see [The workflow daemon](#the-workflow-daemon). Its model-facing tools are **`workflow`** for the strict config/run/resume/setup-response/status/result/permissions-response/stop/pause lifecycle and **`repl`** for persistent interactive orchestration. Version-matched guidance for both is published through the SEP-2640 MCP Skills Extension. Apps-capable clients also get the dedicated `workflow_monitor` launcher. App-only `workflow-events`, `workflow-runs`, and `workflow-notifications` tools feed the [MCP Apps run monitor](#run-monitor-mcp-apps) and never enter the model's tool loop. The `workflow` tool discovers its live backend catalog with `action:"config"` and durably accepts each script before slow preparation and validates it before live execution. Scripts may be supplied inline or by absolute server-side path, and every admitted run exposes its script file as an MCP `file://` resource. Agent backends authenticate from their own credential sources (`claude /login`, `codex login`, `opencode auth login`, provider API keys, or pi's `~/.pi/agent/auth.json`), so there is nothing auth-shaped for a host to manage here. A run that genuinely hits expired/missing credentials pauses with `authContext` and resumes with `action:"resume"` after the backend credentials are configured. Auth and provider *management* APIs live in the [`@automatalabs/workflows`](../workflows) SDK for embedding hosts.
 
 This package is a **thin MCP adapter**. The `workflow` tool's real work — parsing the workflow script, running the deterministic engine, fanning `agent()` calls out to real coding agents over [ACP](https://agentclientprotocol.com), journaling, and resume — lives in **[`@automatalabs/workflows`](../workflows)**; the `repl` tool's real work — the persistent QuickJS-in-WASM VM, the subagent broker, the CDP-style previewer, and the enveloped-snapshot store — lives in **[`@automatalabs/repl-engine`](../repl-engine)**. The MCP server is the *composition root*: it builds the ACP-backed agent runner, injects it into the workflow engine, registers the `workflow` tool over a per-project `WorkflowManager` and the `repl` tool over a per-project QuickJS VM, and serves them over stdin/stdout.
 
@@ -241,17 +241,16 @@ of `script` and `scriptPath`. There are no aliases or completion-wait controls.
 
 | Field | Actions | Contract |
 | --- | --- | --- |
-| `requestId` | run, resume | Required caller-generated retry identity, 1–128 characters matching `[A-Za-z0-9][A-Za-z0-9._:-]*`. Keep it and the complete input unchanged when retrying a lost acknowledgement. Use a new ID for a new operation. |
-| `script`, `scriptPath` | run | Raw JavaScript or an absolute server-side regular-file path, exactly one. First statement: `export const meta = { name, description, phases? }`. The accepted UTF-8 snapshot is at most 1 MiB and immutable. |
+| `script`, `scriptPath` | run | Raw JavaScript or an absolute server-side regular-file path, exactly one. First statement: `export const meta = { name, description, phases? }`. The accepted UTF-8 text is at most 1 MiB. An inline script is copied into the run store as `{runId}.script.js`; a `scriptPath` run records the path. The admitted text is what executes. |
 | `projectDir` | config, run | Absolute project directory, required on the shared daemon; defaults to the server's project under `--in-process`. Other actions locate the project through `runId`. |
-| `args` | run | Strict-JSON script input, immutable after acceptance. |
+| `args` | run | Strict-JSON script input, immutable after admission. |
 | `maxAgents`, `concurrency`, `agentRetries` | run, resume | Runtime limits; default agent cap 1000, concurrency clamped to 16, retries clamped to 3. Resolved limits are returned. |
 | `harnesses`, `modelSpecs`, `modelFilter` | config | Optional backend names, exact routed models, and bounded model substring or `/regex/` filter for no-prompt discovery. |
-| `runId` | resume, setup-response, status, result, permissions-response, stop | Exact persisted identity, matching `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. Resume continues the exact run ID. |
+| `runId` | resume, setup-response, status, result, permissions-response, pause, stop | Exact persisted identity, matching `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. Resume continues the exact run ID, including a paused or stopped one. |
 | `checkpointReplies` | resume | Map `checkpointContext.callIndex` to the explicit kind-valid JSON answer. The first durable answer wins. |
 | `setupId`, `response` | setup-response | Exact pending setup UUID, with `{ action:"accept", content:{...} }`, `{ action:"decline" }`, or `{ action:"cancel" }`. Accept content must satisfy the persisted `requestedSchema`. |
 | `permissionId`, `response` | permissions-response | Exact pending UUID and `{ outcome:{ outcome:"selected", optionId } }` or `{ outcome:{ outcome:"cancelled" } }`. Only an advertised option ID is accepted; response `_meta` is forbidden. |
-| `lastN`, `labelGlob`, `logLines` | status, stop | Bounded inspection: latest 1–50 calls (default 20), case-sensitive whole-label glob, and 0–50 log lines (default 20). |
+| `lastN`, `labelGlob`, `logLines` | status, pause, stop | Bounded inspection: latest 1–50 calls (default 20), case-sensitive whole-label glob, and 0–50 log lines (default 20). |
 | `offset`, `maxBytes` | result | Exact UTF-8 JSON paging: offset defaults to zero; maxBytes is 4–16,384 (default 16,384). Continue at the previous `endOffset`. |
 | `callIndex` | stop | Cancel one uniquely matching live agent; its slot resolves to `null` with `AGENT_CANCELLED`, while siblings continue. |
 | `forceOwner` | whole-run stop | Explicitly permit termination of a superseded owner after identity revalidation; may interrupt sibling runs. Forbidden with `callIndex`. |
@@ -271,35 +270,35 @@ OpenCode's direct models before explicitly classified aggregator browse groups (
 model is shown separately. Expand `openrouter/*` with `modelFilter`; browse selectors cannot dispatch.
 Use `modelSpecs` for exact-model option discovery. Partial probe failures preserve healthy catalogs.
 
-### Durable acceptance and setup
+### Preparation, admission, and setup
 
 ```json
 {
   "action":"run",
-  "requestId":"review-20260908-1",
   "projectDir":"/absolute/project",
   "script":"export const meta = { name: 'review', description: 'review the repository', model: 'codex' }; return await agent('Review the repo');"
 }
 ```
 
-The request validates its input and source structure, acquires the run lease, and durably records
-the immutable script, args, operation identity, limits, and preparation state before returning.
-Slow mock execution, backend probes, and human setup happen after this acknowledgement. Malformed
-source fails before acceptance; a later validation or preparation failure remains an inspectable
-failed run. A repeated `requestId` with the same input finds the original run even if a script file
-has changed or disappeared. Reusing it with different input fails without starting work.
+The request reads the source, checks its structure, runs the mocked dry run and the routed
+no-prompt probes, and only then admits execution under format-3 routing admission and returns.
+Nothing is persisted before admission: malformed source, a failed dry run, missing routing, and a
+full project are tool execution errors (`isError:true`) with no run behind them, and cancelling the
+request (closing the response stream, or `notifications/cancelled` on stdio) abandons preparation
+and releases capacity. A script that declares custom backends is validated the same way and then
+parked in durable setup (`status:"pending"`, `setup.request`) until `setup-response` approves it.
+When the request carries `_meta.progressToken`, preparation stages are reported as progress.
 
 An accepted response is always an acknowledgement, including when work finishes quickly:
 
 ```ts
 type WorkflowOperationAccepted = {
   accepted: true;
-  requestId: string;
-  duplicate: boolean;
   runId: string;
   status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
   scriptSource: "inline" | "path" | "stored";
-  scriptUri: string;
+  scriptUri: string; // file:// URI of the run's script file
+  scriptPath: string; // the same location as an absolute path
   eventsUri: string;
   limits: { maxAgents: number; concurrency: number; agentRetries: number };
   setup?: WorkflowSetup;
@@ -352,7 +351,7 @@ at 24,576 UTF-8 bytes and status text at 8,192; raw terminal outcome has no new 
 Every unanswered script checkpoint pauses with `reason:"checkpoint_required"`. Use the App or:
 
 ```json
-{ "action":"resume", "requestId":"review-answer-1", "runId":"mabc1234-k9x2pq", "checkpointReplies":{"1":true} }
+{ "action":"resume", "runId":"mabc1234-k9x2pq", "checkpointReplies":{"1":true} }
 ```
 
 Use the exact index from `outcome.checkpointContext`. Confirm replies must be boolean, input replies
@@ -368,9 +367,7 @@ request is cancelled rather than partially exposed. Owner loss invalidates the o
 a successor cannot reconstruct it. Setup and checkpoints, in contrast, are durable waits.
 
 An `AUTH_REQUIRED` pause reports `reason:"auth_required"` and `outcome.authContext`. Configure the
-named backend's credentials out of band, then call `action:"resume"` with a new `requestId` and the
-same `runId`. Continuation uses the immutable stored script, args, cwd, immutable routing inputs,
-journal, event stream, cumulative usage, and checkpoint answers; it never accepts edited input.
+named backend's credentials out of band, then call `action:"resume"` with the same `runId`. Continuation keeps the run's args, cwd, immutable routing inputs, journal, event stream, cumulative usage, and checkpoint answers; resume itself accepts no replacement inputs. The script is re-read from the run's file: an unchanged or missing file continues the persisted script, and a changed file is a revision. A revision is validated exactly like a new run (structure, mocked dry run, routed probes), may declare only backends the run's setup already approved, and then continues with an identity-matched replay of this run's own journal: calls whose prompt and inputs are unchanged replay without provider usage, edited or new calls and everything the revision reorders run live. The acknowledgement's `continuation.scriptRevised:true` marks such a generation, the persisted record adopts the revised text, and `scriptRevisions` lists every accepted revision. A revision that does not parse, fails validation, or widens backend approval is a tool execution error that changes nothing; fix the file and resume again.
 Historical records without current admission or explicit checkpoint provenance remain readable
 where supported but refuse continuation/reuse clearly; start a fresh run.
 
@@ -378,25 +375,32 @@ Full status, outcome, and response fields are documented in the [API reference](
 
 ## Run resources
 
-Every admitted manager run has an immutable, persistence-backed script resource, and every
-completed run with a persisted JSON value has an immutable exact-result resource:
+Every admitted run has an editable script file resource, and every completed run with a persisted
+JSON value has an immutable exact-result resource:
 
 ```text
-workflow://runs/{runId}/script
+file:///…/runs/{runId}.script.js   (an inline script: the store's copy next to the run record)
+file:///absolute/scriptPath        (a scriptPath run: the caller's own file)
 workflow://runs/{runId}/result
 ```
 
-`resources/read` returns the exact UTF-8 script snapshotted at admission with MIME type
-`text/javascript`, or `JSON.stringify` of the authoritative persisted authored result with MIME type
-`application/json`. This applies equally to inline and `scriptPath` delivery and works for any
-persisted run in the project namespace, across MCP sessions and server processes. The original path
-is not persisted or re-read. A result read fails closed while the run is nonterminal, or when a
-paused/failed/aborted/completed-without-value run has no exact authored result. A run record deletion
-removes both resources; stopping a run does not.
+The script resource is a `file://` URI naming the one file a run recorded as its script: the store
+copy written for an inline script, or the exact `scriptPath` the caller supplied. `scriptUri` and
+`scriptPath` in run, resume, status, and outcome responses name that location. `resources/read`
+returns the file's current UTF-8 text with MIME type `text/javascript`, so an edit made after
+admission is visible immediately. The admitted text keeps executing until a `resume` reads the
+changed file back as a validated revision; the persisted record always holds the text that executes.
+Only a file some run recorded is addressable: an arbitrary `file://` URI, or an unowned file inside
+the store, is not a resource. The result resource returns `JSON.stringify` of the authoritative
+persisted authored result with MIME type `application/json`, works for any persisted run in the
+project namespace across MCP sessions and server processes, and fails closed while the run is
+nonterminal or when a paused/failed/aborted/completed-without-value run has no exact authored
+result. Deleting a run record removes its store copy and both resources; a caller's `scriptPath`
+file is never touched. Stopping a run removes nothing.
 
 The server advertises and implements `resources: { subscribe: true, listChanged: true }`.
-Subscriptions are process-local. Script and completed-result content are immutable, so
-`notifications/resources/updated` never fires for them. `notifications/resources/list_changed`
+Subscriptions are process-local. The server does not watch script files, and completed-result
+content is immutable, so `notifications/resources/updated` never fires for either. `notifications/resources/list_changed`
 fires when a run is admitted, when a completed result becomes available, and when a run record is
 deleted; deletion also drops those URIs' subscriptions.
 Unsubscribing after that deletion (including a deletion race) is an idempotent empty success for a
@@ -449,11 +453,11 @@ content strings are credential-redacted and capped at 512 UTF-8 bytes. Query URI
 serving a silently incomplete transcript. See the [API contract](../../docs/api.md#mcp-live-events-resource).
 
 Run/resume acknowledgements contain clearly labelled `resource_link` blocks for the newly admitted
-script and its durable events stream, and structured `scriptUri`/`eventsUri` fields. Status,
+script file and its durable events stream, and structured `scriptUri`/`scriptPath`/`eventsUri` fields. Status,
 permission-response, stop, terminal outcome, and result-retrieval responses repeat `eventsUri` and
 the events link whenever that stream exists; legacy rows may omit them. Completed
 status results also carry `resultUri` and a clearly labelled exact result link. Status,
-permission-response, and stop responses link only the exact run's immutable script. Every URI is
+permission-response, and stop responses link only the exact run's script file. Every URI is
 also present in structured output. Lower-level SDK ancestry is not projected through MCP.
 
 Clients need MCP protocol revision **2025-06-18 or newer** to consume `resource_link` content
@@ -464,12 +468,14 @@ client `resources` capability to gate these server-offered primitives.
 
 ## Run model
 
-- **Every run is asynchronous.** Run/resume requests acknowledge durable acceptance. Each lifecycle
-  request has a 45-second bound; each active preparation attempt has a 120-second bound. Human
-  setup and agent execution outlive individual requests. There is no workflow completion wait,
-  request-scoped progress stream, or request-abort ownership of accepted work.
-- **Capacity and retries.** At most four preparing or executing runs per project are active, with
-  no queue. Waiting setup consumes capacity. Failed/stopped/paused/completed work releases it.
+- **Preparation is synchronous; execution is not.** Run and Resume prepare inside the request under
+  a 120-second ceiling, honor request cancellation before admission, and report preparation
+  progress when a progress token is supplied. Observation requests have a 45-second bound. Human
+  setup and agent execution outlive individual requests; there is no workflow completion wait, and
+  cancellation after admission never stops an admitted run.
+- **Capacity.** At most four preparing or executing runs per project are active, with no queue.
+  Waiting setup consumes capacity. Rejected preparation and failed/stopped/paused/completed work
+  release it.
   Exact retries return the existing operation and do not consume another slot, even at capacity.
 - **Same-ID continuation.** Resume durably records its caller operation and generation under the
   run lease before executing. Lost-ack retries reuse that receipt; journal hits add no provider
@@ -477,10 +483,17 @@ client `resources` capability to gate these server-offered primitives.
 - **Observation and recovery.** Status never waits for work or collects an answer. A cold accepted
   preparation is recovered under its lease and preserves pending setup IDs. An interrupted admitted
   execution becomes paused/interrupted for explicit resume. A live lease is never stolen on timeout.
+- **Pause.** A pause request goes to the live execution owner; there is nothing to record cold.
+  Agents already executing finish and journal, nothing new starts, queued calls settle as
+  interrupted rows, and the run settles as `paused` with `reason:"requested"`. The response
+  carries `pauseRequested` and `paused` after a two-second wait for executing agents; a `running`
+  answer settles on its own. Resume continues from the journal. A run whose owner died is
+  reconciled to its interrupted pause instead.
 - **Stop.** Whole-run stop is location independent: it records a durable intent and forwards to the
   lease owner. Final success requires durable aborted state and a matching stopped event. A bounded
   control wait may return `control.state:"pending"` with an operation ID. Repeated terminal stop is
-  a successful no-op. Targeted agent cancellation needs a live owner and is not fabricated cold.
+  a successful no-op. A stopped (`aborted`) run is not final: resume replays its journal and re-runs
+  the interrupted calls. Targeted agent cancellation needs a live owner and is not fabricated cold.
 - **Process lifetime.** Disconnect, shim kill, and session eviction leave daemon-owned work alive.
   A successor routes setup replies, permission replies, and stop/cancel control to a predecessor
   still holding the lease. Owner process exit can interrupt work; `--in-process` ends with its own
@@ -675,7 +688,7 @@ A workflow script can **declare its own backends** in `meta.backends` as
 `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` is configured. Every client can answer with `setup-response`;
 repeat answers are scoped to the saved setup ID. Host-registered names always win over declarations.
 
-**Authentication belongs to the agents, not this server.** Claude, Codex, and OpenCode use their normal CLI credentials; pi uses the selected provider's environment key or `~/.pi/agent/auth.json`. There is no separate auth state for an MCP host to inspect or manage. In particular, a successful no-prompt config probe means session/config discovery succeeded, not that ACP universally proved first-prompt authentication; ambient CLI credentials are not observable through generic runner bookkeeping, so discovery never claims universal first-prompt readiness. If a run genuinely hits expired/missing credentials, the backend returns ACP `AUTH_REQUIRED` and the managed run **pauses** with `reason: "auth_required"` plus a non-secret `authContext` naming the backend and advertised methods: configure that credential out-of-band, then call `workflow` with `{ action:"resume", requestId, runId }` — that exact run continues from its stored script, args, immutable routing inputs, and journal on the same pinned backend. Programmatic auth flows (env-var/gateway credential injection, LLM provider routing) live in the [`@automatalabs/workflows`](../workflows) SDK runner APIs for hosts that embed the engine directly.
+**Authentication belongs to the agents, not this server.** Claude, Codex, and OpenCode use their normal CLI credentials; pi uses the selected provider's environment key or `~/.pi/agent/auth.json`. There is no separate auth state for an MCP host to inspect or manage. In particular, a successful no-prompt config probe means session/config discovery succeeded, not that ACP universally proved first-prompt authentication; ambient CLI credentials are not observable through generic runner bookkeeping, so discovery never claims universal first-prompt readiness. If a run genuinely hits expired/missing credentials, the backend returns ACP `AUTH_REQUIRED` and the managed run **pauses** with `reason: "auth_required"` plus a non-secret `authContext` naming the backend and advertised methods: configure that credential out-of-band, then call `workflow` with `{ action:"resume", runId }` — that exact run continues from its stored script, args, immutable routing inputs, and journal on the same pinned backend. Programmatic auth flows (env-var/gateway credential injection, LLM provider routing) live in the [`@automatalabs/workflows`](../workflows) SDK runner APIs for hosts that embed the engine directly.
 
 ---
 
@@ -742,10 +755,10 @@ await serveStdio(({ era }) => createWorkflowServer(runner, { protocolEra: era, p
 The REPL-specific exports are `replToolInputShape` / `replToolOutputShape` (the tool's Zod input/output schemas), the `ReplToolOptions` type, `createReplProjectState` / `ensureReplWorkspace` / `disposeReplProjectState` / `resetReplProjectState` and the `ReplProjectState` type (per-project workspace state), and `ReplPresenceLedger` (the client-presence drain). Other workflow-side exports include the individual-validator catalog `workflowToolInputShape`, canonical `workflowToolInputBranches` / `workflowToolCanonicalInputSchema`, strict `workflowToolInputSchema` / `parseWorkflowToolInput`,
 `clampWorkflowInput`,
 `CreateWorkflowServerOptions`,
-`WorkflowExecuteToolInput`, `WorkflowResumeToolInput`, `WorkflowSetupResponseToolInput`, `WorkflowStatusToolInput`, `WorkflowPermissionResponseToolInput`, `WorkflowStopToolInput`,
+`WorkflowExecuteToolInput`, `WorkflowResumeToolInput`, `WorkflowSetupResponseToolInput`, `WorkflowStatusToolInput`, `WorkflowPermissionResponseToolInput`, `WorkflowStopToolInput`, `WorkflowPauseToolInput`,
 `WorkflowExecutionOutcome`, `WorkflowOperationAccepted`, `WorkflowSetupResponseResult`,
 `WorkflowRunLatestActivity`,
-`WorkflowStatusToolResult`, `WorkflowPermissionResponseResult`, `WorkflowStopResult`,
+`WorkflowStatusToolResult`, `WorkflowPermissionResponseResult`, `WorkflowStopResult`, `WorkflowPauseResult`,
 `WorkflowToolResult`, `WorkflowPermissionBroker`, `WorkflowPendingPermission`, `MAX_ACTIVE_RUNS`,
 `workflowToolOutputShape` / `toWorkflowExecutionOutcome`,
 `createProgressReporter`, `installMcpServerLifecycle` / `SHUTDOWN_DEADLINE_MS`, and lifecycle

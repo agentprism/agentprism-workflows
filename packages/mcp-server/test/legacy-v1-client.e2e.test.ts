@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import test from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -30,15 +29,13 @@ test("released SDK v1 client retains the sessionful legacy end-to-end path", asy
     assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
       "repl", "workflow", "workflow-events", "workflow-notifications", "workflow-runs", "workflow_monitor",
     ]);
-    const requestId = randomUUID();
     const accepted = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId, script: SCRIPT, projectDir: makeProjectDir("released-v1-client") },
+      arguments: { action: "run", script: SCRIPT, projectDir: makeProjectDir("released-v1-client") },
     });
     assert.equal(accepted.isError, false, JSON.stringify(accepted));
     const acknowledgement = accepted.structuredContent as Record<string, unknown>;
     assert.equal(acknowledgement.accepted, true);
-    assert.equal(acknowledgement.requestId, requestId);
     assert.equal(typeof acknowledgement.runId, "string");
     assert.equal(acknowledgement.result, undefined);
     const runId = acknowledgement.runId as string;

@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { WorkflowManager } from "@automatalabs/workflows";
 import { DAEMON_NAME } from "../../src/daemon/constants.js";
@@ -28,7 +27,7 @@ test("an earlier daemon observes and answers permissions after another daemon co
   let runId: string | undefined;
   try {
     const accepted = await first.client.callTool({ name: "workflow", arguments: {
-      action: "run", requestId: randomUUID(), projectDir,
+      action: "run", projectDir,
       script: 'export const meta = { model: "claude", name: "owner-inspection", description: "follow current ownership" }; await checkpoint("Continue?"); return await agent("work");',
     } });
     assert.equal(accepted.isError, false, textOf(accepted));
@@ -42,7 +41,7 @@ test("an earlier daemon observes and answers permissions after another daemon co
       instanceId: current.instanceId, controlUrl: current.controlUrl, controlProtocol: 1,
     });
     const resumed = await second.client.callTool({ name: "workflow", arguments: {
-      action: "resume", requestId: randomUUID(), runId, checkpointReplies: { 0: true },
+      action: "resume", runId, checkpointReplies: { 0: true },
     } });
     assert.equal(resumed.isError, false, textOf(resumed));
     const waiting = await waitForRun(first.client, runId, (state) =>
@@ -82,7 +81,7 @@ test("a remote completion between inspection reads cannot attach completed field
   let restore: (() => void) | undefined;
   try {
     const accepted = await connection.client.callTool({ name: "workflow", arguments: {
-      action: "run", requestId: randomUUID(), projectDir,
+      action: "run", projectDir,
       script: 'export const meta = { model: "claude", name: "observation-race", description: "coherent status" }; await checkpoint("Continue?"); return "remote completion";',
     } });
     const runId = String(structured(accepted)?.runId);

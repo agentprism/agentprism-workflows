@@ -10,7 +10,7 @@
  * try/catch.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import type {
@@ -42,6 +42,7 @@ import type {
 } from "@automatalabs/shared-types";
 import type { RunEventLogRecord } from "@automatalabs/shared-types";
 import { preview, recomputeWorkflowSnapshot, type WorkflowSnapshot } from "./display.js";
+import { isAbsolute } from "node:path";
 import { errorMessage, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { captureRunEnvironment, type RunEnvironmentIdentity } from "./run-environment.js";
 import { isRunEnvironmentIdentity } from "./resume-identity.js";
@@ -55,6 +56,8 @@ import {
   type RunLease,
   type RunPersistence,
   type RunStatus,
+  type WorkflowScriptOrigin,
+  type WorkflowScriptRevision,
 } from "./run-persistence.js";
 import {
   admitResumeSource,
@@ -92,15 +95,9 @@ import {
   type WorkflowAgentActivity,
 } from "./agent-live-observability.js";
 import {
-  acceptedWorkflowRunId,
-  assertWorkflowOperationMatches,
-  captureWorkflowOperation,
   captureWorkflowPreparation,
   mergeWorkflowSetupResponses,
-  MAX_WORKFLOW_CONTINUATION_OPERATIONS,
   MAX_WORKFLOW_PREPARATION_BYTES,
-  type PersistedWorkflowContinuationOperation,
-  type WorkflowOperationIdentity,
   type WorkflowPreparation,
 } from "./workflow-preparation.js";
 import { assertExplicitCheckpointProvenance } from "./checkpoint-provenance.js";
@@ -115,9 +112,13 @@ export interface ManagedRun {
   result?: WorkflowRunResult;
   error?: WorkflowError;
   controller: AbortController;
+  /** Fires when a host asks this execution to pause; created lazily so an early request is kept. */
+  pauseController?: AbortController;
   startedAt: Date;
   /** The real script, kept so the run can be resumed. */
   script: string;
+  scriptOrigin?: WorkflowScriptOrigin;
+  scriptRevisions?: WorkflowScriptRevision[];
   args?: unknown;
   /** True when managed.args is a faithful strict-JSON pre-execution snapshot. */
   argsSnapshotOk: boolean;
@@ -144,11 +145,9 @@ export interface ManagedRun {
   };
   environment?: RunEnvironmentIdentity;
   admission?: PersistedRunAdmission;
-  acceptanceOperation?: WorkflowOperationIdentity;
   preparation?: WorkflowPreparation;
   preparationRevision?: number;
   setupResponses?: Record<string, string>;
-  continuationOperations?: PersistedWorkflowContinuationOperation[];
   continuation?: WorkflowContinuationResult;
   sameRunContinuation?: true;
   resume?: PersistedResumeFormat;
@@ -265,7 +264,11 @@ export type WorkflowContinuationRefusalReason =
   | "admission-invalid"
   | "checkpoint-required"
   | "checkpoint-mismatch"
-  | "auth-required";
+  | "auth-required"
+  /** The revised script does not parse (a `meta` or structure error). */
+  | "script-invalid"
+  /** The revised script declares a backend the run's admission never approved. */
+  | "backends-changed";
 
 export type WorkflowContinuationStart =
   | {
@@ -277,8 +280,6 @@ export type WorkflowContinuationStart =
       accepted: true;
       runId: string;
       continuation: WorkflowContinuationResult;
-      /** This is recovery of an earlier acknowledgement, not a newly started execution. */
-      duplicate?: true;
       promise: Promise<WorkflowRunResult>;
     };
 
@@ -295,10 +296,10 @@ interface RegisteredAgentAttempt extends WorkflowAgentAttemptControl {
 
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
-  /** Durable caller retry identity used by prepared acceptance and strict same-run continuation. */
-  operation?: WorkflowOperationIdentity;
   /** Caller-minted run id. Collision checks happen under the run lease. */
   runId?: string;
+  /** Where the script came from; an inline origin gets a working copy in the run store. */
+  scriptOrigin?: WorkflowScriptOrigin;
   /** Marks this run as an isolation execution from its initial save onward. */
   executionMode?: PersistedRunState["executionMode"];
   /** Non-git environment label reported in replay provenance diagnostics only. */
@@ -318,6 +319,13 @@ export interface ExecOptions {
    * listRuns()/resume() are unaffected by the per-run directory's lifetime.
    */
   cwd?: string;
+  /**
+   * Same-run continuation only: the script text read back from the run's file. When it differs
+   * from the persisted script, the continuation runs the revision with an identity-matched replay
+   * of this run's own journal (unchanged calls replay, the rest run live). A revision must parse
+   * and may declare only backends the run's admission already approved.
+   */
+  script?: string;
   /** Replay these journaled agent results for the unchanged prefix (resume). */
   resumeJournal?: Map<number, JournalEntry>;
   /** Load this persisted run as the source for a new managed execution. */
@@ -547,12 +555,34 @@ function isContinuationSession(
   );
 }
 
+function hashScriptText(script: string): string {
+  return createHash("sha256").update(script, "utf8").digest("hex");
+}
+
+/**
+ * A revision may keep or drop approved backends but never introduce or alter one: approval was
+ * given for exact commands. Without a routing admission the declaration is inert either way.
+ */
+function revisionKeepsApprovedBackends(
+  declared: Record<string, WorkflowBackendConfig> | undefined,
+  approved: Record<string, WorkflowBackendConfig> | undefined,
+): boolean {
+  if (!declared || Object.keys(declared).length === 0 || approved === undefined) return true;
+  return Object.entries(declared).every(([name, config]) => {
+    const approvedConfig = approved[name];
+    if (approvedConfig === undefined) return false;
+    const left = canonicalStrictJson(config);
+    return left !== undefined && left === canonicalStrictJson(approvedConfig);
+  });
+}
+
 function runReason(status: RunStatus, error: WorkflowError | undefined): string | undefined {
   if (status === "completed" || status === "pending" || status === "running") return undefined;
   if (status !== "paused") return error?.message;
   if (error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT) return "usage_limit";
   if (error?.code === WorkflowErrorCode.AUTH_REQUIRED) return "auth_required";
   if (error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED) return "checkpoint_required";
+  if (error?.code === WorkflowErrorCode.PAUSE_REQUESTED) return "requested";
   return error?.message;
 }
 
@@ -838,6 +868,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private validateNewRunOptions(exec: ExecOptions, journaling: boolean): void {
+    validateScriptOrigin(exec.scriptOrigin);
     const hasSource = exec.resumeFromRunId !== undefined;
     if (hasSource && (typeof exec.resumeFromRunId !== "string" || exec.resumeFromRunId.length === 0)) {
       throw this.scriptValidationError("resumeFromRunId must be a non-empty string");
@@ -1418,6 +1449,7 @@ export class WorkflowManager extends EventEmitter {
         managed.calls = latestRows(exec.resumeCalls);
       }
       this.runs.set(managed.runId, managed);
+      this.writeInlineScriptCopy(managed);
       if (managed.journaling && (source || managed.admission || exec.resumeJournal)) {
         this.persistRunOrThrow(managed);
       } else {
@@ -1425,6 +1457,7 @@ export class WorkflowManager extends EventEmitter {
       }
       return { managed, resumeExecution };
     } catch (error) {
+      if (identity) this.persistence.discardInlineScript?.(identity.runId);
       if (identity) this.persistence.releaseRunLease(identity.lease);
       if (identity) this.runs.delete(identity.runId);
       throw error;
@@ -1433,37 +1466,16 @@ export class WorkflowManager extends EventEmitter {
     }
   }
 
-  /** Look up an accepted operation before reading mutable source paths or reserving capacity. */
-  findAcceptedRun(operation: WorkflowOperationIdentity): PersistedRunState | undefined {
-    const captured = captureWorkflowOperation(operation);
-    const runId = acceptedWorkflowRunId(this.cwd, captured);
-    const persisted = this.persistence.load(runId);
-    if (persisted) {
-      assertWorkflowOperationMatches(persisted.acceptanceOperation, captured);
-      return persisted;
-    }
-    const deleted = this.persistence.loadLineageTombstone?.(runId);
-    if (deleted) {
-      if (deleted.acceptanceOperation) assertWorkflowOperationMatches(deleted.acceptanceOperation, captured);
-      throw this.scriptValidationError(
-        `workflow operation "${captured.id}" refers to a deleted run; use a fresh request identity for new work`,
-      );
-    }
-    if (this.persistence.hasRunArtifact?.(runId)) {
-      throw this.persistenceError(`workflow acceptance ${runId} exists but is unreadable; it cannot be recreated from a retry`);
-    }
-    return undefined;
-  }
-
-  /** Durably accept immutable inputs without evaluating script control flow or opening an agent. */
+  /**
+   * Durably park validated inputs that still await host setup (for example a backend approval)
+   * without evaluating script control flow or opening an agent. The run is created `pending`
+   * under a fresh engine identity; admitPreparedRun later starts execution on that same ID.
+   */
   prepareRun(
     script: string,
     args: unknown,
-    exec: ExecOptions & { operation: WorkflowOperationIdentity; preparation: WorkflowPreparation },
-  ): { runId: string; created: boolean } {
-    const operation = captureWorkflowOperation(exec.operation);
-    const existing = this.findAcceptedRun(operation);
-    if (existing) return { runId: existing.runId, created: false };
+    exec: ExecOptions & { preparation: WorkflowPreparation },
+  ): { runId: string } {
     if (!this.resolveJournaling(exec)) throw this.scriptValidationError("prepared runs require durable journaling");
     if (
       exec.runId !== undefined || exec.resumeFromRunId !== undefined || exec.resumePolicy !== undefined ||
@@ -1483,29 +1495,20 @@ export class WorkflowManager extends EventEmitter {
     if (capturedArgs.clone !== undefined && Buffer.byteLength(JSON.stringify(capturedArgs.clone), "utf8") > MAX_WORKFLOW_PREPARATION_BYTES) {
       throw this.scriptValidationError(`prepared args exceed ${MAX_WORKFLOW_PREPARATION_BYTES} bytes`);
     }
-    const runId = acceptedWorkflowRunId(this.cwd, operation);
-    const lease = this.persistence.acquireRunLease(runId);
-    if (!lease) {
-      const accepted = this.findAcceptedRun(operation);
-      if (accepted) return { runId, created: false };
-      throw this.persistenceError(`workflow acceptance "${operation.id}" is owned elsewhere; retry the same request identity`);
-    }
+    const { runId, lease } = this.acquireNewRunIdentity(exec.runId);
     try {
-      const accepted = this.findAcceptedRun(operation);
-      if (accepted) {
-        this.persistence.releaseRunLease(lease);
-        return { runId, created: false };
-      }
       const managed = this.createManaged(script, capturedArgs.clone, true, exec, true, { runId, lease }, true);
-      managed.acceptanceOperation = operation;
       managed.preparation = preparation;
       managed.preparationRevision = 0;
       managed.setupResponses = mergeWorkflowSetupResponses(undefined, preparation.responses);
+      this.writeInlineScriptCopy(managed);
       this.persistRunOrThrow(managed);
       this.runs.set(runId, managed);
-      return { runId, created: true };
+      return { runId };
     } catch (error) {
+      this.persistence.discardInlineScript?.(runId);
       this.persistence.releaseRunLease(lease);
+      this.runs.delete(runId);
       throw error;
     }
   }
@@ -1526,10 +1529,6 @@ export class WorkflowManager extends EventEmitter {
         this.persistence.releaseRunLease(lease);
         return undefined;
       }
-      const operation = captureWorkflowOperation(persisted.acceptanceOperation!);
-      if (acceptedWorkflowRunId(this.cwd, operation) !== runId) {
-        throw this.scriptValidationError("prepared run acceptance identity does not match its project/run ID");
-      }
       if (!Number.isSafeInteger(persisted.preparationRevision) || persisted.preparationRevision! < 0) {
         throw this.scriptValidationError("prepared run has an incompatible preparation revision");
       }
@@ -1539,6 +1538,7 @@ export class WorkflowManager extends EventEmitter {
       const preparation = captureWorkflowPreparation(persisted.preparation);
       const managed = this.createManaged(persisted.script, persisted.args, true, {
         cwd: persisted.cwd,
+        scriptOrigin: persisted.scriptOrigin,
         maxAgents: persisted.limits?.maxAgents,
         concurrency: persisted.limits?.concurrency,
         agentRetries: persisted.limits?.agentRetries,
@@ -1551,7 +1551,6 @@ export class WorkflowManager extends EventEmitter {
       managed.mainModel = persisted.mainModel;
       managed.agentsDir = persisted.agentsDir;
       managed.environment = persisted.environment;
-      managed.acceptanceOperation = operation;
       managed.preparation = preparation;
       managed.preparationRevision = persisted.preparationRevision;
       managed.setupResponses = mergeWorkflowSetupResponses(persisted.setupResponses, preparation.responses);
@@ -1613,7 +1612,6 @@ export class WorkflowManager extends EventEmitter {
     ) {
       throw this.scriptValidationError("prepared admission requires canonical configuration and preserves accepted inputs");
     }
-    if (exec.operation) assertWorkflowOperationMatches(managed.acceptanceOperation, captureWorkflowOperation(exec.operation));
     const admission = createRunAdmission(exec, new Date().toISOString(), managed.effectiveCwd, managed.agentsDir, managed.mainModel);
     if (!admission) throw this.scriptValidationError("prepared admission requires canonical configuration");
     const previous = {
@@ -1707,6 +1705,11 @@ export class WorkflowManager extends EventEmitter {
   /**
    * Start a workflow in the background.
    * Returns immediately with a run ID; the workflow executes asynchronously.
+   *
+   * The run is admitted and persisted before this returns, but execution begins on the next
+   * macrotask: the concurrency limiter dispatches an agent on the caller's stack when capacity
+   * allows, so starting synchronously would let a permission request, checkpoint, or even the
+   * run's completion fire before the caller could register interest under the returned run ID.
    */
   startInBackground(
     script: string,
@@ -1715,12 +1718,15 @@ export class WorkflowManager extends EventEmitter {
   ): { runId: string; promise: Promise<WorkflowRunResult> } {
     const { managed, resumeExecution } = this.initializeRun(script, args, exec, true);
 
-    // Run workflow asynchronously.
     // Attach a side-channel catch to prevent Node.js unhandled-rejection crashes
     // when a workflow is aborted/paused/stopped — executeRun()'s catch block
     // already records status/event/persist, but the promise still rejects.
     // The original promise is returned so callers can await it in try/catch.
-    const promise = this.executeRun(managed, script, exec, resumeExecution);
+    const promise = new Promise<WorkflowRunResult>((resolve, reject) => {
+      setImmediate(() => {
+        this.executeRun(managed, script, exec, resumeExecution).then(resolve, reject);
+      });
+    });
     promise.catch(() => {});
 
     return { runId: managed.runId, promise };
@@ -1799,6 +1805,9 @@ export class WorkflowManager extends EventEmitter {
       controller: new AbortController(),
       startedAt,
       script,
+      // Every journaled run keeps an editable working copy of its script in the run store unless
+      // the caller recorded the script's own path as its origin.
+      ...(exec.scriptOrigin ? { scriptOrigin: exec.scriptOrigin } : journaling ? { scriptOrigin: { kind: "inline" as const } } : {}),
       args: capturedArgs.ok ? capturedArgs.clone : args,
       argsSnapshotOk: capturedArgs.ok,
       ...(!capturedArgs.ok ? { argsUnreplayable: true as const } : {}),
@@ -1834,6 +1843,23 @@ export class WorkflowManager extends EventEmitter {
       lease: identity.lease,
       ...(journaling ? { eventStreamId: generateEventStreamId(), eventSeq: 0 } : {}),
     };
+  }
+
+  /**
+   * Materialize the store's working copy of an inline script before the run record is saved, so
+   * a persisted run always has its editable file; a failed copy fails the admission.
+   */
+  private writeInlineScriptCopy(managed: ManagedRun): void {
+    if (managed.scriptOrigin?.kind !== "inline" || !managed.journaling) return;
+    try {
+      this.persistence.writeInlineScript?.(managed.runId, managed.script);
+    } catch (error) {
+      throw new WorkflowError(
+        `failed to write the script copy for ${managed.runId}: ${errorMessage(error)}`,
+        WorkflowErrorCode.PERSISTENCE_ERROR,
+        { recoverable: false },
+      );
+    }
   }
 
   private resolveJournaling(exec: ExecOptions): boolean {
@@ -2117,6 +2143,7 @@ export class WorkflowManager extends EventEmitter {
         onMissingAgentConfiguration: exec.onMissingAgentConfiguration,
         agentsDir: managed.agentsDir,
         signal: managed.controller.signal,
+        pauseSignal: (managed.pauseController ??= new AbortController()).signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
         maxAgents,
@@ -2364,11 +2391,12 @@ export class WorkflowManager extends EventEmitter {
         error instanceof WorkflowError
           ? error
           : new WorkflowError(errorMessage(error), WorkflowErrorCode.UNKNOWN, { recoverable: false });
-      // Three recoverable-by-external-action fault codes checkpoint the run as PAUSED (not failed),
+      // Four recoverable-by-external-action fault codes checkpoint the run as PAUSED (not failed),
       // so resume() replays the journaled prefix instead of restarting from scratch (§2.12):
       //  - PROVIDER_USAGE_LIMIT: a provider quota refills over time.
       //  - AUTH_REQUIRED: a host completes an auth step.
       //  - CHECKPOINT_REQUIRED: a host supplies the pending durable checkpoint decision.
+      //  - PAUSE_REQUESTED: a host asked for the pause and resumes when it is ready.
       // All are recoverable:false, so the retry ladder skips them.
       const authPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.AUTH_REQUIRED;
@@ -2376,9 +2404,11 @@ export class WorkflowManager extends EventEmitter {
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
       const checkpointPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.CHECKPOINT_REQUIRED;
-      const paused = usageLimitPaused || authPaused || checkpointPaused;
+      const requestPaused =
+        !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PAUSE_REQUESTED;
+      const paused = usageLimitPaused || authPaused || checkpointPaused || requestPaused;
       if (managed.controller.signal.aborted) {
-        // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
+        // Intentional stop (host signal) — preserve the status set by stop()
         if (managed.status === "running") {
           managed.status = "aborted";
         }
@@ -2411,14 +2441,22 @@ export class WorkflowManager extends EventEmitter {
                 errorRecord,
                 checkpointContext: workflowError.checkpointContext,
               })
-            : this.createRunEvent("paused", {
-                runId: managed.runId,
-                scope: managed.runId,
-                reason: "usage_limit",
-                error: workflowError,
-                errorRecord,
-                resetHint: workflowError.resetHint,
-              });
+            : requestPaused
+              ? this.createRunEvent("paused", {
+                  runId: managed.runId,
+                  scope: managed.runId,
+                  reason: "requested",
+                  error: workflowError,
+                  errorRecord,
+                })
+              : this.createRunEvent("paused", {
+                  runId: managed.runId,
+                  scope: managed.runId,
+                  reason: "usage_limit",
+                  error: workflowError,
+                  errorRecord,
+                  resetHint: workflowError.resetHint,
+                });
         publish(pausedEvent, {
           beforeLive: () => {
             this.persistRun(managed);
@@ -2774,6 +2812,8 @@ export class WorkflowManager extends EventEmitter {
       // Persist the real script + journal so the run can be resumed. Runs live
       // in workflow run storage — protect via directory permissions, not blanking.
       script: managed.script,
+      ...(managed.scriptOrigin ? { scriptOrigin: managed.scriptOrigin } : {}),
+      ...(managed.scriptRevisions ? { scriptRevisions: managed.scriptRevisions } : {}),
       args: managed.args,
       argsUnreplayable: managed.argsUnreplayable,
       // The per-run working directory, so resume() re-runs in the SAME place.
@@ -2787,10 +2827,8 @@ export class WorkflowManager extends EventEmitter {
       ...(managed.resumeReport ? { resumeReport: managed.resumeReport } : {}),
       ...(managed.replayEligibility ? { replayEligibility: managed.replayEligibility } : {}),
       ...(managed.admission ? { admission: managed.admission } : {}),
-      ...(managed.acceptanceOperation ? { acceptanceOperation: managed.acceptanceOperation } : {}),
       ...(managed.preparation ? { preparation: managed.preparation, preparationRevision: managed.preparationRevision } : {}),
       ...(managed.setupResponses ? { setupResponses: managed.setupResponses } : {}),
-      ...(managed.continuationOperations ? { continuationOperations: managed.continuationOperations } : {}),
       ...(managed.continuation ? { continuation: managed.continuation } : {}),
       mainModel: managed.mainModel,
       defaultModel: managed.defaultModel,
@@ -2817,7 +2855,7 @@ export class WorkflowManager extends EventEmitter {
       // Why a pause happened, so the navigator / a future cold start can show it and
       // re-arm resume (§2.12). Selector switches on the paused run's error code:
       // AUTH_REQUIRED -> "auth_required", PROVIDER_USAGE_LIMIT -> "usage_limit",
-      // CHECKPOINT_REQUIRED -> "checkpoint_required".
+      // CHECKPOINT_REQUIRED -> "checkpoint_required", PAUSE_REQUESTED -> "requested".
       pauseReason:
         managed.status === "paused"
           ? managed.error?.code === WorkflowErrorCode.AUTH_REQUIRED
@@ -2826,7 +2864,9 @@ export class WorkflowManager extends EventEmitter {
               ? "usage_limit"
               : managed.error?.code === WorkflowErrorCode.CHECKPOINT_REQUIRED
                 ? "checkpoint_required"
-                : undefined
+                : managed.error?.code === WorkflowErrorCode.PAUSE_REQUESTED
+                  ? "requested"
+                  : undefined
           : undefined,
       // resetHint stays usage-limit-only.
       resetHint:
@@ -2912,27 +2952,24 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * Pause a running workflow.
+   * Ask a running workflow to pause. Agent calls already executing finish and journal, nothing
+   * new is admitted (queued calls settle as interrupted rows that run again on resume), and the
+   * run then settles as `paused` with reason "requested" and a `paused` event. Returns true when
+   * the request is registered with a run this manager is executing, including a repeat request
+   * while one is pending; false when the run is not running here. `stop()` remains the immediate
+   * interruption.
    */
   pause(runId: string): boolean {
     const managed = this.runs.get(runId);
-    if (managed?.status !== "running") return false;
-
-    managed.controller.abort();
-    this.liveAgentObservability.finishRun(managed);
-    managed.status = "paused";
-    this.publishRunEvent(
-      managed,
-      this.createRunEvent("paused", { runId, scope: runId }),
-      () => this.persistRun(managed),
-      {
-        afterLive: () => {
-          this.persistRun(managed);
-          this.releaseRunLease(managed);
-        },
-      },
-    );
+    if (managed?.status !== "running" || managed.preparation !== undefined) return false;
+    (managed.pauseController ??= new AbortController()).abort();
     return true;
+  }
+
+  /** Whether a pause request is registered for a run this manager is still executing. */
+  pausePending(runId: string): boolean {
+    const managed = this.runs.get(runId);
+    return managed?.status === "running" && managed.pauseController?.signal.aborted === true;
   }
 
   /**
@@ -2970,68 +3007,11 @@ export class WorkflowManager extends EventEmitter {
     return this.continueRunInternal(runId, exec, true);
   }
 
-  private continuationOperationRetry(
-    persisted: PersistedRunState,
-    operation: WorkflowOperationIdentity | undefined,
-  ): WorkflowContinuationStart | undefined {
-    assertExplicitCheckpointProvenance(persisted);
-    if (!operation) return undefined;
-    if (persisted.acceptanceOperation?.id === operation.id) {
-      throw this.scriptValidationError(`workflow operation conflict: request identity "${operation.id}" already accepted this run`);
-    }
-    const operations = persisted.continuationOperations ?? [];
-    if (!Array.isArray(operations) || operations.length > MAX_WORKFLOW_CONTINUATION_OPERATIONS) {
-      throw this.scriptValidationError("workflow continuation operation history is incompatible");
-    }
-    const identities = new Set<string>();
-    for (const entry of operations) {
-      captureWorkflowOperation({ id: entry.id, fingerprint: entry.fingerprint });
-      if (
-        identities.has(entry.id) || !entry.continuation ||
-        !Number.isSafeInteger(entry.continuation.generation) || entry.continuation.generation < 1 ||
-        !Number.isSafeInteger(entry.continuation.replayedPrefix) || entry.continuation.replayedPrefix < 0 ||
-        !Number.isFinite(Date.parse(entry.acceptedAt))
-      ) throw this.scriptValidationError("workflow continuation operation history is incompatible");
-      identities.add(entry.id);
-    }
-    const recorded = operations.find((entry) => entry.id === operation.id);
-    if (!recorded) return undefined;
-    assertWorkflowOperationMatches({ id: recorded.id, fingerprint: recorded.fingerprint }, operation);
-    const continuation = cloneFrozenStrictJson(recorded.continuation);
-    if (!continuation.ok) throw this.scriptValidationError("workflow continuation acknowledgement is not strict JSON");
-    // A retry recovers acknowledgement only. Its already-resolved snapshot promise must not be
-    // mistaken for ownership of an executing generation; callers use duplicate to avoid tracking.
-    const snapshot: WorkflowRunResult = {
-      runId: persisted.runId,
-      status: persisted.status,
-      meta: { name: persisted.workflowName, description: "", phases: persisted.phases.map((title) => ({ title })) },
-      result: persisted.result,
-      phases: persisted.phases,
-      agentCount: persisted.agents.length,
-      durationMs: persisted.durationMs ?? Math.max(0, Date.now() - Date.parse(persisted.startedAt)),
-      logs: persisted.logs,
-      ...(persisted.tokenUsage ? { tokenUsage: { ...persisted.tokenUsage, cost: persisted.tokenUsage.cost ?? 0 } } : {}),
-      reason: persisted.reason ?? persisted.pauseReason,
-      authContext: persisted.authContext,
-      checkpointContext: persisted.checkpointContext,
-      continuation: persisted.continuation,
-      effectiveLimits: persisted.limits,
-    };
-    return {
-      accepted: true,
-      runId: persisted.runId,
-      continuation: continuation.clone as unknown as WorkflowContinuationResult,
-      duplicate: true,
-      promise: Promise.resolve(snapshot),
-    };
-  }
-
   private async continueRunInternal(
     runId: string,
     exec: ExecOptions,
     requireCanonicalAdmission: boolean,
   ): Promise<WorkflowContinuationStart> {
-    const operation = exec.operation === undefined ? undefined : captureWorkflowOperation(exec.operation);
     if (
       exec.resumeFromRunId !== undefined ||
       exec.resumePolicy !== undefined ||
@@ -3050,14 +3030,13 @@ export class WorkflowManager extends EventEmitter {
     }
     const observed = this.persistence.load(runId);
     if (observed) {
-      const retried = this.continuationOperationRetry(observed, operation);
-      if (retried) return retried;
+      assertExplicitCheckpointProvenance(observed);
       if (observed.status === "pending" && observed.preparation !== undefined) {
         return { accepted: false, reason: "not-continuable" };
       }
     }
-    // Guard: refuse to resume a run that is already running, or one that was
-    // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
+    // Guard: refuse to resume a run that is already running. Paused, failed, and stopped
+    // (aborted) runs can restart from their journal; only completed runs are final.
     const active = this.runs.get(runId);
     if (active?.journaling === false) throw new Error("journaling disabled for this run");
     if (!this.resolveJournaling(exec)) throw new Error("journaling disabled for this run");
@@ -3074,8 +3053,6 @@ export class WorkflowManager extends EventEmitter {
           : { resolvedCheckpoints: classified.resolutions }),
       };
     }
-    if (active?.status === "aborted") return { accepted: false, reason: "terminal" };
-
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) {
       // A concurrent owner may already have durably committed this checkpoint reply. Read-only
@@ -3090,7 +3067,7 @@ export class WorkflowManager extends EventEmitter {
         accepted: false,
         reason: settledReply && durable?.status === "running"
           ? "running"
-          : settledReply && (durable?.status === "completed" || durable?.status === "aborted")
+          : settledReply && durable?.status === "completed"
             ? "terminal"
             : "owned-elsewhere",
         ...(classified.resolutions.length === 0
@@ -3110,14 +3087,7 @@ export class WorkflowManager extends EventEmitter {
       return { accepted: false, reason: "missing" };
     }
     try {
-      const retried = this.continuationOperationRetry(persisted, operation);
-      if (retried) {
-        this.persistence.releaseRunLease(lease);
-        return retried;
-      }
-      if (operation && (persisted.continuationOperations?.length ?? 0) >= MAX_WORKFLOW_CONTINUATION_OPERATIONS) {
-        throw this.scriptValidationError(`workflow continuation operation limit ${MAX_WORKFLOW_CONTINUATION_OPERATIONS} reached`);
-      }
+      assertExplicitCheckpointProvenance(persisted);
     } catch (error) {
       this.persistence.releaseRunLease(lease);
       throw error;
@@ -3133,7 +3103,7 @@ export class WorkflowManager extends EventEmitter {
           : { resolvedCheckpoints: checkpointReplies.resolutions }),
       };
     }
-    if (persisted.status === "completed" || persisted.status === "aborted") {
+    if (persisted.status === "completed") {
       this.persistence.releaseRunLease(lease);
       return {
         accepted: false,
@@ -3305,10 +3275,31 @@ export class WorkflowManager extends EventEmitter {
       };
     }
 
+    // A revised script (the run's editable file changed since admission) continues through an
+    // identity-matched replay of this run's own terminal state: unchanged calls replay, changed
+    // calls and everything the revision reorders run live. Structure and backend approval are
+    // checked before anything is persisted for the new generation.
+    const revision = exec.script !== undefined && exec.script !== persisted.script ? exec.script : undefined;
+    let revisionMeta: WorkflowMeta | undefined;
+    if (revision !== undefined) {
+      try {
+        revisionMeta = parseWorkflowScript(revision).meta;
+      } catch {
+        this.persistence.releaseRunLease(lease);
+        publication.lease = undefined;
+        return { accepted: false, reason: "script-invalid" };
+      }
+      if (!revisionKeepsApprovedBackends(revisionMeta.backends, persisted.admission?.scriptBackends)) {
+        this.persistence.releaseRunLease(lease);
+        publication.lease = undefined;
+        return { accepted: false, reason: "backends-changed" };
+      }
+    }
+
     const controller = new AbortController();
     let meta: WorkflowMeta | undefined;
     try {
-      meta = parseWorkflowScript(persisted.script).meta;
+      meta = revision !== undefined ? revisionMeta : parseWorkflowScript(persisted.script).meta;
     } catch {
       // A previously-valid script that no longer parses still resumes by journal;
       // the snapshot name carries the run identity.
@@ -3343,7 +3334,9 @@ export class WorkflowManager extends EventEmitter {
       },
       controller,
       startedAt: new Date(persisted.startedAt),
-      script: persisted.script,
+      script: revision ?? persisted.script,
+      ...(persisted.scriptOrigin ? { scriptOrigin: persisted.scriptOrigin } : {}),
+      ...(persisted.scriptRevisions ? { scriptRevisions: persisted.scriptRevisions } : {}),
       args: capturedArgs.ok ? capturedArgs.clone : persisted.args,
       argsSnapshotOk: capturedArgs.ok,
       ...(persisted.argsUnreplayable || !capturedArgs.ok ? { argsUnreplayable: true as const } : {}),
@@ -3357,8 +3350,6 @@ export class WorkflowManager extends EventEmitter {
       runtime: runtimeIdentity(),
       environment: persisted.environment,
       admission: persisted.admission,
-      acceptanceOperation: persisted.acceptanceOperation,
-      continuationOperations: persisted.continuationOperations,
       setupResponses: persisted.setupResponses,
       ...(persisted.legacyResume ? { legacyResume: true as const } : {}),
       ...(persisted.resume ? { resume: { format: "identity-v1" as const } } : {}),
@@ -3386,9 +3377,33 @@ export class WorkflowManager extends EventEmitter {
       eventLogIncomplete: publication.eventLogIncomplete,
     };
     managed.preparedContinuation = this.buildPreparedContinuation(persisted);
+    const generation = (persisted.continuation?.generation ?? 0) + 1;
+
+    let revisedExecution: ManagerResumeExecution | undefined;
+    if (revision !== undefined) {
+      // The new generation starts with an empty journal and manifest; the identity seed built
+      // from this run's own terminal state supplies every replayable call, and a durable
+      // checkpoint reply reaches its call through that seed instead of a synthetic journal row.
+      managed.journal = [];
+      managed.calls = [];
+      managed.scriptRevisions = [
+        ...(persisted.scriptRevisions ?? []),
+        { generation, scriptHash: hashScriptText(revision), revisedAt: new Date().toISOString() },
+      ];
+      try {
+        revisedExecution = this.prepareManagedResume(managed, persisted, {
+          resumePolicy: "auto",
+          ...(exec.checkpointReplies === undefined ? {} : { checkpointReplies: exec.checkpointReplies }),
+        });
+      } catch (error) {
+        this.persistence.releaseRunLease(lease);
+        publication.lease = undefined;
+        throw error;
+      }
+    }
 
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
-    if (checkpointReplies.accepted) {
+    if (checkpointReplies.accepted && revision === undefined) {
       const syntheticEntry = checkpointReplies.accepted;
       resumeJournal.set(syntheticEntry.index, syntheticEntry);
       // Cached entries are replayed without firing onAgentJournal, so seed and persist this
@@ -3414,24 +3429,14 @@ export class WorkflowManager extends EventEmitter {
       managed.calls.push(answeredCall);
     }
     const continuation: WorkflowContinuationResult = deepFreeze({
-      generation: (persisted.continuation?.generation ?? 0) + 1,
+      generation,
       replayedPrefix: contiguousJournalPrefix(managed.journal, runId),
       ...(checkpointReplies.resolutions.length === 0
         ? {}
         : { resolvedCheckpoints: checkpointReplies.resolutions }),
+      ...(revision === undefined ? {} : { scriptRevised: true as const }),
     });
     managed.continuation = continuation;
-    if (operation) {
-      const operations = [
-        ...(persisted.continuationOperations ?? []),
-        { ...operation, acceptedAt: new Date().toISOString(), continuation },
-      ];
-      if (Buffer.byteLength(JSON.stringify(operations), "utf8") > 4_194_304) {
-        this.persistence.releaseRunLease(lease);
-        throw this.scriptValidationError("workflow continuation operation history exceeds 4194304 bytes");
-      }
-      managed.continuationOperations = operations;
-    }
     try {
       this.persistRunOrThrow(managed);
     } catch (error) {
@@ -3448,7 +3453,7 @@ export class WorkflowManager extends EventEmitter {
     // Run in the background; executeRun records status/errors on the managed run.
     // Preserve the original promise for callers while preventing an ignored resume
     // from becoming an unhandled rejection.
-    const promise = this.executeRun(managed, persisted.script, {
+    const promise = this.executeRun(managed, managed.script, {
       agent: exec.agent,
       maxAgents: managed.limits?.maxAgents,
       concurrency: managed.limits?.concurrency,
@@ -3459,13 +3464,13 @@ export class WorkflowManager extends EventEmitter {
       confirm: exec.confirm,
       onNestedWorkflow: exec.onNestedWorkflow,
       onMissingAgentConfiguration: exec.onMissingAgentConfiguration,
-      resumeJournal,
-    }, checkpointReplies.accepted
+      ...(revisedExecution ? {} : { resumeJournal }),
+    }, revisedExecution ?? (checkpointReplies.accepted
       ? {
           resumeJournal,
           injectedCheckpointReplies: new Set([checkpointReplies.accepted.index]),
         }
-      : { resumeJournal });
+      : { resumeJournal }));
     promise.catch(() => {});
     return { accepted: true, runId, continuation, promise };
   }
@@ -3849,6 +3854,23 @@ export class WorkflowManager extends EventEmitter {
    */
   getPersistence(): RunEventPersistence {
     return this.persistence;
+  }
+}
+
+function validateScriptOrigin(origin: WorkflowScriptOrigin | undefined): void {
+  if (origin === undefined) return;
+  const invalid = () => new WorkflowError(
+    'scriptOrigin must be { kind: "inline" } or { kind: "path", path: <absolute path> }',
+    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    { recoverable: false },
+  );
+  if (origin === null || typeof origin !== "object") throw invalid();
+  if (origin.kind === "inline") {
+    if (Object.keys(origin).length !== 1) throw invalid();
+    return;
+  }
+  if (origin.kind !== "path" || typeof origin.path !== "string" || !isAbsolute(origin.path) || Object.keys(origin).length !== 2) {
+    throw invalid();
   }
 }
 

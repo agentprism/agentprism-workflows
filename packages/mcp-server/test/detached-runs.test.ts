@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-import { waitForRun, runAndObserve } from "./_harness.js";
+import { scriptFileUri, waitForRun, runAndObserve } from "./_harness.js";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -78,7 +77,7 @@ const EXPECTED_LIMITS = {
   agentRetries: 1,
 } as const;
 
-test("durable acceptance is immediate and status is an immediate cumulative snapshot", async () => {
+test("run acknowledges an admitted run and status is an immediate cumulative snapshot", async () => {
   const controlled = new ControlledRunner();
   const { client, dispose } = await connect(controlled.runner, { listTools: true });
   try {
@@ -87,8 +86,7 @@ test("durable acceptance is immediate and status is an immediate cumulative snap
       {
         name: "workflow",
         arguments: {
-          action: "run", requestId: randomUUID(),
-          script: TWO_AGENT_ASYNC,
+          action: "run", script: TWO_AGENT_ASYNC,
           concurrency: 3,
           agentRetries: 1,
         },
@@ -99,16 +97,16 @@ test("durable acceptance is immediate and status is an immediate cumulative snap
     const ack = structured(accepted)!;
     assert.equal(ack.action, "run");
     assert.equal(ack.accepted, true);
-    assert.equal(ack.status, "pending");
+    assert.equal(ack.status, "running");
     assert.equal(ack.result, undefined);
     assert.equal(ack.scriptSource, "inline");
-    assert.equal(ack.scriptUri, `workflow://runs/${acceptedRunId}/script`);
+    assert.equal(ack.scriptUri, scriptFileUri(acceptedRunId));
+    assert.equal(typeof ack.scriptPath, "string", "the editable script path accompanies its file URI");
     assert.equal(ack.eventsUri, `workflow://runs/${acceptedRunId}/events`);
     assert.deepEqual(ack.limits, EXPECTED_LIMITS);
-    assert.equal(controlled.calls.length, 0, "preparation starts after durable acceptance");
-    await waitUntil(() => controlled.calls.length === 1, "first agent starts asynchronously");
+    await waitUntil(() => controlled.calls.length === 1, "the first agent starts in the background");
     initiating.abort();
-    assert.equal(controlled.calls[0].options.signal?.aborted, false, "initiating-call cancellation is detached");
+    assert.equal(controlled.calls[0].options.signal?.aborted, false, "cancellation after admission never reaches the run");
 
     const inspected = await client.callTool({
       name: "workflow",
@@ -187,24 +185,21 @@ test("durable acceptance is immediate and status is an immediate cumulative snap
   }
 });
 
-test("the four-run registry includes preparation, admits retries at capacity, and releases settled runs", async () => {
+test("the four-run registry counts admitted runs, rejects a fifth, and releases settled runs", async () => {
   assert.equal(MAX_ACTIVE_RUNS, 4);
   const controlled = new ControlledRunner();
   const { client, dispose } = await connect(controlled.runner, { listTools: true });
   const acceptedIds: string[] = [];
   try {
-    const malformed = await runAndObserve(client, { script: 'export const meta = { model: "claude", name: "invalid", description: "invalid call" }; return agent("work", { unknownOption: true });' });
-    assert.equal(structured(malformed)?.status, "failed", "failed preparation releases capacity");
-    const inputs = Array.from({ length: MAX_ACTIVE_RUNS }, (_, index) => ({ action: "run", requestId: randomUUID(),
-      script: `export const meta = { model: "claude", name: "blocked-${index}", description: "blocked" }; return await agent("${index}");` }));
+    const malformed = await client.callTool({ name: "workflow", arguments: { action: "run", script: 'export const meta = { model: "claude", name: "invalid", description: "invalid call" }; return agent("work", { unknownOption: true });' } });
+    assert.equal(malformed.isError, true, "validation failure is a tool execution error");
+    assert.equal(structured(malformed)?.runId, undefined, "a rejected preparation creates no run");
+    const inputs = Array.from({ length: MAX_ACTIVE_RUNS }, (_, index) => ({ action: "run", script: `export const meta = { model: "claude", name: "blocked-${index}", description: "blocked" }; return await agent("${index}");` }));
     for (const input of inputs) {
       const accepted = await client.callTool({ name: "workflow", arguments: input });
       acceptedIds.push(runIdOf(accepted));
     }
-    const duplicate = await client.callTool({ name: "workflow", arguments: inputs[0] });
-    assert.equal(structured(duplicate)?.runId, acceptedIds[0]);
-    assert.equal(structured(duplicate)?.duplicate, true, "retry consumes no extra capacity");
-    const fifth = await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT } });
+    const fifth = await client.callTool({ name: "workflow", arguments: { action: "run", script: NO_AGENT_SCRIPT } });
     assert.equal(fifth.isError, true);
     assert.match(textOf(fifth), /Workflow limit reached/);
     await waitUntil(() => controlled.calls.length === 4, "all admitted agents should start");
@@ -234,7 +229,7 @@ test("terminal outcomes survive repeated status and server restart, then missing
   }), { listTools: true });
   const accepted = await first.client.callTool({
     name: "workflow",
-    arguments: { action: "run", requestId: randomUUID(), script },
+    arguments: { action: "run", script },
   });
   const runId = runIdOf(accepted);
   const terminal = await waitForRun(first.client, runId);
@@ -270,7 +265,7 @@ test("terminal outcomes survive repeated status and server restart, then missing
   const corruptSource = await connect(makeRunner(() => "corrupt-me"));
   const corruptAccepted = await corruptSource.client.callTool({
     name: "workflow",
-    arguments: { action: "run", requestId: randomUUID(), script },
+    arguments: { action: "run", script },
   });
   const corruptId = runIdOf(corruptAccepted);
   await waitForRun(corruptSource.client, corruptId);
@@ -347,8 +342,7 @@ test("checkpoints pause independently of elicitation capability and auth pauses 
     const accepted = await auth.client.callTool({
       name: "workflow",
       arguments: {
-        action: "run", requestId: randomUUID(),
-        script: 'export const meta = { model: "claude", name: "auth", description: "auth" }; return await agent("auth");',
+        action: "run", script: 'export const meta = { model: "claude", name: "auth", description: "auth" }; return await agent("auth");',
       },
     });
     const awaited = await waitForRun(auth.client, runIdOf(accepted));
@@ -408,7 +402,7 @@ test("a long-lived server lazily reconciles crash residue for status and resume"
     assert.equal(structured(inspected)?.reason, structured(recovered)?.reason);
     const resumed = await cold.client.callTool({
       name: "workflow",
-      arguments: { action: "resume", requestId: randomUUID(), runId: staleId },
+      arguments: { action: "resume", runId: staleId },
     });
     assert.equal(runIdOf(resumed), staleId);
     await waitUntil(async () => structured(await cold.client.callTool({
@@ -437,7 +431,7 @@ test("status preserves byte caps while returning a large authored outcome exactl
     ].join("\n");
     const accepted = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script },
+      arguments: { action: "run", script },
     });
     await waitUntil(async () => structured(await client.callTool({
       name: "workflow",

@@ -254,7 +254,8 @@ test("auth, MCP, and authoring docs retain the implemented contracts", () => {
   for (const [path, text] of [["packages/mcp-server/README.md", mcpReadme], ["docs/api.md", apiDocs]] as const) {
     assert.ok(text.includes("workflow_monitor"), `${path} must document the separate workflow_monitor view entry`);
     assert.ok(text.includes("setup-response"), `${path} must document durable setup responses`);
-    assert.ok(text.includes("requestId"), `${path} must document lifecycle retry identity`);
+    assert.ok(text.includes("notifications/cancelled"), `${path} must document request cancellation`);
+    assert.ok(!text.includes("requestId"), `${path} must not document the retired retry identity`);
   }
   for (const retired of [
     "workflow_auth_status",

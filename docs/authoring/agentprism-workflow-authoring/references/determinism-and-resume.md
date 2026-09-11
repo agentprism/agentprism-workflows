@@ -3,7 +3,7 @@
 **Context:** JavaScript passed to the MCP `workflow` tool. Workflow scripts use `agent(prompt, options?)`; REPL evals use a different API.
 
 One MCP run owns one immutable logical execution. Every `agent()` and `checkpoint()` result is
-journaled under a deterministic call index. `{ action:"resume", requestId, runId }` reconstructs and continues
+journaled under a deterministic call index. `{ action:"resume", runId }` reconstructs and continues
 that exact run; it never forks a child execution and never accepts changed script, args, or agent
 configuration.
 
@@ -20,7 +20,7 @@ configuration.
 ### Durable checkpoints
 
 Every unanswered checkpoint pauses. Resume with
-`{ action:"resume", requestId, runId, checkpointReplies:{ [checkpointContext.callIndex]: decision } }`.
+`{ action:"resume", runId, checkpointReplies:{ [checkpointContext.callIndex]: decision } }`.
 The decision must be strict JSON. Under the run lease, the first answer is journaled before
 continuation. An identical repeat is idempotent. A different later answer is ignored and reported
 against the durable first answer. Cold reconstruction replays the decision forever.
@@ -38,11 +38,10 @@ A paused or failed run with valid admission metadata can continue. A completed o
 terminal. A pre-contract record without the required canonical admission may remain observable but
 must be replaced with a fresh `{ action:"run", ... }`; no migration or inferred mapping exists.
 
-If a Run/Resume acknowledgement is lost, retry the same `requestId` and exact arguments. A durable
-receipt returns the same accepted run/continuation, even after restart; conflicting reuse fails.
-Use a fresh request ID for a new continuation. Replaying an earlier request cannot advance a later
-checkpoint. Client disconnection leaves execution active; execution-owner loss recovers from
-durable state, and explicit Stop remains authoritative through cold recovery.
+A cancelled Run persists nothing and a cancelled Resume changes nothing; once admitted, client
+disconnection leaves execution active. Repeating an earlier checkpoint answer cannot advance a
+later checkpoint. Execution-owner loss recovers from durable state, and explicit Stop remains
+authoritative through cold recovery.
 
 Give repeated calls stable labels and narrate decisions with `log()`. Retain the original run ID:
 the same ID addresses its script, event stream, cumulative usage, status, and result.
