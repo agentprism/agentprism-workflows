@@ -1,5 +1,11 @@
 # @automatalabs/acp-agents
 
+## 1.2.5
+
+### Patch Changes
+
+- efe2c6e: Refresh the wrapped Claude Agent SDK runtime to 0.3.268 (workspace override; `@agentclientprotocol/claude-agent-acp` stays at 0.76.0, which still pins 0.3.257). The runtime's changes are additive or outside AgentPrism's integration surface: the new `result_index`, `local_command`, and `resume_reason` message fields and the `canUseTool` prompt hints (`defaultToNo`, `suppressAlwaysAllowRule`) are not read by the adapter; `setModel()` now confirms a model id the CLI does not know locally with the API on first use instead of refusing it, which AgentPrism never reaches because admission validates routed ids against the discovered catalog; and the task-tracking tools (TaskCreate/Get/Update/List, TodoWrite) are default tools only on Claude 3.x, Opus 4.0–4.7, Sonnet 4.0–4.6, and Haiku 4.5, so an agent definition that relies on them with a newer model must list them in `tools`. The new `verification_required` assistant error kind reaches AgentPrism as a generic provider error, exactly like `account_on_hold`; neither is a usage-limit pause. Claude Code 2.1.268 also fixes every turn failing with HTTP 400 on third-party Anthropic-compatible endpoints (`ANTHROPIC_BASE_URL`) since 2.1.265.
+
 ## 1.2.4
 
 ### Patch Changes
