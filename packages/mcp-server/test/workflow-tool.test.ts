@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 
-import { randomUUID } from "node:crypto";
 
 import {
   connect,
@@ -52,8 +51,8 @@ test("tool discovery exposes asynchronous lifecycle separately from the dedicate
     assert.deepEqual(branches.map(action), ["config", "run", "resume", "setup-response", "status", "result", "permissions-response", "stop"]);
     assert.ok(workflow.outputSchema);
     const properties = Object.keys(field(workflow.outputSchema, "properties") ?? {});
-    for (const name of ["accepted", "requestId", "duplicate", "continuation", "setup", "outcome", "pendingPermissions"]) assert.ok(properties.includes(name));
-    for (const retired of ["validation", "interaction", "background"]) assert.equal(properties.includes(retired), false);
+    for (const name of ["accepted", "continuation", "setup", "outcome", "pendingPermissions"]) assert.ok(properties.includes(name));
+    for (const retired of ["validation", "interaction", "background", "requestId", "duplicate"]) assert.equal(properties.includes(retired), false);
     assert.equal((field(workflow.outputSchema, "oneOf") as unknown[]).length, 8);
   } finally { await dispose(); }
 });
@@ -384,7 +383,7 @@ test("terminal status exposes replay and checkpoint details separately from acce
     const script = `export const meta = { name: "result-observability", description: "result observability" };
 await agent("review", { label: "review", model: "codex/gpt-5.6-sol" });
 return await checkpoint("Release?", { kind: "select", choices: ["ship", "hold"] });`;
-    const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(), script } });
+    const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", script } });
     assert.equal(structured(accepted)?.accepted, true);
     assert.equal(structured(accepted)?.fallbacks, undefined);
     assert.equal(structured(accepted)?.checkpointsTaken, undefined);
@@ -392,7 +391,7 @@ return await checkpoint("Release?", { kind: "select", choices: ["ship", "hold"] 
     const paused = structured(await waitForRun(client, runId));
     assert.equal(paused?.status, "paused");
     assert.equal((field(paused?.outcome, "fallbacks") as unknown[]).length, 1);
-    await client.callTool({ name: "workflow", arguments: { action: "resume", requestId: randomUUID(), runId, checkpointReplies: { "1": "hold" } } });
+    await client.callTool({ name: "workflow", arguments: { action: "resume", runId, checkpointReplies: { "1": "hold" } } });
     const status = structured(await waitForRun(client, runId, status => status.status === "completed"));
     assert.equal(Object.hasOwn(status ?? {}, "fallbacks"), false);
     assert.equal(Object.hasOwn(status ?? {}, "checkpointsTaken"), false);
@@ -478,7 +477,7 @@ test("status surfaces a live run's in-flight agent calls", async () => {
       'await agent("hold", { label: "held-agent" });',
       'return true;',
     ].join("\n");
-    const accepted = await client.callTool({ name: "workflow", arguments: { requestId: randomUUID(), action: "run", script } });
+    const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", script } });
     const runId = String(structured(accepted)?.runId);
 
     // Wait until the held agent is actually in flight (its start is durable in the event log).
@@ -763,18 +762,15 @@ test("automatic routed config validation rejects unknown options before the live
   );
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
-    const result = await runAndObserve(client, {
+    const result = await client.callTool({ name: "workflow", arguments: {
         action: "run",
         script: [
           'export const meta = { name: "bad-config", description: "must not admit" };',
           'return await agent("work", { label: "work", model: "claude", configOptions: { invented: true } });',
         ].join("\n"),
-      });
-    assert.equal(result.isError, false, "status reads succeed independently of execution outcome");
-    const output = structured(result);
-    assert.equal(output?.status, "failed");
-    assert.equal(output?.errorCode, "SCRIPT_VALIDATION_ERROR");
-    assert.match(String(output?.runId), RUN_ID);
+      } });
+    assert.equal(result.isError, true, "config validation failure is a tool execution error");
+    assert.equal(structured(result)?.runId, undefined, "a rejected preparation creates no run");
     assert.equal(probes, 1);
     assert.equal(realCalls, 0);
     assert.match(textOf(result), /invented/);
@@ -816,15 +812,15 @@ test("automatic mode validation rejects a guessed default when the selected back
     assert.match(textOf(discovered), /modes: \(none advertised — omit mode\)/);
     probes = 0;
 
-    const result = await runAndObserve(client, {
+    const result = await client.callTool({ name: "workflow", arguments: {
         action: "run",
         script: [
           'export const meta = { name: "bad-mode", description: "must not admit" };',
           'return agent("work", { label: "pi-call", model: "pi/openai/model", mode: "default", configOptions: { thinkingLevel: "high" } });',
         ].join("\n"),
-      });
-    assert.equal(result.isError, false, "status reads succeed independently of execution outcome");
-    assert.equal(structured(result)?.status, "failed");
+      } });
+    assert.equal(result.isError, true, "mode validation failure is a tool execution error");
+    assert.equal(structured(result)?.runId, undefined);
     assert.equal(probes, 1);
     assert.equal(realCalls, 0);
     assert.match(textOf(result), /mode authored value "default" is not advertised/);
@@ -849,15 +845,15 @@ test("unknown workflow agent option keys fail preparation before config probing 
   });
   const { client, dispose } = await connect(runner, { listTools: true });
   try {
-    const result = await runAndObserve(client, {
+    const result = await client.callTool({ name: "workflow", arguments: {
         action: "run",
         script: [
           'export const meta = { name: "foreign-options", description: "must not admit" };',
           'return agent("work", { label: "pi-call", backend: "pi", model: "openai/model", config: { thinkingLevel: "high" } });',
         ].join("\n"),
-      });
-    assert.equal(result.isError, false, "status reads succeed independently of execution outcome");
-    assert.equal(structured(result)?.status, "failed");
+      } });
+    assert.equal(result.isError, true, "unknown option keys are a tool execution error");
+    assert.equal(structured(result)?.runId, undefined);
     assert.equal(probes, 0);
     assert.equal(realCalls, 0);
     assert.match(textOf(result), /agent "pi-call" options contain unknown keys "backend", "config"/);
@@ -866,29 +862,25 @@ test("unknown workflow agent option keys fail preparation before config probing 
   }
 });
 
-test("mocked dry-run failure persists its accepted run without executing a real agent", async () => {
+test("mocked dry-run failure is a tool execution error that never executes a real agent or creates a run", async () => {
   let realCalls = 0;
   const { client, dispose } = await connect(makeRunner(() => {
     realCalls += 1;
     return "real";
   }), { listTools: true });
   try {
-    const result = await runAndObserve(client, {
+    const result = await client.callTool({ name: "workflow", arguments: {
         action: "run",
         script: [
           'export const meta = { name: "preflight-failure", model: "claude", description: "must not admit" };',
           'await agent("mock-only", { label: "mock-only" });',
           'throw new Error("dry-run boom");',
         ].join("\n"),
-      });
-    assert.equal(result.isError, false, "status reads succeed independently of execution outcome");
-    const output = structured(result);
-    assert.equal(output?.status, "failed");
-    assert.match(String(output?.runId), RUN_ID);
-    assert.equal(output?.errorCode, "SCRIPT_VALIDATION_ERROR");
+      } });
+    assert.equal(result.isError, true, "a failed dry run is a tool execution error");
+    assert.equal(structured(result)?.runId, undefined, "a rejected preparation creates no run");
     assert.equal(realCalls, 0, "the live AgentRunner is never invoked");
     assert.match(textOf(result), /dry-run boom/);
-    assert.match(String(output?.runId), RUN_ID, "failed setup retains its accepted run");
   } finally {
     await dispose();
   }
@@ -897,7 +889,7 @@ test("mocked dry-run failure persists its accepted run without executing a real 
 test("malformed script fails bounded structural acceptance without creating a run", async () => {
   const { client, dispose } = await connect(okRunner());
   try {
-    const res = await client.callTool({ name: "workflow", arguments: { requestId: randomUUID(), action: "run", script: 'await agent("hi");' } });
+    const res = await client.callTool({ name: "workflow", arguments: { action: "run", script: 'await agent("hi");' } });
 
     assert.equal(res.isError, true, "a parse failure is a tool error");
     const output = structured(res);
@@ -914,7 +906,7 @@ test("malformed script (meta present but invalid) -> isError:true with the valid
   try {
     const res = await client.callTool({
       name: "workflow",
-      arguments: { requestId: randomUUID(), action: "run", script: 'export const meta = { description: "missing a name" };\nreturn 1;' },
+      arguments: { action: "run", script: 'export const meta = { description: "missing a name" };\nreturn 1;' },
     });
 
     assert.equal(res.isError, true);

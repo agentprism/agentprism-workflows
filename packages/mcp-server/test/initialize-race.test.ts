@@ -12,7 +12,6 @@ import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 // These tests pin the invariant at the seam where it broke: the tool is registered at
 // construction, and only the negotiated MCP Apps surface waits for client capabilities.
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "../src/mcp-apps.js";
 
@@ -67,7 +66,7 @@ test("the workflow tool is listable and callable before notifications/initialize
   // failure surfaced precisely as a missing structuredContent here.
   const result = await client.callTool({
     name: "workflow",
-    arguments: { action: "run", requestId: randomUUID(), script: 'export const meta = { name: "x", description: "x" };\nreturn 1;' },
+    arguments: { action: "run", script: 'export const meta = { name: "x", description: "x" };\nreturn 1;' },
   });
   assert.equal(result.isError ?? false, false, JSON.stringify(result.content));
   assert.ok(result.structuredContent, "a first tools/call must carry structuredContent");

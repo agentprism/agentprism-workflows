@@ -23,7 +23,6 @@
           "properties": [
             "action",
             "script",
-            "requestId",
             "projectDir",
             "args",
             "maxAgents",
@@ -32,8 +31,7 @@
           ],
           "required": [
             "action",
-            "script",
-            "requestId"
+            "script"
           ],
           "additionalProperties": false
         },
@@ -42,7 +40,6 @@
           "properties": [
             "action",
             "scriptPath",
-            "requestId",
             "projectDir",
             "args",
             "maxAgents",
@@ -51,8 +48,7 @@
           ],
           "required": [
             "action",
-            "scriptPath",
-            "requestId"
+            "scriptPath"
           ],
           "additionalProperties": false
         }
@@ -63,7 +59,6 @@
       "properties": [
         "action",
         "runId",
-        "requestId",
         "maxAgents",
         "concurrency",
         "agentRetries",
@@ -71,8 +66,7 @@
       ],
       "required": [
         "action",
-        "runId",
-        "requestId"
+        "runId"
       ],
       "additionalProperties": false
     },

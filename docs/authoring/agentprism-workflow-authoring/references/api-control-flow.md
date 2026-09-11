@@ -49,7 +49,7 @@ reach the host; keep evidence concise and never put credentials or other secrets
 | `choices` | `string[]` | For `kind: "select"`. |
 | `timeoutMs` | positive finite `number` | Deadline for an SDK host's live prompt; expiry leaves the checkpoint unanswered and pauses. |
 
-Every unanswered checkpoint pauses with non-secret `checkpointContext`. MCP exposes the pending question through status/monitor and accepts a separate bounded `{ action:"resume", requestId, runId, checkpointReplies:{ [context.callIndex]: decision } }`. An SDK host may collect an explicit answer with `ExecOptions.confirm`; a missing callback, `undefined`, non-JSON value, rejection, or interaction timeout pauses. Panel closure cannot answer or cancel a checkpoint. Explicit stop/cancellation remains available.
+Every unanswered checkpoint pauses with non-secret `checkpointContext`. MCP exposes the pending question through status/monitor and accepts a separate bounded `{ action:"resume", runId, checkpointReplies:{ [context.callIndex]: decision } }`. An SDK host may collect an explicit answer with `ExecOptions.confirm`; a missing callback, `undefined`, non-JSON value, rejection, or interaction timeout pauses. Panel closure cannot answer or cancel a checkpoint. Explicit stop/cancellation remains available.
 
 Replies must be strict JSON and are returned verbatim, including explicit `false`, `null`, or an empty string. The first decision stored under the run lease is authoritative forever: repeats are idempotent and conflicts are ignored. The only authored options are `kind`, `choices`, and `timeoutMs`; retired `headless` and `default` fields are rejected, including the former opt-in `headless:"pause"`.
 

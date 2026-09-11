@@ -145,7 +145,6 @@ test("the browser status projection reads explicit checkpoint controls from the 
       name: "workflow",
       arguments: {
         action: "run",
-        requestId: randomUUID(),
         script: 'export const meta = { name: "app-checkpoint", description: "Verify the monitor status seam" }; const answer = await checkpoint("Continue from this monitor?"); return { answer };',
       },
     });
@@ -161,7 +160,7 @@ test("the browser status projection reads explicit checkpoint controls from the 
     assert.equal(typeof snapshot.checkpointContext?.hash, "string");
     assert.deepEqual(snapshot.pendingPermissions, []);
     const resumed = await client.callTool({ name: "workflow", arguments: {
-      action: "resume", runId, requestId: randomUUID(), checkpointReplies: { [snapshot.checkpointContext!.callIndex]: true },
+      action: "resume", runId, checkpointReplies: { [snapshot.checkpointContext!.callIndex]: true },
     } });
     assert.equal(resumed.isError, false, textOf(resumed));
     await waitForRun(client, runId, (status) => status.status === "completed");
@@ -178,7 +177,7 @@ test("workflow-events pages an accepted asynchronous run to terminal state", asy
   try {
     const accepted = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: ONE_AGENT_SCRIPT },
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT },
     });
     assert.equal(accepted.isError ?? false, false, textOf(accepted));
     const runId = runIdOf(accepted);
@@ -237,12 +236,12 @@ test("workflow-runs returns one bounded active/recent project dashboard", async 
   try {
     const first = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: ONE_AGENT_SCRIPT },
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT },
     });
     const firstRunId = runIdOf(first);
     const second = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: ONE_AGENT_SCRIPT },
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT },
     });
     const secondRunId = runIdOf(second);
     await Promise.all([waitForRun(client, firstRunId), waitForRun(client, secondRunId)]);
@@ -265,11 +264,11 @@ test("workflow-runs keeps the panel's anchor run in a bounded listing", async ()
   try {
     const first = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: ONE_AGENT_SCRIPT },
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT },
     });
     const firstRunId = runIdOf(first);
-    await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: ONE_AGENT_SCRIPT } });
-    await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: ONE_AGENT_SCRIPT } });
+    await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
+    await client.callTool({ name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT } });
 
     const listed = await client.callTool({
       name: WORKFLOW_RUNS_TOOL_NAME,
@@ -307,7 +306,7 @@ test("workflow_monitor requires a real accepted run and never starts execution",
       const invalid = await client.callTool({ name: WORKFLOW_MONITOR_TOOL_NAME, arguments: input });
       assert.equal(invalid.isError, true, "invalid monitor input is rejected");
     }
-    const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT } });
+    const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", script: NO_AGENT_SCRIPT } });
     const runId = runIdOf(accepted);
     const monitor = await client.callTool({ name: WORKFLOW_MONITOR_TOOL_NAME, arguments: { runId } });
     assert.equal(monitor.isError, false, textOf(monitor));

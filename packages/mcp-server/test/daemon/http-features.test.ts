@@ -4,7 +4,7 @@
 // bounded resume request. These are the features a stdio host gets from the
 // in-process server; the daemon must serve them identically.
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 
 import {
@@ -77,7 +77,7 @@ test("run scripts are listed and readable as resources over HTTP", async () => {
     const session = await connectHttp(daemon.url);
     const result = await session.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT, projectDir },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir },
     });
     const runId = structured(result)?.runId as string;
     assert.ok(runId);
@@ -105,7 +105,7 @@ test("events subscription delivers resources/updated over the standalone GET str
     const session = await connectHttp(daemon.url);
     const started = await session.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: ONE_AGENT_SCRIPT, projectDir },
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT, projectDir },
     });
     const runId = structured(started)?.runId as string;
     assert.ok(runId, textOf(started));
@@ -138,7 +138,7 @@ test("checkpoint questions pause and accept an explicit later response over HTTP
     });
     const result = await session.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: CHECKPOINT_SCRIPT, projectDir },
+      arguments: { action: "run", script: CHECKPOINT_SCRIPT, projectDir },
     });
     assert.equal(result.isError ?? false, false, textOf(result));
     const runId = String(structured(result)?.runId);
@@ -147,7 +147,7 @@ test("checkpoint questions pause and accept an explicit later response over HTTP
     assert.deepEqual((paused?.outcome as { checkpointContext?: { choices?: string[] } })?.checkpointContext?.choices, ["alpha", "beta"]);
     assert.equal(session.elicitations.length, 0, "the original request never opens an elicitation");
     const resumed = await session.client.callTool({ name: "workflow", arguments: {
-      action: "resume", requestId: randomUUID(), runId, checkpointReplies: { 0: "alpha" },
+      action: "resume", runId, checkpointReplies: { 0: "alpha" },
     } });
     assert.equal(structured(resumed)?.accepted, true);
     await waitForRun(session.client, runId, (run) => run.status === "completed");
@@ -166,7 +166,7 @@ test("a client without elicitation receives the same persistent unanswered check
     const session = await connectHttp(daemon.url); // no elicitation capability
     const result = await session.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: CHECKPOINT_SCRIPT, projectDir },
+      arguments: { action: "run", script: CHECKPOINT_SCRIPT, projectDir },
     });
     assert.equal(result.isError ?? false, false, textOf(result));
     const runId = String(structured(result)?.runId);
@@ -197,7 +197,7 @@ test("a successor session answers setup still owned by its live predecessor", as
   let runId: string | undefined;
   try {
     const accepted = await first.client.callTool({ name: "workflow", arguments: {
-      action: "run", requestId: randomUUID(), projectDir,
+      action: "run", projectDir,
       script: 'export const meta = { name: "setup-succession", description: "live setup owner", backends: { custom: { command: "never-invoked-fixture" } } }; return 42;',
     } });
     runId = String(structured(accepted)?.runId);

@@ -311,7 +311,7 @@ const terminalStatuses = ["paused", "completed", "failed", "aborted"] as const;
 const nonterminalStatuses = ["pending", "running"] as const;
 const commonOutputFields = ["runId", "status", "scriptUri", "resultUri", "eventsUri", "limits"] as const;
 const runOutputRequired = ["runId", "status", "scriptUri"] as const;
-const acceptanceFields = ["runId", "status", "scriptUri", "eventsUri", "limits", "action", "accepted", "requestId", "duplicate", "continuation", "setup", "scriptSource"] as const;
+const acceptanceFields = ["runId", "status", "scriptUri", "eventsUri", "limits", "action", "accepted", "continuation", "setup", "scriptSource"] as const;
 const executionDetailFields = [
   "result",
   "tokenUsage",
@@ -363,7 +363,7 @@ const stopControlSchema = z.object({
 const variantOutputFields = [
   ...executionDetailFields,
   "scriptSource",
-  "accepted", "requestId", "duplicate", "continuation", "setup", "setupId",
+  "accepted", "continuation", "setup", "setupId",
   ...inspectionFields,
   "outcome",
   "stopped",
@@ -411,8 +411,6 @@ export const workflowToolOutputShape = z
     action: z.enum(["run", "resume", "setup-response", "config", "result"]).optional(),
     ok: z.boolean().optional(),
     accepted: z.literal(true).optional(),
-    requestId: workflowToolInputShape.requestId.optional(),
-    duplicate: z.boolean().optional(),
     continuation: continuationSchema.optional(),
     setupId: z.string().uuid().optional(),
     setup: setupSchema.optional(),
@@ -475,7 +473,7 @@ export const workflowToolOutputShape = z
         hasOnlyExactFields(value, ["action", "ok", "harnessOptions", "omittedHarnesses", "models", "authoringSummary"]);
     } else if (value.action === "run" || value.action === "resume") {
       valid = runCommonComplete && has("eventsUri") && has("limits") && has("scriptSource") &&
-        value.accepted === true && has("requestId") && has("duplicate") &&
+        value.accepted === true &&
         (value.action === "resume" ? has("continuation") : !has("continuation")) &&
         hasOnlyExactFields(value, acceptanceFields);
     } else if (value.action === "setup-response") {
@@ -536,7 +534,7 @@ export const workflowToolOutputShape = z
       },
       {
         title: "Workflow operation acceptance",
-        required: [...runOutputRequired, "action", "accepted", "requestId", "duplicate", "eventsUri", "scriptSource", "limits"],
+        required: [...runOutputRequired, "action", "accepted", "eventsUri", "scriptSource", "limits"],
         properties: { action: { enum: ["run", "resume"] }, accepted: { const: true } },
         ...forbidsExactOutside(acceptanceFields),
         if: { properties: { action: { const: "resume" } } },
@@ -658,8 +656,6 @@ export interface WorkflowExecutionOutcome<T = unknown> {
 
 interface WorkflowOperationAcceptedBase extends WorkflowExecutionScriptResourceFields {
   accepted: true;
-  requestId: string;
-  duplicate: boolean;
   runId: string;
   status: WorkflowRunStatus["status"];
   limits: WorkflowRunLimits;

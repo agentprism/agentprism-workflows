@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { runAndObserve, waitForRun } from "./_harness.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -123,7 +122,7 @@ test("initialize advertises full resources capabilities and scriptPath snapshots
     const unreadablePath = join(dir, "missing.workflow.js");
     const unreadable = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), scriptPath: unreadablePath },
+      arguments: { action: "run", scriptPath: unreadablePath },
     });
     assert.equal(unreadable.isError, true);
     assert.match(
@@ -137,7 +136,7 @@ test("initialize advertises full resources capabilities and scriptPath snapshots
     );
     const result = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), scriptPath },
+      arguments: { action: "run", scriptPath },
     });
     const runId = String(structured(result)?.runId);
     const uri = `workflow://runs/${runId}/script`;
@@ -170,7 +169,7 @@ test("admission readback preserves authored args and the original persisted scri
   try {
     const result = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script, args },
+      arguments: { action: "run", script, args },
     });
     assert.equal(structured(result)?.result, undefined);
     const observed = await waitForRun(client, String(structured(result)?.runId));
@@ -209,9 +208,8 @@ test("readback rejects a transient initial save failure before execution can res
     const result = await client.callTool({
       name: "workflow",
       arguments: {
-        action: "run", requestId: randomUUID(),
-        script: [
-          'export const meta = { name: "failed-admission", description: "must not execute" };',
+        action: "run", script: [
+          'export const meta = { name: "failed-admission", description: "must not execute", model: "claude" };',
           'return await agent("must not start");',
         ].join("\n"),
       },
@@ -254,7 +252,7 @@ test("a failed terminal snapshot save never advertises exact-result availability
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
 
   try {
-    const completed = await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT } });
+    const completed = await client.callTool({ name: "workflow", arguments: { action: "run", script: NO_AGENT_SCRIPT } });
     const runId = String(structured(completed)?.runId);
     assert.equal(structured(completed)?.accepted, true);
     await waitUntil(() => manager.getRun(runId)?.executionSettled === true, "failed final save must settle live execution");
@@ -303,8 +301,7 @@ test("a failed initial save cannot execute a checkpoint or leave a transport for
   client.setRequestHandler("elicitation/create", async () => { elicitations++; return { action: "decline" }; });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   try {
-    const failed = await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(),
-      script: 'export const meta = { name: "checkpoint", description: "pre-VM admission" }; return checkpoint("Ship?");' } });
+    const failed = await client.callTool({ name: "workflow", arguments: { action: "run", script: 'export const meta = { name: "checkpoint", description: "pre-VM admission" }; return checkpoint("Ship?");' } });
     assert.equal(failed.isError, true);
     assert.equal(failed.structuredContent, undefined);
     assert.equal(resourceLinks(failed).length, 0);
@@ -337,9 +334,8 @@ test("persistent acceptance failure never starts the runner and leaves no run, r
     const result = await client.callTool({
       name: "workflow",
       arguments: {
-        action: "run", requestId: randomUUID(),
-        script: [
-          'export const meta = { name: "failed-admission", description: "must not execute" };',
+        action: "run", script: [
+          'export const meta = { name: "failed-admission", description: "must not execute", model: "claude" };',
           'return await agent("must not start");',
         ].join("\n"),
       },
@@ -389,7 +385,7 @@ test("persistent admission save failure returns no URI and cleans the run, resou
     await client.listTools();
     const result = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     assert.equal(result.isError, true);
     assert.equal(result.structuredContent, undefined);
@@ -437,11 +433,11 @@ test("concurrent inline and path results report source without persisting it int
   try {
     const inlinePromise = client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: TWO_AGENT_SCRIPT },
+      arguments: { action: "run", script: TWO_AGENT_SCRIPT },
     });
     const pathPromise = client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), scriptPath },
+      arguments: { action: "run", scriptPath },
     });
     await waitUntil(() => pending.length === 2, "both identical admissions should execute concurrently");
     pending.splice(0).forEach((resolve) => resolve());
@@ -639,7 +635,7 @@ test("resource listing/completion are bounded to 50 newest; subscribe, deletion,
   try {
     const admitted = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     const runId = String(structured(admitted)?.runId);
     const uri = `workflow://runs/${runId}/script`;
@@ -676,7 +672,7 @@ test("a fresh MCP session can retrieve a checkpoint script and continue that exa
   try {
     const accepted = await first.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script },
+      arguments: { action: "run", script },
     });
     runId = String(structured(accepted)?.runId);
     await waitUntil(async () => structured(await first.client.callTool({
@@ -701,8 +697,7 @@ test("a fresh MCP session can retrieve a checkpoint script and continue that exa
     const resumed = await second.client.callTool({
       name: "workflow",
       arguments: {
-        action: "resume", requestId: randomUUID(),
-        runId: runId!,
+        action: "resume", runId: runId!,
         checkpointReplies: { 0: true },
       },
     });
@@ -732,7 +727,7 @@ test("cold status does not infer an admission-only script source", async () => {
   try {
     const result = await first.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT },
+      arguments: { action: "run", script: NO_AGENT_SCRIPT },
     });
     runId = String(structured(result)?.runId);
     await waitForRun(first.client, runId);

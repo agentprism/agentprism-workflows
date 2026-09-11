@@ -369,9 +369,6 @@ function MonitorBody({
   const [loopSelections, setLoopSelections] = useState<
     ReadonlyMap<string, number>
   >(new Map());
-  // A status outage can temporarily unmount controls; keep resume retry identities with the view.
-  const resumeRequests = useRef(new Map<string, string>());
-
   // Once the poll loop has given up for good the panel can no longer act on the run: freeze the
   // live affordances (Stop) and show a stale marker instead of the transient "reconnecting…".
   const live =
@@ -592,7 +589,6 @@ function MonitorBody({
           snapshot={snapshot}
           selected={selectedAgent}
           onRefresh={onRefresh}
-          resumeRequests={resumeRequests.current}
         />
       )}
       <div className="selection-toolbar">

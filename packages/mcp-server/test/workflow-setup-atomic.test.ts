@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,9 +32,8 @@ for (const response of cancellations) {
     const activeRuns = new ActiveRunRegistry();
     const lifecycle = new WorkflowLifecycle({ projectDir: root, manager, activeRuns }, runner);
     try {
-      const accepted = lifecycle.accept({
-        action: "run", requestId: randomUUID(),
-        script: 'export const meta = { name: "setup-cancel", description: "atomic decision", backends: { custom: { command: "custom-acp" } } }; return await agent("must not run", { model: "custom" });',
+      const accepted = await lifecycle.prepare({
+        action: "run", script: 'export const meta = { name: "setup-cancel", description: "atomic decision", backends: { custom: { command: "custom-acp" } } }; return await agent("must not run", { model: "custom" });',
       });
       let setup = workflowSetup(disk.load(accepted.runId));
       for (let count = 0; count < 100 && setup?.state !== "input-required"; count++) {
@@ -81,8 +79,7 @@ test("cold setup approval cannot bypass four reserved runs and can retry after a
   const runner = makeRunner(() => { throw new Error("no agent dispatch expected"); });
   const firstManager = new WorkflowManager({ ...paths, agent: runner });
   const first = new WorkflowLifecycle({ projectDir: root, manager: firstManager, activeRuns: new ActiveRunRegistry() }, runner);
-  const input = () => ({ action: "run" as const, requestId: randomUUID(),
-    script: 'export const meta = { name: "capacity", description: "pending approval", backends: { custom: { command: "custom-acp" } } }; return 42;' });
+  const input = () => ({ action: "run" as const, script: 'export const meta = { name: "capacity", description: "pending approval", backends: { custom: { command: "custom-acp" } } }; return 42;' });
   const waitForSetup = async (manager: WorkflowManager, runId: string) => {
     for (let count = 0; count < 100; count++) {
       const setup = workflowSetup(manager.getPersistence().load(runId));
@@ -92,13 +89,14 @@ test("cold setup approval cannot bypass four reserved runs and can retry after a
     assert.fail("expected pending setup");
   };
   try {
-    const original = first.accept(input());
+    const original = await first.prepare(input());
     const originalSetup = await waitForSetup(firstManager, original.runId);
     firstManager.getPersistence().releaseRunLease(firstManager.getRun(original.runId)!.lease!);
     const manager = new WorkflowManager({ ...paths, agent: runner });
     const activeRuns = new ActiveRunRegistry();
     const lifecycle = new WorkflowLifecycle({ projectDir: root, manager, activeRuns }, runner);
-    const activeIds = Array.from({ length: 4 }, () => lifecycle.accept(input()).runId);
+    const activeIds: string[] = [];
+    for (let count = 0; count < 4; count++) activeIds.push((await lifecycle.prepare(input())).runId);
     const activeSetups = await Promise.all(activeIds.map(runId => waitForSetup(manager, runId)));
     const response = { action: "setup-response" as const, runId: original.runId, setupId: originalSetup.id,
       response: { action: "accept" as const, content: { approve: true } } };

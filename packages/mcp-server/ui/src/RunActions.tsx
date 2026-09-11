@@ -235,32 +235,18 @@ function CheckpointForm({
   app,
   snapshot,
   onRefresh,
-  resumeRequests,
 }: {
   app: App;
   snapshot: RunStatusSnapshot;
   onRefresh: () => void;
-  resumeRequests: Map<string, string>;
 }) {
   const checkpoint = snapshot.checkpointContext!;
   const [answer, setAnswer] = useState<string | undefined>();
   const command = useCommand(app, onRefresh);
   const submit = (decision: unknown) => {
-    const key = JSON.stringify([
-      snapshot.runId,
-      checkpoint.callIndex,
-      checkpoint.hash,
-      decision,
-    ]);
-    let requestId = resumeRequests.get(key);
-    if (!requestId) {
-      requestId = crypto.randomUUID();
-      resumeRequests.set(key, requestId);
-    }
     void command.execute({
       action: "resume",
       runId: snapshot.runId,
-      requestId,
       checkpointReplies: { [checkpoint.callIndex]: decision },
     });
   };
@@ -523,13 +509,11 @@ export function RunActions({
   snapshot,
   selected,
   onRefresh,
-  resumeRequests,
 }: {
   app: App;
   snapshot: RunStatusSnapshot | undefined;
   selected: NodeModel | undefined;
   onRefresh: () => void;
-  resumeRequests: Map<string, string>;
 }) {
   if (!snapshot) return null;
   return (
@@ -566,7 +550,6 @@ export function RunActions({
           app={app}
           snapshot={snapshot}
           onRefresh={onRefresh}
-          resumeRequests={resumeRequests}
         />
       )}
       {snapshot.status === "paused" &&

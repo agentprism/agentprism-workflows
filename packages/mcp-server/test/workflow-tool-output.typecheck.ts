@@ -44,8 +44,6 @@ const resultRetrieval: WorkflowResultRetrieval = {
 const acceptance: WorkflowOperationAccepted = {
   action: "run",
   accepted: true,
-  requestId: "request-1",
-  duplicate: false,
   runId: "aa-bb",
   status: "running",
   scriptSource: "stored",
@@ -114,13 +112,11 @@ const resultRetrievalWithoutChunk: WorkflowResultRetrieval = {
   hasMore: false,
 };
 const acceptanceFields = {
-  action: "run" as const, accepted: true as const, duplicate: false, requestId: "request-1",
-  runId: "aa-bb", status: "pending" as const, scriptSource: "inline" as const,
+  action: "run" as const, accepted: true as const, runId: "aa-bb", status: "pending" as const, scriptSource: "inline" as const,
   scriptUri: "workflow://runs/aa-bb/script", eventsUri: "workflow://runs/aa-bb/events", limits,
 };
-const { requestId: _requestId, ...noIdentity } = acceptanceFields;
-// @ts-expect-error acceptance requires retry identity
-const acceptanceWithoutIdentity: WorkflowOperationAccepted = noIdentity;
+// @ts-expect-error acceptance carries no retry identity any more
+const acceptanceWithIdentity: WorkflowOperationAccepted = { ...acceptanceFields, requestId: "retry-1" };
 const { scriptSource: _scriptSource, ...noSource } = acceptanceFields;
 // @ts-expect-error acceptance requires accepted source classification
 const acceptanceWithoutSource: WorkflowOperationAccepted = noSource;
@@ -168,7 +164,7 @@ void [
   resourceFields,
   removedBudgetLimit,
   removedCallDebit,
-  acceptanceWithoutIdentity,
+  acceptanceWithIdentity,
   acceptanceWithoutSource,
   acceptanceWithoutLimits,
   acceptanceWithoutEvents,

@@ -2,7 +2,6 @@
 // any session that inspected it, and no one else. Each session has its own server instance, so
 // "which client" is answered by where the tool call ran.
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 
 import { CLAUDE_CHANNEL_NOTIFICATION, type ClaudeChannelNotificationParams } from "../../src/channel-notifier.js";
@@ -33,7 +32,7 @@ test("channel notifications go to the admitting session and to a session that in
 
     const started = await admitter.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: ONE_AGENT_SCRIPT, projectDir },
+      arguments: { action: "run", script: ONE_AGENT_SCRIPT, projectDir },
     });
     const runId = structured(started)?.runId as string;
     assert.ok(runId, textOf(started));

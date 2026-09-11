@@ -5,7 +5,7 @@
 ## Same-run continuation journal
 
 Each `agent()` and `checkpoint()` result is journaled under a monotonic call index and identity hash.
-MCP `{ action:"resume", requestId, runId }` reloads the same run's persisted script, args, canonical effective
+MCP `{ action:"resume", runId }` reloads the same run's persisted script, args, canonical effective
 agent configuration, journal, events, cumulative usage, and checkpoint decisions. It returns the
 same `runId`; there is no public execution-attempt or child-run model.
 
@@ -21,8 +21,7 @@ Every actual call must resolve a model; additional configured calls are allowed.
 or old-format admission fails closed. Checkpoint replies are first-writer-wins under the run lease and become permanent
 journal facts with `checkpointDecision:"explicit-v1"`. Historical ambiguous/automatic answers and
 missing admission metadata cannot authorize execution; inspect them read-only and start a fresh
-run. Retry the same request ID with identical inputs after a lost acknowledgement; a new
-continuation needs a fresh ID.
+run.
 
 ## <a name="custom-backends-metabackends"></a>Custom backends — `meta.backends`
 

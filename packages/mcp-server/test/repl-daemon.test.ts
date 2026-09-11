@@ -44,7 +44,6 @@
  */
 
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -742,7 +741,6 @@ test("workflow calls register project presence: a workflow-only client B keeps t
         name: "workflow",
         arguments: {
           action: "run",
-          requestId: randomUUID(),
           projectDir: PROJECT,
           script: 'export const meta = { name: "empty", description: "empty script" };',
         },

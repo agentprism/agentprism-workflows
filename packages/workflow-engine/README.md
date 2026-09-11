@@ -205,8 +205,8 @@ MCP enables `requireAgentConfiguration` for actual-call checks. The optional
 `onMissingAgentConfiguration({ label, phase? })` callback supplies diagnostics only and cannot route
 a call. SDK promise-based APIs and `executionAdmission` remain independently supported.
 
-Hosts that separate durable acceptance from execution use `prepareRun`, `claimPreparedRun`,
-`updatePreparation`, and `admitPreparedRun`. To finish setup without execution, call
+Hosts that park a validated run for setup before execution use `prepareRun`, `claimPreparedRun`,
+`updatePreparation`, and `admitPreparedRun`; `prepareRun` mints a fresh engine run identity. To finish setup without execution, call
 `settlePreparedRun(runId, "failed" | "aborted", error, { responses?, expectedRevision? })`.
 `responses` maps exact setup request IDs to their canonical response fingerprints; `expectedRevision`
 guards the observed preparation revision. The first mandatory save commits receipts and terminal

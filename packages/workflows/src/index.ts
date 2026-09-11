@@ -96,6 +96,8 @@ export {
 //    the `agentprism-workflows validate` CLI (./cli.ts). ──
 export {
   validateWorkflowScript,
+  validationAbortError,
+  isValidationAbortError,
   fabricateFromSchema,
   formatValidateReport,
   MOCK_TOKENS_PER_AGENT,
@@ -147,9 +149,7 @@ export type {
   WorkflowAgentCallCancellation,
   WorkflowContinuationRefusalReason,
   WorkflowContinuationStart,
-  WorkflowOperationIdentity,
   WorkflowPreparation,
-  PersistedWorkflowContinuationOperation,
   PersistedRunStopResult,
   AgentOptions,
   ExecOptions,

@@ -38,7 +38,11 @@ import type {
   WorkflowRunStatus,
 } from "@automatalabs/workflows";
 import type { AgentRunner, TokenUsage } from "@automatalabs/shared-types";
-import { boundWorkflowRequest, workflowLifecycle, workflowOperation, workflowSetup } from "./workflow-lifecycle.js";
+import {
+  boundWorkflowRequest, isPreparationCancelled, WorkflowPreparationRejected, workflowLifecycle, workflowSetup,
+  type WorkflowPreparationOutcome,
+} from "./workflow-lifecycle.js";
+import { createProgressReporter } from "./progress.js";
 import { CLAUDE_CHANNEL_CAPABILITY, ClaudeChannelNotifier } from "./channel-notifier.js";
 import {
   createEvalBreakChannel,
@@ -972,7 +976,7 @@ export function createWorkflowServer(
     title: "Run and manage deterministic agent workflows",
     description:
         "Validate, run, resume, observe, and control deterministic JavaScript agent workflows. " +
-        "Use config before pinning live model, mode, or config-option ids; run validates explicit script or scriptPath content; resume continues the exact runId from durable state. " +
+        "Use config before pinning live model, mode, or config-option ids. run validates explicit script or scriptPath content inside the request (cancel the request to abandon it) and returns once execution has started; resume continues the exact runId from durable state. " +
         "Use status for an immediate snapshot, result for exact completed JSON, permissions-response for a pending ACP choice, and stop for a run or one live call. " +
         (requireProjectDir
           ? "Config and run require an absolute projectDir on this shared daemon. "
@@ -1514,15 +1518,14 @@ export function createWorkflowServer(
         lifecycle.recover(parsedInput.runId);
         const input = clampWorkflowInput(parsedInput);
         const persisted = manager.getPersistence().load(input.runId);
-        const knownOperation = persisted?.continuationOperations?.some((operation) => operation.id === input.requestId) === true;
-        const needsReservation = !knownOperation && !context.activeRuns.has(input.runId);
+        const needsReservation = !context.activeRuns.has(input.runId);
         if (needsReservation && !context.activeRuns.reserve()) {
           throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Workflow limit reached (4 active or preparing runs)");
         }
         let reserved = needsReservation;
         try {
           const started = await manager.continueRun(input.runId, {
-            agent: runner, operation: workflowOperation(input), maxAgents: input.maxAgents,
+            agent: runner, maxAgents: input.maxAgents,
             onMissingAgentConfiguration: () => missingRoutingDiagnostics(probeRunner, context.projectDir, persisted?.admission?.scriptBackends),
             concurrency: input.concurrency, agentRetries: input.agentRetries, checkpointReplies: input.checkpointReplies,
           });
@@ -1542,31 +1545,53 @@ export function createWorkflowServer(
                 (requiresFreshRun ? " Please start a fresh run." : "") +
                 (started.resolvedCheckpoints?.length ? `\n${JSON.stringify(started.resolvedCheckpoints)}` : "") }], isError: !informational };
           }
-          if (!started.duplicate) {
-            context.activeRuns.track(input.runId, started.promise);
-            reserved = false;
-          }
+          context.activeRuns.track(input.runId, started.promise);
+          reserved = false;
           channel?.watch(input.runId);
           const state = manager.getPersistence().load(input.runId)!;
-          return { structuredContent: { action: "resume", accepted: true, runId: input.runId, requestId: input.requestId,
-              duplicate: started.duplicate === true, continuation: started.continuation,
+          return { structuredContent: { action: "resume", accepted: true, runId: input.runId,
+              continuation: started.continuation,
               status: state.status, scriptSource: "stored", scriptUri: workflowScriptUri(input.runId),
               eventsUri: scriptResources.availableEventsUri(input.runId), limits: state.limits },
             content: [{ type: "text", text: `Continuation accepted for workflow run ${input.runId}. Use status to inspect it; use result after completion.` },
               ...scriptContentBlocks(scriptResources, input.runId), ...eventsContentBlocks(scriptResources, input.runId)], isError: false };
         } finally { if (reserved) context.activeRuns.releaseReservation(); }
       }
-      const accepted = lifecycle.accept(parsedInput);
-      const state = manager.getPersistence().load(accepted.runId)!;
-      scriptResources.notifyRunAdmitted(accepted.runId);
-      channel?.watch(accepted.runId);
+      // Preparation (source read, static parse, mock dry run, live probes) runs inside this
+      // request. Nothing is persisted until it succeeds: a validation failure is a tool execution
+      // error and a cancelled request leaves no run behind. Only a declared backend awaiting
+      // approval parks the validated run in durable setup before execution starts.
+      let outcome: WorkflowPreparationOutcome;
+      try {
+        outcome = await lifecycle.prepare(parsedInput, {
+          signal: ctx.mcpReq.signal,
+          progress: createProgressReporter(ctx),
+          // Register interest before execution or a setup announcement can race ahead of it.
+          onAdmitted: (runId) => {
+            scriptResources.notifyRunAdmitted(runId);
+            channel?.watch(runId);
+          },
+        });
+      } catch (error) {
+        if (isPreparationCancelled(error)) {
+          throw new ProtocolError(ProtocolErrorCode.InternalError, "Workflow run was cancelled before admission; nothing was started.");
+        }
+        if (error instanceof WorkflowPreparationRejected) {
+          return { content: [{ type: "text", text: `Workflow run was not started: ${error.message}` }], isError: true };
+        }
+        throw error;
+      }
+      const state = manager.getPersistence().load(outcome.runId)!;
+      const summary = outcome.setup
+        ? `Workflow run ${outcome.runId} validated and is waiting for setup: answer status.setup.request with setup-response to start it.`
+        : `Workflow run ${outcome.runId} started. Use workflow_monitor with this runId to open its panel, or status for checkpoints, permissions, and completion.`;
       return {
-        structuredContent: { action: "run", accepted: true, runId: accepted.runId, requestId: parsedInput.requestId,
-          duplicate: accepted.duplicate, status: state.status, scriptSource: parsedInput.script === undefined ? "path" : "inline",
-          scriptUri: workflowScriptUri(accepted.runId), eventsUri: scriptResources.availableEventsUri(accepted.runId),
+        structuredContent: { action: "run", accepted: true, runId: outcome.runId,
+          status: state.status, scriptSource: parsedInput.script === undefined ? "path" : "inline",
+          scriptUri: workflowScriptUri(outcome.runId), eventsUri: scriptResources.availableEventsUri(outcome.runId),
           limits: state.limits, setup: workflowSetup(state) },
-        content: [{ type: "text", text: `Workflow run ${accepted.runId} accepted. Preparation and execution continue independently. Use workflow_monitor with this runId to open its panel, or status for setup, checkpoints, permissions, and completion. Retry a lost acknowledgement with the same requestId.` },
-          ...scriptContentBlocks(scriptResources, accepted.runId), ...eventsContentBlocks(scriptResources, accepted.runId)],
+        content: [{ type: "text", text: summary },
+          ...scriptContentBlocks(scriptResources, outcome.runId), ...eventsContentBlocks(scriptResources, outcome.runId)],
         isError: false,
       };
   };
@@ -1577,7 +1602,13 @@ export function createWorkflowServer(
   // tools/call, and over the stdio shim those arrive as independent HTTP POSTs), so gating
   // the tool on that notification let a client's very first request reach a server with
   // nothing registered: an empty tools/list, or a tool-not-found result on the first call.
-  mcp.registerTool("workflow", workflowToolConfig, (args, ctx) => boundWorkflowRequest(Promise.resolve(workflowToolHandler(args, ctx))));
+  mcp.registerTool("workflow", workflowToolConfig, (args, ctx) => {
+    // run and resume prepare inside the request under the preparation ceiling and the request's
+    // own cancellation signal; every observation action keeps the short transport bound.
+    const action = (args as { action?: unknown } | undefined)?.action;
+    const work = Promise.resolve(workflowToolHandler(args, ctx));
+    return action === "run" || action === "resume" ? work : boundWorkflowRequest(work);
+  });
 
   // Register the Apps union once. tools/list, direct app-only calls, and the fixed UI resource
   // are projected from the current request's capabilities; no modern request inherits another

@@ -38,11 +38,9 @@ export {
   type PersistedRunStopResult,
 } from "./workflow-manager.js";
 export {
-  MAX_WORKFLOW_CONTINUATION_OPERATIONS,
+  MAX_WORKFLOW_SETUP_RESPONSES,
   MAX_WORKFLOW_PREPARATION_BYTES,
-  type WorkflowOperationIdentity,
   type WorkflowPreparation,
-  type PersistedWorkflowContinuationOperation,
 } from "./workflow-preparation.js";
 export {
   createRunPersistence,

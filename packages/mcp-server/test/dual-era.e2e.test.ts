@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -158,7 +157,7 @@ async function exerciseEra(
 
     const result = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: SCRIPT, projectDir },
+      arguments: { action: "run", script: SCRIPT, projectDir },
     });
     assert.equal(result.isError, false);
     return {
@@ -218,12 +217,12 @@ test("modern envelope classification wins over a stale legacy session header", a
     const response = await rawModernToolCall(
       daemon.url,
       1,
-      { action: "run", requestId: randomUUID(), script: SCRIPT, projectDir },
+      { action: "run", script: SCRIPT, projectDir },
       undefined,
       { "mcp-session-id": "stale-legacy-session" },
     );
     assert.equal(response.error, undefined);
-    assert.equal((response.result?.structuredContent as Record<string, unknown> | undefined)?.status, "pending");
+    assert.equal((response.result?.structuredContent as Record<string, unknown> | undefined)?.status, "running");
     assert.equal((response.result?.structuredContent as Record<string, unknown>)?.accepted, true);
     assert.equal(daemon.sessions.size, 0);
   } finally {
@@ -236,7 +235,7 @@ for (const protocolMode of ["legacy", "modern"] as const) {
     const daemon = await startDaemon(okRunner());
     const projectDir = makeProjectDir(`dual-era-retired-state-${protocolMode}`);
     const connected = await connectHttp(daemon.url, { protocolMode });
-    const args = { action: "run", requestId: randomUUID(), script: SCRIPT, projectDir };
+    const args = { action: "run", script: SCRIPT, projectDir };
     try {
       for (const retired of [
         { requestState: "retired-token" },
@@ -250,7 +249,6 @@ for (const protocolMode of ["legacy", "modern"] as const) {
       }
       const accepted = structured(await connected.client.callTool({ name: "workflow", arguments: args }));
       assert.equal(accepted?.accepted, true);
-      assert.equal(accepted?.duplicate, false, "retired wire fields never create a run or receipt");
       await waitForRun(connected.client, String(accepted?.runId), (run) => run.status === "completed");
     } finally {
       await connected.dispose();
@@ -269,7 +267,7 @@ for (const protocolMode of ["legacy", "modern"] as const) {
       const script = `export const meta = { name: "checkpoint", description: "explicit checkpoint" };
 return await checkpoint("Pick one", { kind: "select", choices: ["alpha", "beta"] });`;
       const accepted = await connected.client.callTool({ name: "workflow", arguments: {
-        action: "run", requestId: randomUUID(), script, projectDir,
+        action: "run", script, projectDir,
       } });
       assert.equal(structured(accepted)?.accepted, true);
       const runId = String(structured(accepted)?.runId);
@@ -279,7 +277,7 @@ return await checkpoint("Pick one", { kind: "select", choices: ["alpha", "beta"]
       assert.deepEqual(outcome.checkpointContext?.choices, ["alpha", "beta"]);
       assert.equal(connected.elicitations.length, 0);
       const resumed = await connected.client.callTool({ name: "workflow", arguments: {
-        action: "resume", requestId: randomUUID(), runId,
+        action: "resume", runId,
         checkpointReplies: { [outcome.checkpointContext!.callIndex]: "alpha" },
       } });
       assert.equal(structured(resumed)?.accepted, true);
@@ -338,7 +336,7 @@ for (const protocolMode of ["legacy", "modern"] as const) {
 return await agent("work", { label: "worker", model: "codex" });`;
       const terminal = await connected.client.callTool({
         name: "workflow",
-        arguments: { action: "run", requestId: randomUUID(), script, projectDir },
+        arguments: { action: "run", script, projectDir },
       });
       assert.equal(terminal.isError, false, JSON.stringify(terminal.content));
       assert.equal(structured(terminal)?.accepted, true);
@@ -403,7 +401,7 @@ for (const protocolMode of ["legacy", "modern"] as const) {
 return await agent("work", { label: "worker", model: "codex" });`;
       const accepted = await connected.client.callTool({
         name: "workflow",
-        arguments: { action: "run", requestId: randomUUID(), script, projectDir },
+        arguments: { action: "run", script, projectDir },
       });
       const runId = structured(accepted)?.runId as string;
       await waitUntil(() => broker.has(runId), `${protocolMode} background permission request`);
@@ -453,7 +451,7 @@ test("modern durable setup enforces script-backend approval before execution", a
 return await agent("approved backend", { model: "browser" });`;
     const result = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script, projectDir },
+      arguments: { action: "run", script, projectDir },
     });
     assert.equal(result.isError, false);
     const runId = String(structured(result)?.runId);
@@ -496,7 +494,7 @@ test("modern subscriptions/listen receives list and durable run-event updates", 
 return await agent("wait", { label: "wait" });`;
     const accepted = await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script, projectDir },
+      arguments: { action: "run", script, projectDir },
     });
     const runId = structured(accepted)?.runId;
     assert.equal(typeof runId, "string");
@@ -528,7 +526,7 @@ test("modern checkpoints remain unanswered after the authored timeout", async ()
     const script = `export const meta = { name: "modern-timeout", description: "timeout remains explicit" };
 return await checkpoint("Continue?", { kind: "confirm", timeoutMs: 5 });`;
     const accepted = await connected.client.callTool({ name: "workflow", arguments: {
-      action: "run", requestId: randomUUID(), script, projectDir,
+      action: "run", script, projectDir,
     } });
     const runId = String(structured(accepted)?.runId);
     await waitForRun(connected.client, runId);
@@ -554,13 +552,13 @@ return await checkpoint("Continue?", { kind: "confirm" });`;
   writeFileSync(scriptPath, original, "utf8");
   try {
     const accepted = await connected.client.callTool({ name: "workflow", arguments: {
-      action: "run", requestId: randomUUID(), scriptPath, projectDir,
+      action: "run", scriptPath, projectDir,
     } });
     const runId = String(structured(accepted)?.runId);
     await waitForRun(connected.client, runId);
     writeFileSync(scriptPath, `export const meta = { name: "mutated", description: "must not execute" }; return "mutated";`, "utf8");
     const resumed = await connected.client.callTool({ name: "workflow", arguments: {
-      action: "resume", requestId: randomUUID(), runId, checkpointReplies: { 0: true },
+      action: "resume", runId, checkpointReplies: { 0: true },
     } });
     assert.equal(structured(resumed)?.accepted, true);
     assert.equal(structured(resumed)?.scriptSource, "stored");
@@ -575,11 +573,11 @@ return await checkpoint("Continue?", { kind: "confirm" });`;
   }
 });
 
-test("modern operation retries survive daemon replacement and retired requestState is rejected", async () => {
-  const projectDir = makeProjectDir("dual-era-operation-retry");
+test("a paused run survives daemon replacement and retired requestState is rejected", async () => {
+  const projectDir = makeProjectDir("dual-era-daemon-replacement");
   const script = `export const meta = { name: "restart-checkpoint", description: "restart checkpoint" };
 return await checkpoint("Continue?", { kind: "confirm" });`;
-  const args = { action: "run", requestId: randomUUID(), script, projectDir };
+  const args = { action: "run", script, projectDir };
   const firstDaemon = await startDaemon(okRunner());
   const firstClient = await connectHttp(firstDaemon.url, { protocolMode: "modern" });
   let runId: string;
@@ -594,26 +592,20 @@ return await checkpoint("Continue?", { kind: "confirm" });`;
   const successor = await startDaemon(okRunner());
   const connected = await connectHttp(successor.url, { protocolMode: "modern" });
   try {
-    const retry = await connected.client.callTool({ name: "workflow", arguments: args });
-    assert.equal(structured(retry)?.runId, runId);
-    assert.equal(structured(retry)?.duplicate, true);
-    assert.equal(structured(retry)?.status, "paused");
+    const observed = await connected.client.callTool({ name: "workflow", arguments: { action: "status", runId } });
+    assert.equal(structured(observed)?.status, "paused", "the successor sees the exact durable pause");
     const retired = await rawModernToolCall(successor.url, 3, args, {
       requestState: "retired-token", inputResponses: { checkpoint: { action: "accept", content: { approve: true } } },
     });
     assert.equal(retired.error, undefined);
     assert.equal(retired.result?.isError, true);
     assert.match(JSON.stringify(retired.result?.content), /Workflow requestState\/inputResponses are retired/);
-    const changed = await connected.client.callTool({ name: "workflow", arguments: { ...args, script: `${script}\n// changed` } });
-    assert.equal(changed.isError, true);
-    assert.match(JSON.stringify(changed.content), /conflict|different|match/i);
-    const resumedArgs = { action: "resume", requestId: randomUUID(), runId, checkpointReplies: { 0: true } };
+    const resumedArgs = { action: "resume", runId, checkpointReplies: { 0: true } };
     const resumed = await connected.client.callTool({ name: "workflow", arguments: resumedArgs });
     assert.equal(structured(resumed)?.accepted, true);
     await waitForRun(connected.client, runId, (run) => run.status === "completed");
-    const duplicate = await connected.client.callTool({ name: "workflow", arguments: resumedArgs });
-    assert.equal(structured(duplicate)?.duplicate, true);
-    assert.deepEqual(structured(duplicate)?.continuation, structured(resumed)?.continuation);
+    const repeated = await connected.client.callTool({ name: "workflow", arguments: resumedArgs });
+    assert.notEqual(structured(repeated)?.accepted, true, "a completed run is not continued again");
     const exact = await connected.client.callTool({ name: "workflow", arguments: { action: "result", runId } });
     assert.equal(structured(exact)?.chunk, "true");
   } finally {

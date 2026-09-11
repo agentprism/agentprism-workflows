@@ -2,7 +2,6 @@
 // the session whose tool call named the run. Same wording, same ids, no polling.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { randomUUID } from "node:crypto";
 import type { Client } from "@modelcontextprotocol/client";
 import type { PersistedRunEvent } from "@automatalabs/shared-types";
 
@@ -19,6 +18,7 @@ import {
   connect,
   makeRunner,
   okRunner,
+  throwingRunner,
   structured,
   textOf,
   waitForRun,
@@ -36,10 +36,13 @@ const PERMISSION_SCRIPT = [
   'export const meta = { name: "perm", description: "d" };',
   'return await agent("work", { label: "worker", model: "codex" });',
 ].join("\n");
-// An agent failure resolves to a null result; only a script-level throw fails the run.
+// An agent failure resolves to a null result; only a script-level throw fails the run. The throw
+// is conditional on a live null so the validating dry run (mocked, non-null output) admits it.
 const FAILING_SCRIPT = [
-  'export const meta = { name: "boom", description: "fails" };',
-  'throw new Error("script exploded at line one");',
+  'export const meta = { name: "boom", description: "fails", model: "claude" };',
+  'const reply = await agent("work");',
+  'if (reply === null) throw new Error("script exploded at line one");',
+  'return reply;',
 ].join("\n");
 
 function capture(client: Client): ClaudeChannelNotificationParams[] {
@@ -63,7 +66,7 @@ async function until(predicate: () => boolean, what: string, timeoutMs = 10_000)
 const settle = () => new Promise((resolve) => setTimeout(resolve, 150));
 
 async function runScript(client: Client, script: string): Promise<string> {
-  const res = await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(), script } });
+  const res = await client.callTool({ name: "workflow", arguments: { action: "run", script } });
   assert.equal(res.isError, false, textOf(res));
   return structured(res)?.runId as string;
 }
@@ -110,7 +113,7 @@ test("a run admitted by this session announces its completion once, in the App's
 });
 
 test("a failed run announces the failure with the run's own error message, unaltered", async () => {
-  const { client, dispose } = await connect(okRunner());
+  const { client, dispose } = await connect(throwingRunner(() => new Error("agent offline")));
   const received = capture(client);
   try {
     const runId = await runScript(client, FAILING_SCRIPT);
@@ -119,9 +122,8 @@ test("a failed run announces the failure with the run's own error message, unalt
     assertChannelShape(received[0]!, runId);
     assert.equal(received[0]!.meta.kind, "terminal");
     assert.equal(received[0]!.meta.status, "failed");
-    // The engine's recorded message is passed through whole, preparation diagnostics included.
-    assert.match(received[0]!.content, /Run failed: Workflow preparation validation failed/);
-    assert.match(received[0]!.content, /script exploded at line one/);
+    // The engine's recorded message is passed through whole.
+    assert.match(received[0]!.content, /Run failed: .*script exploded at line one/);
   } finally {
     await dispose();
   }

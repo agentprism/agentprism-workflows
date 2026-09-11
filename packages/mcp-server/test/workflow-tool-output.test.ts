@@ -151,8 +151,8 @@ test("runtime and published schemas isolate acceptance, setup, observation, and 
   const published = await workflowToolOutputShape["~standard"].jsonSchema.output({ target: "draft-2020-12" });
   const validate = new AjvJsonSchemaValidator().getValidator(published as JsonSchemaType);
   const accepted = {
-    action: "run", accepted: true, requestId: "request:1", duplicate: false, runId: baseRun.runId,
-    status: "pending", scriptSource: "inline", scriptUri: resources.scriptUri,
+    action: "run", accepted: true, runId: baseRun.runId,
+    status: "running", scriptSource: "inline", scriptUri: resources.scriptUri,
     eventsUri: resources.eventsUri, limits: baseRun.effectiveLimits,
   };
   const resumed = { ...accepted, action: "resume", scriptSource: "stored", continuation: { generation: 1, replayedPrefix: 0 } };
@@ -172,7 +172,7 @@ test("runtime and published schemas isolate acceptance, setup, observation, and 
     accepted, resumed, config, result, terminal, running: observation(), stopped, pendingStop, setup,
     preparing: { ...accepted, setup: { state: "preparing" } },
     waiting: { ...observation(), setup: { state: "input-required", request: setupRequest } },
-    "duplicate settled acceptance": { ...accepted, status: "completed", duplicate: true },
+    "parked acceptance": { ...accepted, status: "pending", setup: { state: "input-required", request: setupRequest } },
   };
   for (const [name, input] of Object.entries(valid)) {
     assert.equal(workflowToolOutputShape.safeParse(input).success, true, `${name} runtime`);
@@ -182,10 +182,10 @@ test("runtime and published schemas isolate acceptance, setup, observation, and 
   const invalid: Record<string, Record<string, unknown>> = {
     "old foreground result": { ...toWorkflowExecutionOutcome(baseRun, resources), scriptSource: "inline" },
     "old background acceptance": { runId: baseRun.runId, status: "running", scriptSource: "inline", scriptUri: resources.scriptUri, eventsUri: resources.eventsUri, limits: baseRun.effectiveLimits },
-    "missing requestId": without(accepted, "requestId"),
+    "retired requestId": { ...accepted, requestId: "retry-1" },
+    "retired duplicate receipt": { ...accepted, duplicate: true },
     "missing eventsUri": without(accepted, "eventsUri"),
     "missing limits": without(accepted, "limits"),
-    "blank requestId": { ...accepted, requestId: "" },
     "acceptance carries immediate result": { ...accepted, result: 42 },
     "settled acceptance carries resultUri": { ...accepted, status: "completed", resultUri: resources.resultUri },
     "run carries continuation": { ...accepted, continuation: { generation: 1, replayedPrefix: 0 } },
@@ -204,7 +204,7 @@ test("runtime and published schemas isolate acceptance, setup, observation, and 
     "stopped carries outcome": { ...stopped, outcome: terminal.outcome },
     "retired checkpoint default": { ...terminal, outcome: { ...terminal.outcome, checkpointContext: { callIndex: 0, hash: "hash", prompt: "p", kind: "confirm", default: true } } },
   };
-  for (const [name, value] of Object.entries({ requestId: "x", accepted: true, duplicate: true, setup: { state: "preparing" }, setupId: setupRequest.id, continuation: { generation: 1, replayedPrefix: 0 } })) {
+  for (const [name, value] of Object.entries({ accepted: true, setup: { state: "preparing" }, setupId: setupRequest.id, continuation: { generation: 1, replayedPrefix: 0 } })) {
     invalid[`config carries ${name}`] = { ...config, [name]: value };
     invalid[`result carries ${name}`] = { ...result, [name]: value };
   }

@@ -77,7 +77,7 @@ export function workflowProbeRunner(runner: AgentRunner): ValidateProbeRunner {
 
 export function validationText(report: ValidateWorkflowReport): string {
   return truncateUtf8(
-    `Workflow preparation validation failed. The accepted run remains available for inspection.\n\n${formatValidateReport(report)}`,
+    `Workflow preparation validation failed.\n\n${formatValidateReport(report)}`,
     MAX_TEXT_BYTES,
     "…[validation diagnostics truncated]",
   );

@@ -15,7 +15,6 @@ import { Client } from "@modelcontextprotocol/client";
 //     a throwaway temp dir instead of the developer's real home.
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXTENSION_ID, RESOURCE_MIME_TYPE } from "../src/mcp-apps.js";
@@ -196,7 +195,7 @@ export async function waitForRun(
 
 /** Test convenience for assertions about an eventual outcome, returning an actual status response. */
 export async function runAndObserve(client: Pick<Client, "callTool">, input: Record<string, unknown>): Promise<ToolCallResult> {
-  const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", requestId: randomUUID(), ...input } });
+  const accepted = await client.callTool({ name: "workflow", arguments: { action: "run", ...input } });
   assert.equal(accepted.isError, false, textOf(accepted));
   assert.equal(structured(accepted)?.accepted, true, "run must acknowledge asynchronous acceptance");
   return await waitForRun(client, String(structured(accepted)?.runId));

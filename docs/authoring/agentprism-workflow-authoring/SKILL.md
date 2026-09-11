@@ -68,20 +68,19 @@ form or automatically selected backend. Mode and config options remain optional.
 
 ## Validation and execution
 
-Every Run requires a caller-generated `requestId`. After bounded input/source checks, the server durably accepts the immutable source and args and returns its `runId` before mock validation, backend probes, or human setup. An early malformed-input/source rejection creates no run. Later preparation failure remains an inspectable failed run, and declined setup remains an inspectable aborted run. No live worker starts until validation and required backend approval and immutable routing admission finish.
+Run prepares the workflow inside the request: bounded input/source checks, a mocked dry run, routed no-prompt config probes, and immutable routing admission. Only when every step succeeds does the server start execution and return the `runId`. Malformed source, a failed dry run, missing routing, or a full project are tool execution errors (`isError:true`) that create no run. A script declaring custom backends is validated the same way, then parked in durable setup (`status:"pending"` with `setup.request`) until approved; declined setup remains an inspectable aborted run. No live worker starts before validation, required backend approval, and admission finish.
 
-Run and Resume always return bounded acknowledgements. Reuse the same `requestId` and identical inputs when an acknowledgement is lost; a new logical operation needs a fresh ID. Retain `runId` for status, setup, checkpoint replies, stop, and results. No workflow execution-mode field is accepted.
+Cancel a Run by cancelling the request: close the Streamable HTTP response stream, or send `notifications/cancelled` on stdio. Preparation stops, nothing is persisted, and the capacity slot is released. Cancellation that arrives after admission is ignored; a run whose acknowledgement was lost is listed under the `workflow://runs/` resources. Supply `_meta.progressToken` to receive preparation stage notifications. Retain `runId` for status, setup, checkpoint replies, stop, and results. No workflow execution-mode field is accepted.
 
 The input is a strict action union: send only fields belonging to the selected action. In particular, `projectDir` belongs to `config` and `run`, not `status`, `result`, `resume`, or `stop`. Some MCP clients report every rejected union branch; when that happens, first check the branch matching your `action` and remove cross-action fields.
 
 ## Minimal MCP lifecycle
 
-Accept a run and retain its `runId`:
+Start a run and retain its `runId`:
 
 ```json
 {
   "action": "run",
-  "requestId": "review-2026-09-08-1",
   "projectDir": "/absolute/project",
   "script": "export const meta = { name: 'review', description: 'Review a target', model: 'codex' }; return await agent(`Review ${args.target}`, { label: 'review' });",
   "args": { "target": "packages/core" }
@@ -96,7 +95,7 @@ Observe the current state. Status is always an immediate snapshot; issue it agai
 
 If `setup.state` is `"input-required"`, answer the backend-approval request at the exact `setup.request.id` with `action:"setup-response"` and fields matching its `requestedSchema`. Setup acceptance is `{ action:"accept", content:{ ... } }`; decline/cancel has no content. A checkpoint is different: it appears in `outcome.checkpointContext` and requires a new Resume with `checkpointReplies`.
 
-Every unanswered `checkpoint()` pauses. For example, answer the exact observed checkpoint index with `{ action:"resume", requestId:"review-answer-1", runId:"RUN_ID", checkpointReplies:{ "1":false } }`. The explicit value follows the script's authored control flow. Timeouts, absent panels, and dismissed interactions cannot supply an answer.
+Every unanswered `checkpoint()` pauses. For example, answer the exact observed checkpoint index with `{ action:"resume", runId:"RUN_ID", checkpointReplies:{ "1":false } }`. The explicit value follows the script's authored control flow. Timeouts, absent panels, and dismissed interactions cannot supply an answer.
 
 To open an App, call the separate `workflow_monitor` tool with `{ "runId":"RUN_ID" }`. Lifecycle operations carry no UI attachment. A monitor can switch among active/recent runs; status and results remain available without an App.
 
@@ -109,13 +108,13 @@ After completion, retrieve the exact result. If `hasMore` is true, repeat with `
 Continue an incomplete run in place; do not resend `script` or `args`:
 
 ```json
-{ "action": "resume", "requestId": "review-recovery-1", "runId": "RUN_ID" }
+{ "action": "resume", "runId": "RUN_ID" }
 ```
 
 The response keeps the same `runId` without exposing an execution-attempt identity. It reuses the
 admitted script, args, immutable routing inputs, journal, event stream, cumulative usage, and
 durable checkpoint decisions. Use `status` on that same ID, then `result` after completion.
-Explicitly stop with `{ action:"stop", runId:"RUN_ID" }`. Client disconnection or a request timeout leaves accepted work owned by the server; process loss preserves durable state for later inspection/recovery.
+Explicitly stop with `{ action:"stop", runId:"RUN_ID" }`. Once a run is admitted, client disconnection leaves it owned by the server; process loss preserves durable state for later inspection/recovery.
 
 ## What to read next
 

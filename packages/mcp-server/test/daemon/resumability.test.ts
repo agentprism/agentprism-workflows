@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 // Spec resumability end-to-end: a client that vanishes mid-call reconnects with the
 // priming event's ID via GET + Last-Event-ID and receives the stored tool response. This
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
@@ -10,7 +9,7 @@ import { test } from "node:test";
 import { structured, waitForRun, ONE_AGENT_SCRIPT } from "../_harness.js";
 import { connectHttp, gatedRunner, makeProjectDir, startDaemon } from "../_http-harness.js";
 
-test("a dropped asynchronous acceptance response is replayed via GET + Last-Event-ID", async () => {
+test("a dropped legacy run acknowledgement is replayed via GET + Last-Event-ID", async () => {
   const { runner, release } = gatedRunner();
   const projectDir = makeProjectDir("resume-project");
   const daemon = await startDaemon(runner);
@@ -24,7 +23,7 @@ test("a dropped asynchronous acceptance response is replayed via GET + Last-Even
     const pending = session.client.request(
       {
         method: "tools/call",
-        params: { name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: ONE_AGENT_SCRIPT, projectDir } },
+        params: { name: "workflow", arguments: { action: "run", script: ONE_AGENT_SCRIPT, projectDir } },
       },
       { onresumptiontoken: (token) => (resumptionToken ??= token) },
     );
@@ -35,7 +34,8 @@ test("a dropped asynchronous acceptance response is replayed via GET + Last-Even
     // Client dies mid-call: sockets abort, no DELETE, no CancelledNotification.
     await session.transport.close();
 
-    // Spec: disconnect is NOT cancellation — the tool keeps executing server-side.
+    // Legacy (2025) Streamable HTTP: disconnect is NOT cancellation — the admitted run keeps
+    // executing server-side and the stored acknowledgement is replayable.
     release();
     await waitFor(() => daemon.sessions.values()[0]?.openConnections === 0, "connections drained");
 
@@ -52,7 +52,7 @@ test("a dropped asynchronous acceptance response is replayed via GET + Last-Even
     );
     const response = received.find((m) => "result" in m) as { result: { structuredContent?: unknown } };
     const structuredResult = response.result.structuredContent as Record<string, unknown>;
-    assert.equal(structuredResult.status, "pending");
+    assert.equal(structuredResult.status, "running");
     assert.equal(structuredResult.accepted, true);
     const observer = await connectHttp(daemon.url);
     try {

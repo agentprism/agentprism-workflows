@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { randomUUID } from "node:crypto";
 
 import { connect, okRunner, structured, textOf, waitForRun } from "./_harness.js";
 
@@ -20,7 +19,7 @@ test("the first strict checkpoint answer is durable and continues the same runId
   try {
     const first = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: SCRIPT },
+      arguments: { action: "run", script: SCRIPT },
     });
     assert.equal(structured(first)?.accepted, true);
     const paused = structured(await waitForRun(client, String(structured(first)?.runId)));
@@ -32,8 +31,7 @@ test("the first strict checkpoint answer is durable and continues the same runId
     const resumed = await client.callTool({
       name: "workflow",
       arguments: {
-        action: "resume", requestId: randomUUID(),
-        runId,
+        action: "resume", runId,
         checkpointReplies: { "0": "ship" },
       },
     });
@@ -57,26 +55,26 @@ test("same answers are idempotent and conflicting later answers are ignored fore
   try {
     const first = await client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: SCRIPT },
+      arguments: { action: "run", script: SCRIPT },
     });
     const runId = String(structured(first)?.runId);
     await waitForRun(client, runId);
     await client.callTool({
       name: "workflow",
-      arguments: { action: "resume", requestId: randomUUID(), runId, checkpointReplies: { "0": "ship" } },
+      arguments: { action: "resume", runId, checkpointReplies: { "0": "ship" } },
     });
 
     await waitForRun(client, runId, status => status.status === "completed");
     const same = await client.callTool({
       name: "workflow",
-      arguments: { action: "resume", requestId: randomUUID(), runId, checkpointReplies: { "0": "ship" } },
+      arguments: { action: "resume", runId, checkpointReplies: { "0": "ship" } },
     });
     assert.equal(same.isError, false);
     assert.match(textOf(same), /"outcome":"same","decision":"ship"/);
 
     const conflict = await client.callTool({
       name: "workflow",
-      arguments: { action: "resume", requestId: randomUUID(), runId, checkpointReplies: { "0": "hold" } },
+      arguments: { action: "resume", runId, checkpointReplies: { "0": "hold" } },
     });
     assert.equal(conflict.isError, false);
     assert.match(textOf(conflict), /"outcome":"different","decision":"ship","ignored":"hold"/);
@@ -97,7 +95,7 @@ test("cold continuation reconstructs the durable checkpoint decision", async () 
   try {
     const paused = await first.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: SCRIPT },
+      arguments: { action: "run", script: SCRIPT },
     });
     runId = String(structured(paused)?.runId);
     await waitForRun(first.client, runId);
@@ -109,7 +107,7 @@ test("cold continuation reconstructs the durable checkpoint decision", async () 
   try {
     const resumed = await second.client.callTool({
       name: "workflow",
-      arguments: { action: "resume", requestId: randomUUID(), runId, checkpointReplies: { "0": "hold" } },
+      arguments: { action: "resume", runId, checkpointReplies: { "0": "hold" } },
     });
     assert.equal(resumed.isError, false);
     assert.equal(structured(resumed)?.runId, runId);

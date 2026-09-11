@@ -32,7 +32,7 @@ const scriptPathSchema = z
   .string()
   .min(1)
   .refine((value) => isAbsolute(value), "scriptPath must be an absolute path")
-  .describe("Run only: absolute server-side script path, read once at admission.");
+  .describe("Run only: absolute server-side script path, read when the run is admitted.");
 const projectDirSchema = z
   .string()
   .min(1)
@@ -77,10 +77,6 @@ const checkpointRepliesSchema = z
     z.unknown(),
   )
   .describe("Resume only: checkpoint decisions keyed by this run's checkpoint call index.");
-const requestIdSchema = z
-  .string()
-  .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/, "requestId must contain 1..128 identifier characters")
-  .describe("Run/resume retry identity. Reuse for an identical retry; use a fresh ID for a new operation.");
 const setupIdSchema = z.string().uuid().describe("Exact pending setup request ID from status.setup.request.id.");
 const setupResponseSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("accept"), content: z.record(z.string(), z.unknown()) }).strict(),
@@ -153,7 +149,6 @@ export const workflowToolInputShape = {
   concurrency: concurrencySchema,
   agentRetries: agentRetriesSchema,
   checkpointReplies: checkpointRepliesSchema,
-  requestId: requestIdSchema,
   setupId: setupIdSchema,
   runId: runIdSchema,
   permissionId: permissionIdSchema,
@@ -178,7 +173,6 @@ const configInputSchema = z
   .strict();
 
 const executionOptionsShape = {
-  requestId: requestIdSchema,
   projectDir: projectDirSchema.optional(),
   args: argsSchema.optional(),
   maxAgents: maxAgentsSchema.optional(),
@@ -188,14 +182,14 @@ const executionOptionsShape = {
 
 const runInlineInputSchema = z
   .object({
-    action: z.literal("run").describe("Validate and execute explicit workflow content."),
+    action: z.literal("run").describe("Validate explicit workflow content, then start it once preparation succeeds."),
     script: scriptSchema,
     ...executionOptionsShape,
   })
   .strict();
 const runPathInputSchema = z
   .object({
-    action: z.literal("run").describe("Validate and execute explicit workflow content."),
+    action: z.literal("run").describe("Validate explicit workflow content, then start it once preparation succeeds."),
     scriptPath: scriptPathSchema,
     ...executionOptionsShape,
   })
@@ -209,7 +203,6 @@ const resumeInputSchema = z
   .object({
     action: z.literal("resume").describe("Continue this exact run using its durable inputs and configuration."),
     runId: runIdSchema,
-    requestId: requestIdSchema,
     maxAgents: maxAgentsSchema.optional(),
     concurrency: concurrencySchema.optional(),
     agentRetries: agentRetriesSchema.optional(),
@@ -300,7 +293,6 @@ export const workflowToolInputSchema = workflowToolCanonicalInputSchema;
 
 interface WorkflowExecuteToolInputBase {
   action: "run";
-  requestId: string;
   /** Absolute project directory selecting the run store and default execution cwd. */
   projectDir?: string;
   args?: unknown;
@@ -321,7 +313,6 @@ export interface WorkflowResumeToolInput {
   action: "resume";
   /** The exact persisted run to continue. */
   runId: string;
-  requestId: string;
   maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;

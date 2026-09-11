@@ -241,10 +241,9 @@ of `script` and `scriptPath`. There are no aliases or completion-wait controls.
 
 | Field | Actions | Contract |
 | --- | --- | --- |
-| `requestId` | run, resume | Required caller-generated retry identity, 1–128 characters matching `[A-Za-z0-9][A-Za-z0-9._:-]*`. Keep it and the complete input unchanged when retrying a lost acknowledgement. Use a new ID for a new operation. |
 | `script`, `scriptPath` | run | Raw JavaScript or an absolute server-side regular-file path, exactly one. First statement: `export const meta = { name, description, phases? }`. The accepted UTF-8 snapshot is at most 1 MiB and immutable. |
 | `projectDir` | config, run | Absolute project directory, required on the shared daemon; defaults to the server's project under `--in-process`. Other actions locate the project through `runId`. |
-| `args` | run | Strict-JSON script input, immutable after acceptance. |
+| `args` | run | Strict-JSON script input, immutable after admission. |
 | `maxAgents`, `concurrency`, `agentRetries` | run, resume | Runtime limits; default agent cap 1000, concurrency clamped to 16, retries clamped to 3. Resolved limits are returned. |
 | `harnesses`, `modelSpecs`, `modelFilter` | config | Optional backend names, exact routed models, and bounded model substring or `/regex/` filter for no-prompt discovery. |
 | `runId` | resume, setup-response, status, result, permissions-response, stop | Exact persisted identity, matching `^[a-z0-9]+-[a-z0-9]+$`, at most 128 characters. Resume continues the exact run ID. |
@@ -271,31 +270,30 @@ OpenCode's direct models before explicitly classified aggregator browse groups (
 model is shown separately. Expand `openrouter/*` with `modelFilter`; browse selectors cannot dispatch.
 Use `modelSpecs` for exact-model option discovery. Partial probe failures preserve healthy catalogs.
 
-### Durable acceptance and setup
+### Preparation, admission, and setup
 
 ```json
 {
   "action":"run",
-  "requestId":"review-20260908-1",
   "projectDir":"/absolute/project",
   "script":"export const meta = { name: 'review', description: 'review the repository', model: 'codex' }; return await agent('Review the repo');"
 }
 ```
 
-The request validates its input and source structure, acquires the run lease, and durably records
-the immutable script, args, operation identity, limits, and preparation state before returning.
-Slow mock execution, backend probes, and human setup happen after this acknowledgement. Malformed
-source fails before acceptance; a later validation or preparation failure remains an inspectable
-failed run. A repeated `requestId` with the same input finds the original run even if a script file
-has changed or disappeared. Reusing it with different input fails without starting work.
+The request reads the source, checks its structure, runs the mocked dry run and the routed
+no-prompt probes, and only then admits execution under format-3 routing admission and returns.
+Nothing is persisted before admission: malformed source, a failed dry run, missing routing, and a
+full project are tool execution errors (`isError:true`) with no run behind them, and cancelling the
+request (closing the response stream, or `notifications/cancelled` on stdio) abandons preparation
+and releases capacity. A script that declares custom backends is validated the same way and then
+parked in durable setup (`status:"pending"`, `setup.request`) until `setup-response` approves it.
+When the request carries `_meta.progressToken`, preparation stages are reported as progress.
 
 An accepted response is always an acknowledgement, including when work finishes quickly:
 
 ```ts
 type WorkflowOperationAccepted = {
   accepted: true;
-  requestId: string;
-  duplicate: boolean;
   runId: string;
   status: "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
   scriptSource: "inline" | "path" | "stored";
@@ -352,7 +350,7 @@ at 24,576 UTF-8 bytes and status text at 8,192; raw terminal outcome has no new 
 Every unanswered script checkpoint pauses with `reason:"checkpoint_required"`. Use the App or:
 
 ```json
-{ "action":"resume", "requestId":"review-answer-1", "runId":"mabc1234-k9x2pq", "checkpointReplies":{"1":true} }
+{ "action":"resume", "runId":"mabc1234-k9x2pq", "checkpointReplies":{"1":true} }
 ```
 
 Use the exact index from `outcome.checkpointContext`. Confirm replies must be boolean, input replies
@@ -368,8 +366,7 @@ request is cancelled rather than partially exposed. Owner loss invalidates the o
 a successor cannot reconstruct it. Setup and checkpoints, in contrast, are durable waits.
 
 An `AUTH_REQUIRED` pause reports `reason:"auth_required"` and `outcome.authContext`. Configure the
-named backend's credentials out of band, then call `action:"resume"` with a new `requestId` and the
-same `runId`. Continuation uses the immutable stored script, args, cwd, immutable routing inputs,
+named backend's credentials out of band, then call `action:"resume"` with the same `runId`. Continuation uses the immutable stored script, args, cwd, immutable routing inputs,
 journal, event stream, cumulative usage, and checkpoint answers; it never accepts edited input.
 Historical records without current admission or explicit checkpoint provenance remain readable
 where supported but refuse continuation/reuse clearly; start a fresh run.
@@ -464,12 +461,14 @@ client `resources` capability to gate these server-offered primitives.
 
 ## Run model
 
-- **Every run is asynchronous.** Run/resume requests acknowledge durable acceptance. Each lifecycle
-  request has a 45-second bound; each active preparation attempt has a 120-second bound. Human
-  setup and agent execution outlive individual requests. There is no workflow completion wait,
-  request-scoped progress stream, or request-abort ownership of accepted work.
-- **Capacity and retries.** At most four preparing or executing runs per project are active, with
-  no queue. Waiting setup consumes capacity. Failed/stopped/paused/completed work releases it.
+- **Preparation is synchronous; execution is not.** Run and Resume prepare inside the request under
+  a 120-second ceiling, honor request cancellation before admission, and report preparation
+  progress when a progress token is supplied. Observation requests have a 45-second bound. Human
+  setup and agent execution outlive individual requests; there is no workflow completion wait, and
+  cancellation after admission never stops an admitted run.
+- **Capacity.** At most four preparing or executing runs per project are active, with no queue.
+  Waiting setup consumes capacity. Rejected preparation and failed/stopped/paused/completed work
+  release it.
   Exact retries return the existing operation and do not consume another slot, even at capacity.
 - **Same-ID continuation.** Resume durably records its caller operation and generation under the
   run lease before executing. Lost-ack retries reuse that receipt; journal hits add no provider
@@ -675,7 +674,7 @@ A workflow script can **declare its own backends** in `meta.backends` as
 `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` is configured. Every client can answer with `setup-response`;
 repeat answers are scoped to the saved setup ID. Host-registered names always win over declarations.
 
-**Authentication belongs to the agents, not this server.** Claude, Codex, and OpenCode use their normal CLI credentials; pi uses the selected provider's environment key or `~/.pi/agent/auth.json`. There is no separate auth state for an MCP host to inspect or manage. In particular, a successful no-prompt config probe means session/config discovery succeeded, not that ACP universally proved first-prompt authentication; ambient CLI credentials are not observable through generic runner bookkeeping, so discovery never claims universal first-prompt readiness. If a run genuinely hits expired/missing credentials, the backend returns ACP `AUTH_REQUIRED` and the managed run **pauses** with `reason: "auth_required"` plus a non-secret `authContext` naming the backend and advertised methods: configure that credential out-of-band, then call `workflow` with `{ action:"resume", requestId, runId }` — that exact run continues from its stored script, args, immutable routing inputs, and journal on the same pinned backend. Programmatic auth flows (env-var/gateway credential injection, LLM provider routing) live in the [`@automatalabs/workflows`](../workflows) SDK runner APIs for hosts that embed the engine directly.
+**Authentication belongs to the agents, not this server.** Claude, Codex, and OpenCode use their normal CLI credentials; pi uses the selected provider's environment key or `~/.pi/agent/auth.json`. There is no separate auth state for an MCP host to inspect or manage. In particular, a successful no-prompt config probe means session/config discovery succeeded, not that ACP universally proved first-prompt authentication; ambient CLI credentials are not observable through generic runner bookkeeping, so discovery never claims universal first-prompt readiness. If a run genuinely hits expired/missing credentials, the backend returns ACP `AUTH_REQUIRED` and the managed run **pauses** with `reason: "auth_required"` plus a non-secret `authContext` naming the backend and advertised methods: configure that credential out-of-band, then call `workflow` with `{ action:"resume", runId }` — that exact run continues from its stored script, args, immutable routing inputs, and journal on the same pinned backend. Programmatic auth flows (env-var/gateway credential injection, LLM provider routing) live in the [`@automatalabs/workflows`](../workflows) SDK runner APIs for hosts that embed the engine directly.
 
 ---
 

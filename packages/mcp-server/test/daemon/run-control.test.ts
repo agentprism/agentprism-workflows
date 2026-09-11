@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -423,7 +422,7 @@ test("a lost setup forwarding acknowledgement preserves one durable answer and o
   });
   try {
     const accepted = await session.client.callTool({ name: "workflow", arguments: {
-      action: "run", requestId: randomUUID(), projectDir: cwd,
+      action: "run", projectDir: cwd,
       script: 'export const meta = { model: "claude", name: "setup-once", description: "lost setup reply", backends: { custom: { command: "fixture" } } }; return await agent("work", { model: "custom" });',
     } });
     const runId = String(structured(accepted)?.runId);

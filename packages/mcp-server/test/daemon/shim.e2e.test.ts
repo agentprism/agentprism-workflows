@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 // End-to-end over the BUILT dist: real MCP clients spawn the real shim (dist/entry.js),
 // which spawns the real daemon, all inside an isolated $HOME. Proves the migration's
 // user-visible contract: stdio clients keep working unchanged, exactly one daemon serves
@@ -121,7 +120,7 @@ async function connectShim(opts: { elicit?: () => ElicitResult; protocolMode?: "
 
 async function callWorkflow(client: Client): Promise<Record<string, unknown> | undefined> {
   const result = await client.callTool(
-    { name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT, projectDir: e2eHome } },
+    { name: "workflow", arguments: { action: "run", script: NO_AGENT_SCRIPT, projectDir: e2eHome } },
     { timeout: 60_000 },
   );
   assert.equal(result.isError ?? false, false, JSON.stringify(result.content));
@@ -213,7 +212,7 @@ test("unanswered setup survives daemon death and the same client answers the sto
   const session = await connectShim();
   try {
     const script = `export const meta = { name: "durable-setup", description: "setup survives daemon death", backends: { approvalOnly: { command: "never-invoked-acp-fixture" } } }; return 42;`;
-    const input = { action: "run", requestId: randomUUID(), script, projectDir: e2eHome };
+    const input = { action: "run", script, projectDir: e2eHome };
     const accepted = await session.client.callTool({ name: "workflow", arguments: input });
     assert.equal(accepted.isError ?? false, false, JSON.stringify(accepted.content));
     const runId = String((accepted.structuredContent as { runId: string }).runId);
@@ -229,9 +228,6 @@ test("unanswered setup survives daemon death and the same client answers the sto
     const recovered = await observeRun(session.client, runId, (snapshot) =>
       (snapshot.setup as { state?: string })?.state === "input-required");
     assert.deepEqual(recovered.setup, waiting.setup, "recovery preserves the exact unanswered request");
-    const retry = await session.client.callTool({ name: "workflow", arguments: input });
-    assert.equal((retry.structuredContent as { runId: string }).runId, runId);
-    assert.equal((retry.structuredContent as { duplicate: boolean }).duplicate, true);
     const response = { action: "setup-response", runId, setupId: setup.request.id,
       response: { action: "accept", content: { approve: true } } };
     const answered = await session.client.callTool({ name: "workflow", arguments: response });
@@ -293,14 +289,14 @@ test("the full MCP feature surface works through the shim: prompts, resources, d
     'return await checkpoint("Pick one", { kind: "select", choices: ["alpha", "beta"] });',
   ].join("\n");
   const answered = await session.client.callTool(
-    { name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: checkpointScript, projectDir: e2eHome } },
+    { name: "workflow", arguments: { action: "run", script: checkpointScript, projectDir: e2eHome } },
     { timeout: 60_000 },
   );
   assert.equal(answered.isError ?? false, false, JSON.stringify(answered.content));
   const runId = (answered.structuredContent as { runId: string }).runId;
   await observeRun(session.client, runId, "paused");
   const resumed = await session.client.callTool({ name: "workflow", arguments: {
-    action: "resume", requestId: randomUUID(), runId, checkpointReplies: { 0: "alpha" },
+    action: "resume", runId, checkpointReplies: { 0: "alpha" },
   } });
   assert.equal(resumed.isError ?? false, false, JSON.stringify(resumed.content));
   await observeRun(session.client, runId, "completed");
@@ -321,7 +317,7 @@ test("the full MCP feature surface works through the shim: prompts, resources, d
     'return await checkpoint("gate");',
   ].join("\n");
   const startedBg = await session.client.callTool(
-    { name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: pausingScript, projectDir: e2eHome } },
+    { name: "workflow", arguments: { action: "run", script: pausingScript, projectDir: e2eHome } },
     { timeout: 60_000 },
   );
   assert.equal(startedBg.isError ?? false, false, JSON.stringify(startedBg.content));
@@ -348,7 +344,7 @@ test("subscriptions survive daemon death: the shim re-subscribes on session reco
       'return await checkpoint("gate");',
     ].join("\n");
     const started = await session.client.callTool(
-      { name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: pausingScript, projectDir: e2eHome } },
+      { name: "workflow", arguments: { action: "run", script: pausingScript, projectDir: e2eHome } },
       { timeout: 60_000 },
     );
     const runId = (started.structuredContent as { runId: string }).runId;
@@ -382,7 +378,7 @@ test("subscriptions survive daemon death: the shim re-subscribes on session reco
       'return await checkpoint("gate");',
     ].join("\n");
     const second = await session.client.callTool(
-      { name: "workflow", arguments: { action: "run", requestId: randomUUID(), script: secondScript, projectDir: e2eHome } },
+      { name: "workflow", arguments: { action: "run", script: secondScript, projectDir: e2eHome } },
       { timeout: 60_000 },
     );
     const secondRunId = (second.structuredContent as { runId: string }).runId;

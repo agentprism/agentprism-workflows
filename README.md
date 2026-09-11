@@ -350,7 +350,6 @@ inputs.
 | `harnesses` | string[] | Config only: optional backend names to probe; omission discovers every registered backend. |
 | `modelSpecs` | string[] | Config only: select exact routed models before reading their model-specific options. |
 | `modelFilter` | string | Config only: bounded model-id substring or `/regex/` filter. |
-| `requestId` | string | Required for run/resume. Keep the caller-generated ID and complete input unchanged on retries; use a new ID for a new operation. |
 | `setupId` | UUID | Setup-response only: the exact pending ID from status. |
 | `args` | any | Run only: JSON value exposed to the script as global `args`; immutable after admission. |
 | `maxAgents` | number | Default 1000. |
@@ -383,19 +382,20 @@ OpenCode's direct models before explicitly classified aggregator browse groups (
 model is shown separately. Expand `openrouter/*` with `modelFilter`; browse selectors cannot dispatch.
 Use `modelSpecs` for exact-model option discovery. Partial probe failures preserve healthy catalogs.
 
-Run acceptance checks input/source structure and durably saves the script before slow preparation.
-Validation failure after acceptance remains a failed run; declined setup remains cancelled in history.
-No agent dispatch occurs before backend approval and format-3 immutable routing admission are saved.
+Run prepares the script inside the request: structure checks, a mocked dry run, routed no-prompt
+probes, and format-3 immutable routing admission. Execution starts only after all of them succeed;
+validation failure is a tool execution error and creates no run. A script declaring custom backends
+is parked in durable backend-approval setup instead; declined setup remains cancelled in history.
 
 ```json
-{ "action":"run", "requestId":"review-20260908-1", "projectDir":"/absolute/project", "script":"export const meta = { name: 'review', description: 'review', model: 'codex' }; return await agent('Review the repo');" }
+{ "action":"run", "projectDir":"/absolute/project", "script":"export const meta = { name: 'review', description: 'review', model: 'codex' }; return await agent('Review the repo');" }
 ```
 
-Retain `runId` and `requestId`. Exact retries recover the original acceptance even if its source file
-changed. The acknowledgement contains `accepted:true`, current status, resolved limits, and script/
-events URIs. It never carries the final result. All workflow lifecycle requests are bounded to 45
-seconds; active preparation is bounded to 120 seconds. At most four preparing/executing runs are
-active per project, including those waiting for setup. Retries do not use additional capacity.
+Retain `runId`. The acknowledgement contains `accepted:true`, current status, resolved limits, and
+script/events URIs. It never carries the final result. Cancelling the request before admission
+abandons preparation without persisting anything. Preparation is bounded to 120 seconds and
+observation requests to 45 seconds. At most four preparing/executing runs are active per project,
+including those waiting for setup.
 
 ```json
 { "action":"status", "runId":"mabc1234-k9x2pq" }
@@ -501,7 +501,7 @@ const implementation = await agent(`Implement this reviewed plan:\n${review}`, {
 return { applied: true, implementation };
 ```
 
-After the pause, send `{ "action":"resume", "requestId":"resume-1", "runId":"…", "checkpointReplies":{ "1":true } }`
+After the pause, send `{ "action":"resume", "runId":"…", "checkpointReplies":{ "1":true } }`
 using the exact call index from `checkpointContext`. The response retains the same run ID. Its
 script, args, immutable routing inputs, journal, event stream, and cumulative usage remain
 attached to that identity. The first strict-JSON checkpoint answer is durable before continuation;
@@ -520,7 +520,7 @@ both call rows and activity. Its structured payload, including `latestActivity`,
 UTF-8 bytes and its text at 8,192 bytes.
 Paused, failed, and aborted outcomes also include a redacted final-20 `logTail` immediately.
 
-The model-facing tools are `workflow`, `repl`, and the capability-gated `workflow_monitor`; `repl` is a persistent QuickJS-in-WASM JavaScript VM (one per project) for live, stateful orchestration. The server also advertises `agentprism-workflow-authoring` and `agentprism-repl-orchestration` through the MCP Skills Extension, and prompt-capable hosts get the compact user-controlled **`author-workflow`** MCP prompt (optional `task` argument). Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `{ "action":"resume", "requestId":"resume-1", "runId":"…" }` for the paused source. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
+The model-facing tools are `workflow`, `repl`, and the capability-gated `workflow_monitor`; `repl` is a persistent QuickJS-in-WASM JavaScript VM (one per project) for live, stateful orchestration. The server also advertises `agentprism-workflow-authoring` and `agentprism-repl-orchestration` through the MCP Skills Extension, and prompt-capable hosts get the compact user-controlled **`author-workflow`** MCP prompt (optional `task` argument). Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `{ "action":"resume", "runId":"…" }` for the paused source. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
 
 ---
 
@@ -641,7 +641,7 @@ const verdict = await agent("Verify the checkout flow…", { model: "browser", s
 Script-declared backends spawn commands on the host, so they are **inert until approved** — the engine parses them but never acts on them:
 
 - **SDK**: pass `allowScriptBackends: true` (or a per-backend approval callback) to `runDynamicWorkflow`; unapproved declarations throw with guidance rather than silently rerouting.
-- **MCP server**: every accepted run exposes durable backend-approval setup before probing or execution. All clients can answer via `setup-response`; `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` is the explicit environment opt-in.
+- **MCP server**: a run that declares custom backends is validated, then parked in durable backend-approval setup before execution. All clients can answer via `setup-response`; `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1` is the explicit environment opt-in.
 - Host-registered names always win on conflict — a script can never hijack a name the operator configured.
 
 ---

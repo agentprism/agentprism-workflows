@@ -42,8 +42,6 @@ import type { RunEnvironmentIdentity } from "./run-environment.js";
 import { withRunEventsUsingFs, type RunEventPersistence } from "./run-event-persistence.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 import type {
-  PersistedWorkflowContinuationOperation,
-  WorkflowOperationIdentity,
   WorkflowPreparation,
 } from "./workflow-preparation.js";
 
@@ -144,8 +142,6 @@ export interface PersistedRunLineageTombstone {
   runId: string;
   sourceRunId?: string;
   deletedAt: string;
-  /** Content-free acceptance identity prevents a lost-response retry from recreating deleted work. */
-  acceptanceOperation?: WorkflowOperationIdentity;
 }
 
 export interface PersistedRunState {
@@ -172,15 +168,11 @@ export interface PersistedRunState {
   environment?: RunEnvironmentIdentity;
   /** Required by same-ID continuation; deliberately absent on pre-contract runs. */
   admission?: PersistedRunAdmission;
-  /** Immutable initial acceptance identity, committed together with the pending run. */
-  acceptanceOperation?: WorkflowOperationIdentity;
   /** Host-owned preparation survives request/session/process loss before execution admission. */
   preparation?: WorkflowPreparation;
   preparationRevision?: number;
   /** Accepted host setup response hashes survive removal of the preparation envelope. */
   setupResponses?: Record<string, string>;
-  /** Durable accepted continuation identities; these entries are never silently evicted. */
-  continuationOperations?: PersistedWorkflowContinuationOperation[];
   continuation?: WorkflowContinuationResult;
   resume?: PersistedResumeFormat;
   /** Immediate run named by resumeFromRunId, written once by the engine at admission. */
@@ -260,8 +252,6 @@ export interface RunPersistence {
   save(state: PersistedRunState): void;
   /** Load a persisted run by ID. */
   load(runId: string): PersistedRunState | null;
-  /** Detect an existing but unreadable identity without treating corrupt acceptance as new work. */
-  hasRunArtifact?(runId: string): boolean;
   /** List all persisted runs. */
   list(): PersistedRunState[];
   /** Delete a persisted run. */
@@ -401,13 +391,6 @@ export function createRunPersistence(
           // corrupt candidate -> fall through to the next candidate
           continue;
         }
-        if (candidate !== path && (state.acceptanceOperation !== undefined || state.continuationOperations !== undefined)) {
-          throw new WorkflowError(
-            `run ${runId} cannot recover acceptance or continuation from an older backup; the current operation record is unreadable`,
-            WorkflowErrorCode.PERSISTENCE_ERROR,
-            { recoverable: false },
-          );
-        }
         return state;
       }
     }
@@ -499,11 +482,6 @@ export function createRunPersistence(
       return loadState(runId);
     },
 
-    hasRunArtifact(runId: string): boolean {
-      return candidateRunPaths(runId).some((path) => _existsSync(path) || _existsSync(`${path}.bak`)) ||
-        candidateLineagePaths(runId).some((path) => _existsSync(path));
-    },
-
     list(): PersistedRunState[] {
       const byRunId = new Map<string, PersistedRunState>();
       for (const dir of [runsDir, legacyRunsDir]) {
@@ -537,7 +515,6 @@ export function createRunPersistence(
             runId,
             ...(sourceRunId ? { sourceRunId } : {}),
             deletedAt: new Date().toISOString(),
-            ...(state.acceptanceOperation ? { acceptanceOperation: state.acceptanceOperation } : {}),
           };
           const path = primaryLineagePath(runId);
           _writeFileSync(`${path}.tmp`, JSON.stringify(tombstone, null, 2));
@@ -608,7 +585,6 @@ export function createRunPersistence(
             runId,
             ...(value.sourceRunId === undefined ? {} : { sourceRunId: value.sourceRunId }),
             deletedAt: value.deletedAt,
-            ...(value.acceptanceOperation ? { acceptanceOperation: value.acceptanceOperation } : {}),
           };
         } catch {
           // corrupt candidate -> fall through to the next candidate

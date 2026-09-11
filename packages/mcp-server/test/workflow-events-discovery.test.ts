@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { runAndObserve, waitForRun } from "./_harness.js";
 import assert from "node:assert/strict";
 import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -188,8 +187,7 @@ test("status exposes live redacted activity and retains terminal activity after 
     const accepted = await first.client.callTool({
       name: "workflow",
       arguments: {
-        action: "run", requestId: randomUUID(),
-        script: [
+        action: "run", script: [
           'export const meta = { name: "activity-cancel", description: "targeted cancellation" };',
           'return await agent("hold", { label: "active-review", model: "claude" });',
         ].join("\n"),
@@ -274,8 +272,7 @@ test("whole-run abort preserves the last activity as terminal", async () => {
     const accepted = await connection.client.callTool({
       name: "workflow",
       arguments: {
-        action: "run", requestId: randomUUID(),
-        script: [
+        action: "run", script: [
           'export const meta = { name: "activity-abort", description: "whole abort" };',
           'return await agent("hold", { label: "abort-review", model: "claude" });',
         ].join("\n"),
@@ -313,8 +310,7 @@ test("latest activity participates in the existing structured byte cap", async (
       (_, index) => `() => agent("work-${index}", { label: "activity-${String(index).padStart(2, "0")}", model: "claude" })`,
     ).join(",\n");
     const completed = await runAndObserve(connection.client, {
-        action: "run", requestId: randomUUID(),
-        script: [
+        action: "run", script: [
           'export const meta = { name: "activity-cap", description: "bounded activity" };',
           `return await parallel([${calls}]);`,
         ].join("\n"),
@@ -347,7 +343,7 @@ test("legacy persisted rows omit events discovery and latest activity without br
   let runId: string | undefined;
   let runFile: string | undefined;
   try {
-    const completed = await runAndObserve(first.client, { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT });
+    const completed = await runAndObserve(first.client, { action: "run", script: NO_AGENT_SCRIPT });
     runId = runIdOf(completed);
     runFile = persistedRunFile(runId);
     assert.ok(runFile);
@@ -392,7 +388,7 @@ test("an eventLogIncomplete stream omits events discovery and latest activity wi
   let runId: string | undefined;
   let runFile: string | undefined;
   try {
-    const completed = await runAndObserve(first.client, { action: "run", requestId: randomUUID(), script: NO_AGENT_SCRIPT });
+    const completed = await runAndObserve(first.client, { action: "run", script: NO_AGENT_SCRIPT });
     runId = runIdOf(completed);
     runFile = persistedRunFile(runId);
     assert.ok(runFile);

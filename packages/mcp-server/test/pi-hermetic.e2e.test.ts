@@ -2,7 +2,6 @@
 // real pi-acp transport -> real Pi AgentSession with its documented injected stream seam.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
@@ -26,7 +25,6 @@ const STRUCTURED_SCRIPT = [
 ].join("\n");
 
 async function runAndReadExactResult(client: Client, script: string): Promise<unknown> {
-  const requestId = randomUUID();
   const deadline = Date.now() + 45_000;
   const call = (arguments_: Record<string, unknown>) => {
     const remaining = deadline - Date.now();
@@ -35,11 +33,10 @@ async function runAndReadExactResult(client: Client, script: string): Promise<un
       timeout: remaining, maxTotalTimeout: remaining,
     });
   };
-  const accepted = await call({ action: "run", requestId, script });
+  const accepted = await call({ action: "run", script });
   assert.equal(accepted.isError, false, JSON.stringify(accepted));
   const acknowledgement = accepted.structuredContent as Record<string, unknown>;
   assert.equal(acknowledgement.accepted, true);
-  assert.equal(acknowledgement.requestId, requestId);
   assert.equal(typeof acknowledgement.runId, "string");
   assert.equal(acknowledgement.result, undefined);
   const runId = acknowledgement.runId as string;

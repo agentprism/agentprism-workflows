@@ -71,6 +71,11 @@ export interface ValidateWorkflowOptions {
   /** Dry-run wall-clock limit. Default 30_000 ms. */
   timeoutMs?: number;
   /**
+   * Caller cancellation. When it aborts, the dry run and any live config probes stop and
+   * validateWorkflowScript rejects with an `AbortError` instead of returning a report.
+   */
+  signal?: AbortSignal;
+  /**
    * Host-pinned model/backend for calls with no authored model, agentType model, tier,
    * or phase/meta route. The dry run resolves and reports it like live execution.
    */
@@ -891,6 +896,7 @@ async function probeHarnessConfigOptions(
   declared: Record<string, CustomBackendConfig> | undefined,
   warnings: string[],
   probeRunner: ValidateProbeRunner | undefined,
+  signal?: AbortSignal,
 ): Promise<ProbeStageResult> {
   const targets = configProbeTargets(calls, registry, hostRegistry, declared);
   const harnessOptions: ValidateHarnessOptions[] = [];
@@ -930,14 +936,16 @@ async function probeHarnessConfigOptions(
       if (cached) return cached;
       if (failures.has(key)) return undefined;
       try {
+        throwIfValidationAborted(signal);
         const result = await withValidationProbeTimeout(
-          (signal) => runner.probeConfigOptions(target.model ?? target.backendId, {
+          (probeSignal) => runner.probeConfigOptions(target.model ?? target.backendId, {
             cwd,
             selectModel: target.model !== undefined,
             backends: declared,
-            signal,
+            signal: probeSignal,
           }),
           60_000,
+          signal,
         );
         catalogs.set(key, result.options);
         modes.set(key, result.modes ?? null);
@@ -1006,9 +1014,31 @@ async function probeHarnessConfigOptions(
   return { harnessOptions, catalogs, modes, defaultModes };
 }
 
-function withValidationProbeTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
+/** The rejection raised when ValidateWorkflowOptions.signal aborts a validation in flight. */
+export function validationAbortError(): Error {
+  return new DOMException("workflow validation was cancelled", "AbortError");
+}
+
+export function isValidationAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function throwIfValidationAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw validationAbortError();
+}
+
+function withValidationProbeTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  parent?: AbortSignal,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const controller = new AbortController();
+    const onParentAbort = () => {
+      controller.abort();
+      reject(validationAbortError());
+    };
+    parent?.addEventListener("abort", onParentAbort, { once: true });
     const timer = setTimeout(() => {
       controller.abort();
       reject(new Error(`config probe timed out after ${timeoutMs}ms`));
@@ -1017,10 +1047,12 @@ function withValidationProbeTimeout<T>(operation: (signal: AbortSignal) => Promi
     operation(controller.signal).then(
       (value) => {
         clearTimeout(timer);
+        parent?.removeEventListener("abort", onParentAbort);
         resolve(value);
       },
       (error) => {
         clearTimeout(timer);
+        parent?.removeEventListener("abort", onParentAbort);
         reject(error);
       },
     );
@@ -1638,6 +1670,7 @@ export async function validateWorkflowScript(
     },
   } as unknown as AgentRunner;
 
+  throwIfValidationAborted(options.signal);
   const controller = new AbortController();
   let timedOut = false;
   const timeoutMs = options.timeoutMs ?? 30_000;
@@ -1646,6 +1679,8 @@ export async function validateWorkflowScript(
     controller.abort();
   }, timeoutMs);
   timer.unref?.();
+  const onCallerAbort = () => controller.abort();
+  options.signal?.addEventListener("abort", onCallerAbort, { once: true });
 
   const flows =
     options.workflows === undefined
@@ -1703,6 +1738,7 @@ export async function validateWorkflowScript(
       },
     });
 
+    throwIfValidationAborted(options.signal);
     const runOk = run.status === "completed";
     if (!runOk && flows === undefined && run.reason?.includes("must be the first statement") && /\bworkflow\s*\(/.test(script)) {
       warnings.push(
@@ -1739,7 +1775,9 @@ export async function validateWorkflowScript(
           declaredBackends,
           warnings,
           options.probeRunner,
+          options.signal,
         );
+    throwIfValidationAborted(options.signal);
     const optionErrors = options.probeConfig === false
       ? []
       : configOptionErrors(
@@ -1793,6 +1831,7 @@ export async function validateWorkflowScript(
     };
   } finally {
     clearTimeout(timer);
+    options.signal?.removeEventListener("abort", onCallerAbort);
     try {
       rmSync(persistenceRoot, { recursive: true, force: true });
     } catch {

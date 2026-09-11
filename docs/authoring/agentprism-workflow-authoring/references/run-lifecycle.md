@@ -2,11 +2,11 @@
 
 **Context:** JavaScript passed to the MCP `workflow` tool. Workflow scripts use `agent(prompt, options?)`; REPL evals use a different API.
 
-The server owns accepted execution across client-session churn and request timeouts. Both legacy
-2025 and modern `2026-07-28` transports expose the same bounded lifecycle. Every request has a
-45-second bound; autonomous preparation has a 120-second bound per stage, excluding durable human
-waiting. Neither bound limits live workflow duration. Each project allows four active runs,
-including runs preparing or waiting for setup; a settled run releases its slot.
+The server owns admitted execution across client-session churn. Both legacy 2025 and modern
+`2026-07-28` transports expose the same lifecycle. Run and Resume prepare inside the request under
+a 120-second preparation ceiling and honor request cancellation; every observation request has a
+45-second bound. Neither bound limits live workflow duration. Each project allows four active runs,
+including runs preparing or waiting for setup; a settled or rejected run releases its slot.
 
 On the shared daemon, Config and Run require absolute `projectDir`. Other actions locate the
 project through `runId` and reject `projectDir`. A single-project server defaults to its own project.
@@ -16,22 +16,22 @@ cross-action fields, and retired request-state tokens are rejected in both proto
 ### Actions
 
 - **Config** (`{ action:"config", projectDir, harnesses?, modelSpecs?, modelFilter? }`): read bounded no-prompt model/mode/config catalogs without creating a run. Use `modelSpecs` for a selected model's exact option domain. Preserve backend-advertised ids and descriptions.
-- **Run** (`{ action:"run", requestId, projectDir, script | scriptPath, args?, maxAgents?, concurrency?, agentRetries? }`): provide exactly one source. Bounded source/metadata checks precede durable acceptance; a path is read once, and later edits cannot change the accepted source. The acknowledgement contains `accepted:true`, `requestId`, `duplicate`, `runId`, current `status`, resource links, limits, and optional `setup`. It contains no final result. Backend approval, mock validation, and routed probes run afterward with live dispatch blocked. A later setup failure remains an inspectable failed run; decline/cancel leaves an aborted run.
-- **Resume** (`{ action:"resume", requestId, runId, checkpointReplies?, maxAgents?, concurrency?, agentRetries? }`): continue the exact run using stored source, args, configuration, journal, events, usage, and checkpoint decisions. An accepted acknowledgement adds `continuation`; observe later state with Status. Running, completed, aborted, auth-blocked, or unanswered-checkpoint states return an observation when no continuation is admitted. Resume never accepts replacement logical inputs or opens an inline human interaction.
+- **Run** (`{ action:"run", projectDir, script | scriptPath, args?, maxAgents?, concurrency?, agentRetries? }`): provide exactly one source. The request reads the source, checks its structure, runs the mocked dry run and routed no-prompt probes, and only then admits execution; a path is read at admission, and later edits cannot change the admitted source. The acknowledgement contains `accepted:true`, `runId`, current `status`, resource links, limits, and optional `setup`. It contains no final result. Malformed source, validation failure, and a full project are tool execution errors that create no run. A script declaring custom backends is parked in durable setup instead of started; decline/cancel leaves an aborted run. Cancelling the request before admission abandons preparation without persisting anything.
+- **Resume** (`{ action:"resume", runId, checkpointReplies?, maxAgents?, concurrency?, agentRetries? }`): continue the exact run using stored source, args, configuration, journal, events, usage, and checkpoint decisions. An accepted acknowledgement adds `continuation`; observe later state with Status. Running, completed, aborted, auth-blocked, or unanswered-checkpoint states return an observation when no continuation is admitted. Resume never accepts replacement logical inputs or opens an inline human interaction.
 - **Setup response** (`{ action:"setup-response", runId, setupId, response }`): answer `status.setup.request.id`. Acceptance is exactly `{ action:"accept", content:{ ... } }`, matching the advertised `requestedSchema`. Backend approval is the only setup kind and requires `{ approve:true }`; it never chooses agent routes. `{ action:"decline" }` and `{ action:"cancel" }` have no content and stop setup. Identical retransmissions are idempotent; conflicting or stale responses cannot authorize a new request.
 - **Status** (`{ action:"status", runId, lastN?, labelGlob?, logLines? }`): return an immediate bounded observation with calls, durable `latestActivity`, log tail, usage, safe pending permissions, setup state, and resource links. Settled runs add `outcome`; a checkpoint appears at `outcome.checkpointContext`. Reading a failed workflow is a successful tool request. Status never waits for execution or collects input.
 - **Result** (`{ action:"result", runId, offset?, maxBytes? }`): page exact completed JSON results in chunks up to 16,384 UTF-8 bytes. If `hasMore`, continue from `endOffset`; code points are never split.
 - **Permission response** (`{ action:"permissions-response", runId, permissionId, response:{ outcome:{ outcome:"selected", optionId } } }`): select an exact advertised ACP option. Cancellation is `response:{ outcome:{ outcome:"cancelled" } }`. The request must still belong to the live execution owner. Caller response `_meta` is forbidden. These bounded controls work with or without an App.
 - **Stop** (`{ action:"stop", runId }`): durably abort a whole run, including pending setup. Add `callIndex` to cancel one live agent while preserving the run. Status filters are accepted. `forceOwner:true` authorizes a whole-run superseded-owner stop and cannot accompany `callIndex`; cross-daemon forwarding targets the owner. Losing a panel or transport never implies Stop.
 
-### Retry, continuation, and checkpoint rules
+### Cancellation, continuation, and checkpoint rules
 
-`requestId` must match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Use one identity for one Run or Resume
-operation and resend identical inputs after a lost acknowledgement. The durable receipt returns
-the accepted run/continuation with `duplicate:true`, including after restart. Reusing an identity
-with different inputs fails. A retry of an earlier checkpoint continuation cannot answer a later
-checkpoint. A fresh operation needs a fresh request ID; do not use a fresh ID merely because the
-transport timed out.
+A Run or Resume request is cancelled the way its transport defines: closing the Streamable HTTP
+response stream, or `notifications/cancelled` on stdio. Cancellation before admission stops
+preparation, persists nothing, and releases capacity; cancellation after admission is ignored and
+the started run stays discoverable through the `workflow://runs/` resources. A Run carries no
+retry identity: sending the same input again starts an independent run. Progress notifications
+report preparation stages when the request carries `_meta.progressToken`.
 
 One run ID names one immutable source, event stream, usage total, and final result. Before live
 dispatch, the host persists format-3 routing admission: `strict:true`, captured tier configuration

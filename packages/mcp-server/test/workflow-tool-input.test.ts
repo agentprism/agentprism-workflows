@@ -20,8 +20,8 @@ const PERMISSION_ID = "123e4567-e89b-12d3-a456-426614174000";
 
 const canonicalInputs = {
   config: { action: "config", projectDir: "/tmp/project", harnesses: ["codex"] },
-  run: { action: "run", requestId: "test-request", script: "export const meta = {};" },
-  resume: { action: "resume", requestId: "test-request", runId: "source-1" },
+  run: { action: "run", script: "export const meta = {};" },
+  resume: { action: "resume", runId: "source-1" },
   "setup-response": { action: "setup-response", runId: "source-1", setupId: PERMISSION_ID, response: { action: "accept", content: { approved: true } } },
   status: { action: "status", runId: "source-1" },
   result: { action: "result", runId: "source-1", offset: 0, maxBytes: 16_384 },
@@ -36,8 +36,8 @@ const canonicalInputs = {
 
 const crossActionInputs = {
   "config + run field": { action: "config", script: "x" },
-  "run + status field": { action: "run", requestId: "test-request", script: "x", lastN: 1 },
-  "resume + run field": { action: "resume", requestId: "test-request", runId: "source-1", script: "x" },
+  "run + status field": { action: "run", script: "x", lastN: 1 },
+  "resume + run field": { action: "resume", runId: "source-1", script: "x" },
   "status + control field": { action: "status", runId: "source-1", callIndex: 0 },
   "result + status field": { action: "result", runId: "source-1", lastN: 1 },
   "permissions-response + result field": {
@@ -123,18 +123,18 @@ test("runtime and published JSON Schema accept every canonical action and reject
 
 test("run requires exactly one explicit script source and rejects fields outside its branch", () => {
   for (const input of [
-    { action: "run", requestId: "test-request", script: "x" },
-    { action: "run", requestId: "test-request", scriptPath: "/tmp/workflow.js" },
+    { action: "run", script: "x" },
+    { action: "run", scriptPath: "/tmp/workflow.js" },
   ]) {
     assert.equal(Schema.safeParse(input).success, true, JSON.stringify(input));
   }
   for (const input of [
     {},
     { action: "run" },
-    { action: "run", requestId: "test-request", script: "x", scriptPath: "/tmp/workflow.js" },
-    { action: "run", requestId: "test-request", scriptPath: "relative/workflow.js" },
-    { action: "run", requestId: "test-request", script: "x", checkpointReplies: { "0": true } },
-    { action: "run", requestId: "test-request", script: "x", offset: 0 },
+    { action: "run", script: "x", scriptPath: "/tmp/workflow.js" },
+    { action: "run", scriptPath: "relative/workflow.js" },
+    { action: "run", script: "x", checkpointReplies: { "0": true } },
+    { action: "run", script: "x", offset: 0 },
   ]) {
     assert.equal(Schema.safeParse(input).success, false, JSON.stringify(input));
   }
@@ -166,11 +166,11 @@ test("published and runtime schemas reject every retired wait, alias, and edited
     inspect: { action: "inspect", runId: "source-1" },
     await: { action: "await", runId: "source-1" },
     "omitted action": { runId: "source-1" },
-    resumeFromRunId: { action: "run", requestId: "test-request", script: "x", resumeFromRunId: "source-1" },
-    resumePolicy: { action: "run", requestId: "test-request", script: "x", resumePolicy: "positional" },
-    "resume args": { action: "resume", requestId: "test-request", runId: "source-1", args: { changed: true } },
-    "resume edited inline script": { action: "resume", requestId: "test-request", runId: "source-1", script: "return 'edited';" },
-    "resume edited script path": { action: "resume", requestId: "test-request", runId: "source-1", scriptPath: "/tmp/edited.js" },
+    resumeFromRunId: { action: "run", script: "x", resumeFromRunId: "source-1" },
+    resumePolicy: { action: "run", script: "x", resumePolicy: "positional" },
+    "resume args": { action: "resume", runId: "source-1", args: { changed: true } },
+    "resume edited inline script": { action: "resume", runId: "source-1", script: "return 'edited';" },
+    "resume edited script path": { action: "resume", runId: "source-1", scriptPath: "/tmp/edited.js" },
   } as const;
 
   for (const [name, input] of Object.entries(retiredInputs)) {
@@ -187,18 +187,18 @@ test("published and runtime schemas reject every retired wait, alias, and edited
 
 test("config/run require projectDir only in shared-daemon mode", () => {
   assert.doesNotThrow(() => parseWorkflowToolInput({ action: "config" }));
-  assert.doesNotThrow(() => parseWorkflowToolInput({ action: "run", requestId: "test-request", script: "x" }));
+  assert.doesNotThrow(() => parseWorkflowToolInput({ action: "run", script: "x" }));
   assert.throws(
     () => parseWorkflowToolInput({ action: "config" }, { requireProjectDir: true }),
     /config requires projectDir/,
   );
   assert.throws(
-    () => parseWorkflowToolInput({ action: "run", requestId: "test-request", script: "x" }, { requireProjectDir: true }),
+    () => parseWorkflowToolInput({ action: "run", script: "x" }, { requireProjectDir: true }),
     /run requires projectDir/,
   );
   assert.doesNotThrow(() =>
     parseWorkflowToolInput(
-      { action: "run", requestId: "test-request", script: "x", projectDir: "/tmp/project" },
+      { action: "run", script: "x", projectDir: "/tmp/project" },
       { requireProjectDir: true },
     ),
   );
@@ -206,30 +206,26 @@ test("config/run require projectDir only in shared-daemon mode", () => {
 
 test("run args and same-ID resume checkpoint replies use disjoint strict fields", () => {
   const run = parseWorkflowToolInput({
-    action: "run", requestId: "test-request",
-    script: "x",
+    action: "run", script: "x",
     args: ["any", { json: true }],
   });
   assert.equal(run.action, "run");
   assert.deepEqual(run.args, ["any", { json: true }]);
   assert.equal(Object.hasOwn(run, "background"), false);
   const resume = parseWorkflowToolInput({
-    action: "resume", requestId: "test-request",
-    runId: "source-1",
+    action: "resume", runId: "source-1",
     concurrency: 99,
     checkpointReplies: { "0": true, "12": "ship" },
   });
   assert.deepEqual(resume, {
-    action: "resume", requestId: "test-request",
-    runId: "source-1",
+    action: "resume", runId: "source-1",
     concurrency: 99,
     checkpointReplies: { 0: true, 12: "ship" },
   });
   for (const key of ["nope", "-1", "9007199254740992"]) {
     assert.equal(
       Schema.safeParse({
-        action: "resume", requestId: "test-request",
-        runId: "source-1",
+        action: "resume", runId: "source-1",
         checkpointReplies: { [key]: true },
       }).success,
       false,
@@ -306,16 +302,16 @@ test("permissions-response preserves the exact strict ACP response variants", ()
 });
 
 test("execution resource knobs remain clamp-at-runtime rather than schema maxima", () => {
-  const accepted = Schema.parse({ action: "run", requestId: "test-request", script: "x", concurrency: 1000, agentRetries: 99 });
+  const accepted = Schema.parse({ action: "run", script: "x", concurrency: 1000, agentRetries: 99 });
   assert.equal(accepted.concurrency, 1000);
   assert.equal(accepted.agentRetries, 99);
   const clamped = clampWorkflowInput(
-    parseWorkflowToolInput({ action: "run", requestId: "test-request", script: "x", concurrency: 1000, agentRetries: 99 }),
+    parseWorkflowToolInput({ action: "run", script: "x", concurrency: 1000, agentRetries: 99 }),
   );
   assert.equal(clamped.concurrency, 16);
   assert.equal(clamped.agentRetries, 3);
-  assert.equal(clampWorkflowInput({ action: "run", requestId: "test-request", script: "x", maxAgents: 0.4 }).maxAgents, 1);
-  assert.equal(clampWorkflowInput({ action: "run", requestId: "test-request", script: "x", maxAgents: 7.9 }).maxAgents, 7);
+  assert.equal(clampWorkflowInput({ action: "run", script: "x", maxAgents: 0.4 }).maxAgents, 1);
+  assert.equal(clampWorkflowInput({ action: "run", script: "x", maxAgents: 7.9 }).maxAgents, 7);
 });
 
 test("field catalog is canonical and points detailed syntax to the authoring skill", () => {
@@ -325,20 +321,18 @@ test("field catalog is canonical and points detailed syntax to the authoring ski
 });
 
 
-test("run and resume require a bounded stable retry identity in both schemas", async () => {
+test("run and resume carry no retry identity: the retired requestId field is rejected in both schemas", async () => {
   const published = await Schema["~standard"].jsonSchema.input({ target: "draft-2020-12" });
   const validate = new AjvJsonSchemaValidator().getValidator(published as JsonSchemaType);
   for (const base of [canonicalInputs.run, canonicalInputs.resume]) {
-    const { requestId: _requestId, ...missing } = base;
-    for (const input of [missing, ...["", " ", "-leading", "../path", "x".repeat(129)].map(requestId => ({ ...base, requestId }))]) {
-      assert.equal(Schema.safeParse(input).success, false, JSON.stringify(input));
-      assert.equal(validate(input).valid, false, JSON.stringify(input));
-    }
+    assert.equal(Schema.safeParse(base).success, true, JSON.stringify(base));
+    assert.equal(validate(base).valid, true, JSON.stringify(base));
     for (const requestId of ["a", "retry:42_attempt.2", "x".repeat(128)]) {
-      assert.equal(Schema.safeParse({ ...base, requestId }).success, true);
-      assert.equal(validate({ ...base, requestId }).valid, true);
+      assert.equal(Schema.safeParse({ ...base, requestId }).success, false);
+      assert.equal(validate({ ...base, requestId }).valid, false);
     }
   }
+  assert.equal("requestId" in workflowToolInputShape, false);
   assert.equal("background" in workflowToolInputShape, false);
 });
 
@@ -351,7 +345,7 @@ test("setup responses bind an exact run and pending request without accepting st
     assert.equal(validate({ ...base, response }).valid, true);
   }
   for (const input of [
-    { ...base, runId: "" }, { ...base, setupId: "not-a-uuid" }, { ...base, requestId: "unrelated" },
+    { ...base, runId: "" }, { ...base, setupId: "not-a-uuid" }, { ...base, requestId: "retry-1" },
     { ...base, response: { action: "accept" } }, { ...base, response: { action: "approve", content: {} } },
     { ...base, response: { action: "decline", content: {} } }, { ...base, response: { action: "cancel", default: true } },
   ]) {

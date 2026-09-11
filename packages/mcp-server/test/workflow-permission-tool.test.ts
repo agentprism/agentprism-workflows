@@ -1,5 +1,4 @@
 import test from "node:test";
-import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -65,7 +64,7 @@ test("run acceptance remains separate from a later required permission", async (
   try {
     const result = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: SCRIPT },
+      arguments: { action: "run", script: SCRIPT },
     }));
     assert.equal(result.accepted, true);
     assert.equal(result.pendingPermissions, undefined);
@@ -115,7 +114,7 @@ test("status exposes a live permission and permissions-response resumes the work
   try {
     const started = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: SCRIPT },
+      arguments: { action: "run", script: SCRIPT },
     }));
     const runId = started.runId as string;
     await eventually(() => broker.has(runId));
@@ -175,7 +174,7 @@ test("elicitation-capable status stays observation-only and requires permissions
   try {
     const started = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: SCRIPT },
+      arguments: { action: "run", script: SCRIPT },
     }));
     const runId = started.runId as string;
     await eventually(() => broker.has(runId));
@@ -254,7 +253,7 @@ test("the real ACP client, broker, and MCP tool preserve a same-kind Codex choic
   try {
     const started = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: SCRIPT },
+      arguments: { action: "run", script: SCRIPT },
     }));
     const runId = started.runId as string;
     await eventually(() => broker.has(runId));
@@ -328,7 +327,7 @@ test("status immediately exposes an action-required permission snapshot", async 
   try {
     const started = structured(await connected.client.callTool({
       name: "workflow",
-      arguments: { action: "run", requestId: randomUUID(), script: SCRIPT },
+      arguments: { action: "run", script: SCRIPT },
     }));
     const runId = started.runId as string;
     await eventually(() => broker.has(runId));
