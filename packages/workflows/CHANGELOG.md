@@ -1,5 +1,34 @@
 # @automatalabs/workflows
 
+## 6.0.0
+
+### Major Changes
+
+- fef6ac6: Prepare workflow runs inside the MCP request and drop the custom retry identity.
+
+  - `workflow` `run` now reads the source, validates it (static parse, mocked dry run, routed config probes), and admits execution before it acknowledges. Malformed source, validation failures, missing routing, and a full project are tool execution errors (`isError: true`) that persist no run. A script that declares custom backends is validated and then parked in durable backend-approval setup exactly as before.
+  - Request cancellation is honored the way each transport defines it (closing the Streamable HTTP response stream, or `notifications/cancelled` on stdio): preparation stops, nothing is persisted, and capacity is released. Preparation stages are reported through `notifications/progress` when the request carries `_meta.progressToken`. The stdio shim aborts the upstream request for a modern-era cancellation instead of forwarding the notification.
+  - `requestId` and `duplicate` are removed from `run` and `resume`. There is no idempotent retry receipt any more; sending the same input again starts an independent run.
+  - Engine: `prepareRun` mints a fresh run identity and no longer takes an operation; `findAcceptedRun`, `ExecOptions.operation`, `WorkflowOperationIdentity`, `PersistedWorkflowContinuationOperation`, `MAX_WORKFLOW_CONTINUATION_OPERATIONS`, `RunPersistence.hasRunArtifact`, and the persisted `acceptanceOperation`/`continuationOperations` fields are gone (`MAX_WORKFLOW_SETUP_RESPONSES` names the remaining receipt limit). `startInBackground` begins execution on the next macrotask so callers can register interest under the returned run ID first.
+  - `validateWorkflowScript` accepts `signal` and rejects with an `AbortError` (`isValidationAbortError`) when it aborts.
+
+### Minor Changes
+
+- fef6ac6: Stopped runs resume, and a `pause` action drains executing work before pausing. A stopped (`aborted`) run is no longer terminal for continuation: `resume` replays its journal and re-runs the interrupted calls. `WorkflowManager.pause(runId)` now requests a pause instead of interrupting: agent calls already executing finish and journal, nothing new is admitted, queued calls settle as interrupted rows, and the run pauses with `reason: "requested"` (new `WorkflowErrorCode.PAUSE_REQUESTED` and `paused` event reason). The MCP `workflow` tool gains `action: "pause"`, routed to the live execution owner like agent cancellation, answering `pauseRequested`/`paused` after a bounded wait for executing agents.
+- fef6ac6: Record where each run's script lives and expose it as a `file://` MCP resource. An inline script is copied into the run store as `<runId>.script.js` beside the run record; a `scriptPath` run records the caller's path and exposes that file. The `workflow://runs/{runId}/script` resource is removed; run, resume, status, and outcome responses carry `scriptUri` (a `file://` URI) and `scriptPath`. Resource reads are confined to files some persisted run recorded, and deleting a run removes its store copy without touching a caller's file. The engine persists `scriptOrigin` on run state and `RunPersistence` gains optional `scriptLocation`, `writeInlineScript`, `discardInlineScript`, and `readScript` seams.
+- fef6ac6: Resume re-reads the run's script file and continues an edited script as a validated revision. `ExecOptions.script` on a same-run continuation with text that differs from the persisted script parses the revision, refuses backends the admission never approved (`backends-changed`) or text that does not parse (`script-invalid`), and continues through an identity-matched replay of the run's own journal: unchanged calls replay, edited or new calls run live. The persisted record adopts the revised text, records `scriptRevisions`, and marks the generation with `continuation.scriptRevised`. The MCP `resume` action reads the run's `file://` script back, validates a changed file exactly like a new run, and reports refusals as tool execution errors that change nothing; MCP inspection no longer projects the engine's `replayEligibility` diagnostic.
+
+### Patch Changes
+
+- Updated dependencies [fef6ac6]
+- Updated dependencies [fef6ac6]
+- Updated dependencies [fef6ac6]
+- Updated dependencies [fef6ac6]
+  - @automatalabs/workflow-engine@4.0.0
+  - @automatalabs/shared-types@2.2.0
+  - @automatalabs/acp-agents@1.2.6
+  - @automatalabs/repl-engine@0.4.31
+
 ## 5.1.1
 
 ### Patch Changes

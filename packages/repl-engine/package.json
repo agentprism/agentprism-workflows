@@ -1,6 +1,6 @@
 {
   "name": "@automatalabs/repl-engine",
-  "version": "0.4.30",
+  "version": "0.4.31",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22"
