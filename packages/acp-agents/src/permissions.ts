@@ -163,6 +163,10 @@ function candidateNames(request: RequestPermissionRequest): CandidateNames {
   if (toolCall.title) decoration.push(toolCall.title);
   if (toolCall.kind) decoration.push(toolCall.kind);
   const toolNames: string[] = [];
+  // The standard ACP tool-call `name` (claude-agent-acp 0.77+, codex-acp 1.12+ set it on the
+  // initial tool_call) is the authoritative programmatic name; vendor `_meta.*.toolName` keys
+  // remain the fallback for adapters that only carry the name there.
+  if (typeof toolCall.name === "string" && toolCall.name.length > 0) toolNames.push(toolCall.name);
   collectMetaToolNames(toolCall._meta, toolNames);
   return { toolNames, decoration };
 }

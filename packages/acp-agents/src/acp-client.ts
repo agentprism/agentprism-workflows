@@ -559,7 +559,8 @@ class SessionState {
           role: "tool",
           kind: "toolCall",
           text: update.title,
-          toolName: toolNameFromMeta(update._meta) ?? update.kind,
+          toolName: (typeof update.name === "string" && update.name.length > 0 ? update.name : undefined)
+            ?? toolNameFromMeta(update._meta) ?? update.kind,
           timestamp: Date.now(),
         });
         break;
