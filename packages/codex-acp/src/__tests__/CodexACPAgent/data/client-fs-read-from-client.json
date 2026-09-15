@@ -25,7 +25,17 @@
             "newText": "package test.project\n\nclass UpdatedFile {}",
             "path": "/test/project/OldFile.kt",
             "_meta": {
-              "kind": "update"
+              "kind": "update",
+              "jetbrains": {
+                "air": {
+                  "version": 1,
+                  "diffStats": {
+                    "version": 1,
+                    "added": 1,
+                    "removed": 1
+                  }
+                }
+              }
             }
           }
         ]
