@@ -120,8 +120,10 @@ export interface AcpAgentPromptOptions {
    *  does not embed it in the prompt (today: Codex). Otherwise SCRIPT_VALIDATION_ERROR naming the
    *  backend and pointing at the constructor `schema` option. */
   schema?: TSchema;
-  /** Per-call abort: queued → rejects without sending; in flight → `session/cancel`, then rejects
-   *  with the reason. */
+  /** Per-call abort: queued, or started but not yet on the wire (the lazy open, the per-turn
+   *  `configOptions`/`mode`) → rejects with the reason without sending; in flight →
+   *  `session/cancel`, then rejects with the reason. The one way to stop a turn `cancel()` cannot
+   *  reach: `cancel()` targets only a turn whose `session/prompt` is on the wire. */
   signal?: AbortSignal;
 }
 

@@ -473,7 +473,10 @@ export class AcpAgent {
    * cancelled included). Rejects only on a wire rejection (mapped like the runner), validation,
    * abort (`signal.reason` untouched), a closed agent, or a typed session failure (the mapped
    * `WorkflowError` carrying the complete turn as `error.turn`; see `isAcpAgentTurnError`).
-   * `configOptions`/`mode` are applied before the turn and stick for the session.
+   * `configOptions`/`mode` are applied before the turn and stick for the session. To stop a
+   * specific turn use `options.signal`: it rejects while queued or before the turn reached the
+   * wire (nothing is sent) and sends one `session/cancel` once in flight — `cancel()` reaches only
+   * a turn already on the wire.
    */
   prompt(content: string | ContentBlock[], options: AcpAgentPromptOptions = {}): Promise<AcpAgentTurn> {
     return this.#enqueue(async () => {
@@ -581,11 +584,15 @@ export class AcpAgent {
     }
   }
 
-  /** ONE `session/cancel` for the in-flight turn (no-op otherwise). Resolves at the notify
-   *  boundary; the in-flight `prompt()` then resolves with `stopReason: "cancelled"` when the agent
-   *  honors it. A turn that ignores the cancel for the grace period ends in process disposal
-   *  WITHOUT a wire `session/close` (the session stays re-openable through `sessionRef`); the turn
-   *  then rejects and the agent is closed. Queued turns are untouched (use per-call signals). */
+  /** ONE `session/cancel` for the turn whose `session/prompt` is on the wire (no-op otherwise).
+   *  Resolves at the notify boundary; the in-flight `prompt()` then resolves with
+   *  `stopReason: "cancelled"` when the agent honors it. A turn that ignores the cancel for the
+   *  grace period ends in process disposal WITHOUT a wire `session/close` (the session stays
+   *  re-openable through `sessionRef`); the turn then rejects and the agent is closed. Queued
+   *  turns are untouched, and so is a turn that has started (`state === "busy"`) but has not
+   *  reached the wire yet — the lazy first open, or its per-turn `configOptions`/`mode` — a
+   *  `cancel()` in that window is a no-op the turn never sees. A per-call `signal` covers every
+   *  window (rejects with the reason before anything is sent; `session/cancel` once in flight). */
   cancel(): Promise<void> {
     return this.#cancelTurn();
   }
