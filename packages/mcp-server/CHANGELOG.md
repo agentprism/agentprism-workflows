@@ -1,5 +1,14 @@
 # @automatalabs/mcp-server
 
+## 7.0.4
+
+### Patch Changes
+
+- Updated dependencies [76bbf8f]
+  - @automatalabs/shared-types@3.1.0
+  - @automatalabs/workflows@6.2.0
+  - @automatalabs/repl-engine@0.4.35
+
 ## 7.0.3
 
 ### Patch Changes
