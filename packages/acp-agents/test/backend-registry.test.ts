@@ -210,7 +210,7 @@ test("definition helper rejects profile, factory id, and profile-object mismatch
 test("source drift locks registry imports and import hygiene, including type-only syntax", () => {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
   const runner = readFileSync(resolve(root, "packages/acp-agents/src/runner.ts"), "utf8");
-  const workflows = readFileSync(resolve(root, "packages/workflows/src/config.ts"), "utf8");
+  const catalog = readFileSync(resolve(root, "packages/acp-agents/src/config-catalog.ts"), "utf8");
   const define = readFileSync(resolve(root, "packages/acp-agents/src/backends/define.ts"), "utf8");
   const coverage = readFileSync(resolve(root, "packages/acp-agents/src/protocol-coverage.ts"), "utf8");
   const backend = readFileSync(resolve(root, "packages/acp-agents/src/backend.ts"), "utf8");
@@ -234,10 +234,11 @@ test("source drift locks registry imports and import hygiene, including type-onl
   assertNoIdentityEqualityBranches(runner);
   assert.doesNotMatch(runner, /\bfunction\s+builtinBackend\b/);
   assert.match(
-    workflows,
-    /from "@automatalabs\/acp-agents"[\s\S]*?\[\.\.\.BUILTIN_BACKEND_IDS, \.\.\.registry\.keys\(\)\]/,
+    catalog,
+    /from "\.\/backends\/builtins\.js"[\s\S]*?\[\.\.\.BUILTIN_BACKEND_IDS, \.\.\.registry\.keys\(\)\]/,
   );
-  assert.doesNotMatch(workflows, /BUILTIN_HARNESSES/);
+  assert.doesNotMatch(catalog, /BUILTIN_HARNESSES/);
+  assertNoConcreteBackendDependencies(catalog, new Set(["builtins"]));
 
   const forbiddenDefineDependency = /BUILTIN_BACKENDS|["'][^"']*builtins(?:\.js)?["']/;
   for (const syntax of [

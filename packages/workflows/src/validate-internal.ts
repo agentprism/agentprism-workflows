@@ -1,23 +1,4 @@
-import {
-  AcpAgentRunner,
-  type CustomBackendConfig,
-  type ProbedConfigOptions,
-} from "@automatalabs/acp-agents";
-
-export interface ValidateProbeRunner {
-  probeConfigOptions(
-    spec?: string,
-    opts?: { cwd?: string; selectModel?: boolean; backends?: Record<string, CustomBackendConfig>; signal?: AbortSignal },
-  ): Promise<ProbedConfigOptions>;
-  /** Every host-routable backend name. Used by protocol-native discovery. */
-  listBackends?(): string[];
-  /** Host-registered custom names, including deliberate built-in shadows. */
-  listCustomBackends?(): string[];
-  /** The host's backend selected when a workflow omits model. */
-  defaultBackendId?(): string;
-  /** Present on owned probe runners; shared host runners are never disposed by validation. */
-  dispose?(): Promise<void>;
-}
+import { AcpAgentRunner, type CustomBackendConfig, type ValidateProbeRunner } from "@automatalabs/acp-agents";
 
 export type ValidateProbeFactory = (
   backends: Record<string, CustomBackendConfig> | undefined,

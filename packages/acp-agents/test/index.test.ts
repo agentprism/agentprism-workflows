@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 
 // Same-package unit test: relative ../src import (resolved by tsx; sibling @automatalabs/*
 // deps it pulls in resolve to their built dist, which `pnpm test` builds first).
-import { createAcpRunner, selectBackend } from "../src/index.js";
+import { createAcpRunner, probeHarnessConfig, selectBackend } from "../src/index.js";
 
 test("@automatalabs/acp-agents public entry is reachable via ../src", () => {
   assert.equal(typeof createAcpRunner, "function");
   assert.equal(typeof selectBackend, "function");
+  assert.equal(typeof probeHarnessConfig, "function");
 });

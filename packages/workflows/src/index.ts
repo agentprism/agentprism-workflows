@@ -112,26 +112,25 @@ export type {
   UnusedMockAnswer,
   ValidateWorkflowOptions,
   ValidateWorkflowReport,
-  ValidateHarnessOptions,
   ValidatedAgentCall,
   ValidatedCheckpoint,
   ValidatedMockAnswerRule,
   ValidatedMockAnswers,
   ValidatedMockAnswerUse,
 } from "./validate.js";
-export type { ValidateProbeRunner } from "./validate-internal.js";
 
 // ── Harness config discovery: validate's sibling (`agentprism-workflows config`) — probe
 //    any routable ACP harness's advertised config-option catalog (model ids, effort levels,
-//    modes, …) without authoring a script. ──
+//    modes, …) without authoring a script. The catalog core lives in @automatalabs/acp-agents;
+//    this facade re-export is the supported surface. ──
 export {
   probeHarnessConfig,
-  formatHarnessConfigReport,
   buildHarnessModelsView,
   buildModelFilter,
   buildHarnessConfigSummary,
   formatHarnessConfigSummary,
-} from "./config.js";
+} from "@automatalabs/acp-agents";
+export { formatHarnessConfigReport } from "./config.js";
 export type {
   ProbeHarnessConfigOptions,
   HarnessConfigReport,
@@ -140,7 +139,9 @@ export type {
   HarnessConfigSummaryEntry,
   HarnessConfigSummaryModel,
   HarnessConfigSummaryGroup,
-} from "./config.js";
+  ValidateHarnessOptions,
+  ValidateProbeRunner,
+} from "@automatalabs/acp-agents";
 export type {
   WorkflowRunOptions,
   WorkflowRoutingSnapshot,

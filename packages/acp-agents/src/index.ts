@@ -142,6 +142,31 @@ export type {
 export { BACKENDS_ENV, registryWithRunBackends, resolveBackendRegistry } from "./registry.js";
 export type { BackendRegistry, CustomBackendConfig, RegisteredBackend } from "./registry.js";
 
+// Harness config catalog discovery (moved here from @automatalabs/workflows; the facade re-exports it).
+export {
+  probeHarnessConfig,
+  buildHarnessModelsView,
+  buildModelFilter,
+  buildHarnessConfigSummary,
+  formatHarnessConfigSummary,
+  selectChoicePairs,
+  summarizeSelectChoices,
+  DEFAULT_PROBE_TIMEOUT_MS,
+} from "./config-catalog.js";
+export type {
+  ProbeHarnessConfigOptions,
+  HarnessConfigReport,
+  ValidateHarnessOptions,
+  HarnessModelsView,
+  HarnessConfigSummary,
+  HarnessConfigSummaryEntry,
+  HarnessConfigSummaryModel,
+  HarnessConfigSummaryGroup,
+  SelectChoiceGroup,
+  SelectChoiceSummary,
+  ValidateProbeRunner,
+} from "./config-catalog.js";
+
 export {
   CANCEL_NOT_HONORED_GRACE_MS,
   PI_CHILD_CLEANUP_DEADLINE_MS,

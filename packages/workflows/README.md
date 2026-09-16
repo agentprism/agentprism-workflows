@@ -804,7 +804,7 @@ report.harnessOptions; // [{ backendId, model?, probed, modes?: SessionModeState
 formatHarnessConfigReport(report); // the CLI's human table
 ```
 
-`probeHarnessConfig({ harnesses?, modelSpecs?, backends?, cwd?, probeRunner?, probeTimeoutMs?, probeConcurrency?, signal? })` — `modelSpecs` selects exact routed models before reading their model-specific option domains; `probeRunner` reuses a host-owned live runner without disposing it; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner({ backends })`.
+`probeHarnessConfig({ harnesses?, modelSpecs?, backends?, cwd?, probeRunner?, probeTimeoutMs?, probeConcurrency?, signal? })` — `modelSpecs` selects exact routed models before reading their model-specific option domains; `probeRunner` reuses a host-owned live runner without disposing it; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner({ backends })` (implemented in `@automatalabs/acp-agents`; the facade re-exports it).
 
 Probes run concurrently with independent cancellation deadlines. `probeTimeoutMs` defaults to
 60,000 ms and must be a positive timer-safe integer; `probeConcurrency` defaults to 4 and accepts
