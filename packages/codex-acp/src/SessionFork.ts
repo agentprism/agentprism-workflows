@@ -5,6 +5,7 @@ import type {CodexAppServerClient} from "./CodexAppServerClient";
 import type {ModeKind} from "./app-server/ModeKind";
 import type {ServiceTier} from "./app-server/ServiceTier";
 import type {Model, ThreadForkParams} from "./app-server/v2";
+import {readInstructionOverrides} from "./InstructionOverrides";
 import type {SessionMetadata} from "./SessionMetadata";
 
 export type SessionForkDependencies = {
@@ -39,8 +40,15 @@ export async function forkSession(
         ...(lastTurnId !== undefined && {lastTurnId}),
         modelProvider: await dependencies.getResumeModelProvider(),
         threadId: request.sessionId,
+        // The session/fork request's own `_meta.baseInstructions` / `_meta.developerInstructions`
+        // ride thread/fork exactly as thread/start and thread/resume carry them: a live fork has
+        // no reattach that could deliver them later.
+        ...readInstructionOverrides(request._meta),
     });
-    await dependencies.codexClient.threadUnsubscribe({threadId: response.thread.id});
+    // `thread/fork` subscribes this connection to the new thread the way `thread/resume` does (the
+    // app-server protocol has no separate subscribe request; `thread/unsubscribe` is the only
+    // subscription control), so the forked session is live from here on: its turns, approvals,
+    // and notifications route like a resumed session's. Nothing to unsubscribe.
 
     const models = await dependencies.fetchAvailableModels();
     return {

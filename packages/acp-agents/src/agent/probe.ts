@@ -13,6 +13,7 @@ import {
 import { mapThrownError } from "../errors-map.js";
 import { registryWithRunBackends, type CustomBackendConfig } from "../registry.js";
 import { resolveModelRoute } from "../routing.js";
+import { describeBackendTraits } from "../traits.js";
 import { releaseOnExit, retainOnExit } from "./process-registry.js";
 import { resolveAgentRegistry } from "./routing.js";
 import type { AcpAgentCatalog, AcpAgentProbeOptions } from "./types.js";
@@ -45,6 +46,9 @@ export function createAgentProbeRunner(backends: Record<string, CustomBackendCon
           ...(route.backend.defaultModeId === undefined ? {} : { defaultModeId: route.backend.defaultModeId }),
           options: handle.advertisedConfigOptions,
           modes: handle.modes ?? null,
+          // The live refinement: pi and the Codex fork advertise their system-prompt channel and the
+          // two vendor extensions at initialize; Claude advertises nothing and reports the tables.
+          traits: describeBackendTraits(route.backend, registry, connection.capabilities),
         };
       } finally {
         opts.signal?.removeEventListener("abort", onAbort);
@@ -64,7 +68,7 @@ export function createAgentProbeRunner(backends: Record<string, CustomBackendCon
 
 /** The catalog behind `AcpAgent.probe` (see the file header). Per-target failures never throw
  *  (`probed: false` with a redacted `error`); a bad `modelFilter`, `probeTimeoutMs`, or
- *  `probeConcurrency` throws a TypeError and a malformed registry a SCRIPT_VALIDATION_ERROR — all
+ *  `probeConcurrency` throws a TypeError and a malformed registry an INVALID_ARGUMENT — all
  *  before any process spawns. */
 export async function probeCatalog(options: AcpAgentProbeOptions = {}): Promise<AcpAgentCatalog> {
   // Validation only: a bad regex must surface BEFORE any spawn (the MCP handler does the same).

@@ -23,6 +23,7 @@ import {
   AcpAgent,
   isAcpAgentTurnError,
   mapTypedSessionFailure,
+  type AcpAgentMessage,
   type AcpAgentTurn,
   type TypedSessionFailure,
 } from "../../src/index.js";
@@ -90,6 +91,17 @@ const count = (log: LogEntry[], method: string): number => methods(log).filter((
 const permissionOutcomes = (log: LogEntry[]) =>
   log.filter((entry) => entry.method === "permissionOutcome").map((entry) => entry.outcome);
 const find = (log: LogEntry[], method: string): LogEntry | undefined => log.find((entry) => entry.method === method);
+
+/** Messages without their wall-clock field (the agent's tap and the turn's tap each read the clock). */
+const undated = (messages: readonly AcpAgentMessage[]) => messages.map(({ receivedAt: _receivedAt, ...message }) => message);
+const textOf = (message: AcpAgentMessage): string =>
+  message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
+/** The documented relationship: the TEXT-BEARING assistant messages joined by a blank line. */
+const assistantText = (messages: readonly AcpAgentMessage[]): string =>
+  messages
+    .filter((message) => message.role === "assistant" && message.content.some((block) => block.type === "text"))
+    .map(textOf)
+    .join("\n\n");
 
 function isCode(code: WorkflowErrorCode, extra?: (error: Error & Record<string, unknown>) => void) {
   return (error: unknown): boolean => {
@@ -224,6 +236,22 @@ test("prompt returns the verbatim response with _meta, every update, raw message
   ]);
   assert.equal(turn.text, "narration\n\nanswer", "distinct assistant messages join with a blank line");
   assert.equal(agent.text, turn.text, "the session text uses the same fold");
+  assert.deepEqual(
+    turn.messages.map(({ receivedAt, ...message }) => ({ ...message, dated: typeof receivedAt === "number" })),
+    [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "narration" }],
+        toolCalls: [{ toolCallId: "tc-1", name: "read_file", title: "Read", kind: "read", status: "completed", rawOutput: "x", meta: { vendor: 1 } }],
+        thoughts: [],
+        dated: true,
+      },
+      { role: "assistant", content: [{ type: "text", text: "answer" }], toolCalls: [], thoughts: [], dated: true },
+    ],
+    "messages: the same fold per message, with the tool call attached to the message that issued it",
+  );
+  assert.equal(turn.messages[0]!.receivedAt, turn.updates[0]!.receivedAt, "dated by its first update");
+  assert.deepEqual(undated(agent.messages), undated(turn.messages), "the retained transcript is this one turn");
   assert.deepEqual(turn.usage.response, usage);
   assert.deepEqual(turn.usage.turn, { input: 3, output: 2, cacheRead: 0, cacheWrite: 0, total: 5, cost: 0 });
   assert.equal(turn.history.length, 3, "two text entries + one tool call");
@@ -231,6 +259,76 @@ test("prompt returns the verbatim response with _meta, every update, raw message
   assert.deepEqual(turn.permissions, []);
   assert.deepEqual(turn.elicitations, []);
   assert.equal("structured" in turn, false, "no schema → no structured keys");
+});
+
+test("turn.messages splits exactly where turn.text splits: the assistant messages joined by a blank line ARE turn.text", async () => {
+  const chunk = (text: string) => ({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+  const thought = (text: string) => ({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text } });
+  const { cwd } = configure({
+    turns: [
+      {
+        // Interleaved thoughts, tool calls (with a later update), a plan, a user echo (a steer's), and
+        // text that streams in several chunks — the real accumulator folds `text`, the message fold
+        // folds `messages`; the two must agree on every boundary.
+        updates: [
+          thought("plan it"),
+          chunk("A1"),
+          chunk("A2"),
+          { sessionUpdate: "tool_call", toolCallId: "tc-1", title: "Read", kind: "read", status: "in_progress" },
+          { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed", rawOutput: "x" },
+          thought("then"),
+          chunk("B"),
+          { sessionUpdate: "tool_call", toolCallId: "tc-2", title: "Edit", kind: "edit", status: "in_progress" },
+          { sessionUpdate: "plan", entries: [] },
+          chunk("C"),
+          { sessionUpdate: "user_message_chunk", content: { type: "text", text: "steer" } },
+          chunk("D1"),
+          chunk("D2"),
+        ],
+        text: [],
+      },
+      // A turn that starts with a tool call: a leading assistant message with no text, which the
+      // text fold never sees — the join over the TEXT-BEARING messages is the exact statement.
+      { updates: [{ sessionUpdate: "tool_call", toolCallId: "tc-3", title: "Grep", kind: "search", status: "completed" }], text: "E" },
+    ],
+  });
+  const agent = track(new AcpAgent({ cwd, model: "claude" }));
+  const t1 = await agent.prompt("one");
+  assert.equal(t1.text, "A1A2\n\nB\n\nC\n\nD1D2");
+  assert.equal(t1.messages.filter((m) => m.role === "assistant").map(textOf).join("\n\n"), t1.text);
+  assert.deepEqual(
+    t1.messages.map((m) => ({
+      role: m.role,
+      text: textOf(m),
+      tools: m.toolCalls.map((c) => `${c.toolCallId}:${c.status}`),
+      thoughts: m.thoughts.map((block) => (block.type === "text" ? block.text : block.type)),
+    })),
+    [
+      { role: "assistant", text: "A1A2", tools: ["tc-1:completed"], thoughts: ["plan it"] },
+      { role: "assistant", text: "B", tools: ["tc-2:in_progress"], thoughts: ["then"] },
+      { role: "assistant", text: "C", tools: [], thoughts: [] },
+      { role: "user", text: "steer", tools: [], thoughts: [] },
+      { role: "assistant", text: "D1D2", tools: [], thoughts: [] },
+    ],
+  );
+  assert.deepEqual(t1.toolCalls.map((c) => c.toolCallId), ["tc-1", "tc-2"], "turn.toolCalls is the flattening of the messages' tool calls");
+  assert.deepEqual(t1.history.map((e) => e.kind), ["text", "text", "toolCall", "text", "toolCall", "text", "text", "text"], "history stays per chunk");
+
+  const t2 = await agent.prompt("two");
+  assert.equal(t2.text, "E");
+  assert.deepEqual(
+    t2.messages.map((m) => ({ text: textOf(m), tools: m.toolCalls.map((c) => c.toolCallId) })),
+    [{ text: "", tools: ["tc-3"] }, { text: "E", tools: [] }],
+  );
+  assert.equal(assistantText(t2.messages), t2.text);
+
+  // The retained transcript is the concatenation of the turns' messages and folds like agent.text.
+  assert.deepEqual(undated(agent.messages), [...undated(t1.messages), ...undated(t2.messages)]);
+  assert.equal(agent.text, "A1A2\n\nB\n\nC\n\nD1D2\n\nE");
+  assert.equal(assistantText(agent.messages), agent.text);
+  const snapshot = agent.messages;
+  (snapshot[0]!.content[0] as { text: string }).text = "mutated";
+  assert.equal(textOf(agent.messages[0]!), "A1A2", "messages hands out copies");
 });
 
 test("a typed session failure rejects with the mapped error carrying the complete turn and the verbatim response", async () => {
@@ -385,7 +483,7 @@ test("steer overlaps an in-flight turn and is rejected when idle", async () => {
   await parked;
   await assert.rejects(
     () => agent.steer("late"),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /requires a prompt\(\) in flight/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /requires a prompt\(\) in flight/)),
   );
 });
 
@@ -421,7 +519,7 @@ test("a turn that ignores cancel ends in process disposal without session/close,
     assert.ok(wire.includes("cancel"));
     assert.equal(wire.includes("closeSession"), false, "no wire session/close: the session stays re-openable");
     assert.equal(agent.sessionRef?.sessionId, agent.sessionId);
-    await assert.rejects(() => agent.prompt("z"), isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (e) => assert.match(e.message, /is closed/)));
+    await assert.rejects(() => agent.prompt("z"), isCode(WorkflowErrorCode.INVALID_ARGUMENT, (e) => assert.match(e.message, /is closed/)));
     await agent.close();
     await waitFor(() => liveConnectionCount() === 0);
   } finally {
@@ -446,11 +544,11 @@ test("per-turn configOptions/mode apply before the turn and stick; unknown ids a
   const before = readLog().length;
   await assert.rejects(
     () => agent.prompt("y", { configOptions: { model: "m" } }),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /reserved option id "model"/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /reserved option id "model"/)),
   );
   await assert.rejects(
     () => agent.prompt("y", { configOptions: { nope: true } }),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /not advertised.*model, effort/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /not advertised.*model, effort/)),
   );
   assert.equal(readLog().length, before, "the rejections never reached the wire");
   assert.equal(agent.state, "ready");
@@ -480,11 +578,12 @@ test("close({ keep: true }) skips session/close, disposes the process, and retai
   assert.equal(count(readLog(), "__exit"), 1, "a second close() is the same teardown");
   await assert.rejects(
     () => agent.prompt("z"),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /is closed/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /is closed/)),
   );
   await assert.rejects(() => agent.ready(), /is closed/);
   await assert.rejects(() => agent.fork(), /is closed/);
   await assert.rejects(() => agent.setMode("plan"), /is closed/);
+  await assert.rejects(() => agent.setModel("claude/opus"), /is closed/);
   await assert.rejects(() => agent.setConfigOptions({}), /is closed/);
   await agent.cancel(); // never throws after close
 });
@@ -529,7 +628,7 @@ test("process death closes the agent, rejects queued work, and emits backend_err
   await assert.rejects(first, isCode(WorkflowErrorCode.AGENT_EXECUTION_ERROR));
   await assert.rejects(
     queued,
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /process exited/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /process exited/)),
   );
   assert.equal(agent.state, "closed");
   assert.equal(errors.length, 1, "backend_error reaches the agent's own listeners");
@@ -688,7 +787,7 @@ test("a per-call signal aborted while queued never reaches the wire; aborted in 
 
 test("cwd and configOptions are validated synchronously before any spawn", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
-  const validation = isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+  const validation = isCode(WorkflowErrorCode.INVALID_ARGUMENT);
   assert.throws(() => new AcpAgent({ cwd: "relative" }), validation);
   assert.throws(() => new AcpAgent({ cwd: "" }), validation);
   assert.throws(() => new AcpAgent({ cwd: join(cwd, "missing", "dir") }), validation);
@@ -721,7 +820,7 @@ test("a synchronous spawn failure closes the agent and surfaces as the mapped er
   assert.equal(agent.state, "closed", "an open that failed before spawning still closes the agent");
   await assert.rejects(
     () => agent.prompt("y"),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /is closed/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /is closed/)),
   );
   assert.deepEqual(readLog(), [], "nothing was ever spawned");
   assert.equal(liveConnectionCount(), 0, "nothing was retained for the exit hook");
@@ -796,6 +895,8 @@ test("history/text are cumulative by default and per-turn with retainHistory:fal
     const t2 = await agent.prompt("2");
     assert.equal(agent.text, "one\n\ntwo", "agent.text folds like turn.text: distinct messages join with a blank line");
     assert.equal(agent.text, [t1.text, t2.text].join("\n\n"));
+    assert.deepEqual(undated(agent.messages), [...undated(t1.messages), ...undated(t2.messages)], "messages are cumulative too");
+    assert.equal(assistantText(agent.messages), agent.text);
     assert.equal(agent.history.length, 2);
     assert.equal(t1.history.length, 1);
     assert.equal(t2.history.length, 1, "each turn's slice holds only its own entry");
@@ -813,6 +914,7 @@ test("history/text are cumulative by default and per-turn with retainHistory:fal
     const t2 = await agent.prompt("2");
     assert.equal(agent.text, "two");
     assert.equal(agent.history.length, 1);
+    assert.deepEqual(undated(agent.messages), undated(t2.messages), "messages hold only the latest turn, like the accumulator");
     assert.equal(t2.text, "two");
     assert.equal(t2.history.length, 1, "the turn's slice starts at 0 after the accumulator was cleared");
     assert.equal(t2.history[0]!.text, "two");
@@ -913,7 +1015,7 @@ test("systemPrompt is validated in the constructor against the routed backend, b
   // OpenCode carries no channel: refused synchronously with the backend named.
   assert.throws(
     () => new AcpAgent({ cwd, model: "opencode", label: "oc", systemPrompt: { replace: "R" } }),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => {
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => {
       assert.match(error.message, /systemPrompt\.replace is not supported by backend "opencode"/);
       assert.equal(error.agentLabel, "oc");
     }),
@@ -921,13 +1023,13 @@ test("systemPrompt is validated in the constructor against the routed backend, b
   // A malformed value is refused on a supporting backend too.
   assert.throws(
     () => new AcpAgent({ cwd, model: "claude", systemPrompt: { append: "" } }),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => {
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => {
       assert.match(error.message, /systemPrompt\.append must be a non-empty string/);
     }),
   );
   assert.throws(
     () => new AcpAgent({ cwd, model: "claude", systemPrompt: { base: "x" } as never }),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => {
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => {
       assert.match(error.message, /unknown field "base"/);
     }),
   );
@@ -982,4 +1084,54 @@ test("Codex and pi: systemPrompt rides session/new in each backend's own dialect
   assert.deepEqual(readLog().filter((entry) => entry.method === "newSession")[1]?.params?._meta, {
     systemPrompt: { append: "DEV" },
   });
+});
+
+// ---- permissions (the headless allow/deny auto-policy) -------------------------------------------
+
+test("permissions: the headless allow/deny policy answers the agent's permission requests; a resolver, when present, answers them all", async () => {
+  const { cwd, readLog } = configure({
+    turns: [
+      { toolCall: { title: "Bash", kind: "execute", name: "Bash", toolCallId: "tc-deny" }, text: "denied" },
+      { toolCall: { title: "Read", kind: "read", name: "Read", toolCallId: "tc-allow" }, text: "allowed" },
+    ],
+  });
+  const optionOf = (turn: AcpAgentTurn): string | undefined => {
+    const outcome = turn.permissions[0]!.outcome.outcome;
+    return outcome.outcome === "selected" ? outcome.optionId : undefined;
+  };
+  const agent = track(new AcpAgent({ cwd, model: "claude", permissions: { deny: ["Bash"] } }));
+  const denied = await agent.prompt("one");
+  assert.equal(denied.text, "denied");
+  assert.equal(optionOf(denied), "reject-1", "the deny list picks the reject option");
+  const allowed = await agent.prompt("two");
+  assert.equal(optionOf(allowed), "allow-1", "defaultOutcome allow answers the unmatched request");
+  assert.deepEqual(permissionOutcomes(readLog()), [
+    { outcome: "selected", optionId: "reject-1" },
+    { outcome: "selected", optionId: "allow-1" },
+  ]);
+
+  // A resolver next to the policy answers EVERY request (the runner's default precedence: the
+  // policy is the headless fallback, consulted only when no resolver is installed).
+  await harness.cleanup();
+  const both = configure({
+    turns: [
+      { toolCall: { title: "Bash", kind: "execute", name: "Bash", toolCallId: "tc-1" }, text: "a" },
+      { toolCall: { title: "Read", kind: "read", name: "Read", toolCallId: "tc-2" }, text: "b" },
+    ],
+  });
+  const asked: string[] = [];
+  const guarded = track(
+    new AcpAgent({
+      cwd: both.cwd,
+      model: "claude",
+      permissions: { deny: ["Bash"], defaultOutcome: "deny" },
+      onPermissionRequest: (request) => {
+        asked.push(request.toolCall.toolCallId);
+        return ALLOW;
+      },
+    }),
+  );
+  assert.equal(optionOf(await guarded.prompt("one")), "allow-1", "the resolver decided, not the deny list");
+  assert.equal(optionOf(await guarded.prompt("two")), "allow-1", "the resolver decided, not defaultOutcome");
+  assert.deepEqual(asked, ["tc-1", "tc-2"], "the resolver saw every request");
 });

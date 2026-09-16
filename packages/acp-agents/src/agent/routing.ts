@@ -1,7 +1,8 @@
-// Agent-facing routing over ../routing.js: the registry read (malformed → SCRIPT_VALIDATION_ERROR),
+// Agent-facing routing over ../routing.js: the registry read (malformed → INVALID_ARGUMENT),
 // the runner's model-spec grammar for `new AcpAgent({ model })`, the ref-driven route the cold
-// statics use (never the default backend), cwd validation that fails BEFORE a process spawns, and
-// the fresh-Backend-instance rule a fork child needs.
+// statics use (never the default backend), the same-backend rule a fork override and a
+// mid-session model switch (`setModel`, a per-turn `model`) must satisfy, cwd validation that
+// fails BEFORE a process spawns, and the fresh-Backend-instance rule a fork child needs.
 import { isAbsolute } from "node:path";
 import { statSync } from "node:fs";
 import type { AgentSessionRef } from "@automatalabs/shared-types";
@@ -14,7 +15,8 @@ import { agentValidationError } from "./errors.js";
 import type { AcpAgentOptions } from "./types.js";
 
 /** The custom-backend registry for an agent: `backends` merged over `AGENTPRISM_BACKENDS`. A
- *  malformed registry is a caller error (SCRIPT_VALIDATION_ERROR), mirroring the runner's wrap. */
+ *  malformed registry is a caller error (INVALID_ARGUMENT; the runner's wrap says
+ *  SCRIPT_VALIDATION_ERROR for the same condition). */
 export function resolveAgentRegistry(
   backends: Record<string, CustomBackendConfig> | undefined,
   label?: string,
@@ -72,6 +74,58 @@ export function resolveRefRoute(
     );
   }
   return { backend, modelSpec: model };
+}
+
+/**
+ * The model rule `fork()`, `setModel()` and a per-turn `model` share: `spec` goes through the
+ * runner's grammar (`resolveModelRoute` — a registered name wins, an unrouted spec goes to the
+ * default backend) and the route must land on THIS agent's backend, poolKey-equal; otherwise
+ * INVALID_ARGUMENT naming both backends. The remainder is the verbatim model id (`undefined` for a
+ * backend-only spec — `fork()` reads that as "no selection"; a switch rejects it, see
+ * `resolveModelSwitch`).
+ */
+export function resolveSameBackendModel(
+  spec: string,
+  backend: Backend,
+  registry: BackendRegistry,
+  label: string | undefined,
+  method: string,
+): ModelRoute {
+  const route = resolveModelRoute(spec, registry);
+  const routedPool = route.backend.poolKey ?? route.backend.id;
+  const ownPool = backend.poolKey ?? backend.id;
+  if (route.backend.id !== backend.id || routedPool !== ownPool) {
+    // Same id, different pool (a registry entry shadowing this built-in's name): say which pool.
+    const pooled = route.backend.id === backend.id;
+    const routed = `backend "${route.backend.id}"${pooled ? ` (pool "${routedPool}")` : ""}`;
+    const own = `backend "${backend.id}"${pooled ? ` (pool "${ownPool}")` : ""}`;
+    throw agentValidationError(`${method}: model "${spec}" routes to ${routed} but must stay on ${own}`, label);
+  }
+  return route;
+}
+
+/** What a mid-session switch selects: `spec` resolved with `resolveSameBackendModel`, with a
+ *  blank spec or a backend-only spec (`"claude"`, `"claude/"`) rejected — there is no wire form
+ *  for "unselect", so a switch always names a model id. Returns the verbatim id to send and the
+ *  routed `<backendId>/<id>` form the agent's `model` takes once it applied. */
+export function resolveModelSwitch(
+  spec: unknown,
+  backend: Backend,
+  registry: BackendRegistry,
+  label: string | undefined,
+  method: string,
+): { modelSpec: string; model: string } {
+  if (typeof spec !== "string" || spec.trim() === "") {
+    throw agentValidationError(`${method} requires a non-empty model spec ("${backend.id}/<model id>")`, label);
+  }
+  const { modelSpec } = resolveSameBackendModel(spec, backend, registry, label, method);
+  if (modelSpec === undefined || modelSpec.trim() === "") {
+    throw agentValidationError(
+      `${method}: model "${spec}" names backend "${backend.id}" but no model id; use "${backend.id}/<model id>"`,
+      label,
+    );
+  }
+  return { modelSpec, model: `${backend.id}/${modelSpec}` };
 }
 
 /** A fresh `Backend` instance with the same identity as `backend` (a registered name wins, as in

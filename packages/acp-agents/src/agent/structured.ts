@@ -1,15 +1,17 @@
 // Schema plumbing for the AcpAgent SDK: the per-session injection decision (the same rule the
 // runner applies — the backend opts in AND the initialized agent strictly advertises HTTP MCP),
 // the client-hosted StructuredOutput tool registration each agent owns, the per-turn schema gate,
-// and the no-repair result ladder (capture → native → final-message extraction → structuredError).
+// the `schemaRetries` budget guard, and the per-turn result resolution (capture → native →
+// final-message extraction → structuredError). The opt-in repair ladder that re-prompts on a miss
+// lives in acp-agent.ts (`#promptTurn`) and sends the runner's `repairPromptText`.
 import type { TSchema } from "typebox";
-import { Convert, Errors } from "typebox/value";
 import type { McpServerConfig } from "@automatalabs/shared-types";
 import type { PooledConnection } from "../acp-client.js";
 import type { Backend, StructuredSource } from "../backend.js";
 import { extractValidated, validateValue } from "../structured-output.js";
 import {
   STRUCTURED_OUTPUT_SERVER_NAME,
+  describeSchemaErrors,
   type StructuredOutputToolHost,
   type StructuredOutputToolRegistration,
 } from "../structured-tool.js";
@@ -93,26 +95,39 @@ export function assertPerTurnSchemaAllowed(backend: Backend, schema: TSchema | u
   );
 }
 
+/** `schemaRetries` (constructor or per turn): an integer ≥ 0, or INVALID_ARGUMENT naming `where`.
+ *  `undefined` is the default budget, 0. */
+export function validateSchemaRetries(value: unknown, label: string | undefined, where: string): number {
+  if (value === undefined) return 0;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw agentValidationError(
+      `${where}: schemaRetries must be an integer >= 0 (the number of extra repair turns), got ${describeValue(value)}`,
+      label,
+    );
+  }
+  return value;
+}
+
+/** The offending value for the message. `JSON.stringify` renders NaN and ±Infinity as `null`,
+ *  so numbers go through `String`; so does anything JSON cannot serialize (undefined, a symbol,
+ *  a bigint). */
+function describeValue(value: unknown): string {
+  if (typeof value === "number") return String(value);
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
 /** The slice of a SessionHandle the result ladder reads. */
 export type StructuredHandle = StructuredSource;
 
-function describeErrors(schema: TSchema, value: unknown): string {
-  let converted: unknown;
-  try {
-    converted = Convert(schema, value);
-  } catch {
-    converted = value;
-  }
-  return Errors(schema, converted)
-    .slice(0, 3)
-    .map((error) => `${error.instancePath || "/"} ${error.message}`)
-    .join("; ");
-}
-
 /**
- * The no-repair ladder for one turn: this turn's StructuredOutput capture (already validated by
- * the tool host) → the backend's native result, validated → a validated JSON block in the final
- * assistant message → otherwise `structuredError` naming every channel that applied.
+ * The result resolution for ONE turn (no re-prompt here): this turn's StructuredOutput capture
+ * (already validated by the tool host) → the backend's native result, validated → a validated
+ * JSON block in the final assistant message → otherwise `structuredError` naming every channel
+ * that applied. The same three channels the runner's `resolveStructuredOutput` tries per attempt.
  */
 export function resolveTurnStructured(args: {
   schema: TSchema;
@@ -127,7 +142,7 @@ export function resolveTurnStructured(args: {
   if (native !== undefined && native !== null) {
     const validated = validateValue(native, schema);
     if (validated !== undefined) return { structured: validated };
-    reasons.push(`native result rejected: ${describeErrors(schema, native)}`);
+    reasons.push(`native result rejected: ${describeSchemaErrors(schema, native)}`);
   }
   const extracted = extractValidated(handle.finalMessageText(), schema);
   if (extracted !== undefined) return { structured: extracted };

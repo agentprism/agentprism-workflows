@@ -692,7 +692,9 @@ export class CodexAcpServer {
         operation: "new" | "resume" | "fork" = "sessionId" in request ? "resume" : "new",
     ): Promise<[SessionId, LegacySessionModelState, SessionModeState]> {
         const existingSessionRequest = request as acp.ResumeSessionRequest | acp.ForkSessionRequest;
-        const requestedSessionGeneration = operation === "resume"
+        // The generation this open is registered under. A resume registers before its request goes
+        // out (the id is known up front); a fork registers the moment thread/fork returns the new id.
+        let openGeneration: number | null = operation === "resume"
             ? this.beginSessionOpen(existingSessionRequest.sessionId)
             : null;
         await this.checkAuthorization();
@@ -702,19 +704,22 @@ export class CodexAcpServer {
             : null;
 
         let sessionMetadata: SessionMetadata;
-        let resumeSubscribed = false;
+        // Whether this connection holds a thread subscription that no installed session state owns
+        // yet. A failure in that window must release it (cleanupStaleSessionOpen → session close →
+        // thread/unsubscribe), or the thread stays subscribed with no session to route it to.
+        let threadSubscribed = false;
         if (operation === "resume") {
             const resumeRequest = request as acp.ResumeSessionRequest;
             logger.log(`Resume existing session: ${resumeRequest.sessionId}...`);
             try {
                 sessionMetadata = await this.runWithProcessCheck(() =>
                     this.codexAcpClient.resumeSession(resumeRequest, () => {
-                        resumeSubscribed = true;
+                        threadSubscribed = true;
                     })
                 );
             } catch (err) {
-                if (resumeSubscribed && requestedSessionGeneration !== null) {
-                    await this.cleanupStaleSessionOpen(resumeRequest.sessionId, requestedSessionGeneration);
+                if (threadSubscribed && openGeneration !== null) {
+                    await this.cleanupStaleSessionOpen(resumeRequest.sessionId, openGeneration);
                 }
                 throw err;
             }
@@ -722,6 +727,11 @@ export class CodexAcpServer {
             const forkRequest = request as acp.ForkSessionRequest;
             logger.log(`Fork existing session: ${forkRequest.sessionId}...`);
             sessionMetadata = await this.runWithProcessCheck(() => this.codexAcpClient.forkSession(forkRequest));
+            // thread/fork subscribed this connection to the forked thread (nothing unsubscribes it
+            // after the fork any more), so the fork is now in the same window as a resumed thread:
+            // register the open under the new id so a failure before installSessionState can close it.
+            threadSubscribed = true;
+            openGeneration = this.beginSessionOpen(sessionMetadata.sessionId);
         } else {
             logger.log(`Create new session...`);
             sessionMetadata = await this.runWithProcessCheck(() => this.codexAcpClient.newSession(request as acp.NewSessionRequest));
@@ -733,14 +743,14 @@ export class CodexAcpServer {
         try {
             authState = await this.getAuthStateForProvider(authProvider);
         } catch (err) {
-            if (resumeSubscribed && requestedSessionGeneration !== null) {
-                await this.cleanupStaleSessionOpen(sessionId, requestedSessionGeneration);
+            if (threadSubscribed && openGeneration !== null) {
+                await this.cleanupStaleSessionOpen(sessionId, openGeneration);
             }
             throw err;
         }
-        const sessionGeneration = requestedSessionGeneration ?? this.beginSessionOpen(sessionId);
+        const sessionGeneration = openGeneration ?? this.beginSessionOpen(sessionId);
         if (!this.sessionOpenCanInstall(sessionId, sessionGeneration)) {
-            resumeSubscribed = false;
+            threadSubscribed = false;
             await this.closeStaleSessionOpen(sessionId, sessionGeneration);
         }
         const sessionMcpServers = this.resolveSessionMcpServers(requestedMcpServers, operation === "resume");
@@ -793,10 +803,11 @@ export class CodexAcpServer {
             );
         }
         this.installSessionState(sessionState);
-        resumeSubscribed = false;
+        threadSubscribed = false;
 
-        const canPublishSessionUpdates = operation !== "fork";
-        if (canPublishSessionUpdates && requestedMcpServers.length > 0 && mcpServerStartupVersion !== null) {
+        // A forked session is live (thread/fork subscribes this connection like thread/resume), so
+        // it publishes its startup state exactly like a new or resumed one.
+        if (requestedMcpServers.length > 0 && mcpServerStartupVersion !== null) {
             this.pendingMcpStartupSessions.set(sessionId, {
                 requestedServers: new Set(getRequestedMcpServerNames(requestedMcpServers)),
                 afterVersion: mcpServerStartupVersion,
@@ -804,9 +815,7 @@ export class CodexAcpServer {
             this.publishMcpStartupStatusAsync(sessionId);
         }
 
-        if (canPublishSessionUpdates) {
-            this.publishAvailableCommandsAsync(sessionState, sessionGeneration);
-        }
+        this.publishAvailableCommandsAsync(sessionState, sessionGeneration);
         if (operation === "resume") {
             this.publishCurrentGoalAsync(sessionState, sessionGeneration);
             this.publishAsyncTasksAsync(sessionState, sessionGeneration);

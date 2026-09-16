@@ -6,7 +6,7 @@ Use [OpenAI Codex](https://github.com/openai/codex) from [Agent Client Protocol]
 
 `codex-acp` is a stdio ACP agent server. It starts the Codex App Server, translates ACP requests into Codex operations, and maps Codex events back into the client.
 
-This package is a fork of [`agentclientprotocol/codex-acp`](https://github.com/agentclientprotocol/codex-acp), regularly synced with upstream. On top of upstream it exposes Codex App Server features not (yet) piped through the ACP interface — turn-level structured output (`outputSchema`), per-session instruction overrides, native session steering, and loaded-session turn-terminal state. Outgoing metadata capabilities remain under `agentCapabilities._meta`; steering is separately advertised at top-level initialize metadata as `_meta.steering.supported === true`, so clients can feature-detect before sending `_session/steering`, and the `_session/loaded_turn` extension is advertised the same way (`_meta.loadedTurn.supported === true`).
+This package is a fork of [`agentclientprotocol/codex-acp`](https://github.com/agentclientprotocol/codex-acp), regularly synced with upstream. On top of upstream it exposes Codex App Server features not (yet) piped through the ACP interface — turn-level structured output (`outputSchema`), per-session instruction overrides, native session steering, loaded-session turn-terminal state, and live `session/fork`. Outgoing metadata capabilities remain under `agentCapabilities._meta`; steering is separately advertised at top-level initialize metadata as `_meta.steering.supported === true`, so clients can feature-detect before sending `_session/steering`, and the `_session/loaded_turn` extension is advertised the same way (`_meta.loadedTurn.supported === true`).
 
 ## Features
 
@@ -19,6 +19,7 @@ This package is a fork of [`agentclientprotocol/codex-acp`](https://github.com/a
 - Strict native session steering via `_session/steering` while the original prompt is active; an accepted instruction returns `{ outcome: "injected" }`, while an idle session or settlement race returns `{ outcome: "promptRequired", reason: "noRunningTurn" }`. Steering never starts or queues a turn, and unexpected failures reject the JSON-RPC request.
 - Loaded-session turn-terminal state via `_session/loaded_turn` (the re-attach arm's authoritative completion evidence): `_session/loaded_turn/query { sessionId }` answers whether the loaded session's founding turn is still running right now — `running` while a turn executes in-process (the `_session/loaded_turn/ended` notification then fires when that turn completes, with its stop reason or its error), `completed` when the loaded thread's last turn completed (the replayed final message is authoritative), and `interrupted` when it ended without a terminal message (nothing is running — re-issue is safe).
 - Fork extensions advertised under `agentCapabilities._meta["@automatalabs/codex-acp"]` for client-side feature detection.
+- Live `session/fork`: the forked Codex thread stays subscribed — `thread/fork` subscribes the connection to the new thread exactly like `thread/resume` does, and this fork no longer unsubscribes it afterwards — and the new session publishes its available commands and MCP startup status like a resumed one, so the returned session id is promptable at once with no `session/resume` / `session/load` round trip (upstream unsubscribes the forked thread until it is reopened).
 - Shell command, file change, [permission request](docs/permission-extension.md), MCP tool call, terminal output, reasoning, plan, web search, image generation, image view, token usage, and review events.
 - Client `fs.readTextFile` capability: when the client advertises it, file-change diff content is read through `fs/read_text_file` (so diffs reflect unsaved editor buffers), with local file system fallback otherwise. File writes happen inside codex itself — the app-server delegates no file IO to the client.
 - [Native ACP subagent sessions](docs/subagent-sessions.md) (after capability negotiation) with separate child histories and root-routed permissions; a legacy tool-call fallback otherwise. Legacy tool updates retain Codex thread identity and activity details in namespaced `_meta.codex.subagent` metadata.
@@ -82,9 +83,12 @@ The adapter advertises ACP auth methods during initialization. Clients can authe
 ## Session instruction overrides
 
 Clients can override Codex's thread instructions per session by setting bare keys on the ACP
-session request's `_meta` (on `session/new`, `session/load`, or `session/resume`). They map
-directly onto the Codex `thread/start` / `thread/resume` / `thread/fork` parameters of the same
-name:
+session request's `_meta` (on `session/new`, `session/load`, `session/resume`, or `session/fork`).
+They map directly onto the Codex `thread/start` / `thread/resume` / `thread/fork` parameters of
+the same name — a forked session carries the instructions its own `session/fork` request named,
+with no reattach needed (observed live: a forked thread honors a `baseInstructions` override, while
+a `developerInstructions` override sent on `thread/fork` did not change the fork's behavior — the
+forked thread kept its source thread's developer instructions; Codex app-server behavior):
 
 | `_meta` key | Codex thread param | Effect |
 | --- | --- | --- |

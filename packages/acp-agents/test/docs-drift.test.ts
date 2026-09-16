@@ -386,3 +386,33 @@ test("system-prompt instruction support is documented per backend and the Codex-
   const contributing = readRepoFile("CONTRIBUTING.md");
   assert.ok(contributing.includes("`systemPrompt`"), "CONTRIBUTING must list the bare systemPrompt _meta key");
 });
+
+// Mid-session model switching: wherever the AcpAgent SDK is described, `setModel` and the
+// per-turn `model` option are named, the FIFO list carries `setModel`, and the agent's `model`
+// is no longer described as fixed at open.
+test("mid-session model switching is documented wherever the AcpAgent SDK is described", () => {
+  for (const path of ["docs/api.md", "packages/acp-agents/README.md"]) {
+    const text = readRepoFile(path);
+    assert.ok(text.includes("`setModel`"), `${path} must name setModel in the FIFO list`);
+    assert.match(text, /setModel\(spec\)/, `${path} must describe setModel(spec)`);
+    assert.doesNotMatch(text, /the model this agent selects at open/, `${path} still describes \`model\` as fixed at open`);
+  }
+  const api = readRepoFile("docs/api.md");
+  assert.match(api, /`model\?`[^\n]{0,400}`session\/set_config_option \{ configId: "model" \}`/, "docs/api.md must document the per-turn model option's wire form");
+  assert.ok(api.includes('but must stay on backend "claude"'), "docs/api.md must quote the same-backend refusal");
+});
+
+// The AcpAgent function-tool surface and the `permissions` rename: the SDK docs must name the
+// injected server, pi's alias for its calls, the renamed policy option, and must not describe
+// `tools` as the permission policy any more.
+test("function tools and the permissions option are documented wherever the AcpAgent SDK is described", () => {
+  for (const path of ["docs/api.md", "packages/acp-agents/README.md"]) {
+    const text = readRepoFile(path);
+    assert.ok(text.includes("`agent_tools`"), `${path} must name the injected agent_tools MCP server`);
+    assert.ok(text.includes("mcp__agent_tools__"), `${path} must document pi's mcp__agent_tools__<name> alias`);
+    assert.ok(text.includes("`permissions`"), `${path} must document the permissions option`);
+    assert.ok(text.includes("AcpAgentToolDefinition"), `${path} must name the tool definition type`);
+    assert.ok(text.includes("mcpCapabilities.http"), `${path} must document the HTTP MCP gate`);
+    assert.doesNotMatch(text, /`tools\?`[^\n]{0,120}`ToolPolicy`/, `${path} still describes \`tools\` as the ToolPolicy`);
+  }
+});

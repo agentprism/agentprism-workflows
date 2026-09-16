@@ -573,7 +573,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         expect(threadReadSpy).toHaveBeenCalledWith("thread-id");
     });
 
-    it('forks an ACP session through thread/fork with the requested workspace', async () => {
+    it('forks an ACP session through thread/fork with the requested workspace and keeps the forked thread subscribed', async () => {
         const mockFixture = createCodexMockTestFixture();
         const codexAcpClient = mockFixture.getCodexAcpClient();
         const codexAppServerClient = mockFixture.getCodexAppServerClient();
@@ -615,7 +615,10 @@ describe('ACP server test', { timeout: 40_000 }, () => {
                 },
             }),
         }));
-        expect(threadUnsubscribeSpy).toHaveBeenCalledWith({threadId: "fork-id"});
+        // thread/fork subscribes this connection to the new thread like thread/resume does; the
+        // fork is live and must NOT be unsubscribed (upstream's post-fork unsubscribe left the
+        // forked session unable to publish until it was reopened).
+        expect(threadUnsubscribeSpy).not.toHaveBeenCalled();
     });
 
     it('maps an AIR fork message id to the containing Codex turn', async () => {
@@ -836,6 +839,53 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         expect(threadResumeSpy.mock.calls[0]![0].developerInstructions).toBe("resume-dev");
         expect(threadResumeSpy.mock.calls[1]![0].baseInstructions).toBe("load-base");
         expect(threadResumeSpy.mock.calls[1]![0].developerInstructions).toBe("load-dev");
+    });
+
+    it('forwards baseInstructions/developerInstructions from _meta into thread/fork', async () => {
+        const mockFixture = createCodexMockTestFixture();
+        const codexAcpClient = mockFixture.getCodexAcpClient();
+        const codexAppServerClient = mockFixture.getCodexAppServerClient();
+
+        vi.spyOn(codexAppServerClient, "skillsExtraRootsSet").mockResolvedValue(undefined);
+        vi.spyOn(codexAppServerClient, "listSkills").mockResolvedValue({data: []});
+        const threadForkSpy = vi.spyOn(codexAppServerClient, "threadFork").mockResolvedValue({
+            thread: {id: "fork-id"} as any,
+            model: "gpt-5",
+            modelProvider: "openai",
+            reasoningEffort: "medium",
+            serviceTier: null,
+        } as any);
+        const threadResumeSpy = vi.spyOn(codexAppServerClient, "threadResume");
+        vi.spyOn(codexAppServerClient, "listModels").mockResolvedValue({
+            data: [createTestModel({id: "gpt-5"})],
+            nextCursor: null,
+        });
+
+        await codexAcpClient.forkSession({
+            sessionId: "source-id",
+            cwd: "/workspace",
+            mcpServers: [],
+            _meta: {baseInstructions: "fork-base", developerInstructions: "fork-dev"},
+        });
+
+        // A live fork has no reattach to carry the overrides later: they ride thread/fork itself.
+        expect(threadForkSpy.mock.calls[0]![0].baseInstructions).toBe("fork-base");
+        expect(threadForkSpy.mock.calls[0]![0].developerInstructions).toBe("fork-dev");
+        expect(threadResumeSpy).not.toHaveBeenCalled();
+
+        // Omitted keys stay unset so Codex keeps its defaults for the forked thread.
+        await codexAcpClient.forkSession({sessionId: "source-id", cwd: "/workspace", mcpServers: []});
+        expect(threadForkSpy.mock.calls[1]![0]).not.toHaveProperty("baseInstructions");
+        expect(threadForkSpy.mock.calls[1]![0]).not.toHaveProperty("developerInstructions");
+
+        // A present non-string value is rejected before any thread/fork is sent.
+        await expect(codexAcpClient.forkSession({
+            sessionId: "source-id",
+            cwd: "/workspace",
+            mcpServers: [],
+            _meta: {baseInstructions: 42},
+        })).rejects.toThrow("baseInstructions must be a string");
+        expect(threadForkSpy).toHaveBeenCalledTimes(2);
     });
 
     it('leaves instructions unset when _meta omits them and rejects non-string values', async () => {

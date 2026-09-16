@@ -13,8 +13,8 @@ export const CUSTOM_CAPABILITY_NAMESPACE = "@automatalabs/codex-acp";
  *    Codex App Server's `turn/start.outputSchema` (a strict-mode constraint on the final
  *    assistant message).
  *  - `baseInstructions` / `developerInstructions`: the session-scoped `_meta` overrides folded
- *    into the Codex `thread/start` / `thread/resume` params of the same name at
- *    `session/new` / `session/resume` / `session/load`. */
+ *    into the Codex `thread/start` / `thread/resume` / `thread/fork` params of the same name at
+ *    `session/new` / `session/resume` / `session/load` / `session/fork`. */
 export const customAgentCapabilities: NonNullable<acp.AgentCapabilities["_meta"]> = {
     [CUSTOM_CAPABILITY_NAMESPACE]: {
         outputSchema: true,

@@ -111,11 +111,32 @@ export interface ResolveOptions {
   repromptText?: string;
 }
 
-const REPROMPT_TEXT = [
+/** The repair prompt for a schema turn that produced no valid JSON (native channels, prose
+ *  extraction). Sent bare — text only, no re-embedded contract; the schema is in the session's
+ *  context from the first turn — by the runner's ladder and by `AcpAgent`'s opt-in one. */
+export const REPROMPT_TEXT = [
   "Your previous reply did not return valid JSON matching the required output schema.",
   "Reply now with ONLY a single JSON object that conforms to the schema —",
   "no prose, no explanation, and no markdown code fences.",
 ].join(" ");
+
+/** The repair prompt when the client-hosted StructuredOutput tool is active on the session and
+ *  the turn did not call it. */
+export const STRUCTURED_TOOL_REPROMPT_TEXT =
+  "You did not call the StructuredOutput tool. Call the StructuredOutput tool now, exactly once, with your final answer as its arguments conforming to its parameter schema. Do not reply with plain text.";
+
+/**
+ * The one repair prompt both ladders send (package-internal; the runner and `AcpAgent` are its
+ * only callers): `STRUCTURED_TOOL_REPROMPT_TEXT` when the injected StructuredOutput tool is active
+ * for the session, else `REPROMPT_TEXT`; with `reason` (the previous turn's validation failure —
+ * `AcpAgentTurn.structuredError`) appended on its own line so the agent corrects against the actual
+ * miss, not a guess. The runner passes no reason and sends the bare text.
+ */
+export function repairPromptText(options: { toolActive: boolean; reason?: string }): string {
+  const base = options.toolActive ? STRUCTURED_TOOL_REPROMPT_TEXT : REPROMPT_TEXT;
+  const reason = options.reason?.trim();
+  return reason ? `${base}\n\nValidation error: ${reason}` : base;
+}
 
 /**
  * Resolve a schema agent's result via the ladder above. Returns the validated value (typed

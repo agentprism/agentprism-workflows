@@ -299,12 +299,14 @@ export const ACP_EXTENSION_SUPPORT_MATRIX: readonly AcpExtensionSupportMatrixRow
 /** How each installed agent answers `session/fork`, read from its adapter source, and what the
  *  AcpAgent SDK must do with the response. `id-only`: the response names a persisted copy that
  *  is not live — claude-agent-acp returns `{ sessionId }` from `dist/fork-session.js` and `prompt`
- *  on it throws "Session not found"; codex-acp installs state but unsubscribes the thread
- *  (`threadUnsubscribe`) and publishes no updates until resume/load. `live`: the fork handle is
- *  the session (pi constructs it in-process; OpenCode by live verification only). `reattach`
- *  names the reopen an `id-only` fork needs before its first turn. `cwd`: whether the fork may
- *  re-home — claude's transcript store is keyed by the source cwd. Data for the SDK's fork
- *  choreography; the runner's `forkSession()` returns the raw fork handle and never consults it. */
+ *  on it throws "Session not found". `live`: the fork handle is the session — @automatalabs/codex-acp
+ *  forks the thread through `thread/fork`, which subscribes the connection to the new thread
+ *  exactly like `thread/resume` does, keeps that subscription (no `threadUnsubscribe`), and
+ *  publishes the forked session's available commands and MCP startup status like a resumed one;
+ *  pi constructs the fork in-process; OpenCode by live verification only. `reattach` names the
+ *  reopen an `id-only` fork needs before its first turn. `cwd`: whether the fork may re-home —
+ *  claude's transcript store is keyed by the source cwd. Data for the SDK's fork choreography;
+ *  the runner's `forkSession()` returns the raw fork handle and never consults it. */
 export interface ForkSessionTraitRow {
   readonly agent: string;
   readonly disposition: "id-only" | "live";
@@ -317,7 +319,7 @@ export interface ForkSessionTraitRow {
 
 const FORK_SESSION_TRAIT_ROWS = [
   { agent: "claude", disposition: "id-only", reattach: "resume-or-load", cwd: "source-only", distProbe: "claude" },
-  { agent: "codex", disposition: "id-only", reattach: "resume-or-load", cwd: "free", distProbe: "codex" },
+  { agent: "codex", disposition: "live", reattach: "none", cwd: "free", distProbe: "codex" },
   { agent: "opencode", disposition: "live", reattach: "none", cwd: "free" },
   { agent: "pi", disposition: "live", reattach: "none", cwd: "free", distProbe: "pi" },
 ] satisfies readonly ForkSessionTraitRow[];
@@ -379,7 +381,8 @@ const SYSTEM_PROMPT_SUPPORT_ROWS = [
   // merged into the `claude_code` preset with type/preset locked (`{ append }` extends it).
   { agent: "claude", replace: true, append: true, metaKeys: ["systemPrompt"], distProbe: "claude" },
   // @automatalabs/codex-acp: bare `_meta.baseInstructions` (base prompt replacement) and
-  // `_meta.developerInstructions` (developer-role instructions) => thread/{start,resume} params.
+  // `_meta.developerInstructions` (developer-role instructions) => thread/{start,resume,fork} params
+  // (a Codex fork is live, so session/fork's own `_meta` is where a fork's instructions travel).
   { agent: "codex", replace: true, append: true, metaKeys: ["baseInstructions", "developerInstructions"], distProbe: "codex" },
   { agent: "opencode", replace: false, append: false, metaKeys: [] },
   // @automatalabs/pi-acp: `_meta.systemPrompt` `{ replace?, append? }` (or a string = replace) =>

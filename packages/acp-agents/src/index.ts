@@ -69,8 +69,14 @@ export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.j
 // live forks, cold reopen from a session ref, and the no-prompt catalog probe.
 export { AcpAgent } from "./agent/acp-agent.js";
 export { isAcpAgentTurnError } from "./agent/errors.js";
+// Client-side function tools: the definition helper and the injected `mcpServers` entry name.
+export { defineTool, AGENT_TOOL_NAME_PATTERN } from "./agent/tools.js";
+export { AGENT_TOOLS_SERVER_NAME } from "./agent/tool-host.js";
 export type {
   AcpAgentOptions,
+  AcpAgentToolDefinition,
+  AcpAgentToolContext,
+  AcpAgentToolResult,
   AcpAgentPromptOptions,
   AcpAgentSteerOptions,
   AcpAgentForkOptions,
@@ -81,12 +87,16 @@ export type {
   AcpAgentTurn,
   AcpAgentTurnError,
   AcpAgentToolCall,
+  AcpAgentMessage,
   AcpAgentUpdateRecord,
   AcpAgentRawRecord,
   AcpAgentTurnUsage,
   AcpAgentEventMap,
   AcpAgentEventName,
   AcpAgentEventListener,
+  AcpAgentStream,
+  AcpAgentStreamEvent,
+  AcpAgentStreamEventName,
   AcpAgentState,
 } from "./agent/types.js";
 
@@ -257,6 +267,10 @@ export type {
 } from "./protocol-coverage.js";
 // The one validator every front door runs on `systemPrompt` before a session opens.
 export { assertSystemPromptSupported, describeSystemPromptSupport } from "./system-prompt.js";
+// Per-agent traits: the tables before open, the live initialize advertisements after (`AcpAgent#traits`,
+// `AcpAgent.traits()`, and the `traits` field of every probe result).
+export { describeBackendTraits } from "./traits.js";
+export type { AcpAgentTraits } from "./traits.js";
 
 // ACP standard capability negotiation. Vendor initialize metadata stays raw for extension owners.
 export {

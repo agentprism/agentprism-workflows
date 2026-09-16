@@ -1149,6 +1149,13 @@ test("probeConfigOptions opens and closes exactly one session without sending a 
 
   assert.equal(probed.backendId, "codex");
   assert.deepEqual(probed.options, advertised);
+  // The traits ride the probe result, refined by this connection's initialize (the fake advertises
+  // no steering/loadedTurn/system-prompt blocks by default, so the table's row stands).
+  assert.equal(probed.traits?.backendId, "codex");
+  assert.equal(probed.traits?.custom, false);
+  assert.equal(probed.traits?.steering, "not-advertised");
+  assert.deepEqual(probed.traits?.systemPrompt, { replace: true, append: true, source: "table" });
+  assert.equal(probed.traits?.structuredOutput, "turn-meta");
   assert.equal(readLog().filter((entry) => entry.method === "newSession").length, 1);
   assert.equal(readLog().filter((entry) => entry.method === "closeSession").length, 1);
   assert.equal(readLog().filter((entry) => entry.method === "prompt").length, 0);

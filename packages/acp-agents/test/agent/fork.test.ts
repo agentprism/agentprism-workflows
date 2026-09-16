@@ -81,7 +81,7 @@ function isSessionNotFound(error: unknown): boolean {
 function validation(pattern: RegExp) {
   return (error: unknown): boolean => {
     assert.ok(isWorkflowError(error), `expected a WorkflowError, got ${String(error)}`);
-    assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+    assert.equal(error.code, WorkflowErrorCode.INVALID_ARGUMENT);
     assert.match(error.message, pattern);
     return true;
   };
@@ -198,14 +198,23 @@ test("live fork (pi): the fork handle is the session and the parent's history se
   assert.notEqual(child.history[0], parent.history[0], "a copy of the parent's entry");
   assert.ok(child.text.startsWith("parent"));
   assert.equal(child.text, "parent");
+  assert.deepEqual(child.messages, parent.messages, "the parent's message snapshot seeds the child exactly like history/text");
+  assert.notEqual(child.messages[0], parent.messages[0], "copies, not the parent's objects");
 
   const turn = await child.prompt("go");
   assert.equal(turn.text, "child");
   assert.equal(turn.history.length, 1, "the turn's own slice never includes the seed");
+  assert.equal(turn.messages.length, 1, "the turn's own messages never include the seed");
   assert.equal(child.history.length, 2);
   assert.equal(child.history[1]!.text, "child");
   assert.equal(child.text, "parent\n\nchild", "the seed and the child's own messages fold like turn.text");
+  assert.deepEqual(
+    child.messages.map((message) => message.content),
+    [[{ type: "text", text: "parent" }], [{ type: "text", text: "child" }]],
+    "messages: the seed, then the child's own turn",
+  );
   assert.equal(parent.history.length, 1, "the parent is untouched by the child's turn");
+  assert.equal(parent.messages.length, 1);
 });
 
 test("pre-response fork replay is buffered and adopted for the new id", async () => {
@@ -232,9 +241,12 @@ test("pre-response fork replay is buffered and adopted for the new id", async ()
     assert.equal((record.update as { sessionId?: unknown }).sessionId, undefined, "the update itself, not the event envelope");
   }
   // Received before the fork response registered the id: not folded into the handle's history;
-  // the parent's snapshot (empty here — no parent turn ran) is the seed instead.
+  // the parent's snapshot (empty here — no parent turn ran) is the seed instead. `messages`
+  // follows the same retained log, so it excludes the pre-response replay too.
   assert.equal(child.history.length, 0);
+  assert.equal(child.messages.length, 0);
   assert.equal((await child.prompt("go")).text, "child");
+  assert.deepEqual(child.messages.map((message) => message.content), [[{ type: "text", text: "child" }]]);
 });
 
 test("fork inherits options, suffixes the label, drops the signal, re-applies model/config/mode, and honors overrides", async () => {
@@ -483,7 +495,36 @@ test("fork inherits systemPrompt (sent on the fork and its reattach), honors an 
   await assert.rejects(
     () => parent.fork({ systemPrompt: { append: "  " } }),
     (error: unknown) =>
-      isWorkflowError(error) && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR && /append must be a non-empty string/.test(error.message),
+      isWorkflowError(error) && error.code === WorkflowErrorCode.INVALID_ARGUMENT && /append must be a non-empty string/.test(error.message),
   );
   assert.equal(readLog().filter((entry) => entry.method === "__start").length, spawns, "the refused fork spawned nothing");
+});
+
+test("live fork (codex): systemPrompt rides session/fork _meta in the Codex dialect, an override replaces it, and no reattach follows", async () => {
+  const { cwd, readLog } = configure(
+    { lifecycleSupport: true, forkSession: { turns: [{ text: "child" }] }, turns: [{ text: "parent" }] },
+    { backends: ["codex"] },
+  );
+  const parent = track(await AcpAgent.open({ cwd, model: "codex", systemPrompt: { replace: "Reviewer.", append: "Be terse." } }));
+  await parent.prompt("p");
+  const child = track(await parent.fork());
+  let log = readLog();
+  const forkEntry = log.find((entry) => entry.method === "forkSession");
+  assert.deepEqual(
+    forkEntry?.params?._meta,
+    { baseInstructions: "Reviewer.", developerInstructions: "Be terse." },
+    "inherited on session/fork in the codex-acp dialect — the live fork's only delivery",
+  );
+  assert.equal(count(log, "resumeSession"), 0, "a live fork is never reattached");
+  assert.equal(count(log, "loadSession"), 0);
+  assert.equal(child.state, "ready");
+  assert.equal((await child.prompt("go")).text, "child");
+
+  const overridden = track(await parent.fork({ systemPrompt: { append: "Override." } }));
+  log = readLog();
+  const overriddenFork = log.filter((entry) => entry.method === "forkSession").at(-1);
+  assert.deepEqual(overriddenFork?.params?._meta, { developerInstructions: "Override." }, "the override replaced the inherited value");
+  assert.equal(count(log, "resumeSession"), 0);
+  assert.equal(count(log, "loadSession"), 0);
+  assert.equal(overridden.state, "ready");
 });

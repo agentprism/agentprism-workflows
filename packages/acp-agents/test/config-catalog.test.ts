@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { probeHarnessConfig, setConfigProbeFactoryForTests } from "../src/config-catalog.js";
-import { BUILTIN_BACKEND_IDS, type SessionConfigOption } from "../src/index.js";
+import { BUILTIN_BACKEND_IDS, type AcpAgentTraits, type SessionConfigOption } from "../src/index.js";
 
 const HOME = mkdtempSync(join(tmpdir(), "automatalabs-acp-agents-config-catalog-"));
 
@@ -204,6 +204,36 @@ test("modelSpecs select exact routed models and report model-specific catalogs",
     { spec: "codex/gpt", selectModel: true },
   ]);
   assert.deepEqual(report.harnessOptions.map((harness) => harness.model), ["claude/opus[1m]", "codex/gpt"]);
+});
+
+test("a probe runner's traits ride the harness entry; a runner that reports none leaves the field out", async () => {
+  const traits = {
+    backendId: "claude",
+    custom: false,
+    defaultModeId: "auto",
+    fork: { agent: "claude", disposition: "id-only", reattach: "resume-or-load", cwd: "source-only" },
+    systemPrompt: { replace: true, append: true, source: "table" },
+    steering: "supported",
+    loadedTurn: "not-advertised",
+    structuredOutput: "session-meta",
+    promptUsage: "turn",
+  } as const satisfies AcpAgentTraits;
+  const restore = setConfigProbeFactoryForTests(() => ({
+    async probeConfigOptions(spec) {
+      return spec === "claude"
+        ? { backendId: "claude", options: ADVERTISED_OPTIONS, traits }
+        : { backendId: spec ?? "claude", options: ADVERTISED_OPTIONS };
+    },
+    async dispose() {},
+  }));
+  try {
+    const report = await probeHarnessConfig({ harnesses: ["claude", "codex"] });
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.harnessOptions[0].traits, traits);
+    assert.equal("traits" in report.harnessOptions[1], false);
+  } finally {
+    restore();
+  }
 });
 
 test("a failing probe reports probed:false with the reason and flips the exit code only", async () => {

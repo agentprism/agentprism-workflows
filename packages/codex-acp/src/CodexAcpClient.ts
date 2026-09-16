@@ -58,6 +58,7 @@ import type {ModeKind} from "./app-server/ModeKind";
 import {arePathBasenamesEqual, arePathsEqual, isAbsolutePathLike} from "./PathUtils";
 import {CodexSubagentSubscriptions} from "./subagents/CodexSubagentSubscriptions";
 import {forkSession as runForkSession} from "./SessionFork";
+import {readInstructionOverrides} from "./InstructionOverrides";
 import type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
 export type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
 
@@ -1259,51 +1260,6 @@ function readMetaAdditionalRoots(meta?: Record<string, unknown> | null): string[
         .filter((value): value is string => typeof value === "string")
         .map(value => value.trim())
         .filter(value => value.length > 0));
-}
-
-/**
- * Read the optional per-session instruction overrides a client may supply on a session
- * request's `_meta` as bare keys (mirroring the upstream `additionalRoots` convention):
- *
- *   _meta.baseInstructions      -> thread/{start,resume,fork}.baseInstructions
- *   _meta.developerInstructions -> thread/{start,resume,fork}.developerInstructions
- *
- * `baseInstructions` replaces Codex's built-in base system prompt for the thread;
- * `developerInstructions` injects developer-role instructions. An absent key is left
- * unset so Codex keeps its defaults; a present non-string value is rejected. The returned
- * object is spread straight into the Codex thread params, so undefined entries drop out on
- * the wire.
- */
-function readInstructionOverrides(meta?: Record<string, unknown> | null): {
-    baseInstructions?: string;
-    developerInstructions?: string;
-} {
-    // Only assign keys that are actually present so spreading them leaves Codex's defaults
-    // untouched (and satisfies exactOptionalPropertyTypes).
-    const overrides: { baseInstructions?: string; developerInstructions?: string } = {};
-    const baseInstructions = readOptionalInstruction(meta, "baseInstructions");
-    if (baseInstructions !== undefined) {
-        overrides.baseInstructions = baseInstructions;
-    }
-    const developerInstructions = readOptionalInstruction(meta, "developerInstructions");
-    if (developerInstructions !== undefined) {
-        overrides.developerInstructions = developerInstructions;
-    }
-    return overrides;
-}
-
-function readOptionalInstruction(
-    meta: Record<string, unknown> | null | undefined,
-    key: "baseInstructions" | "developerInstructions",
-): string | undefined {
-    const value = meta?.[key];
-    if (value === undefined || value === null) {
-        return undefined;
-    }
-    if (typeof value !== "string") {
-        throw RequestError.invalidParams(undefined, `${key} must be a string`);
-    }
-    return value;
 }
 
 function readAdditionalDirectories(cwd: string, additionalDirectories?: string[],  meta?: Record<string, unknown> | null): string[] {

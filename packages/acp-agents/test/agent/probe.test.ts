@@ -5,6 +5,7 @@
 import test, { after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
+import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { AcpAgent, BUILTIN_BACKEND_IDS } from "../../src/index.js";
 import { liveConnectionCount } from "../../src/agent/process-registry.js";
 import { createFakeAgentHarness, waitFor } from "../helpers/fake-agent.js";
@@ -46,6 +47,50 @@ test("probe() returns the report plus models, targets every built-in by default,
   assert.equal(count(readLog(), "newSession"), 4);
   await waitFor(() => liveConnectionCount() === 0);
   assert.equal(liveConnectionCount(), 0);
+});
+
+test("probe() carries per-harness traits refined by the live probe connection", async () => {
+  // The fake's default initialize advertises none of the blocks: the tables' system-prompt row
+  // stands and the extensions read not-advertised on every probed built-in.
+  const { cwd } = configure({});
+  const catalog = await AcpAgent.probe({ cwd });
+  for (const entry of catalog.harnessOptions) {
+    assert.ok(entry.probed);
+    assert.equal(entry.traits?.backendId, entry.backendId);
+    assert.equal(entry.traits?.custom, false);
+    assert.equal(entry.traits?.steering, "not-advertised");
+    assert.equal(entry.traits?.loadedTurn, "not-advertised");
+    assert.equal(entry.traits?.systemPrompt.source, "table");
+    assert.deepEqual(entry.traits?.fork, AcpAgent.traits(entry.backendId).fork);
+  }
+  assert.equal(catalog.harnessOptions.find((entry) => entry.backendId === "claude")?.traits?.structuredOutput, "session-meta");
+  assert.equal(catalog.harnessOptions.find((entry) => entry.backendId === "codex")?.traits?.structuredOutput, "turn-meta");
+  assert.equal(catalog.harnessOptions.find((entry) => entry.backendId === "pi")?.traits?.structuredOutput, "client-tool");
+  await waitFor(() => liveConnectionCount() === 0);
+
+  // An agent that advertises its system-prompt channel and the extensions at initialize (pi-acp's
+  // shape) reports them as advertised — the live answer, not the table.
+  await harness.cleanup();
+  const advertised = configure({
+    initialize: {
+      protocolVersion: PROTOCOL_VERSION,
+      agentCapabilities: { sessionCapabilities: { close: {} } },
+      _meta: { steering: { supported: true }, loadedTurn: { supported: true }, systemPrompt: { replace: true, append: true } },
+    },
+  });
+  const pi = await AcpAgent.probe({ cwd: advertised.cwd, harnesses: ["pi"] });
+  assert.deepEqual(pi.harnessOptions[0]!.traits?.systemPrompt, { replace: true, append: true, source: "advertised" });
+  assert.equal(pi.harnessOptions[0]!.traits?.steering, "supported");
+  assert.equal(pi.harnessOptions[0]!.traits?.loadedTurn, "supported");
+  await waitFor(() => liveConnectionCount() === 0);
+
+  // A failed probe has no traits: nothing was negotiated.
+  await harness.cleanup();
+  const failing = configure({});
+  const failed = await AcpAgent.probe({ cwd: failing.cwd, harnesses: ["bad"], backends: { bad: { command: join(failing.cwd, "missing-binary") } } });
+  assert.equal(failed.harnessOptions[0]!.probed, false);
+  assert.equal("traits" in failed.harnessOptions[0]!, false);
+  await waitFor(() => liveConnectionCount() === 0);
 });
 
 test("probe({ model }) selects the model first and reports the model-specific catalog; modelFilter narrows to matches", async () => {
@@ -122,7 +167,7 @@ test("a bad modelFilter throws a TypeError before any spawn", async () => {
   await assert.rejects(AcpAgent.probe({ cwd, modelFilter: "/(/" }), TypeError);
   await assert.rejects(AcpAgent.probe({ cwd, probeTimeoutMs: 0 }), TypeError);
   await assert.rejects(AcpAgent.probe({ cwd, backends: { bad: {} as never } }), (error: unknown) => {
-    assert.equal((error as { code?: string }).code, "SCRIPT_VALIDATION_ERROR");
+    assert.equal((error as { code?: string }).code, "INVALID_ARGUMENT");
     return true;
   });
   assert.deepEqual(readLog(), []);

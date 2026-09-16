@@ -1,17 +1,20 @@
 // The per-turn collector and the AcpAgentTurn builder. A collector taps the agent's bus for the
 // duration of one `session/prompt` (the drain contract guarantees every update of the turn is
 // delivered before the prompt resolves), storing verbatim clones of every session/update and raw
-// vendor notification, the final permission/elicitation decisions, and a tool-call fold keyed by
-// toolCallId. `buildTurn` derives text, history slice, usage, and the structured result.
-import type { PromptResponse, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind } from "@agentclientprotocol/sdk";
+// vendor notification, the final permission/elicitation decisions, and the message fold (which
+// owns the tool-call fold keyed by toolCallId). `buildTurn` derives text, messages, history
+// slice, usage, and the structured result.
+import type { PromptResponse } from "@agentclientprotocol/sdk";
 import type { AgentHistoryEntry, AgentUsage } from "@automatalabs/shared-types";
 import type { TSchema } from "typebox";
 import type { Backend } from "../backend.js";
 import type { AcpElicitationEvent, AcpPermissionEvent, AcpSessionUpdate } from "../events.js";
 import type { UsageBaseline } from "../usage.js";
 import type { AgentEventBus } from "./events.js";
+import { MessageFolder } from "./messages.js";
 import { resolveTurnStructured, type StructuredHandle } from "./structured.js";
 import type {
+  AcpAgentMessage,
   AcpAgentRawRecord,
   AcpAgentToolCall,
   AcpAgentTurn,
@@ -26,25 +29,6 @@ export interface TurnHandle extends StructuredHandle {
   foldedTurnText(): string;
 }
 
-interface MutableToolCall {
-  toolCallId: string;
-  name?: string;
-  title: string;
-  kind?: ToolKind;
-  status: ToolCallStatus;
-  rawInput?: unknown;
-  rawOutput?: unknown;
-  content?: ToolCallContent[];
-  locations?: ToolCallLocation[];
-  meta?: Record<string, unknown>;
-}
-
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
 export class TurnCollector {
   readonly historyStart: number;
   readonly gaugeBefore: UsageBaseline;
@@ -52,7 +36,8 @@ export class TurnCollector {
   readonly raw: AcpAgentRawRecord[] = [];
   readonly permissions: AcpPermissionEvent[] = [];
   readonly elicitations: AcpElicitationEvent[] = [];
-  readonly #toolCalls = new Map<string, MutableToolCall>();
+  /** This turn's messages and tool calls — one fold, fed every update record as it is stored. */
+  readonly #messages = new MessageFolder();
   #active = true;
   readonly #untap: () => void;
 
@@ -67,8 +52,9 @@ export class TurnCollector {
       switch (name) {
         case "session_update": {
           const update = structuredClone((event as { update: AcpSessionUpdate }).update);
-          this.updates.push({ update, receivedAt: Date.now() });
-          this.#foldToolCall(update);
+          const receivedAt = Date.now();
+          this.updates.push({ update, receivedAt });
+          this.#messages.apply(update, receivedAt);
           return;
         }
         case "raw_message": {
@@ -90,49 +76,17 @@ export class TurnCollector {
 
   /** The folded tool calls in first-seen order (copies). */
   get toolCalls(): AcpAgentToolCall[] {
-    return [...this.#toolCalls.values()].map((call) => ({ ...call }));
+    return this.#messages.toolCalls;
+  }
+
+  /** This turn's messages so far (copies). */
+  get messages(): AcpAgentMessage[] {
+    return this.#messages.snapshot();
   }
 
   stop(): void {
     this.#active = false;
     this.#untap();
-  }
-
-  #foldToolCall(update: AcpSessionUpdate): void {
-    if (update.sessionUpdate === "tool_call") {
-      const existing = this.#toolCalls.get(update.toolCallId);
-      const meta = record(update._meta);
-      const entry: MutableToolCall = existing ?? { toolCallId: update.toolCallId, title: update.title, status: "pending" };
-      entry.title = update.title;
-      if (typeof update.name === "string") entry.name = update.name;
-      if (update.kind !== undefined && update.kind !== null) entry.kind = update.kind;
-      if (update.status !== undefined && update.status !== null) entry.status = update.status;
-      if (update.rawInput !== undefined) entry.rawInput = update.rawInput;
-      if (update.rawOutput !== undefined) entry.rawOutput = update.rawOutput;
-      if (update.content !== undefined && update.content !== null) entry.content = update.content;
-      if (update.locations !== undefined && update.locations !== null) entry.locations = update.locations;
-      if (meta) entry.meta = { ...(entry.meta ?? {}), ...meta };
-      if (!existing) this.#toolCalls.set(update.toolCallId, entry);
-      return;
-    }
-    if (update.sessionUpdate !== "tool_call_update") return;
-    const existing = this.#toolCalls.get(update.toolCallId);
-    const meta = record(update._meta);
-    const entry: MutableToolCall = existing ?? {
-      toolCallId: update.toolCallId,
-      title: typeof update.title === "string" ? update.title : "",
-      status: "pending",
-    };
-    if (typeof update.title === "string") entry.title = update.title;
-    if (typeof update.name === "string") entry.name = update.name;
-    if (update.kind !== undefined && update.kind !== null) entry.kind = update.kind;
-    if (update.status !== undefined && update.status !== null) entry.status = update.status;
-    if (update.rawInput !== undefined) entry.rawInput = update.rawInput;
-    if (update.rawOutput !== undefined) entry.rawOutput = update.rawOutput;
-    if (update.content !== undefined && update.content !== null) entry.content = update.content;
-    if (update.locations !== undefined && update.locations !== null) entry.locations = update.locations;
-    if (meta) entry.meta = { ...(entry.meta ?? {}), ...meta };
-    if (!existing) this.#toolCalls.set(update.toolCallId, entry);
   }
 }
 
@@ -201,8 +155,9 @@ export interface BuildTurnArgs {
   readonly sessionBefore: AgentUsage;
 }
 
-/** Assemble the turn: verbatim response, folded text, the turn's history slice (copies), usage
- *  per the per-turn model above (with the session sum AFTER this turn), and the structured result. */
+/** Assemble the turn: verbatim response, folded text, the messages folded from the turn's update
+ *  records, the turn's history slice (copies), usage per the per-turn model above (with the
+ *  session sum AFTER this turn), and the structured result. */
 export function buildTurn(args: BuildTurnArgs): AcpAgentTurn {
   const { response, collector, handle, backend, schema, captured, sessionBefore } = args;
   const gaugeAfter = handle.usage.baseline();
@@ -217,6 +172,7 @@ export function buildTurn(args: BuildTurnArgs): AcpAgentTurn {
     updates: collector.updates,
     raw: collector.raw,
     toolCalls: collector.toolCalls,
+    messages: collector.messages,
     permissions: collector.permissions,
     elicitations: collector.elicitations,
     usage: {

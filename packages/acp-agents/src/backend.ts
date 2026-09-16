@@ -85,9 +85,10 @@ export interface Backend {
    *  unset; custom ACP backends opt in unless their registry entry disables it. */
   readonly injectStructuredOutputTool?: boolean;
   /** Which halves of `SystemPromptOptions` this backend can carry on its session `_meta`
-   *  (`SYSTEM_PROMPT_SUPPORT` for the built-ins). Undefined = neither: the runner and the AcpAgent
-   *  SDK reject a `systemPrompt` for such a backend with SCRIPT_VALIDATION_ERROR before a session
-   *  opens, so instructions are never silently dropped. */
+   *  (`SYSTEM_PROMPT_SUPPORT` for the built-ins). Undefined = neither: a `systemPrompt` for such a
+   *  backend is rejected before a session opens — SCRIPT_VALIDATION_ERROR from the runner and
+   *  `InteractiveSession`, INVALID_ARGUMENT from the AcpAgent SDK — so instructions are never
+   *  silently dropped. */
   readonly systemPrompt?: SystemPromptSupport;
   /** OPTIONAL `initialize.clientCapabilities._meta` this backend adds: the namespaced vendor
    *  extensions THIS CLIENT implements for that agent, so the agent may turn them on. Backend-scoped

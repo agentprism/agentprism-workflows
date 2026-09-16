@@ -12,6 +12,7 @@ import { redactText } from "@automatalabs/shared-types";
 import { BUILTIN_BACKEND_IDS } from "./backends/builtins.js";
 import { resolveBackendRegistry, type CustomBackendConfig } from "./registry.js";
 import { AcpAgentRunner, type ProbedConfigOptions } from "./runner.js";
+import type { AcpAgentTraits } from "./traits.js";
 
 export interface ValidateProbeRunner {
   probeConfigOptions(
@@ -55,6 +56,9 @@ export interface ValidateHarnessOptions {
   /** Effective advertised ACP modes; null means this backend/model supports no session modes. */
   modes?: SessionModeState | null;
   options?: SessionConfigOption[];
+  /** Present when probed=true and the probe runner reports it (the runner and the SDK probe always
+   *  do): the backend's traits refined by the live initialize advertisements. */
+  traits?: AcpAgentTraits;
 }
 
 type SelectConfigOption = Extract<SessionConfigOption, { type: "select" }>;
@@ -208,6 +212,7 @@ export async function probeHarnessConfig(
             probed: true,
             modes: result.modes ?? null,
             options: result.options,
+            ...(result.traits === undefined ? {} : { traits: result.traits }),
           };
         } catch (error) {
           harnessOptions[index] = {

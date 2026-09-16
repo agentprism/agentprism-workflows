@@ -30,6 +30,12 @@ export enum WorkflowErrorCode {
    *  the same journal. Catching it inside the script cannot keep the run going. */
   PAUSE_REQUESTED = "PAUSE_REQUESTED",
   SCRIPT_VALIDATION_ERROR = "SCRIPT_VALIDATION_ERROR",
+  /** An SDK call (the `AcpAgent` surface) received invalid options or arguments, or was made in
+   *  an invalid state such as after `close()`. Non-recoverable: the same call fails the same way.
+   *  Distinct from SCRIPT_VALIDATION_ERROR, which stays the code for workflow scripts and for the
+   *  one-shot runner / `InteractiveSession` — the shared validators keep throwing that code, and
+   *  the SDK re-codes it at its boundary. */
+  INVALID_ARGUMENT = "INVALID_ARGUMENT",
   /** The workflow SCRIPT crashed at runtime: an uncaught throw or an unhandled promise
    *  rejection inside the script body. Distinct from WORKFLOW_ABORTED (someone cancelled the
    *  run) and SCRIPT_VALIDATION_ERROR (invalid syntax or agent configuration). Non-recoverable: rerunning
