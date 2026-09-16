@@ -253,6 +253,7 @@ test("fork inherits options, suffixes the label, drops the signal, re-applies mo
   assert.equal(child.label, "primary/fork-1");
   assert.equal(child.cwd, cwd);
   assert.equal(child.backendId, "claude");
+  assert.equal(child.model, "claude/opus", "the parent's routed model is inherited");
   assert.equal(child.modes?.currentModeId, "plan");
   assert.equal(child.configOptions.find((option) => option.id === "effort")?.currentValue, "high");
   assert.equal(child.configOptions.find((option) => option.id === "model")?.currentValue, "opus");
@@ -328,6 +329,7 @@ test("fork guards: model routing to another backend and a cwd override on a sour
     // The same backend through a model spec is fine (and the spec is applied on the child).
     const child = track(await parent.fork({ model: "claude/claude-opus-4-1" }));
     assert.equal(child.backendId, "claude");
+    assert.equal(child.model, "claude/claude-opus-4-1", "the override is the child's routed model");
     assert.equal(count(readLog(), "__start"), 2);
   }
   await harness.cleanup();

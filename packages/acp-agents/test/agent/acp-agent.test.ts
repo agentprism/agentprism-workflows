@@ -141,6 +141,12 @@ test("the constructor is lazy and ready() is idempotent", async () => {
   assert.deepEqual(readLog(), [], "nothing spawned by the constructor");
   assert.equal(agent.state, "idle");
   assert.equal(agent.sessionId, undefined);
+  assert.equal(agent.model, undefined, "a backend-only spec selects no model");
+  // `model` is the routed spec in canonical form: it leads back to the same backend and model id.
+  assert.equal(new AcpAgent({ cwd, model: "Claude/opus[1m]" }).model, "claude/opus[1m]");
+  const unrouted = new AcpAgent({ cwd, model: "gpt-5" });
+  assert.equal(unrouted.model, `${unrouted.backendId}/gpt-5`, "an unrouted spec is pinned to the backend it routed to");
+  assert.deepEqual(readLog(), [], "still nothing spawned");
 
   await Promise.all([agent.ready(), agent.ready()]);
   assert.equal(count(readLog(), "__start"), 1, "exactly one process");

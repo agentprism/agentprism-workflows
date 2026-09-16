@@ -16,7 +16,7 @@ import { FAKE_AGENT_FIXTURE, createFakeAgentHarness, trackAgent, waitFor } from 
 
 interface LogEntry {
   method: string;
-  params?: { sessionId?: string; cwd?: string; prompt?: ContentBlock[] };
+  params?: { sessionId?: string; cwd?: string; prompt?: ContentBlock[]; configId?: string; value?: string | boolean };
 }
 
 const harness = createFakeAgentHarness({ prefix: "acp-agent-statics-it-", backends: ["claude"] });
@@ -63,20 +63,24 @@ test("AcpAgent.open is new + ready", async () => {
   assert.equal((await agent.prompt("hi")).text, "ok");
 });
 
-test("resume(ref) routes by ref.backendId, passes ref.cwd, and sends session/resume then prompt", async () => {
+test("resume(ref) routes by ref.backendId, passes ref.cwd, sends session/resume then prompt, and keeps the model only when passed back", async () => {
   const { cwd, readLog } = configure({ lifecycleSupport: true, resumeSession: {}, turns: [{ text: "one" }, { text: "two" }] });
-  const original = track(await AcpAgent.open({ cwd, model: "claude" }));
+  const original = track(await AcpAgent.open({ cwd, model: "claude/opus" }));
+  assert.equal(original.model, "claude/opus", "the routed spec the agent selected");
   await original.prompt("first");
   const ref = original.sessionRef!;
   await original.close({ keep: true });
   assert.equal(ref.backendId, "claude");
   assert.equal(ref.cwd, cwd);
+  assert.equal("model" in ref, false, "the ref carries no model");
   assert.deepEqual(ref.reopen, { load: true, resume: true, list: true, fork: true });
 
-  const resumed = track(await AcpAgent.resume(ref, { label: "resumed" }));
+  const resumed = track(await AcpAgent.resume(ref, { label: "resumed", model: original.model }));
   assert.equal(resumed.sessionId, ref.sessionId);
   assert.equal(resumed.cwd, ref.cwd);
   assert.equal(resumed.backendId, "claude");
+  assert.equal(resumed.model, "claude/opus");
+  assert.equal(resumed.configOptions.find((option) => option.id === "model")?.currentValue, "opus", "the passed-back model was selected");
   assert.equal(resumed.history.length, 0, "resume replays nothing");
   // The resumed agent is a FRESH fake process with its own turn cursor: it serves turns[0].
   assert.equal((await resumed.prompt("again")).text, "one");
@@ -85,9 +89,18 @@ test("resume(ref) routes by ref.backendId, passes ref.cwd, and sends session/res
   assert.ok(resume > 0);
   assert.equal(log[resume]!.params?.cwd, ref.cwd);
   assert.equal(log[resume]!.params?.sessionId, ref.sessionId);
+  const selectedAfterResume = log.slice(resume + 1).find((entry) => entry.method === "setSessionConfigOption" && entry.params?.configId === "model");
+  assert.equal(selectedAfterResume?.params?.value, "opus", "session/set_config_option model=opus after session/resume");
   assert.ok(resume < methods(log).lastIndexOf("prompt"), "resume, then the prompt");
   assert.equal(count(log, "__start"), 2, "a fresh dedicated process for the resumed agent");
   assert.deepEqual(withoutSessionId(resumed.sessionRef!), withoutSessionId(ref), "the resumed agent reports the same ref");
+
+  // Without `model` the reopen selects nothing: the session runs on the backend's current default.
+  const selections = count(readLog(), "setSessionConfigOption");
+  const plain = track(await AcpAgent.resume(ref));
+  assert.equal(plain.model, undefined);
+  assert.equal(count(readLog(), "setSessionConfigOption"), selections, "no model passed back: no selection on the wire");
+  await plain.close({ keep: true });
 
   // Behavioral companion to the routing weld: the agent's ref IS the runner's builder output,
   // which is InteractiveSession.sessionRef plus poolKey (modulo sessionId).
@@ -188,6 +201,7 @@ test("a ref with an unknown backend, a mismatched poolKey, or a model routing el
   // Positive control: the same ref on its own backend with a same-backend model spec does spawn.
   const ok = track(await AcpAgent.resume(ref, { model: "claude/claude-opus-4-1" }));
   assert.equal(ok.backendId, "claude");
+  assert.equal(ok.model, "claude/claude-opus-4-1");
   assert.equal(ok.configOptions.find((option) => option.id === "model")?.currentValue, "claude-opus-4-1");
   assert.equal(count(readLog(), "__start"), 1);
 });

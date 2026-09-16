@@ -1394,7 +1394,9 @@ const reviewer = await primary.fork();                   // includes the follow-
 
 await Promise.all([planner.close(), reviewer.close()]);
 await primary.close({ keep: true });                     // the process is gone; the session stays re-openable
-const again = await AcpAgent.resume(primary.sessionRef!); // a fresh process on the same transcript
+// The same session on a fresh process. The ref carries no model, so pass the agent's back; `resume`
+// replays nothing (history/text start empty) — `AcpAgent.load(ref)` replays the transcript instead.
+const again = await AcpAgent.resume(primary.sessionRef!, { model: primary.model });
 ```
 
 `await using agent = new AcpAgent({ cwd })` closes the agent at scope exit (`Symbol.asyncDispose` is `close()`). `AcpAgent.open(options)` is `new AcpAgent(options)` + `ready()`; on an open failure the agent is closed and the mapped error rethrown.
@@ -1417,7 +1419,7 @@ const again = await AcpAgent.resume(primary.sessionRef!); // a fresh process on 
 - `authStore?` / `providerStore?` — optional shared stores. Auth is **default-off**: without them each agent uses its own login, and an ACP `-32000` surfaces as `AUTH_REQUIRED`. Forks share the parent's stores.
 - `clientHandlers?` — client-side fs/terminal/mcp handlers advertised at initialize (validated like the runner's).
 
-Read-only members: `backendId`, `cwd`, `label`, `state` (`idle` → `opening` → `ready` ⇄ `busy` → `closed`), `sessionId` / `sessionRef` (retained after close — they drive the cold statics), `capabilities` (`NegotiatedCapabilities`), `configOptions` (the latest echoed catalog), `modes`, `history` / `text` (the retained log, seeded from the parent on a fork), `replay` (verbatim `session/update` records received before the session was ready — a `load` replay or a fork's pre-response replay), `usage` (the running session sum), and `schema`.
+Read-only members: `backendId`, `cwd`, `label`, `model` (the model this agent selects at open as a routing spec that leads back to the same backend — `<backendId>/<model id>`, e.g. `"claude/opus[1m]"` — or `undefined` when none was selected; inherited by forks, and what a cold reopen needs back), `state` (`idle` → `opening` → `ready` ⇄ `busy` → `closed`), `sessionId` / `sessionRef` (retained after close — they drive the cold statics), `capabilities` (`NegotiatedCapabilities`), `configOptions` (the latest echoed catalog), `modes`, `history` / `text` (the retained log, seeded from the parent on a fork), `replay` (verbatim `session/update` records received before the session was ready — a `load` replay or a fork's pre-response replay), `usage` (the running session sum), and `schema`.
 
 ### <a name="acpagent-turns"></a>Turns — `prompt()` and `AcpAgentTurn`
 
@@ -1463,7 +1465,7 @@ What a `session/fork` response *is* differs per adapter, and the SDK follows the
 
 The statics rebuild an agent from a persisted `AgentSessionRef` (from `agent.sessionRef`, `InteractiveSession.sessionRef`, or `WorkflowRunResult.agentSessions`) on a fresh dedicated process: `resume(ref, options?)` sends `session/resume` (no replay), `load(ref, options?)` sends `session/load` (the agent replays the transcript before the response; it lands in `history`/`text`/`replay`, and the load boundary is marked so the re-attach classification holds), and `fork(ref, options?)` runs the trait-driven fork choreography on the recorded session without a history seed — on an id-only backend the child's `history` starts empty unless the reattach fell back to `session/load`; to seed a cold fork with the transcript, `load(ref)` then `fork()`.
 
-Routing is by `ref.backendId` through the built-ins and the registry and **never falls back to the default backend**: an unknown backend id, a `poolKey` that does not match the currently resolved backend, or a `model` option whose first segment routes elsewhere all reject with `SCRIPT_VALIDATION_ERROR` before any process spawns (a `model` on the ref's own backend selects that model; an unrouted spec goes verbatim to the ref's backend). `cwd` defaults to `ref.cwd`; a cold `fork` must keep it on `source-only` backends. `AcpAgentReopenOptions` is `Partial<AcpAgentOptions>`. A backend that does not advertise the requested lifecycle method fails through the same capability gate as the runner (`SCRIPT_VALIDATION_ERROR` naming the method) and leaves no process behind.
+Routing is by `ref.backendId` through the built-ins and the registry and **never falls back to the default backend**: an unknown backend id, a `poolKey` that does not match the currently resolved backend, or a `model` option whose first segment routes elsewhere all reject with `SCRIPT_VALIDATION_ERROR` before any process spawns (a `model` on the ref's own backend selects that model; an unrouted spec goes verbatim to the ref's backend). `cwd` defaults to `ref.cwd`; a cold `fork` must keep it on `source-only` backends. `AcpAgentReopenOptions` is `Partial<AcpAgentOptions>`. An `AgentSessionRef` carries **no model**: a reopen without `model` runs on the backend's current default, so pass the original agent's back — `AcpAgent.resume(ref, { model: agent.model })` — to keep the session on the model it was running. A backend that does not advertise the requested lifecycle method fails through the same capability gate as the runner (`SCRIPT_VALIDATION_ERROR` naming the method) and leaves no process behind.
 
 ### <a name="acpagent-structured-output"></a>Structured output
 

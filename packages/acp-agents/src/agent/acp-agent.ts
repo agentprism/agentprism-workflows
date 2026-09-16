@@ -200,6 +200,11 @@ export class AcpAgent {
   readonly cwd: string;
   /** The human label stamped on event contexts and error `agentLabel`; never on the wire. */
   readonly label: string | undefined;
+  /** The model this agent selects at open, as a routing spec that leads back to the same backend
+   *  (`<backendId>/<model id>`, e.g. `"claude/opus[1m]"`), or `undefined` when no model was
+   *  selected (the backend's default). Inherited by forks. An `AgentSessionRef` carries no model,
+   *  so a cold reopen keeps it only when told: `AcpAgent.resume(agent.sessionRef!, { model: agent.model })`. */
+  readonly model: string | undefined;
 
   readonly #options: AcpAgentOptions;
   readonly #seed: AcpAgentSeed;
@@ -259,6 +264,7 @@ export class AcpAgent {
     this.#modelSpec = seed.modelSpec;
     this.cwd = options.cwd;
     this.label = label;
+    this.model = seed.modelSpec === undefined ? undefined : `${seed.backend.id}/${seed.modelSpec}`;
     this.#schema = options.schema;
     this.#retainHistory = options.retainHistory ?? true;
     this.#raw = options.raw ?? true;

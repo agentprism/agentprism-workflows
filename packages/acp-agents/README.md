@@ -252,7 +252,9 @@ await primary.prompt("Meanwhile, list the callers.");        // the parent keeps
 
 await planner.close();
 await primary.close({ keep: true });                         // process disposed; the session stays re-openable
-const again = await AcpAgent.resume(primary.sessionRef!);    // a fresh process on the same transcript
+// The same session on a fresh process: the ref carries no model, so pass the agent's back. `resume` replays
+// nothing (history/text start empty) — `AcpAgent.load(ref)` replays the transcript instead.
+const again = await AcpAgent.resume(primary.sessionRef!, { model: primary.model });
 await again.close();
 ```
 

@@ -16,6 +16,10 @@ custom backends declare `fork: { disposition }`), cold `AcpAgent.resume/load/for
 ref's backend (never the default backend), `close({ keep })`, `Symbol.asyncDispose`, a single
 process-exit hook, and `AcpAgent.probe()` returning the harness config catalog plus a models view.
 
+- `agent.model` is the model the agent selects at open as a routing spec that leads back to the same
+  backend (`<backendId>/<model id>`), or `undefined` when none was selected; forks inherit it. An
+  `AgentSessionRef` carries no model, so a cold reopen keeps it only when passed back
+  (`AcpAgent.resume(ref, { model: agent.model })`).
 - `PROMPT_USAGE_SCOPES` pins that every installed agent reports `PromptResponse.usage` per turn
   (dist-probed); `AcpAgent` sums turns into `usage.session` itself.
 - `SessionHandle.promptOutcome()` returns `{ response, failure? }` without throwing on a typed session
