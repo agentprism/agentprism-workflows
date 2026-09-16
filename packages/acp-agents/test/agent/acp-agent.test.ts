@@ -566,6 +566,94 @@ test("constructor signal abort rejects queued work with the reason, cancels the 
   assert.deepEqual(again.readLog(), []);
 });
 
+test("a close({ keep: true }) queued behind a parked turn survives a constructor abort: the teardown waits out the cancel grace and keeps its keep", async () => {
+  const grace = 300;
+  const restore = setCancelGraceForTests(grace);
+  try {
+    const { cwd, readLog } = configure({ lifecycleSupport: true, turns: [{ ignoreCancel: true }] });
+    const controller = new AbortController();
+    const reason = new Error("stop");
+    const agent = track(await AcpAgent.open({ cwd, model: "claude", signal: controller.signal }));
+    const parked = agent.prompt("park");
+    await waitFor(() => methods(readLog()).includes("prompt"));
+    const closed = agent.close({ keep: true });
+    let closeSettled = false;
+    void closed.then(
+      () => {
+        closeSettled = true;
+      },
+      () => {
+        closeSettled = true;
+      },
+    );
+    const settled = Promise.allSettled([parked]);
+    const abortedAt = Date.now();
+    controller.abort(reason);
+    assert.equal(agent.state, "closed");
+
+    // The abort's cancel goes out; the queued close() must NOT tear down under the parked turn.
+    await waitFor(() => methods(readLog()).includes("cancel"));
+    assert.equal(closeSettled, false, "close() waits for the in-flight turn to settle");
+    assert.equal(methods(readLog()).includes("__exit"), false, "the process is alive while the turn is parked");
+
+    const [p] = await settled;
+    assert.equal(p.status, "rejected");
+    assert.equal((p as PromiseRejectedResult).reason, reason, "the parked turn rejects with the abort reason");
+    await closed;
+    assert.ok(Date.now() - abortedAt >= grace - 50, "the teardown ran only after the ignored-cancel grace disposed the process");
+    await waitFor(() => methods(readLog()).includes("__exit"));
+    const wire = methods(readLog());
+    assert.ok(wire.indexOf("cancel") < wire.indexOf("__exit"), wire.join(","));
+    assert.equal(wire.includes("closeSession"), false, "close({ keep: true }) kept its keep: no wire session/close");
+    assert.equal(agent.sessionRef?.sessionId, agent.sessionId, "the session stays re-openable");
+    await waitFor(() => liveConnectionCount() === 0);
+  } finally {
+    restore();
+  }
+});
+
+test("a close() queued behind a parked turn survives a constructor abort: session/close goes out only after the cancelled turn settled", async () => {
+  const { cwd, readLog } = configure({ lifecycleSupport: true, turns: [{ waitForCancel: true }] });
+  const controller = new AbortController();
+  const reason = new Error("stop");
+  const agent = track(await AcpAgent.open({ cwd, model: "claude", signal: controller.signal }));
+  const parked = agent.prompt("park");
+  await waitFor(() => methods(readLog()).includes("prompt"));
+  const closed = agent.close();
+  // `session_close` is emitted synchronously when the handle's release starts; record whether the
+  // in-flight turn had already settled at that instant (the reaction below is registered first).
+  let parkedSettled = false;
+  const observed = parked.then(
+    () => {
+      parkedSettled = true;
+    },
+    () => {
+      parkedSettled = true;
+    },
+  );
+  const settled = Promise.allSettled([parked]);
+  let releasedAfterTurn: boolean | undefined;
+  agent.on("session_close", () => {
+    releasedAfterTurn = parkedSettled;
+  });
+  controller.abort(reason);
+
+  const [p] = await settled;
+  await observed;
+  assert.equal(p.status, "rejected");
+  assert.equal((p as PromiseRejectedResult).reason, reason);
+  await closed;
+  assert.equal(releasedAfterTurn, true, "the session was released only after the in-flight turn settled");
+  await waitFor(() => methods(readLog()).includes("__exit"));
+  const wire = methods(readLog());
+  const cancel = wire.indexOf("cancel");
+  const close = wire.indexOf("closeSession");
+  assert.ok(cancel >= 0 && close > cancel && close < wire.indexOf("__exit"), wire.join(","));
+  assert.equal(find(readLog(), "closeSession")?.params?.sessionId, agent.sessionId);
+  assert.equal(agent.state, "closed");
+  await waitFor(() => liveConnectionCount() === 0);
+});
+
 test("a per-call signal aborted while queued never reaches the wire; aborted in flight sends session/cancel and rejects with the reason", async () => {
   const { cwd, readLog } = configure({ turns: [{ waitForCancel: true }, { text: "after" }] });
   const agent = track(await AcpAgent.open({ cwd, model: "claude" }));

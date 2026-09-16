@@ -229,6 +229,9 @@ export class AcpAgent {
   #collectingReplay = false;
   #activeTurn: ActiveTurn | undefined;
   #closePromise: Promise<void> | undefined;
+  /** The `keep` the first `close()` asked for; a constructor-signal abort that drains that queued
+   *  close() tears down with it, never with a keep of its own. */
+  #closeKeep: boolean | undefined;
   #teardownPromise: Promise<void> | undefined;
   #teardownStarted = false;
   #forkCount = 0;
@@ -675,7 +678,8 @@ export class AcpAgent {
    * already-dead process; rethrows only a `child_cleanup_error` (mapped, non-recoverable).
    */
   close(options: AcpAgentCloseOptions = {}): Promise<void> {
-    this.#closePromise ??= this.#closeOwned(options.keep === true);
+    this.#closeKeep ??= options.keep === true;
+    this.#closePromise ??= this.#closeOwned(this.#closeKeep);
     return this.#closePromise;
   }
 
@@ -872,8 +876,9 @@ export class AcpAgent {
     void this.#cancelTurn().catch(noop);
     // An open/fork/reattach in flight: dispose the process so the raced wire call rejects.
     if (this.#handle === undefined && this.#connection) void this.#connection.dispose().catch(noop);
-    // Not queued: tear down once the in-flight op settled (queued ones were just drained).
-    void this.#queue.whenIdle().then(() => this.#teardown(false)).catch(noop);
+    // Not queued: tear down once the in-flight op settled (queued ones were just drained). A
+    // close() that was queued behind that op keeps the `keep` it asked for.
+    void this.#queue.whenIdle().then(() => this.#teardown(this.#closeKeep ?? false)).catch(noop);
   }
 
   #onDead(): void {
@@ -887,11 +892,19 @@ export class AcpAgent {
 
   async #closeOwned(keep: boolean): Promise<void> {
     this.#closed = true;
+    let started = false;
     try {
-      await this.#queue.run(() => this.#teardown(keep));
-    } catch {
-      // The queued entry was drained (abort/death) or the teardown itself failed: await the
-      // memoized teardown directly so only a genuine teardown failure propagates.
+      await this.#queue.run(() => {
+        started = true;
+        return this.#teardown(keep);
+      });
+    } catch (error) {
+      // The teardown itself failed: only a genuine child_cleanup_error (mapped) gets here.
+      if (started) throw error;
+      // The queued entry was drained (constructor abort / process death) while an op was still
+      // running: wait for that op to settle, then run the memoized teardown — never under a turn
+      // that is still on the wire (the abort's own cancel + grace must play out first).
+      await this.#queue.whenIdle();
       await this.#teardown(keep);
     }
   }
