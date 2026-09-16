@@ -43,7 +43,11 @@ interface Slot {
 
 export interface StructuredOutputToolRegistration {
   readonly url: string;
+  /** Peek at the last valid capture without consuming it (the runner's single-turn read). */
   tryCaptured(): unknown | undefined;
+  /** Return the captured value and clear the slot — a capture belongs to exactly one turn, so a
+   *  long-lived registration never hands turn N's object to turn N+1. */
+  takeCaptured(): unknown | undefined;
   release(): void;
 }
 
@@ -76,6 +80,11 @@ export class StructuredOutputToolHost {
       return {
         url: `http://${HOST}:${port}/${token}`,
         tryCaptured: () => slot.captured,
+        takeCaptured: () => {
+          const captured = slot.captured;
+          slot.captured = undefined;
+          return captured;
+        },
         release: once(() => {
           this.slots.delete(token);
         }),

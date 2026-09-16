@@ -127,6 +127,30 @@ test("StructuredOutput tool uses the last valid call", async () => {
   });
 });
 
+test("StructuredOutput takeCaptured returns the capture once and clears the slot", async () => {
+  await withHost(async (host) => {
+    const slot = await host.register(SCHEMA);
+    assert.equal(slot.takeCaptured(), undefined, "nothing captured yet");
+
+    await call(slot, { city: "Oslo", hot: false });
+    assert.deepEqual(slot.tryCaptured(), { city: "Oslo", hot: false }, "peeking does not consume");
+    assert.deepEqual(slot.takeCaptured(), { city: "Oslo", hot: false });
+    // A capture belongs to exactly one turn: after it is taken, neither reader sees it again.
+    assert.equal(slot.takeCaptured(), undefined);
+    assert.equal(slot.tryCaptured(), undefined);
+
+    // The registration stays live: a later call captures afresh, and a rejected call in between
+    // leaves the cleared slot empty rather than resurrecting the earlier value.
+    const rejected = await call(slot, { city: "", hot: true });
+    assert.equal(rejected.isError, true);
+    assert.equal(slot.takeCaptured(), undefined);
+    await call(slot, { city: "Rome", hot: true });
+    assert.deepEqual(slot.takeCaptured(), { city: "Rome", hot: true });
+    assert.equal(slot.takeCaptured(), undefined);
+    slot.release();
+  });
+});
+
 test("StructuredOutput registrations isolate concurrent token paths", async () => {
   await withHost(async (host) => {
     const first = await host.register(SCHEMA);
