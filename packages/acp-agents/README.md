@@ -247,7 +247,10 @@ turn.updates; turn.raw; turn.toolCalls;          // every update / vendor notifi
 turn.usage.turn; turn.usage.session;             // this turn's tokens; the agent's running sum
 
 const planner = await primary.fork();                        // a NEW process seeded with the transcript so far
-const plan = await planner.prompt("Plan the smallest fix.", { mode: "plan" }); // per-turn mode/config passthrough
+const plan = await planner.prompt("Plan the smallest fix.", {
+  mode: "plan",                    // sticky: applies to this and every later turn of `planner`
+  meta: { trace: "plan-1" },       // turn `_meta`, passed through verbatim
+});
 await primary.prompt("Meanwhile, list the callers.");        // the parent keeps going, unaffected
 
 await planner.close();

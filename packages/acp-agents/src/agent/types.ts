@@ -230,7 +230,9 @@ export interface AcpAgentTurn {
   readonly structured?: unknown;
   /** Why `structured` is absent although a schema was active. */
   readonly structuredError?: string;
-  /** This turn's accumulator entries (copies). */
+  /** This turn's accumulator entries (copies). Per CHUNK, not per message: one `assistant`/`text`
+   *  entry per streamed `agent_message_chunk` and one `tool`/`toolCall` entry per `tool_call`, so
+   *  `history.length` is not a message count — `text` is the folded, per-message view. */
   readonly history: readonly AgentHistoryEntry[];
 }
 

@@ -1387,7 +1387,10 @@ turn.response;   // the verbatim PromptResponse, `_meta` intact
 turn.text;       // this turn's assistant text
 
 const planner = await primary.fork();                    // a NEW process seeded with everything committed so far
-const plan = await planner.prompt("Plan the implementation of the fix.", { mode: "plan" }); // per-turn passthrough
+const plan = await planner.prompt("Plan the implementation of the fix.", {
+  mode: "plan",                     // sticky: applies to this and every later turn of `planner`
+  meta: { trace: "plan-1" },        // turn `_meta`, passed through verbatim
+});
 await primary.prompt("Meanwhile, list the callers of enqueue()."); // primary keeps going, unaffected
 const reviewer = await primary.fork();                   // includes the follow-up too
 // plan.response / plan.updates / plan.raw carry everything the harness sent back — nothing is stripped
@@ -1419,7 +1422,7 @@ const again = await AcpAgent.resume(primary.sessionRef!, { model: primary.model 
 - `authStore?` / `providerStore?` — optional shared stores. Auth is **default-off**: without them each agent uses its own login, and an ACP `-32000` surfaces as `AUTH_REQUIRED`. Forks share the parent's stores.
 - `clientHandlers?` — client-side fs/terminal/mcp handlers advertised at initialize (validated like the runner's).
 
-Read-only members: `backendId`, `cwd`, `label`, `model` (the model this agent selects at open as a routing spec that leads back to the same backend — `<backendId>/<model id>`, e.g. `"claude/opus[1m]"` — or `undefined` when none was selected; inherited by forks, and what a cold reopen needs back), `state` (`idle` → `opening` → `ready` ⇄ `busy` → `closed`), `sessionId` / `sessionRef` (retained after close — they drive the cold statics), `capabilities` (`NegotiatedCapabilities`), `configOptions` (the latest echoed catalog), `modes`, `history` / `text` (the retained log, seeded from the parent on a fork; `text` folds the retained assistant messages exactly like `turn.text` — distinct messages joined by a blank line, a `load` replay included), `replay` (verbatim `session/update` records received before the session was ready — a `load` replay or a fork's pre-response replay), `usage` (the running session sum), and `schema`.
+Read-only members: `backendId`, `cwd`, `label`, `model` (the model this agent selects at open as a routing spec that leads back to the same backend — `<backendId>/<model id>`, e.g. `"claude/opus[1m]"` — or `undefined` when none was selected; inherited by forks, and what a cold reopen needs back), `state` (`idle` → `opening` → `ready` ⇄ `busy` → `closed`), `sessionId` / `sessionRef` (retained after close — they drive the cold statics), `capabilities` (`NegotiatedCapabilities`), `configOptions` (the latest echoed catalog), `modes`, `history` / `text` (the retained log, seeded from the parent on a fork; `history` is per chunk — one entry per streamed `agent_message_chunk` and per `tool_call`, so its length is not a message count — and `text` folds the same retained assistant messages exactly like `turn.text`: distinct messages joined by a blank line, a `load` replay included), `replay` (verbatim `session/update` records received before the session was ready — a `load` replay or a fork's pre-response replay), `usage` (the running session sum), and `schema`.
 
 ### <a name="acpagent-turns"></a>Turns — `prompt()` and `AcpAgentTurn`
 
@@ -1433,7 +1436,7 @@ Read-only members: `backendId`, `cwd`, `label`, `model` (the model this agent se
 - `permissions` / `elicitations` — the resolved permission and elicitation events of the turn.
 - `usage` — `{ turn, session, response? }`. **`turn` is this turn's `response.usage`** mapped to `AgentUsage` (every installed adapter reports the turn, not the session — the `PROMPT_USAGE_SCOPES` pin; the ACP SDK's own "across session" doc is not what the adapters send), with `cost` as the clamped delta of the cumulative `usage_update` cost gauge across the turn; when the response carries no `usage`, tokens fall back to the context-token gauge delta exactly like `UsageAccumulator.delta()`. **`session` is the running per-field sum of the turns this agent ran** (starting at zero at open/fork/resume/load — replayed history and the parent's turns are not counted; `cost` is the latest gauge value). `response` is `response.usage` verbatim.
 - `structured?` / `structuredError?` — when a schema was active: the validated object, or why it is absent. There is no repair ladder and no re-prompt.
-- `history` — this turn's accumulator entries (copies).
+- `history` — this turn's accumulator entries (copies). They are **per chunk**, not per message: one `assistant`/`text` entry per `agent_message_chunk` the agent streamed and one `tool`/`toolCall` entry per `tool_call`, so `history.length` is not a message count (a two-chunk answer is two entries) — `text` is the folded, per-message view of the same chunks.
 
 `AcpAgentPromptOptions`: `images?` (appended as image blocks, degraded like the runner when unadvertised), `meta?` (turn `_meta` passthrough — backend keys win direct collisions like `mergeTurnMeta`), `configOptions?` and `mode?` (applied via `session/set_config_option` / `session/set_mode` **before** the turn, inside the FIFO, with the constructor's validation — they are **sticky** for the rest of the session), `schema?` (a per-turn override, Codex only — see below), `signal?`.
 
