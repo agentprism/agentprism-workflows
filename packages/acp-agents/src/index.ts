@@ -237,9 +237,12 @@ export {
   FORK_SESSION_TRAITS,
   FORK_SESSION_TRAIT_DEFAULT,
   PROMPT_USAGE_SCOPES,
+  SYSTEM_PROMPT_SUPPORT,
+  SYSTEM_PROMPT_UNSUPPORTED,
   assertAuthCapabilityShape,
   forkSessionTrait,
   promptUsageScope,
+  systemPromptSupport,
 } from "./protocol-coverage.js";
 export type {
   AgentMethodCoverage,
@@ -249,7 +252,11 @@ export type {
   ClientMethodCoverage,
   ForkSessionTraitRow,
   PromptUsageScopeRow,
+  SystemPromptSupport,
+  SystemPromptSupportRow,
 } from "./protocol-coverage.js";
+// The one validator every front door runs on `systemPrompt` before a session opens.
+export { assertSystemPromptSupported, describeSystemPromptSupport } from "./system-prompt.js";
 
 // ACP standard capability negotiation. Vendor initialize metadata stays raw for extension owners.
 export {

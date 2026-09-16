@@ -39,6 +39,7 @@ import type { BackendRegistry } from "../registry.js";
 import { assertNoModelConfigOption, resolveModelRoute } from "../routing.js";
 import { sessionRefFor } from "../session-ref.js";
 import { StructuredOutputToolHost } from "../structured-tool.js";
+import { assertSystemPromptSupported } from "../system-prompt.js";
 import { agentClosedError, agentTurnError, agentValidationError, mapAgentError } from "./errors.js";
 import { AgentEventBus } from "./events.js";
 import { acquireForkedSession, forkTraitFor } from "./fork.js";
@@ -175,6 +176,7 @@ function assertKnownConfigOptionIds(
 function resolveNewSeed(options: AcpAgentOptions): ResolvedSeed {
   const registry = resolveAgentRegistry(options.backends, options.label);
   const route = resolveAgentRoute(options, registry);
+  assertSystemPromptSupported(route.backend, options.systemPrompt, options.label);
   return { kind: "new", registry, backend: route.backend, modelSpec: route.modelSpec };
 }
 
@@ -354,6 +356,7 @@ export class AcpAgent {
     validateAgentCwd(cwd, label, method);
     const registry = resolveAgentRegistry(options.backends, label);
     const route = resolveRefRoute(ref, options.model, registry, label);
+    assertSystemPromptSupported(route.backend, options.systemPrompt, label);
     const base = { registry, backend: route.backend, modelSpec: route.modelSpec };
     let seed: ResolvedSeed;
     if (kind === "fork") {
@@ -648,6 +651,9 @@ export class AcpAgent {
         }
       }
       assertNoModelConfigOption(merged.configOptions, label);
+      // The backend is fixed by the parent, so an inherited value already passed; an override
+      // is validated here, before the child's process spawns.
+      assertSystemPromptSupported(this.#backend, merged.systemPrompt, label);
       const child = AcpAgent.#seeded(merged, {
         kind: "fork",
         sourceSessionId: handle.sessionId,
@@ -768,8 +774,7 @@ export class AcpAgent {
       mcpServers: plan.mcpServers,
       meta: this.#layeredMeta(),
       label: this.label,
-      baseInstructions: options.instructions?.base,
-      developerInstructions: options.instructions?.developer,
+      systemPrompt: options.systemPrompt,
       retainSessionLog: this.#retainHistory,
     };
   }

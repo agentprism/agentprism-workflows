@@ -3,15 +3,17 @@
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
+import { META_KEYS, type PiSystemPromptMeta } from "@automatalabs/shared-types";
 import type { AuthProfile } from "../auth/auth-profile.js";
 import type {
   Backend,
   ProviderErrorClassification,
   ProviderErrorMetadata,
+  SessionMetaInputs,
   SpawnConfig,
 } from "../backend.js";
 import { splitArgs } from "../backend.js";
-import { BUILTIN_PROTOCOL_COVERAGE } from "../protocol-coverage.js";
+import { BUILTIN_PROTOCOL_COVERAGE, systemPromptSupport } from "../protocol-coverage.js";
 import { defineBuiltinBackend } from "./define.js";
 
 const require = createRequire(import.meta.url);
@@ -42,6 +44,9 @@ export class PiBackend implements Backend {
 
   readonly embedSchemaInPrompt = true;
   readonly injectStructuredOutputTool = true;
+  /** pi-acp reads `_meta.systemPrompt` `{ replace?, append? }` on session/new, resume, load, and
+   *  fork and folds it into pi's `DefaultResourceLoader` system-prompt overrides. */
+  readonly systemPrompt = systemPromptSupport("pi");
 
   classifyProviderError(
     error: unknown,
@@ -82,8 +87,16 @@ export class PiBackend implements Backend {
     }
   }
 
-  sessionMeta(): Record<string, unknown> | undefined {
-    return undefined;
+  sessionMeta(_schema: TSchema | undefined, inputs?: SessionMetaInputs): Record<string, unknown> | undefined {
+    // The schema rides the client-hosted StructuredOutput tool and the prompt, never session
+    // `_meta`. The neutral instructions ride pi-acp's `_meta.systemPrompt` object VERBATIM (only
+    // the defined fields), so an unconfigured session sends no `_meta` at all.
+    const systemPrompt = inputs?.systemPrompt;
+    const value: PiSystemPromptMeta = {
+      ...(systemPrompt?.replace !== undefined ? { replace: systemPrompt.replace } : {}),
+      ...(systemPrompt?.append !== undefined ? { append: systemPrompt.append } : {}),
+    };
+    return Object.keys(value).length > 0 ? { [META_KEYS.systemPrompt]: value } : undefined;
   }
 
   promptMeta(_schema: TSchema | undefined): Record<string, unknown> | undefined {

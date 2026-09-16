@@ -8,8 +8,9 @@
 //   3. how to read the native structured result OUT (Claude: structured_output off the raw
 //      _claude/sdkMessage; Codex/OpenCode/Pi: JSON.parse the final assistant message off the stream).
 import type { TSchema } from "typebox";
-import type { ProviderUsageLimitContext } from "@automatalabs/shared-types";
+import type { ProviderUsageLimitContext, SystemPromptOptions } from "@automatalabs/shared-types";
 import type { AuthProfile } from "./auth/auth-profile.js";
+import type { SystemPromptSupport } from "./protocol-coverage.js";
 
 /** Compatibility type path; the registry table is the only authored built-in identity source. */
 export type { BuiltinBackendId } from "./backends/builtins.js";
@@ -39,10 +40,11 @@ export interface StructuredSource {
 /** Per-session inputs a backend may fold into its `session/new` `_meta`, beyond the schema.
  *  Additive/optional; a backend that doesn't understand a field ignores it. */
 export interface SessionMetaInputs {
-  /** CODEX-ONLY: replaces Codex's base system prompt (`thread/start.baseInstructions`). */
-  baseInstructions?: string;
-  /** CODEX-ONLY: developer-role instructions (`thread/start.developerInstructions`). */
-  developerInstructions?: string;
+  /** Backend-neutral system prompt instructions, already validated against `Backend.systemPrompt`
+   *  (`assertSystemPromptSupported`): the backend maps `replace`/`append` onto its own
+   *  `_meta` dialect — Codex `baseInstructions`/`developerInstructions`, Claude and pi
+   *  `systemPrompt`. A backend that declares no support never sees a defined value. */
+  systemPrompt?: SystemPromptOptions;
   /** Engine run correlation id. Backends may use it to suppress autonomous session work. */
   runId?: string;
   /** Human-readable occurrence label associated with `runId`; never sent unless a backend uses it. */
@@ -82,6 +84,11 @@ export interface Backend {
    *  initialized agent strictly advertises HTTP MCP support. Native schema channels leave this
    *  unset; custom ACP backends opt in unless their registry entry disables it. */
   readonly injectStructuredOutputTool?: boolean;
+  /** Which halves of `SystemPromptOptions` this backend can carry on its session `_meta`
+   *  (`SYSTEM_PROMPT_SUPPORT` for the built-ins). Undefined = neither: the runner and the AcpAgent
+   *  SDK reject a `systemPrompt` for such a backend with SCRIPT_VALIDATION_ERROR before a session
+   *  opens, so instructions are never silently dropped. */
+  readonly systemPrompt?: SystemPromptSupport;
   /** OPTIONAL `initialize.clientCapabilities._meta` this backend adds: the namespaced vendor
    *  extensions THIS CLIENT implements for that agent, so the agent may turn them on. Backend-scoped
    *  on purpose — advertising a capability to an agent that does not implement it is noise, and

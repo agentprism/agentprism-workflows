@@ -490,7 +490,11 @@ test("wire server advertises top-level steering, parses the extension, and route
     const initialized = await connection.agent.request(methods.agent.initialize, {
       protocolVersion: 1,
     });
-    assert.deepEqual(initialized._meta, { steering: { supported: true }, loadedTurn: { supported: true } });
+    assert.deepEqual(initialized._meta, {
+      steering: { supported: true },
+      loadedTurn: { supported: true },
+      systemPrompt: { replace: true, append: true },
+    });
     assert.equal(
       "_meta" in (initialized.agentCapabilities as Record<string, unknown>),
       false,

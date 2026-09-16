@@ -86,8 +86,7 @@ test("legacy agent (no custom namespace): Codex instruction overrides ride sessi
   await makeRunner().run("hi", {
     model: "codex",
     cwd,
-    baseInstructions: "BASE",
-    developerInstructions: "DEV",
+    systemPrompt: { replace: "BASE", append: "DEV" },
   });
 
   const meta = newSessionMeta(readLog());
@@ -111,8 +110,7 @@ test("agent capability lookalikes do not filter session/new extension metadata",
   await makeRunner().run("hi", {
     model: "codex",
     cwd,
-    baseInstructions: "BASE",
-    developerInstructions: "DEV",
+    systemPrompt: { replace: "BASE", append: "DEV" },
   });
 
   const meta = newSessionMeta(readLog());
@@ -226,8 +224,7 @@ test("published fork 1.2.0 (no custom namespace): overrides + outputSchema still
     model: "codex",
     cwd,
     schema: SCHEMA,
-    baseInstructions: "BASE",
-    developerInstructions: "DEV",
+    systemPrompt: { replace: "BASE", append: "DEV" },
   });
 
   assert.deepEqual(out, { city: "Oslo", hot: false });

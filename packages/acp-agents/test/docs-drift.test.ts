@@ -10,6 +10,7 @@ import {
   CODEX_SPAWN_AUTH_ENV,
   FORK_SESSION_TRAITS,
   PI_ACP_PROTOCOL_CONTRACT,
+  SYSTEM_PROMPT_SUPPORT,
 } from "../src/index.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -350,4 +351,38 @@ test("maintained examples do not reintroduce invalid agent/model contracts", () 
       `${path} must not claim agentless scripts are invalid`,
     );
   }
+});
+
+// The backend-neutral `systemPrompt` instructions are executable data (`SYSTEM_PROMPT_SUPPORT`);
+// every public document that describes the runner or the AcpAgent SDK must carry the same rows
+// and none may keep the retired Codex-only story.
+test("system-prompt instruction support is documented per backend and the Codex-only story is retired", () => {
+  const publicDocs = [
+    "docs/api.md",
+    "packages/acp-agents/README.md",
+    "packages/workflows/README.md",
+    "packages/shared-types/README.md",
+  ];
+  for (const path of publicDocs) {
+    const text = readRepoFile(path);
+    assert.ok(text.includes("`systemPrompt`"), `${path} must document the systemPrompt option`);
+    assert.doesNotMatch(text, /Codex-only[^\n]{0,40}`baseInstructions`/, `${path} still describes baseInstructions as Codex-only`);
+    assert.doesNotMatch(text, /ignored by the Claude backend/i, `${path} still claims Claude ignores instructions`);
+    assert.doesNotMatch(text, /Claude has no analog/i, `${path} still claims Claude has no system-prompt analog`);
+    assert.doesNotMatch(text, /never drives `systemPrompt`/, `${path} still claims AgentPrism never drives systemPrompt`);
+  }
+  for (const path of ["docs/api.md", "packages/acp-agents/README.md"]) {
+    const text = readRepoFile(path);
+    for (const row of SYSTEM_PROMPT_SUPPORT) {
+      for (const key of row.metaKeys) {
+        assert.ok(text.includes(`\`${key}\``), `${path} must name the ${row.agent} \`${key}\` _meta key`);
+      }
+    }
+    assert.match(text, /opencode[^\n]{0,200}(?:no|neither)[^\n]{0,80}system[- ]prompt/i, `${path} must state OpenCode carries no system-prompt channel`);
+  }
+  const piReadme = readRepoFile("packages/pi-acp/README.md");
+  assert.ok(piReadme.includes("_meta.systemPrompt"), "pi-acp README must document its _meta.systemPrompt channel");
+  assert.ok(piReadme.includes("{ replace: true, append: true }"), "pi-acp README must document the initialize advertisement");
+  const contributing = readRepoFile("CONTRIBUTING.md");
+  assert.ok(contributing.includes("`systemPrompt`"), "CONTRIBUTING must list the bare systemPrompt _meta key");
 });

@@ -216,3 +216,22 @@ test("resume on a backend that does not advertise session/resume fails with the 
   await waitFor(() => liveConnectionCount() === 0);
   assert.equal(liveConnectionCount(), 0);
 });
+
+test("resume(ref, { systemPrompt }) carries the instructions on session/resume; an unsupported ref backend refuses before spawning", async () => {
+  const { cwd, readLog } = configure({ lifecycleSupport: true, resumeSession: {}, turns: [{ text: "one" }] });
+  const original = track(await AcpAgent.open({ cwd, model: "claude", raw: false }));
+  const ref = original.sessionRef!;
+  await original.close({ keep: true });
+
+  const resumed = track(await AcpAgent.resume(ref, { raw: false, systemPrompt: { append: "Continue tersely." } }));
+  const resume = readLog().find((entry) => entry.method === "resumeSession");
+  assert.deepEqual((resume?.params as { _meta?: unknown } | undefined)?._meta, { systemPrompt: { append: "Continue tersely." } });
+  await resumed.close({ keep: true });
+
+  const spawns = count(readLog(), "__start");
+  await assert.rejects(
+    () => AcpAgent.resume({ ...ref, backendId: "opencode", poolKey: "opencode" }, { systemPrompt: { replace: "R" } }),
+    validation(/systemPrompt\.replace is not supported by backend "opencode"/),
+  );
+  assert.equal(count(readLog(), "__start"), spawns, "refused before any process spawned");
+});

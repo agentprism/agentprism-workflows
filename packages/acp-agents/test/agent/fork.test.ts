@@ -459,3 +459,31 @@ test("closing a fork with keep never closes the parent's session", async () => {
     [closed.sessionId, parent.sessionId],
   );
 });
+
+test("fork inherits systemPrompt (sent on the fork and its reattach), honors an override, and validates it before spawning", async () => {
+  const { cwd, readLog } = configure({
+    lifecycleSupport: true,
+    forkSession: { idOnly: true, turns: [{ text: "child" }] },
+    turns: [{ text: "parent" }],
+  });
+  const parent = track(await AcpAgent.open({ cwd, model: "claude", raw: false, systemPrompt: { append: "Be terse." } }));
+  const child = track(await parent.fork());
+  let log = readLog();
+  const forkEntry = log.find((entry) => entry.method === "forkSession");
+  assert.deepEqual(forkEntry?.params?._meta, { systemPrompt: { append: "Be terse." } }, "inherited on session/fork");
+  const resumeEntry = log.find((entry) => entry.method === "resumeSession" && entry.params?.sessionId === child.sessionId);
+  assert.deepEqual(resumeEntry?.params?._meta, { systemPrompt: { append: "Be terse." } }, "and on the id-only reattach");
+
+  const overridden = track(await parent.fork({ systemPrompt: { replace: "Reviewer." } }));
+  log = readLog();
+  const overriddenResume = log.find((entry) => entry.method === "resumeSession" && entry.params?.sessionId === overridden.sessionId);
+  assert.deepEqual(overriddenResume?.params?._meta, { systemPrompt: "Reviewer." }, "the override replaced the inherited value");
+
+  const spawns = log.filter((entry) => entry.method === "__start").length;
+  await assert.rejects(
+    () => parent.fork({ systemPrompt: { append: "  " } }),
+    (error: unknown) =>
+      isWorkflowError(error) && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR && /append must be a non-empty string/.test(error.message),
+  );
+  assert.equal(readLog().filter((entry) => entry.method === "__start").length, spawns, "the refused fork spawned nothing");
+});

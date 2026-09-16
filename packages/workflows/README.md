@@ -187,7 +187,8 @@ try {
 `run(prompt, options?)` accepts the seam's `RunOptions`: `schema`, `maxSchemaRetries`, `model`, `mode`, `configOptions`, `tier`, `cwd`,
 `instructions`, `label`, `toolNames` / `disallowedToolNames`, `signal`, `mcpServers`, `images`,
 `backends`, `meta` / `promptMeta` (generic ACP `_meta` passthroughs merged into `session/new` /
-`session/prompt`), `baseInstructions` / `developerInstructions` (Codex-only), `keepSession`, and
+`session/prompt`), `systemPrompt` (backend-neutral `{ replace?, append? }` system-prompt
+instructions), `keepSession`, and
 the out-of-band callbacks `onUsage` / `onModelResolved` / `onModelFallback` / `onHistory` /
 `onSessionOpen`. Omitted modes explicitly apply Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi/custom mode. Token/cost usage is delivered via `onUsage` (it may never fire — ACP usage is
 experimental), never via the return value.
@@ -199,17 +200,19 @@ calls, usage), `fork()` seeds a parallel agent with everything committed so far,
 `close({ keep: true })` + `AcpAgent.resume(ref)` reopen it on a fresh process. See
 [docs/api.md — AcpAgent SDK](../../docs/api.md#acpagent-sdk).
 
-> **Codex session instructions.** When the run routes to the Codex backend, `baseInstructions`
-> **replaces** Codex's built-in base system prompt and `developerInstructions` adds developer-role
-> instructions for the session. They ride ACP `session/new` `_meta` into Codex `thread/start` and
-> are **ignored by the Claude backend** (which has no analog) — unlike `instructions`, which is
-> folded into the prompt text for either backend.
+> **System prompt instructions.** `systemPrompt: { replace?, append? }` shapes the agent's system
+> prompt for the session on every backend that has a channel for it: `replace` swaps the built-in
+> prompt, `append` adds to it. Codex carries them as its `baseInstructions` / `developerInstructions`
+> thread params, Claude and pi as `_meta.systemPrompt`; OpenCode and custom backends have no
+> channel and **refuse** the option before a session opens (`SCRIPT_VALIDATION_ERROR`), so an
+> instruction is never silently dropped. Unlike `instructions`, which is folded into the prompt
+> text for every backend. Per-backend wire details:
+> [acp-agents README — System prompt instructions](../acp-agents/README.md#system-prompt-instructions-systemprompt).
 >
 > ```ts
 > await runner.run("Cut the release.", {
 >   model: "codex/gpt-5.6-sol",
->   baseInstructions: "You are a release bot. Only touch CHANGELOG.md.",
->   developerInstructions: "Prefer conventional-commit summaries.",
+>   systemPrompt: { replace: "You are a release bot. Only touch CHANGELOG.md.", append: "Prefer conventional-commit summaries." },
 > });
 > ```
 

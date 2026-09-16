@@ -13,7 +13,7 @@ import type {
   SessionModeState,
   StopReason,
 } from "@agentclientprotocol/sdk";
-import type { AgentHistoryEntry, AgentSessionRef, McpServerConfig, PromptImage } from "@automatalabs/shared-types";
+import type { AgentHistoryEntry, AgentSessionRef, McpServerConfig, PromptImage, SystemPromptOptions } from "@automatalabs/shared-types";
 import type { RunOptions } from "@automatalabs/shared-types";
 import { WorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 import type { TSchema } from "typebox";
@@ -82,10 +82,9 @@ export interface InteractiveSessionOptions {
   runId?: string;
   /** Generic session-scoped `_meta` passthrough merged under backend-computed session meta. */
   meta?: Record<string, unknown>;
-  /** CODEX-ONLY base instruction override, forwarded at session/new. */
-  baseInstructions?: string;
-  /** CODEX-ONLY developer instruction override, forwarded at session/new. */
-  developerInstructions?: string;
+  /** Backend-neutral system prompt instructions (`replace` / `append`), forwarded on the session
+   *  `_meta` in the backend's own dialect; refused before open when the backend carries neither. */
+  systemPrompt?: SystemPromptOptions;
   /** Client-provided MCP servers to attach at session/new. */
   mcpServers?: McpServerConfig[];
   /** Keep accumulated text/history after each prompt turn; default false for held-open sessions. */

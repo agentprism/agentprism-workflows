@@ -445,6 +445,7 @@ export type {
   McpAcpServerConfig,
   McpServerConfig,
   RunOptions,
+  SystemPromptOptions,
   AgentResult,
   AgentUsage,
 } from "@automatalabs/shared-types";

@@ -355,6 +355,55 @@ export function forkSessionTrait(
   return FORK_SESSION_TRAITS.find((row) => row.agent === agent) ?? FORK_SESSION_TRAIT_DEFAULT;
 }
 
+/** Which halves of the backend-neutral `SystemPromptOptions` (`replace` / `append`) each built-in
+ *  can carry, and on which `session/new|resume|load|fork` `_meta` key — read from each adapter's
+ *  source and pinned by the protocol coverage suite (claude/codex/pi dists) and the docs-drift
+ *  suite. `replace` swaps the agent's built-in system prompt; `append` adds to it. A backend with
+ *  both `false` (opencode: `opencode acp` reads no session `_meta`; system prompts live in its
+ *  config and agent definitions) rejects any `systemPrompt` before a session opens. */
+export interface SystemPromptSupport {
+  readonly replace: boolean;
+  readonly append: boolean;
+}
+
+export interface SystemPromptSupportRow extends SystemPromptSupport {
+  readonly agent: string;
+  /** The bare `_meta` key(s) the instructions ride on; empty when unsupported. */
+  readonly metaKeys: readonly string[];
+  /** Installed distributions whose `_meta` reader is probed by the protocol coverage suite. */
+  readonly distProbe?: "claude" | "codex" | "pi";
+}
+
+const SYSTEM_PROMPT_SUPPORT_ROWS = [
+  // claude-agent-acp `createSession`: `_meta.systemPrompt` string => replaces the prompt; object =>
+  // merged into the `claude_code` preset with type/preset locked (`{ append }` extends it).
+  { agent: "claude", replace: true, append: true, metaKeys: ["systemPrompt"], distProbe: "claude" },
+  // @automatalabs/codex-acp: bare `_meta.baseInstructions` (base prompt replacement) and
+  // `_meta.developerInstructions` (developer-role instructions) => thread/{start,resume} params.
+  { agent: "codex", replace: true, append: true, metaKeys: ["baseInstructions", "developerInstructions"], distProbe: "codex" },
+  { agent: "opencode", replace: false, append: false, metaKeys: [] },
+  // @automatalabs/pi-acp: `_meta.systemPrompt` `{ replace?, append? }` (or a string = replace) =>
+  // pi's `DefaultResourceLoader` system-prompt overrides.
+  { agent: "pi", replace: true, append: true, metaKeys: ["systemPrompt"], distProbe: "pi" },
+] satisfies readonly SystemPromptSupportRow[];
+
+/** Per-built-in system-prompt instruction support. Executable data: the backends read their own
+ *  row (`Backend.systemPrompt`), the validators reject what a row does not carry, and the drift
+ *  suites pin the rows against the installed adapters and the public docs. */
+export const SYSTEM_PROMPT_SUPPORT: readonly SystemPromptSupportRow[] = Object.freeze(
+  SYSTEM_PROMPT_SUPPORT_ROWS.map((row) => Object.freeze({ ...row, metaKeys: Object.freeze([...row.metaKeys]) })),
+);
+
+/** Unknown agents carry no system-prompt channel: a custom registry entry's own `_meta` keys
+ *  travel through the generic `meta` passthrough instead. */
+export const SYSTEM_PROMPT_UNSUPPORTED: SystemPromptSupport = Object.freeze({ replace: false, append: false });
+
+/** The built-in row for `agent`, or `SYSTEM_PROMPT_UNSUPPORTED` for an unknown agent. */
+export function systemPromptSupport(agent: string): SystemPromptSupport {
+  const row = SYSTEM_PROMPT_SUPPORT.find((candidate) => candidate.agent === agent);
+  return row ? { replace: row.replace, append: row.append } : SYSTEM_PROMPT_UNSUPPORTED;
+}
+
 /** What `PromptResponse.usage` covers on each installed agent, read from its adapter source.
  *  Every source-verified agent reports THE TURN (the SDK's own type doc says "across session";
  *  the adapters do not follow it): claude-agent-acp resets its accumulator at every turn

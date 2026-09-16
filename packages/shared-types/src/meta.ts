@@ -10,6 +10,12 @@ export const META_KEYS = {
   outputSchema: "outputSchema",
   /** Run correlation passthrough on ACP requests, for tracing/telemetry. */
   runId: "runId",
+  /** Session-scoped system prompt instructions (`RunOptions.systemPrompt` /
+   *  `AcpAgentOptions.systemPrompt`) on `session/new|resume|load|fork` `_meta`, in the dialect the
+   *  two `systemPrompt`-keyed servers read: claude-agent-acp takes a string (replaces the prompt)
+   *  or `{ append }` (added to its `claude_code` preset); @automatalabs/pi-acp takes a string or
+   *  `{ replace?, append? }`. Codex carries the same instructions under CODEX_META_KEYS instead. */
+  systemPrompt: "systemPrompt",
 } as const;
 
 /** VENDOR (codex-acp) bare `session/new` `_meta` keys the @automatalabs/codex-acp adapter reads
@@ -75,14 +81,26 @@ export const CODEX_CUSTOM_CAPABILITY_NAMESPACE = "@automatalabs/codex-acp";
  *  structured-output path: _meta.claudeCode.options.outputFormat = { type:"json_schema", schema }
  *  AND _meta.claudeCode.emitRawSDKMessages = true (MANDATORY — the parsed object lands on
  *  SDKResultSuccess.structured_output, readable ONLY off the raw _claude/sdkMessage notification).
- *  Typed here so the two namespaces never collide. */
+ *  `systemPrompt` (META_KEYS.systemPrompt) is the adapter's session system-prompt channel: a
+ *  string replaces the whole prompt; an object is merged into the `claude_code` preset with
+ *  `type`/`preset` locked, so `{ append }` extends it. Typed here so the namespaces never collide. */
 export interface ClaudeJsonSchemaOutputFormat {
   type: "json_schema";
   schema: Record<string, unknown>;
 }
+export type ClaudeSystemPromptMeta = string | { append?: string; [k: string]: unknown };
 export interface ClaudeCodeSessionMeta extends Record<string, unknown> {
   claudeCode?: {
     options?: { outputFormat?: ClaudeJsonSchemaOutputFormat; [k: string]: unknown };
     emitRawSDKMessages?: boolean;
   };
+  systemPrompt?: ClaudeSystemPromptMeta;
 }
+
+/** The `_meta.systemPrompt` value @automatalabs/pi-acp reads on `session/new|resume|load|fork`:
+ *  a string replaces pi's built-in system prompt; the object form carries the backend-neutral
+ *  `SystemPromptOptions` verbatim (`replace` => pi's `systemPromptOverride`, `append` => one more
+ *  `appendSystemPromptOverride` entry). Pi advertises support at initialize under
+ *  `InitializeResponse._meta.systemPrompt` as `{ replace: true, append: true }`. Mirrored, not
+ *  imported: pi-acp is a leaf package; `acp-agents/test/pi-backend.test.ts` pins the mirror. */
+export type PiSystemPromptMeta = string | { replace?: string; append?: string };

@@ -107,7 +107,11 @@ test("a turn executing in-process answers `running`, and its finish pushes the a
     const initialized = await connection.agent.request(methods.agent.initialize, {
       protocolVersion: 1,
     });
-    assert.deepEqual(initialized._meta, { steering: { supported: true }, loadedTurn: { supported: true } });
+    assert.deepEqual(initialized._meta, {
+      steering: { supported: true },
+      loadedTurn: { supported: true },
+      systemPrompt: { replace: true, append: true },
+    });
 
     const opened = await connection.agent.request(methods.agent.session.new, {
       cwd: setup.cwd,

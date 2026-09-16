@@ -905,3 +905,81 @@ test("permission and elicitation events of the turn are captured with the decisi
   await bare.ready();
   assert.ok(!find(plain.readLog(), "initialize")?.params?.clientCapabilities?.elicitation);
 });
+
+// ---- system prompt instructions ------------------------------------------------------------
+
+test("systemPrompt is validated in the constructor against the routed backend, before any spawn", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
+  // OpenCode carries no channel: refused synchronously with the backend named.
+  assert.throws(
+    () => new AcpAgent({ cwd, model: "opencode", label: "oc", systemPrompt: { replace: "R" } }),
+    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => {
+      assert.match(error.message, /systemPrompt\.replace is not supported by backend "opencode"/);
+      assert.equal(error.agentLabel, "oc");
+    }),
+  );
+  // A malformed value is refused on a supporting backend too.
+  assert.throws(
+    () => new AcpAgent({ cwd, model: "claude", systemPrompt: { append: "" } }),
+    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => {
+      assert.match(error.message, /systemPrompt\.append must be a non-empty string/);
+    }),
+  );
+  assert.throws(
+    () => new AcpAgent({ cwd, model: "claude", systemPrompt: { base: "x" } as never }),
+    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => {
+      assert.match(error.message, /unknown field "base"/);
+    }),
+  );
+  assert.equal(readLog().length, 0, "nothing spawned");
+  assert.equal(liveConnectionCount(), 0);
+});
+
+test("Claude: systemPrompt rides session/new `_meta.systemPrompt` next to the raw-message flag, and wins over `meta`", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "ok" }, { text: "ok" }, { text: "ok" }] });
+  const appended = track(new AcpAgent({ cwd, model: "claude", systemPrompt: { append: "Be terse." } }));
+  await appended.ready();
+  assert.deepEqual(find(readLog(), "newSession")?.params?._meta, {
+    claudeCode: { emitRawSDKMessages: true },
+    systemPrompt: { append: "Be terse." },
+  });
+  await appended.close();
+
+  const replaced = track(
+    new AcpAgent({
+      cwd,
+      model: "claude",
+      raw: false,
+      meta: { systemPrompt: "from meta", vendor: { keep: true } },
+      systemPrompt: { replace: "You are a release bot.", append: "Only touch CHANGELOG.md." },
+    }),
+  );
+  await replaced.ready();
+  const sessions = readLog().filter((entry) => entry.method === "newSession");
+  assert.deepEqual(sessions[1]?.params?._meta, {
+    vendor: { keep: true },
+    systemPrompt: "You are a release bot.\n\nOnly touch CHANGELOG.md.",
+  });
+  await replaced.close();
+
+  // Without the option, a caller-supplied `meta.systemPrompt` passes through untouched.
+  const passthrough = track(new AcpAgent({ cwd, model: "claude", raw: false, meta: { systemPrompt: { append: "via meta" } } }));
+  await passthrough.ready();
+  assert.deepEqual(readLog().filter((entry) => entry.method === "newSession")[2]?.params?._meta, {
+    systemPrompt: { append: "via meta" },
+  });
+});
+
+test("Codex and pi: systemPrompt rides session/new in each backend's own dialect", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "ok" }, { text: "ok" }] }, { backends: ["codex", "pi"] });
+  const codex = track(new AcpAgent({ cwd, model: "codex", systemPrompt: { replace: "BASE", append: "DEV" } }));
+  await codex.ready();
+  assert.deepEqual(find(readLog(), "newSession")?.params?._meta, { baseInstructions: "BASE", developerInstructions: "DEV" });
+  await codex.close();
+
+  const pi = track(new AcpAgent({ cwd, model: "pi", systemPrompt: { append: "DEV" } }));
+  await pi.ready();
+  assert.deepEqual(readLog().filter((entry) => entry.method === "newSession")[1]?.params?._meta, {
+    systemPrompt: { append: "DEV" },
+  });
+});

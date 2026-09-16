@@ -77,8 +77,8 @@ From [`src/index.ts`](./src/index.ts):
 - `AgentRunner` — the `run(prompt, options) => result` interface above.
 - `RunOptions<S>` — the options bag: `label`, `schema`, `instructions`, `signal`, `model`,
   `mode`, `tier`, `cwd`, `toolNames`, `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`,
-  `images`, `runId`, `backends`, `meta`, `promptMeta`, the Codex-only `baseInstructions` /
-  `developerInstructions`, `keepSession`, and the out-of-band callbacks `onUsage`,
+  `images`, `runId`, `backends`, `meta`, `promptMeta`, the backend-neutral `systemPrompt`
+  (`SystemPromptOptions`: `replace` / `append`), `keepSession`, and the out-of-band callbacks `onUsage`,
   `onModelResolved`, `onModelFallback`, `onHistory`, and `onSessionOpen`. The resume-only
   `continueFromSession` directive is advisory: a capable runner reopens that exact session and
   reports the attempt through `AgentResultProvenance.continuation`; otherwise it runs fresh.

@@ -48,7 +48,7 @@ try {
 }
 ```
 
-`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, base/developer instructions, session hand-off fields, and telemetry callbacks. See `@automatalabs/shared-types` for the field-by-field contract.
+`run()` accepts the full `RunOptions` seam: `schema`, `model`, `mode`, `configOptions`, `tier`, `cwd`, `instructions`, `label`, `signal` (cancellation), `toolNames` / `disallowedToolNames`, `maxSchemaRetries`, `mcpServers`, `images` (see below), `runId`, `backends`, `meta` / `promptMeta`, the backend-neutral `systemPrompt` instructions, session hand-off fields, and telemetry callbacks. See `@automatalabs/shared-types` for the field-by-field contract.
 
 Aborting `signal` sends ACP `session/cancel` for that session. If its active turn does not settle
 within five seconds, the client sends `session/close` when the agent advertised it and quarantines
@@ -95,21 +95,30 @@ await runner.run("What's in this screenshot?", {
 });
 ```
 
-### Codex session instructions (`baseInstructions` / `developerInstructions`)
+### System prompt instructions (`systemPrompt`)
 
-When the run routes to the Codex backend, two optional fields let you override Codex's thread-level instructions for the session:
+`systemPrompt` (a `SystemPromptOptions` from `@automatalabs/shared-types`) is the one backend-neutral way to shape the agent's system prompt for a session — on `run()`, `openSession()`, and the `AcpAgent` SDK alike. `replace` swaps the backend's built-in system prompt for your text; `append` adds your text on top of it. Each backend carries the two halves on its own session `_meta` channel (`session/new`, and `session/resume` / `session/load` / the reattach of an id-only fork):
 
-- **`baseInstructions`** — replaces Codex's built-in base system prompt.
-- **`developerInstructions`** — injects developer-role instructions (added on top of the base prompt).
+| backend | `replace` | `append` | wire |
+|---|---|---|---|
+| `codex` | replaces Codex's base system prompt | developer-role instructions on top of it | the bare `baseInstructions` / `developerInstructions` keys on `_meta` → the Codex `thread/start` / `thread/resume` params of the same name ([`@automatalabs/codex-acp`](https://www.npmjs.com/package/@automatalabs/codex-acp)) |
+| `claude` | replaces the whole prompt | appended to the adapter's `claude_code` preset | `_meta.systemPrompt`: a string for `replace`, `{ append }` for `append`; both together are sent as one replacement string (replaced prompt, blank line, appended text) because the adapter has no custom-base-plus-append form |
+| `pi` | pi's custom-prompt slot (the `SYSTEM.md` / `--system-prompt` slot) | one more append entry after the operator's own | `_meta.systemPrompt` `{ replace?, append? }` verbatim ([`@automatalabs/pi-acp`](https://www.npmjs.com/package/@automatalabs/pi-acp) advertises `_meta.systemPrompt: { replace: true, append: true }` at initialize) |
+| `opencode` | — | — | `opencode acp` reads no session `_meta`; system prompts live in OpenCode's own config and agent definitions, so there is no system-prompt channel |
+| custom | — | — | ACP has no standard key; send your agent's own `_meta` through `meta` |
 
-They ride ACP `session/new` `_meta` as bare keys and are threaded into the Codex `thread/start.{baseInstructions,developerInstructions}` params by the [`@automatalabs/codex-acp`](https://www.npmjs.com/package/@automatalabs/codex-acp) adapter. Both are additive (never part of the resume identity) and are **ignored by the Claude backend** — Claude has no analog. Note this is distinct from `instructions`, which is folded into the prompt text for either backend.
+Support is validated **before a session opens**: a field the routed backend cannot carry is a non-recoverable `SCRIPT_VALIDATION_ERROR` naming the backend and the field, never a silent no-op, and so is a non-object, an unknown field, or a blank string. `systemPrompt` is additive (never part of the resume identity) and wins over the same key in the generic `meta` passthrough; a backend's own extras (Claude's `excludeDynamicSections`, say) still travel through `meta` when the option is not used. Note this is distinct from the `instructions` string, which is folded into the prompt text for every backend.
 
 ```ts
 await runner.run("Cut the release.", {
   model: "codex/gpt-5.6-sol",
   cwd: "/abs/path/to/worktree",
-  baseInstructions: "You are a release bot. Only touch CHANGELOG.md.",
-  developerInstructions: "Prefer conventional-commit summaries.",
+  systemPrompt: { replace: "You are a release bot. Only touch CHANGELOG.md.", append: "Prefer conventional-commit summaries." },
+});
+await runner.run("Summarize the diff.", {
+  model: "claude/opus",
+  cwd: "/abs/path/to/worktree",
+  systemPrompt: { append: "Answer in at most three sentences." },
 });
 ```
 
