@@ -1407,6 +1407,11 @@ function lifecycleCapabilityError(
   );
 }
 
+/** Which reopen method a reattach should take when the agent advertises both: `resume` (no
+ *  replay — the runner's continuation and the live fork hand-off) or `load` (the transcript is
+ *  replayed into the handle — the cold `AcpAgent.fork(ref)`). The other is the fallback. */
+export type ReattachPreference = "resume" | "load";
+
 /** Internal typed sentinel for the continuation path. It is deliberately thrown only after
  * initialize completes and before any session/load or session/resume wire request is sent. */
 export class ReattachCapabilityUnavailable extends Error {
@@ -2155,22 +2160,26 @@ export class PooledConnection {
     }
   }
 
-  /** Reserve one connection slot, await initialize, choose the best currently-advertised reopen
-   * method, prepare against that same ready connection, and reattach under the single reservation. */
+  /** Reserve one connection slot, await initialize, choose the reopen method — the preferred one
+   * when the agent advertises it (`resume` by default: no replay; `load` when the caller wants the
+   * transcript replayed into the handle), else the other, else `ReattachCapabilityUnavailable` —
+   * prepare against that same ready connection, and reattach under the single reservation. */
   async openPreparedReattachedSession(
     sessionId: string,
     prepare: (connection: PooledConnection) => AcpSessionOptions | Promise<AcpSessionOptions>,
     onReleased?: () => void,
-  ): Promise<{ handle: SessionHandle; method: "resume" | "load" }> {
+    prefer: ReattachPreference = "resume",
+  ): Promise<{ handle: SessionHandle; method: ReattachPreference }> {
     this._activeSessions += 1;
     try {
       await this.ready;
       const caps = this.negotiated;
-      const method: "resume" | "load" | undefined = caps?.supportsResumeSession
-        ? "resume"
-        : caps?.supportsLoadSession
-          ? "load"
-          : undefined;
+      const advertised: Record<ReattachPreference, boolean> = {
+        resume: caps?.supportsResumeSession === true,
+        load: caps?.supportsLoadSession === true,
+      };
+      const order: readonly ReattachPreference[] = prefer === "load" ? ["load", "resume"] : ["resume", "load"];
+      const method = order.find((candidate) => advertised[candidate]);
       if (method === undefined) throw new ReattachCapabilityUnavailable(this.backendId, sessionId);
       const opts = await prepare(this);
       const handle = await this.reattachReadySession(

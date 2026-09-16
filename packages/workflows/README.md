@@ -810,9 +810,11 @@ import { probeHarnessConfig, formatHarnessConfigReport } from "@automatalabs/wor
 const report = await probeHarnessConfig({ harnesses: ["codex"] });
 const exact = await probeHarnessConfig({ modelSpecs: ["codex/gpt-5.6-sol"] }); // selects it first
 report.ok;             // every requested harness probed
-report.harnessOptions; // [{ backendId, model?, probed, modes?: SessionModeState | null, options?: SessionConfigOption[], error?: string }]
+report.harnessOptions; // [{ backendId, model?, probed, modes?: SessionModeState | null, options?: SessionConfigOption[], traits?: AcpAgentTraits, error?: string }]
 formatHarnessConfigReport(report); // the CLI's human table
 ```
+
+Every probed entry also carries `traits` — the same `AcpAgentTraits` as `agent.traits` (the `fork` row, the `systemPrompt` channel and its `source`, `steering` / `loadedTurn`, `structuredOutput`, `promptUsage`), computed from the probe connection — and `config --json` spreads each entry into its output as-is, so the field appears in the CLI report too; a failed entry (`probed: false`) has none.
 
 `probeHarnessConfig({ harnesses?, modelSpecs?, backends?, cwd?, probeRunner?, probeTimeoutMs?, probeConcurrency?, signal? })` — `modelSpecs` selects exact routed models before reading their model-specific option domains; `probeRunner` reuses a host-owned live runner without disposing it; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner({ backends })` (implemented in `@automatalabs/acp-agents`; the facade re-exports it).
 

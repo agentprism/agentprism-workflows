@@ -2,11 +2,14 @@
 "@automatalabs/acp-agents": major
 "@automatalabs/shared-types": minor
 "@automatalabs/pi-acp": patch
+"@automatalabs/codex-acp": minor
+"@automatalabs/workflows": minor
 ---
 
 AcpAgent SDK round 2: per-agent traits, `INVALID_ARGUMENT` for SDK misuse, system-prompt discovery,
 the message-level transcript (`turn.messages` / `agent.messages`), `stream()`, client-side function
-tools, the `permissions` rename, and mid-session model switching (`setModel()` / a per-turn `model`).
+tools, the `permissions` rename, mid-session model switching (`setModel()` / a per-turn `model`), the
+opt-in `schemaRetries` structured repair ladder, transcript-carrying cold forks, and live Codex forks.
 
 `@automatalabs/shared-types`
 
@@ -27,8 +30,9 @@ tools, the `permissions` rename, and mid-session model switching (`setModel()` /
   `agentLabel`, and `details` preserved; the runner and `InteractiveSession` are unchanged.
 - New `AcpAgentTraits` / `describeBackendTraits(backend, registry, live?)`, `agent.traits`, and the
   spawn-free static `AcpAgent.traits(spec?, { backends? })`: `backendId`, `custom`, `defaultModeId`,
-  the `fork` row, `systemPrompt` (`replace` / `append` plus `source`: `table` / `declared` /
-  `advertised` / `none`), `steering` / `loadedTurn` (`supported` / `not-advertised` / `unknown`),
+  the `fork` row, `systemPrompt` (`replace` / `append` plus `source`: `table` / `advertised` /
+  `none` — a custom backend is `none` before open, since `CustomAcpBackend` carries no channel),
+  `steering` / `loadedTurn` (`supported` / `not-advertised` / `unknown`),
   `structuredOutput` (`session-meta` / `turn-meta` / `client-tool`, derived from the `Backend`
   object's behavior), and `promptUsage`. The executable protocol-coverage tables answer before the
   agent opens; once the connection is up, the agent's initialize advertisements win — pi's bare
@@ -70,9 +74,10 @@ tools, the `permissions` rename, and mid-session model switching (`setModel()` /
   default precedence); the docs previously claimed explicit lists beat the resolver and now describe
   the real order.
 - New client-side function tools: `AcpAgentOptions.tools?: AcpAgentToolDefinition[]` —
-  `{ name, description, inputSchema (typebox), execute(input, ctx) }`, with `defineTool()` to infer
-  the input type, `AcpAgentToolContext` (`sessionId`, `backendId`, `label?`, a best-effort
-  `toolCallId?`, `signal`) and `AcpAgentToolResult` (a string, MCP content blocks, or
+  `{ name, description, inputSchema (a typebox object schema), execute(input, ctx) }`, with
+  `defineTool()` to infer the input type, `AcpAgentToolContext` (`sessionId`, `backendId`, `label?`,
+  a best-effort `toolCallId?`, `signal`) and `AcpAgentToolResult` (a string, MCP content blocks —
+  `@modelcontextprotocol/sdk`'s `ContentBlock`, the `tools/call` result shape, not ACP's — or
   `{ content, isError? }`). Every agent with tools runs its own local tool host (`AgentToolHost`,
   the `StructuredOutputToolHost` pattern generalized over a shared `LocalMcpHttpHost` base): an
   in-process Streamable HTTP MCP server on `127.0.0.1` behind an unguessable token path serving
@@ -81,8 +86,9 @@ tools, the `permissions` rename, and mid-session model switching (`setModel()` /
   fork's reattach, separate from and coexisting with the `structured_output` host. Arguments are
   validated with typebox Convert + Check before `execute`; a validation failure or a thrown
   `execute` answers the agent with an `isError: true` result carrying the message, never a
-  transport error. Names (`^[A-Za-z0-9_-]{1,64}$`, unique; `AGENT_TOOL_NAME_PATTERN`) are validated
-  in the constructor (`INVALID_ARGUMENT` before any spawn); an agent that does not advertise
+  transport error. Names (`^[A-Za-z0-9_-]{1,64}$`, unique; `AGENT_TOOL_NAME_PATTERN`) and the
+  object-typed `inputSchema` (`type: "object"` — MCP `tools/call` arguments are an object) are
+  validated in the constructor (`INVALID_ARGUMENT` before any spawn); an agent that does not advertise
   `mcpCapabilities.http` fails the open with `INVALID_ARGUMENT` naming the backend — tools are never
   silently dropped. `ctx.signal` aborts on `cancel()`, a per-call signal, the agent's signal, and
   close; forks inherit the tools on a host of their own; the host closes with the agent, waiting up
@@ -90,18 +96,80 @@ tools, the `permissions` rename, and mid-session model switching (`setModel()` /
   `tool_call` / `tool_call_update` events (pi: `mcp__agent_tools__<name>`).
 - Both local MCP hosts now close without waiting on a peer's keep-alive socket: idle connections
   are closed at once, requests still being answered get a bounded grace, then the rest are torn down.
+  A close that lands while the host is still binding waits for the bind to settle and closes the
+  socket it produced, so no listening socket outlives `dispose()`; the racing `listen()` rejects.
+- `StructuredOutputToolHost.dispose()` — the host the one-shot runner uses for the injected
+  StructuredOutput tool, not only the agent's — now shares the local MCP host's close semantics:
+  idle connections closed, a one-second drain grace for requests mid-answer, then the remaining
+  connections force-closed, instead of awaiting `server.close()` indefinitely.
 - New mid-session model switching: `agent.setModel(spec)` (queued in the FIFO like `setMode`;
   sticky) and `AcpAgentPromptOptions.model` (applied before that turn, ahead of its
   `configOptions` and `mode` — open's order; sticky). The spec is resolved with the rule `fork()`
   applies to a `model` override — the runner's routing grammar, and it must route to this agent's
   backend and poolKey (`"<backendId>/<model id>"`) — otherwise `INVALID_ARGUMENT` naming both
-  backends before anything is sent; a backend-only or blank spec is refused the same way (there is
-  no wire form for "unselect"). The switch is applied exactly like open's selection
+  backends before anything is sent — `setModel` resolves the route before queueing the operation,
+  so a refused spec on an agent that has not opened yet spawns nothing, and the per-turn message
+  names the entry point used (`AcpAgent.prompt({ model })` / `AcpAgent.stream({ model })`); a
+  backend-only or blank spec is refused the same way (there is no wire form for "unselect"). The
+  switch is applied exactly like open's selection
   (`SessionHandle.selectModel`: `session/set_config_option { configId: "model" }` with the routed
   remainder verbatim; no aliases, coercion, catalog matching, or fallback), a wire rejection maps
   through the normal error path with `model` unchanged, and on success `agent.model` (now a getter)
   is the routed spec, so later forks and a cold `AcpAgent.resume(ref, { model: agent.model })`
   inherit the switch. `"model"` stays reserved in `configOptions`.
+
+- New opt-in structured repair ladder: `AcpAgentOptions.schemaRetries` and
+  `AcpAgentPromptOptions.schemaRetries` (integer ≥ 0, `INVALID_ARGUMENT` otherwise; the per-turn value
+  wins; forks inherit; default `0` keeps `prompt()` exactly one turn). With a budget, a turn that
+  ended `end_turn` with `structured` absent is followed inside the same queued operation by up to
+  that many repair turns on the same session, each sending the runner's repair prompt (the
+  StructuredOutput-tool variant when the injected tool is active, else the JSON variant, with the
+  previous attempt's `structuredError` appended — one package-internal `repairPromptText` in
+  `structured-output.ts` that the runner's ladder now selects through as well; nothing new is
+  exported) with the same turn `_meta`, so the native channel stays authoritative. Every repair turn is a real turn (events,
+  `stream()`, `usage`, `cancel()`/`steer()`); the resolved turn is the final attempt's plus the new
+  `AcpAgentTurn.structuredAttempts` (1 + repairs run; absent without a schema). An attempt that ended
+  `cancelled` / `refusal` / `max_tokens` / `max_turn_requests`, or was walled, ends the ladder.
+- Cold forks carry the transcript: `AcpAgent.fork(ref)` prefers `session/load` for the id-only
+  reattach (the replay lands in the child's `history`/`text`/`messages`/`replay`) and falls back to
+  `session/resume` only when load is not advertised. The live `agent.fork()` keeps its resume-first
+  choreography (the child is seeded from the parent). `PooledConnection.openPreparedReattachedSession`
+  and `acquireForkedSession` take a `ReattachPreference` (`"resume"` default — the runner's
+  continuation path is unchanged).
+- **Breaking (tables):** the `codex` row of `FORK_SESSION_TRAITS` is now `live` / `none` / `free` —
+  the workspace `@automatalabs/codex-acp` fork keeps the forked thread subscribed and publishes its
+  startup state, so `agent.fork()` on Codex is the fork handle itself with no `session/resume`
+  reattach. `agent.traits.fork`, `BUILTIN_PROTOCOL_COVERAGE.codex.fork`, and the docs follow; the
+  dist probes now assert the ABSENCE of the post-fork `threadUnsubscribe` and of the fork publish
+  gate, and that thread/fork spreads the instruction overrides like thread/start and thread/resume.
+  A Codex fork's `systemPrompt` (inherited or overridden) rides the `session/fork` request's `_meta`
+  (`baseInstructions` / `developerInstructions`), which the workspace fork threads into `thread/fork`
+  — there is no reattach to carry it any more. A custom entry wrapping upstream codex-acp (which
+  still unsubscribes) must declare `id-only`.
+
+`@automatalabs/codex-acp`
+
+- Live `session/fork`: `SessionFork` no longer calls `thread/unsubscribe` on the forked thread
+  (`thread/fork` subscribes the connection exactly like `thread/resume`; the v2 protocol has no
+  separate subscribe request), and `CodexAcpServer.tryCreateSession` drops the `operation !== "fork"`
+  publish gate so a forked session publishes `available_commands_update` and MCP startup status like
+  a resumed one. The returned session id is promptable at once. `session/fork` now forwards the
+  request's `_meta.baseInstructions` / `_meta.developerInstructions` into `thread/fork` exactly as
+  `session/new` and `session/resume` / `session/load` forward them into `thread/start` /
+  `thread/resume` (the reader moved to `InstructionOverrides.ts`, shared by all four call sites);
+  previously a fork silently ran on Codex's default instructions. Observed live: the forked thread
+  honors `baseInstructions`; a `developerInstructions` override on `thread/fork` reached the wire
+  but the fork kept its source thread's developer instructions (Codex app-server behavior). Because
+  the forked thread is subscribed from the moment `thread/fork` returns, a failure between it and
+  the session install (the auth-state read, for example) now releases that subscription through
+  the same stale-open cleanup a failed `session/resume` uses, instead of leaving the thread
+  subscribed with no session state.
+
+`@automatalabs/workflows`
+
+- The facade re-exports the rest of the AcpAgent SDK surface it had left out: `AcpAgentTraits` /
+  `describeBackendTraits`, `AcpAgentMessage`, and `AcpAgentStream` / `AcpAgentStreamEvent` /
+  `AcpAgentStreamEventName`, next to `defineTool` and the tool types.
 
 `@automatalabs/pi-acp`
 

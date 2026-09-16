@@ -248,6 +248,32 @@ test("a spec routing to another backend, a backend-only spec, and a blank spec a
   assert.equal(modelValue(custom), "Some.Model[high]");
 });
 
+test("setModel on an agent that has not opened yet refuses a spec that leaves its backend with nothing spawned: the log stays empty and the agent stays idle", async () => {
+  const { cwd, readLog } = configure({ configOptions: [MODEL], turns: [{ text: "ok" }] });
+  const agent = track(new AcpAgent({ cwd, model: "claude/opus", label: "cold" }));
+  assert.equal(agent.state, "idle");
+
+  await assert.rejects(
+    () => agent.setModel("codex/gpt-5.6-sol"),
+    validation(/^AcpAgent\.setModel\(\): model "codex\/gpt-5\.6-sol" routes to backend "codex" but must stay on backend "claude"$/, "cold"),
+  );
+  await assert.rejects(() => agent.setModel("claude"), validation(/no model id/, "cold"));
+  await assert.rejects(() => agent.setModel(""), validation(/requires a non-empty model spec/, "cold"));
+  assert.equal(readLog().length, 0, "the route is checked before the operation is queued: no process was spawned");
+  assert.equal(agent.state, "idle");
+  assert.equal(agent.model, "claude/opus");
+
+  // A spec that stays on the backend queues the switch ahead of the open like any other operation.
+  await agent.setModel("claude/sonnet");
+  assert.equal(agent.state, "ready");
+  assert.equal(agent.model, "claude/sonnet");
+  assert.deepEqual(wireAfterOpen(readLog(), "newSession", agent.sessionId), [
+    "setSessionConfigOption:model=opus",
+    "setSessionConfigOption:model=sonnet",
+  ]);
+  assert.equal((await agent.prompt("hi")).text, "ok");
+});
+
 test("a model value the agent rejects maps through the normal error path (recoverable AGENT_EXECUTION_ERROR); model is unchanged and the agent stays usable", async () => {
   const { cwd, readLog } = configure({
     setConfigOptionError: "unknown model id",
@@ -319,7 +345,17 @@ test("per-turn model applies first — model, configOptions, mode — then the p
   assert.equal(agent.modes?.currentModeId, "plan");
   assert.equal(agent.state, "ready");
 
-  // `stream()` is the same turn body, so the per-turn model rides it too.
+  // `stream()` is the same turn body, so the per-turn model rides it too — and a refusal names
+  // the entry point actually used, not `prompt()`.
+  await assert.rejects(
+    () => agent.stream("never sent", { model: "codex/x" }).next(),
+    validation(/^AcpAgent\.stream\(\{ model \}\): model "codex\/x" routes to backend "codex" but must stay on backend "claude"$/),
+  );
+  await assert.rejects(
+    () => agent.stream("never sent", { schemaRetries: -1 }).next(),
+    validation(/^AcpAgent\.stream\(\{ schemaRetries \}\): schemaRetries must be an integer >= 0/),
+  );
+  assert.equal(wireAfterOpen(readLog(), "newSession", agent.sessionId).length, 6, "neither refused stream reached the wire");
   let terminal = 0;
   for await (const event of agent.stream("z", { model: "claude/default-model" })) {
     if (event.type === "turn") terminal += 1;

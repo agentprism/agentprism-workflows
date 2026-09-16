@@ -35,11 +35,13 @@ export interface AcpAgentTraits {
    *  `FORK_SESSION_TRAITS` row, or a custom entry's declaration. */
   readonly fork: ForkSessionTraitRow;
   /** Which halves of `systemPrompt` the backend carries and where the answer came from: `table`
-   *  (a built-in's `SYSTEM_PROMPT_SUPPORT` row), `declared` (a custom backend's own declaration),
-   *  `advertised` (the live agent's initialize advertisement — pi under `_meta.systemPrompt`, the
-   *  Codex fork under `agentCapabilities._meta["@automatalabs/codex-acp"]` — which wins over the
-   *  table once the connection is open), or `none` (no channel). */
-  readonly systemPrompt: SystemPromptSupport & { readonly source: "table" | "declared" | "advertised" | "none" };
+   *  (a built-in's `SYSTEM_PROMPT_SUPPORT` row), `advertised` (the live agent's initialize
+   *  advertisement — pi under `_meta.systemPrompt`, the Codex fork under
+   *  `agentCapabilities._meta["@automatalabs/codex-acp"]` — which wins over the table once the
+   *  connection is open), or `none` (no channel — every custom backend before open, since
+   *  `CustomAcpBackend` never carries the neutral instructions; a built-in that supports neither
+   *  half, OpenCode, still reports its all-false row as `table`). */
+  readonly systemPrompt: SystemPromptSupport & { readonly source: "table" | "advertised" | "none" };
   /** `_session/steering`: the built-in `ACP_EXTENSION_SUPPORT_MATRIX` row before open (`unknown`
    *  for a custom backend); after open, whether `initializeMeta.steering.supported === true`. */
   readonly steering: "supported" | "not-advertised" | "unknown";
@@ -80,7 +82,7 @@ export function describeBackendTraits(
     custom,
     ...(backend.defaultModeId === undefined ? {} : { defaultModeId: backend.defaultModeId }),
     fork: forkTraitFor(backend, registry),
-    systemPrompt: systemPromptTrait(backend, custom, live),
+    systemPrompt: systemPromptTrait(backend, live),
     steering: extensionTrait(backend.id, custom, SESSION_STEERING_METHOD, live, initializeMeta?.steering),
     loadedTurn: extensionTrait(backend.id, custom, LOADED_TURN_QUERY_METHOD, live, initializeMeta?.loadedTurn),
     structuredOutput: structuredOutputChannel(backend),
@@ -88,16 +90,14 @@ export function describeBackendTraits(
   });
 }
 
-function systemPromptTrait(
-  backend: Backend,
-  custom: boolean,
-  live: NegotiatedCapabilities | undefined,
-): AcpAgentTraits["systemPrompt"] {
+/** The live advertisement wins; else the Backend object's row — set only by the built-ins
+ *  (`SYSTEM_PROMPT_SUPPORT`), never by `CustomAcpBackend`, so a defined row is always `table`. */
+function systemPromptTrait(backend: Backend, live: NegotiatedCapabilities | undefined): AcpAgentTraits["systemPrompt"] {
   const advertised = live ? advertisedSystemPrompt(live) : undefined;
   if (advertised) return Object.freeze({ ...advertised, source: "advertised" as const });
   const table = backend.systemPrompt;
   if (!table) return Object.freeze({ ...SYSTEM_PROMPT_UNSUPPORTED, source: "none" as const });
-  return Object.freeze({ replace: table.replace, append: table.append, source: custom ? ("declared" as const) : ("table" as const) });
+  return Object.freeze({ replace: table.replace, append: table.append, source: "table" as const });
 }
 
 /** The live system-prompt advertisement, when the agent made one: the bare `_meta.systemPrompt`

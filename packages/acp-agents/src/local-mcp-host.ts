@@ -23,7 +23,8 @@ const CLOSE_DRAIN_GRACE_MS = 1000;
 
 export abstract class LocalMcpHttpHost {
   private server: HttpServer | undefined;
-  private listenPromise: Promise<void> | undefined;
+  /** The pending or settled bind of `server`, resolving with its port. */
+  private listenPromise: Promise<number> | undefined;
   private port: number | undefined;
   private inFlightRequests = 0;
   private drained: (() => void) | undefined;
@@ -44,15 +45,21 @@ export abstract class LocalMcpHttpHost {
   }
 
   /** Stop listening. Idempotent; resolves once the HTTP server closed (immediately when it never
-   *  bound). A peer's keep-alive socket never holds the close open: idle connections are closed at
-   *  once, requests still being answered get a bounded grace to flush, then everything left is
-   *  destroyed — the peer is the agent process, which is gone or going. */
+   *  bound). A close that lands while `ensureListening()` is still binding waits for that bind to
+   *  settle and then closes the socket it produced — returning early would leave the socket to
+   *  come up after the close with nothing left to close it (the racing `ensureListening()` sees
+   *  the host closed and rejects). A peer's keep-alive socket never holds the close open: idle
+   *  connections are closed at once, requests still being answered get a bounded grace to flush,
+   *  then everything left is destroyed — the peer is the agent process, which is gone or going. */
   protected async closeServer(): Promise<void> {
     const server = this.server;
+    const binding = this.listenPromise;
     this.server = undefined;
     this.listenPromise = undefined;
     this.port = undefined;
-    if (!server || !server.listening) return;
+    if (!server) return;
+    if (binding) await binding.then(noop, noop);
+    if (!server.listening) return;
     const closed = new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
@@ -80,9 +87,9 @@ export abstract class LocalMcpHttpHost {
       });
       this.server.unref();
     }
+    const server = this.server;
     if (!this.listenPromise) {
-      this.listenPromise = new Promise<void>((resolve, reject) => {
-        const server = this.server!;
+      this.listenPromise = new Promise<number>((resolve, reject) => {
         const onError = (error: Error) => {
           server.off("listening", onListening);
           reject(error);
@@ -94,19 +101,21 @@ export abstract class LocalMcpHttpHost {
             reject(new Error(`${this.hostName} MCP server did not bind to a TCP port`));
             return;
           }
-          this.port = (address as AddressInfo).port;
-          resolve();
+          resolve((address as AddressInfo).port);
         };
         server.once("error", onError);
         server.once("listening", onListening);
         server.listen(0, LOCAL_MCP_HOST);
       });
     }
-    await this.listenPromise;
-    if (this.port === undefined) {
-      throw new Error(`${this.hostName} MCP server has no listening port`);
+    const port = await this.listenPromise;
+    // `closeServer()` ran while the bind was pending: it waited for this bind and closed the
+    // server, so the port must not be handed out.
+    if (this.server !== server) {
+      throw new Error(`${this.hostName} MCP server was closed while it was binding`);
     }
-    return this.port;
+    this.port = port;
+    return port;
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -139,6 +148,8 @@ export abstract class LocalMcpHttpHost {
     }
   }
 }
+
+function noop(): void {}
 
 /** The single path segment of the request URL, or undefined when the path is not exactly `/<token>`. */
 function tokenOf(req: IncomingMessage): string | undefined {

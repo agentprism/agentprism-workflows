@@ -297,7 +297,7 @@ test("an agent that does not advertise mcpCapabilities.http refuses the open wit
   assert.equal(agentToolsEntry(newSessionServers(plain.readLog())), undefined, "an empty tools array injects nothing");
 });
 
-test("tool definitions are validated in the constructor: names, uniqueness, and shape are INVALID_ARGUMENT before any spawn", async () => {
+test("tool definitions are validated in the constructor: names, uniqueness, shape, and an object-typed inputSchema are INVALID_ARGUMENT before any spawn", async () => {
   const { cwd, readLog } = configure({ mcpHttpSupport: true, turns: [{ text: "never" }] });
   const cases: Array<{ tools: unknown; pattern: RegExp }> = [
     { tools: [{ ...add, name: "bad name" }], pattern: /tools\[0\]\.name must match \^\[A-Za-z0-9_-\]\{1,64\}\$ \(got "bad name"\)/ },
@@ -308,6 +308,10 @@ test("tool definitions are validated in the constructor: names, uniqueness, and 
     { tools: [{ ...add, execute: undefined }], pattern: /tool "add" needs an execute function/ },
     { tools: [{ ...add, description: undefined }], pattern: /tool "add" needs a string description/ },
     { tools: [{ ...add, inputSchema: undefined }], pattern: /tool "add" needs an inputSchema/ },
+    // MCP tools/call arguments are an object: only an object-typed schema can ever be satisfied.
+    { tools: [{ ...add, inputSchema: Type.String() }], pattern: /tool "add" inputSchema must be an object schema \(typebox Type\.Object\(\.\.\.\), type: "object"\); got type "string"/ },
+    { tools: [{ ...add, inputSchema: Type.Array(Type.Number()) }], pattern: /tool "add" inputSchema must be an object schema .*got type "array"/ },
+    { tools: [{ ...add, inputSchema: Type.Union([Type.Object({ a: Type.Number() }), Type.Object({ b: Type.Number() })]) }], pattern: /tool "add" inputSchema must be an object schema .*got type undefined/ },
     { tools: [null], pattern: /tools\[0\] must be a tool definition object/ },
     { tools: { name: "add" }, pattern: /`tools` must be an array/ },
   ];

@@ -51,7 +51,7 @@ const EXPECTED: Record<BuiltinBackendId, Omit<AcpAgentTraits, "backendId" | "cus
   },
   codex: {
     defaultModeId: "agent",
-    fork: { agent: "codex", disposition: "id-only", reattach: "resume-or-load", cwd: "free", distProbe: "codex" },
+    fork: { agent: "codex", disposition: "live", reattach: "none", cwd: "free", distProbe: "codex" },
     systemPrompt: { replace: true, append: true, source: "table" },
     steering: "supported",
     loadedTurn: "supported",

@@ -59,7 +59,12 @@ export interface AcpAgentToolContext {
 }
 
 /** What `execute` may return: a string (one text block), MCP content blocks, or a complete
- *  `{ content, isError? }` result — `isError: true` is passed through to the agent as-is. */
+ *  `{ content, isError? }` result — `isError: true` is passed through to the agent as-is. The
+ *  blocks are MCP's `ContentBlock` (`@modelcontextprotocol/sdk/types.js`: `text`, `image`,
+ *  `audio`, `resource_link`, `resource`) — the `tools/call` result shape the agent receives on the
+ *  wire — and NOT the ACP `ContentBlock` every other content on the AcpAgent surface uses
+ *  (`prompt()` input, `AcpAgentMessage.content`, the update events). A `{ type: "text", text }`
+ *  block is valid in both. */
 export type AcpAgentToolResult =
   | string
   | McpContentBlock[]
@@ -78,6 +83,8 @@ export interface AcpAgentToolDefinition<TInput extends TSchema = TSchema> {
   /** `^[A-Za-z0-9_-]{1,64}$`, unique across the agent's tools (INVALID_ARGUMENT in the constructor). */
   name: string;
   description: string;
+  /** A typebox OBJECT schema (`Type.Object(...)`, JSON `type: "object"`): MCP `tools/call`
+   *  arguments are an object, so any other top-level type is INVALID_ARGUMENT in the constructor. */
   inputSchema: TInput;
   execute(input: Static<TInput>, ctx: AcpAgentToolContext): Promise<AcpAgentToolResult> | AcpAgentToolResult;
 }
@@ -107,8 +114,20 @@ export interface AcpAgentOptions {
    *  at session/new|resume|load|fork; Codex: `_meta.outputSchema` on every turn; OpenCode/pi/custom:
    *  the client-hosted `StructuredOutput` HTTP MCP tool injected into `mcpServers` when the agent
    *  advertises `mcpCapabilities.http`, plus the in-prompt contract. Each turn reports
-   *  `structured` / `structuredError`; there is no repair ladder. */
+   *  `structured` / `structuredError`; a repair ladder runs only when `schemaRetries` asks for one. */
   schema?: TSchema;
+  /** Opt-in structured repair ladder: how many EXTRA turns `prompt()` may spend re-prompting the
+   *  same session when a schema is active and the turn ended (`end_turn`) with `structured` absent
+   *  — an integer ≥ 0 (INVALID_ARGUMENT otherwise), default 0 = exactly one turn per `prompt()`.
+   *  A repair turn sends the runner's repair prompt (`repairPromptText`: the StructuredOutput-tool
+   *  variant when the tool is active, else the JSON variant, with the previous attempt's
+   *  `structuredError` appended) with the same turn `_meta`; the native channel (Claude session
+   *  `outputFormat`, Codex per-turn `outputSchema`, the client-hosted tool) stays authoritative.
+   *  Every repair turn is a real turn: events fire, `stream()` yields them, `usage` accumulates.
+   *  The resolved `AcpAgentTurn` is the FINAL attempt's plus `structuredAttempts`. A turn that ended
+   *  `cancelled` / `refusal` / `max_tokens` / `max_turn_requests` is never repaired. Overridable
+   *  per turn (`AcpAgentPromptOptions.schemaRetries`); inherited by forks. */
+  schemaRetries?: number;
   /** Client-provided MCP servers (stdio/http/sse/acp). Capability-gated by the connection exactly
    *  like the runner. */
   mcpServers?: McpServerConfig[];
@@ -135,7 +154,7 @@ export interface AcpAgentOptions {
    *  prompt, `append` adds to it. Validated in the constructor (and `fork()` / the statics) against
    *  the routed backend's `Backend.systemPrompt` support BEFORE any process spawns — a field the
    *  backend cannot carry is INVALID_ARGUMENT, never a silent no-op (Codex and Claude and pi
-   *  carry both; OpenCode and custom backends carry neither). Sent on `session/new|resume|load`
+   *  carry both; OpenCode and custom backends carry neither). Sent on `session/new|resume|load|fork`
    *  and the reattach of an id-only fork in the backend's dialect: Codex `_meta.baseInstructions`
    *  / `_meta.developerInstructions`, Claude `_meta.systemPrompt` (string, or `{ append }`), pi
    *  `_meta.systemPrompt` `{ replace?, append? }`. Wins over the same key in `meta`. Inherited by
@@ -192,6 +211,9 @@ export interface AcpAgentPromptOptions {
    *  does not embed it in the prompt (today: Codex). Otherwise INVALID_ARGUMENT naming the
    *  backend and pointing at the constructor `schema` option. */
   schema?: TSchema;
+  /** Per-turn repair budget (integer ≥ 0; INVALID_ARGUMENT otherwise, before anything is sent);
+   *  wins over the constructor's `schemaRetries` for this `prompt()` only. */
+  schemaRetries?: number;
   /** Per-call abort: queued, or started but not yet on the wire (the lazy open, the per-turn
    *  `model`/`configOptions`/`mode`) → rejects with the reason without sending; in flight →
    *  `session/cancel`, then rejects with the reason. The one way to stop a turn `cancel()` cannot
@@ -289,8 +311,14 @@ export interface AcpAgentMessage {
   /** Assistant only: the tool calls this message issued, folded by `toolCallId` (first-seen
    *  order; a later `tool_call_update` updates the call where it lives). Empty for user messages. */
   readonly toolCalls: readonly AcpAgentToolCall[];
-  /** Assistant only: the `agent_thought_chunk` blocks that preceded this message's content,
-   *  consecutive text chunks folded like `content`. Empty for user messages. */
+  /** Assistant only: the `agent_thought_chunk` blocks folded into this message, consecutive text
+   *  chunks folded like `content`. A thought is held until the next assistant content and attaches
+   *  to the message that content lands on: a text chunk (or a non-text block) after a thought
+   *  OPENS a new message — a thought is a boundary — and the thought goes with it; a tool call
+   *  attaches to the assistant message in progress, which may already hold text, so `text →
+   *  thought → tool_call` puts the thought on the message with that text (opening a message when
+   *  none is in progress). A thought followed by a user message or by the end of the turn is an
+   *  assistant message of its own with no `content`. Empty for user messages. */
   readonly thoughts: ContentBlock[];
   /** The `receivedAt` of the first update folded into this message. */
   readonly receivedAt: number;
@@ -332,8 +360,12 @@ export interface AcpAgentTurn {
   readonly usage: AcpAgentTurnUsage;
   /** Validated (typebox Convert + Check) when a schema was active for the turn. */
   readonly structured?: unknown;
-  /** Why `structured` is absent although a schema was active. */
+  /** Why `structured` is absent although a schema was active (the LAST attempt's failure when
+   *  the repair ladder ran). */
   readonly structuredError?: string;
+  /** When a schema was active: the turns this `prompt()` spent — 1 plus the repair turns the
+   *  `schemaRetries` ladder actually ran (1 under the default budget of 0). Absent without a schema. */
+  readonly structuredAttempts?: number;
   /** This turn's accumulator entries (copies). Per CHUNK, not per message: one `assistant`/`text`
    *  entry per streamed `agent_message_chunk` and one `tool`/`toolCall` entry per `tool_call`, so
    *  `history.length` is not a message count — `text` is the folded, per-message view. */

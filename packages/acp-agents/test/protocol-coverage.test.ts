@@ -254,8 +254,9 @@ test("the executable ACP extension matrix documents installed advertisements wit
   }
 });
 
-// The per-backend `session/fork` trait table. `id-only` adapters answer the fork with a persisted
-// copy that is not live (claude, codex); `live` adapters construct it on the serving process (pi;
+// The per-backend `session/fork` trait table. The `id-only` adapter answers the fork with a
+// persisted copy that is not live (claude); `live` adapters hand back the session itself (codex —
+// the workspace fork keeps the forked thread subscribed; pi — constructed on the serving process;
 // opencode by live verification only). The rows are pinned exactly, then grounded in the installed
 // adapter dists so an adapter bump that changes what a fork response IS fails the build.
 const CLAUDE_FORK_DIST = readDist("@agentclientprotocol/claude-agent-acp/dist/fork-session.js"); // a DIFFERENT file from acp-agent.js
@@ -266,7 +267,7 @@ test("FORK_SESSION_TRAITS pins the exact per-agent fork dispositions", () => {
     FORK_SESSION_TRAITS.map(({ agent, disposition, reattach, cwd }) => ({ agent, disposition, reattach, cwd })),
     [
       { agent: "claude", disposition: "id-only", reattach: "resume-or-load", cwd: "source-only" },
-      { agent: "codex", disposition: "id-only", reattach: "resume-or-load", cwd: "free" },
+      { agent: "codex", disposition: "live", reattach: "none", cwd: "free" },
       { agent: "opencode", disposition: "live", reattach: "none", cwd: "free" },
       { agent: "pi", disposition: "live", reattach: "none", cwd: "free" },
     ],
@@ -311,9 +312,15 @@ test("fork traits are grounded in the installed agent dists", () => {
   assert.ok(CLAUDE_FORK_DIST.includes("return { sessionId: forked.sessionId };"));
   assert.ok(CLAUDE_FORK_DIST.includes("forkClaudeSession(params.sessionId, {"));
   assert.ok(CLAUDE_FORK_DIST.includes("dir: params.cwd"));
-  // codex: the forked thread is unsubscribed and never publishes updates until resume/load re-subscribes.
-  assert.equal(CODEX_DIST.split("threadUnsubscribe({ threadId: response.thread.id })").length - 1, 1);
-  assert.ok(CODEX_DIST.includes('const canPublishSessionUpdates = operation !== "fork";'));
+  // codex: the fork is LIVE — thread/fork subscribes the connection like thread/resume, the adapter
+  // keeps that subscription (no unsubscribe of the forked thread; the only threadUnsubscribe left
+  // is session/close's), and no publish gate withholds the forked session's startup updates.
+  assert.ok(CODEX_DIST.includes('method: "thread/fork"'), "the fork goes through thread/fork");
+  assert.equal(CODEX_DIST.split("threadUnsubscribe({ threadId: response.thread.id })").length - 1, 0, "the forked thread is never unsubscribed");
+  assert.ok(CODEX_DIST.includes("async threadUnsubscribe(params)"), "the wrapper still exists (guards the literal above)");
+  assert.equal(CODEX_DIST.split("threadUnsubscribe({ threadId: sessionId })").length - 1, 1, "session/close is the one remaining unsubscribe call");
+  assert.ok(!CODEX_DIST.includes("canPublishSessionUpdates"), "no fork publish gate");
+  assert.ok(!CODEX_DIST.includes('operation !== "fork"'), "no fork publish gate");
   // pi: the fork is constructed live on the serving process and refuses a source with a turn in flight.
   assert.ok(PI_AGENT_DIST.includes("sessionCapabilities: { resume: {}, fork: {}, list: {}, close: {} }"));
   assert.ok(PI_AGENT_DIST.includes('adapterError("session_busy")'));
@@ -402,9 +409,16 @@ test("system-prompt support rows are grounded in the installed agent dists", () 
   assert.ok(CLAUDE_DIST.includes("if (params._meta?.systemPrompt) {"));
   assert.ok(CLAUDE_DIST.includes('if (typeof customPrompt === "string") {'));
   assert.ok(CLAUDE_DIST.includes('preset: "claude_code",'));
-  // codex: the bare base/developer keys are read on every thread start/resume.
+  // codex: the bare base/developer keys are read on every thread-opening call — thread/start
+  // (session/new), thread/resume (session/resume and session/load), and thread/fork (session/fork:
+  // the fork is live, so its own request `_meta` is the only place a fork's instructions can ride).
   assert.match(CODEX_DIST, /readOptionalInstruction\(\w+, "baseInstructions"\)/);
   assert.match(CODEX_DIST, /readOptionalInstruction\(\w+, "developerInstructions"\)/);
+  assert.equal(
+    CODEX_DIST.split("...readInstructionOverrides(request._meta)").length - 1,
+    4,
+    "thread/start, thread/resume (resume + load), and thread/fork each spread the instruction overrides",
+  );
   // pi: the reader runs on new/resume|load/fork and the loader overrides realize the instructions.
   assert.equal(PI_AGENT_DIST.split("readSystemPromptMeta(context.params._meta)").length - 1, 3);
   assert.ok(PI_AGENT_DIST.includes("...systemPromptLoaderOverrides(systemPrompt)"));

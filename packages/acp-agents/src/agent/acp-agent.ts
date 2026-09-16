@@ -21,6 +21,12 @@
 //     session failure (then with the complete turn attached, `isAcpAgentTurnError`). `stream()`
 //     is the same turn observed as an async iterable: its tap is attached inside the queued
 //     operation, the instant the turn is dequeued, so it yields THIS turn's events and no other's.
+//   - A schema miss is a RESULT, not an error, and `prompt()` is one turn unless `schemaRetries`
+//     buys more: the opt-in ladder re-prompts the same session inside the same queued operation
+//     with the runner's repair prompt, each repair a real turn (`stream()` sees it, `usage` counts
+//     it, `cancel()`/`steer()` reach it), and the resolved turn is the final attempt's plus
+//     `structuredAttempts`. Only an `end_turn` miss is repaired — a cancelled or walled attempt
+//     ends the ladder where it stands.
 //   - The agent never calls `SessionHandle.cancel()`: it sends one `session/cancel` through
 //     `PooledConnection.cancelSession` and owns the escalation (process disposal, no wire
 //     `session/close`) so `close({ keep: true })` semantics survive an ignored cancel.
@@ -35,6 +41,7 @@ import {
   isChildCleanupError,
   type AcpSessionOptions,
   type PooledConnectionDeps,
+  type ReattachPreference,
   type SessionHandle,
   type SteeringResponse,
 } from "../acp-client.js";
@@ -47,9 +54,11 @@ import { appendPromptImages, buildRunPrompt, mergeTurnMeta, validatePromptImages
 import type { BackendRegistry, CustomBackendConfig } from "../registry.js";
 import { assertNoModelConfigOption, type ModelRoute } from "../routing.js";
 import { sessionRefFor } from "../session-ref.js";
+import { repairPromptText } from "../structured-output.js";
 import { StructuredOutputToolHost } from "../structured-tool.js";
 import { assertSystemPromptSupported } from "../system-prompt.js";
 import { describeBackendTraits, type AcpAgentTraits } from "../traits.js";
+import type { TypedSessionFailure } from "../typed-failures.js";
 import {
   agentClosedError,
   agentTurnError,
@@ -73,7 +82,7 @@ import {
   resolveSameBackendModel,
   validateAgentCwd,
 } from "./routing.js";
-import { assertPerTurnSchemaAllowed, planStructured, type StructuredPlan } from "./structured.js";
+import { assertPerTurnSchemaAllowed, planStructured, validateSchemaRetries, type StructuredPlan } from "./structured.js";
 import { AgentToolHost, type AgentToolHostContext } from "./tool-host.js";
 import { planTools, validateToolDefinitions } from "./tools.js";
 import { TurnCollector, buildTurn } from "./turn.js";
@@ -106,6 +115,9 @@ type AcpAgentSeed =
   | {
       readonly kind: "fork";
       readonly sourceSessionId: string;
+      /** The id-only reattach's preferred method: `resume` for the live `fork()` (the child is
+       *  seeded from the parent), `load` for the cold static (the replay IS the child's transcript). */
+      readonly reattach: ReattachPreference;
       readonly historySeed?: AgentHistoryEntry[];
       readonly textSeed?: string;
       readonly messagesSeed?: AcpAgentMessage[];
@@ -220,7 +232,7 @@ function assertSessionRef(ref: AgentSessionRef, label: string | undefined, metho
  * One ACP agent session on its own dedicated backend process.
  *
  * Lazy: the constructor validates (cwd, `configOptions`, the registry, `clientHandlers`, the
- * function-tool definitions) and routes the backend synchronously but spawns nothing; the first
+ * function-tool definitions, `schemaRetries`) and routes the backend synchronously but spawns nothing; the first
  * queued operation (an explicit `ready()` or an implicit `prompt()`) opens the session. `state`
  * walks `idle → opening → ready ⇄ busy → closed`.
  */
@@ -240,6 +252,8 @@ export class AcpAgent {
   /** `#modelSpec` in its routed spec form (`<backendId>/<id>`) — what the `model` getter returns. */
   #model: string | undefined;
   readonly #schema: TSchema | undefined;
+  /** The default repair budget (`schemaRetries`, validated in the constructor); a per-turn value wins. */
+  readonly #schemaRetries: number;
   readonly #tools: readonly AcpAgentToolDefinition[];
   readonly #retainHistory: boolean;
   readonly #raw: boolean;
@@ -283,15 +297,15 @@ export class AcpAgent {
   #removeAbort: (() => void) | undefined;
 
   /**
-   * Lazy: validates cwd/configOptions/registry/clientHandlers/tools synchronously, routes the
-   * backend, spawns nothing. This is the ONLY public constructor signature — seeded agents (forks,
+   * Lazy: validates cwd/configOptions/registry/clientHandlers/tools/schemaRetries synchronously,
+   * routes the backend, spawns nothing. This is the ONLY public constructor signature — seeded agents (forks,
    * cold reopen) are built by the statics through a module-private factory.
    */
   constructor(options: AcpAgentOptions) {
     const label = options.label;
     // Every pre-spawn guard speaks INVALID_ARGUMENT: the SDK's own throw it directly, a shared
     // validator's SCRIPT_VALIDATION_ERROR is re-coded here at the boundary.
-    const { seed, tools } = validateArguments(() => {
+    const { seed, tools, schemaRetries } = validateArguments(() => {
       validateAgentCwd(options.cwd, label, "AcpAgent");
       assertNoModelConfigOption(options.configOptions, label);
       try {
@@ -300,10 +314,12 @@ export class AcpAgent {
         throw agentValidationError(error instanceof Error ? error.message : String(error), label);
       }
       const tools = validateToolDefinitions(options.tools, label);
-      return { seed: constructionSeed ?? resolveNewSeed(options), tools };
+      const schemaRetries = validateSchemaRetries(options.schemaRetries, label, "AcpAgent");
+      return { seed: constructionSeed ?? resolveNewSeed(options), tools, schemaRetries };
     });
     this.#options = { ...options };
     this.#tools = tools;
+    this.#schemaRetries = schemaRetries;
     this.#seed = seed;
     this.#registry = seed.registry;
     this.#backend = seed.backend;
@@ -398,9 +414,11 @@ export class AcpAgent {
     return AcpAgent.#reopen("load", ref, options);
   }
 
-  /** Cold fork of a recorded session: the trait-driven choreography without a history seed
-   *  (`history` starts empty on id-only backends unless the reattach fell back to `session/load`).
-   *  To seed the fork with the transcript: `const src = await AcpAgent.load(ref); await src.fork()`. */
+  /** Cold fork of a recorded session: the trait-driven choreography with no parent to seed from,
+   *  so on an id-only backend the reattach PREFERS `session/load` — the agent replays the forked
+   *  transcript and it lands in the child's `history`/`text`/`messages`/`replay` — and takes
+   *  `session/resume` (an empty transcript) only when load is not advertised. On a live backend the
+   *  fork handle is the session and the child's transcript is whatever the agent streams. */
   static fork(ref: AgentSessionRef, options: AcpAgentReopenOptions = {}): Promise<AcpAgent> {
     return AcpAgent.#reopen("fork", ref, options);
   }
@@ -425,7 +443,7 @@ export class AcpAgent {
         if (trait.cwd === "source-only" && cwd !== ref.cwd) {
           throw agentValidationError(`fork on ${route.backend.id} must keep the source cwd (${ref.cwd})`, label);
         }
-        return { cwd, seed: { kind, sourceSessionId: ref.sessionId, ...base } satisfies ResolvedSeed };
+        return { cwd, seed: { kind, sourceSessionId: ref.sessionId, reattach: "load", ...base } satisfies ResolvedSeed };
       }
       return { cwd, seed: { kind, sessionId: ref.sessionId, ...base } satisfies ResolvedSeed };
     });
@@ -563,12 +581,15 @@ export class AcpAgent {
    * abort (`signal.reason` untouched), a closed agent, or a typed session failure (the mapped
    * `WorkflowError` carrying the complete turn as `error.turn`; see `isAcpAgentTurnError`).
    * `model`/`configOptions`/`mode` are applied before the turn, in that order, and stick for the
-   * session. To stop a specific turn use `options.signal`: it rejects while queued or before the
-   * turn reached the wire (nothing is sent) and sends one `session/cancel` once in flight —
-   * `cancel()` reaches only a turn already on the wire.
+   * session. With a schema active and a `schemaRetries` budget > 0 (constructor or per turn), an
+   * `end_turn` that left `structured` absent is followed by up to that many repair turns inside
+   * this same operation; the resolved turn is the final attempt's with `structuredAttempts`. To
+   * stop a specific turn use `options.signal`: it rejects while queued or before the turn reached
+   * the wire (nothing is sent) and sends one `session/cancel` once in flight — `cancel()` reaches
+   * only a turn already on the wire (a repair turn included).
    */
   prompt(content: string | ContentBlock[], options: AcpAgentPromptOptions = {}): Promise<AcpAgentTurn> {
-    return this.#enqueue(() => this.#promptTurn(content, options), options.signal);
+    return this.#enqueue(() => this.#promptTurn(content, options, "prompt"), options.signal);
   }
 
   /**
@@ -608,7 +629,7 @@ export class AcpAgent {
         stream.push({ type: name, ...(event as object) } as AcpAgentStreamEvent);
       });
       try {
-        const turn = await this.#promptTurn(content, { ...options, signal: controller.signal });
+        const turn = await this.#promptTurn(content, { ...options, signal: controller.signal }, "stream");
         stream.push({ type: "turn", turn });
         return turn;
       } finally {
@@ -627,8 +648,13 @@ export class AcpAgent {
   }
 
   /** The body of one turn — runs inside the FIFO (`prompt()` queues it directly, `stream()` under
-   *  its tap). `options.signal` is the per-call signal; `stream()` hands in its own combined one. */
-  async #promptTurn(content: string | ContentBlock[], options: AcpAgentPromptOptions): Promise<AcpAgentTurn> {
+   *  its tap). `options.signal` is the per-call signal; `stream()` hands in its own combined one.
+   *  `entry` is the public method the caller used, so a refused per-turn option names it. */
+  async #promptTurn(
+    content: string | ContentBlock[],
+    options: AcpAgentPromptOptions,
+    entry: "prompt" | "stream",
+  ): Promise<AcpAgentTurn> {
     await this.#ensureOpen();
     options.signal?.throwIfAborted();
     this.#signal?.throwIfAborted();
@@ -639,14 +665,21 @@ export class AcpAgent {
 
     // Every per-turn option is validated up front — a rejected turn sends nothing, not even the
     // options that would have passed.
-    const modelSwitch = validateArguments(() => {
+    const { modelSwitch, schemaRetries } = validateArguments(() => {
       validatePromptImages(options.images, label);
       assertPerTurnSchemaAllowed(backend, options.schema, label);
       assertNoModelConfigOption(options.configOptions, label);
       assertKnownConfigOptionIds(options.configOptions, handle.advertisedConfigOptions, this.backendId, label);
-      return options.model === undefined
-        ? undefined
-        : resolveModelSwitch(options.model, backend, this.#registry, label, "AcpAgent.prompt({ model })");
+      return {
+        modelSwitch:
+          options.model === undefined
+            ? undefined
+            : resolveModelSwitch(options.model, backend, this.#registry, label, `AcpAgent.${entry}({ model })`),
+        schemaRetries:
+          options.schemaRetries === undefined
+            ? this.#schemaRetries
+            : validateSchemaRetries(options.schemaRetries, label, `AcpAgent.${entry}({ schemaRetries })`),
+      };
     });
     try {
       // The open's order, verbatim: model, config options, mode.
@@ -679,6 +712,49 @@ export class AcpAgent {
     const turnContent = appendPromptImages(shaped, options.images);
     const promptMeta = mergeTurnMeta(options.meta, backend.promptMeta(turnSchema));
 
+    let attempt = await this.#runTurn(turnContent, promptMeta, turnSchema, options.signal);
+    if (turnSchema === undefined) {
+      if (attempt.failure) throw agentTurnError(attempt.failure, attempt.turn, this.#errorContext());
+      return attempt.turn;
+    }
+    // The opt-in repair ladder (`schemaRetries`, default 0): re-prompt the SAME session with the
+    // runner's repair prompt — the StructuredOutput-tool variant when the tool is active, else
+    // the JSON one, plus the attempt's validation failure — and the same turn `_meta`, so the
+    // native channel stays authoritative (Codex's per-turn `outputSchema` rides the repair too).
+    // Text only, like the runner's repair turns: no images, no re-embedded contract. Only an
+    // `end_turn` miss is repaired — a cancelled, refused, or truncated attempt (or a walled one)
+    // ends the ladder where it stands; a per-call or agent abort between attempts rejects.
+    let attempts = 1;
+    while (
+      attempts <= schemaRetries &&
+      attempt.failure === undefined &&
+      attempt.turn.structured === undefined &&
+      attempt.turn.stopReason === "end_turn"
+    ) {
+      options.signal?.throwIfAborted();
+      this.#signal?.throwIfAborted();
+      const repair = repairPromptText({ toolActive: plan.toolActive, reason: attempt.turn.structuredError });
+      attempt = await this.#runTurn(repair, promptMeta, turnSchema, options.signal);
+      attempts += 1;
+    }
+    const turn: AcpAgentTurn = { ...attempt.turn, structuredAttempts: attempts };
+    if (attempt.failure) throw agentTurnError(attempt.failure, turn, this.#errorContext());
+    return turn;
+  }
+
+  /** ONE `session/prompt` on the wire and its fold: the collector's tap is attached synchronously
+   *  before the call, the turn is the agent's active turn for `cancel()`/`steer()`/tool
+   *  correlation while it flies, an abort observed in flight rejects with the reason (never a
+   *  resolved `cancelled` turn), and the turn's tokens are added to the session sum whether or
+   *  not it was walled. `#promptTurn` runs it once, plus once per repair. */
+  async #runTurn(
+    content: string | ContentBlock[],
+    promptMeta: Record<string, unknown> | undefined,
+    schema: TSchema | undefined,
+    callSignal: AbortSignal | undefined,
+  ): Promise<{ turn: AcpAgentTurn; failure?: TypedSessionFailure }> {
+    const handle = this.#handle!;
+    const plan = this.#plan!;
     // SYNCHRONOUSLY before the wire call: the collector's tap sees every update of the turn, and
     // the transcript marks the turn boundary exactly where the handle's accumulator does
     // (`SessionState.beginTurn()` inside `promptOutcome`) — nothing can interleave.
@@ -687,11 +763,10 @@ export class AcpAgent {
     // A capture left by a turn that rejected (wire error/abort) must not leak into this turn.
     plan.registration?.takeCaptured();
 
-    const outcome = handle.promptOutcome(turnContent, promptMeta);
+    const outcome = handle.promptOutcome(content, promptMeta);
     const active: ActiveTurn = { ended: outcome.then(noop, noop), aborted: false };
     this.#activeTurn = active;
     this.#activeCollector = collector;
-    const callSignal = options.signal;
     const onCallAbort = (): void => {
       active.aborted = true;
       active.abortReason = callSignal?.reason;
@@ -722,15 +797,14 @@ export class AcpAgent {
       response,
       collector,
       handle,
-      backend,
-      schema: turnSchema,
+      backend: this.#backend,
+      schema,
       captured: plan.registration?.takeCaptured(),
       sessionBefore: this.#sessionUsage,
     });
     // A walled turn still counts the tokens it burned.
     this.#sessionUsage = turn.usage.session;
-    if (failure) throw agentTurnError(failure, turn, this.#errorContext());
-    return turn;
+    return failure ? { turn, failure } : { turn };
   }
 
   /** Inject content into the turn in flight (`_session/steering`). Overlaps the FIFO; requires a
@@ -816,6 +890,8 @@ export class AcpAgent {
       const child = AcpAgent.#seeded(merged, {
         kind: "fork",
         sourceSessionId: handle.sessionId,
+        // The parent's snapshot seeds the child: reattach without a replay (load is the fallback).
+        reattach: "resume",
         registry: this.#registry,
         backend: route?.backend ?? freshBackendFor(this.#backend, this.#registry),
         // The model the parent is on NOW (a `setModel` / per-turn switch included), not its
@@ -833,25 +909,31 @@ export class AcpAgent {
    * Switch the session's model (queued, FIFO like `setMode`; sticky). `spec` is resolved with the
    * fork rule — the runner's routing grammar, and it must land on this agent's backend and poolKey
    * (`"<backendId>/<model id>"`; an unrouted spec goes to the default backend and passes only when
-   * that is this one) — otherwise INVALID_ARGUMENT naming both backends, before anything is sent.
-   * A backend-only spec is INVALID_ARGUMENT too: there is no wire form for "unselect". Applied
-   * exactly like open's selection — `session/set_config_option { configId: "model" }` with the
-   * routed remainder verbatim; no aliases, coercion, catalog matching, or fallback; the agent's
-   * catalog and validation are authoritative and a wire rejection maps through the normal error
-   * path with `model` unchanged. On success `model` becomes the routed spec, so later forks and a
-   * cold reopen passing `agent.model` back inherit the switch. `"model"` stays reserved in
-   * `configOptions`; this is the one way to move it after open.
+   * that is this one) — otherwise INVALID_ARGUMENT naming both backends. The route is checked
+   * BEFORE the operation is queued, so a refused spec sends nothing and, on an agent that has not
+   * opened yet, spawns nothing (the agent stays `idle`). A backend-only spec is INVALID_ARGUMENT
+   * too: there is no wire form for "unselect". Applied exactly like open's selection —
+   * `session/set_config_option { configId: "model" }` with the routed remainder verbatim; no
+   * aliases, coercion, catalog matching, or fallback; the agent's catalog and validation are
+   * authoritative and a wire rejection maps through the normal error path with `model` unchanged.
+   * On success `model` becomes the routed spec, so later forks and a cold reopen passing
+   * `agent.model` back inherit the switch. `"model"` stays reserved in `configOptions`; this is
+   * the one way to move it after open.
    */
   setModel(spec: string): Promise<void> {
+    let modelSwitch: { modelSpec: string; model: string };
+    try {
+      modelSwitch = validateArguments(() =>
+        resolveModelSwitch(spec, this.#backend, this.#registry, this.label, "AcpAgent.setModel()"),
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return this.#enqueue(async () => {
       await this.#ensureOpen();
       this.#signal?.throwIfAborted();
-      const handle = this.#handle!;
-      const modelSwitch = validateArguments(() =>
-        resolveModelSwitch(spec, this.#backend, this.#registry, this.label, "AcpAgent.setModel()"),
-      );
       try {
-        await this.#applyModelSwitch(handle, modelSwitch);
+        await this.#applyModelSwitch(this.#handle!, modelSwitch);
       } catch (error) {
         throw mapAgentError(error, this.#errorContext(), this.#signal);
       }
@@ -1048,7 +1130,7 @@ export class AcpAgent {
         const opts = this.#sessionOptions(plan);
         if (seed.kind === "fork") {
           const trait = forkTraitFor(this.#backend, this.#registry);
-          const acquired = await acquireForkedSession(connection, seed.sourceSessionId, opts, trait);
+          const acquired = await acquireForkedSession(connection, seed.sourceSessionId, opts, trait, seed.reattach);
           handle = acquired.handle;
           replayed = acquired.method === "load";
         } else if (seed.kind === "resume") {
@@ -1122,7 +1204,8 @@ export class AcpAgent {
   }
 
   /** Seed a live fork's history/text/messages from the parent's snapshot — only when the child's
-   *  own accumulator is empty (a `session/load` fallback already replayed the transcript). */
+   *  own accumulator is empty (a `session/load` reattach already replayed the transcript). The
+   *  cold static carries no seed: its transcript is the load replay, or empty after a resume. */
   #seedHistory(seed: Extract<AcpAgentSeed, { kind: "fork" }>, handle: SessionHandle): void {
     if (!seed.historySeed || handle.history.length > 0) return;
     this.#historySeed = seed.historySeed;

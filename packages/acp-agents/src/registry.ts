@@ -26,9 +26,9 @@ export interface CustomBackendConfig {
    *  Default true; set false for custom agents that should use only the generic prompt/_meta path. */
   structuredOutputTool?: boolean;
   /** How the custom agent answers `session/fork` (see `FORK_SESSION_TRAITS`). Omitted = `live` /
-   *  `free`: the plain ACP contract. Entries wrapping claude-agent-acp or codex-acp MUST declare
-   *  `{ disposition: "id-only" }` — a registered name is a different program from the built-in it
-   *  may shadow and never inherits the built-in's row. */
+   *  `free`: the plain ACP contract. Entries wrapping claude-agent-acp (or upstream codex-acp, which
+   *  unsubscribes its forks) MUST declare `{ disposition: "id-only" }` — a registered name is a
+   *  different program from the built-in it may shadow and never inherits the built-in's row. */
   fork?: CustomBackendForkConfig;
 }
 

@@ -34,6 +34,7 @@ import {
   AcpAgent,
   isAcpAgentTurnError,
   defineTool,
+  describeBackendTraits,
   createAcpRunner,
   WorkflowManager,
   runWorkflow,
@@ -170,6 +171,11 @@ import type {
   AcpAgentEventName,
   AcpAgentEventListener,
   AcpAgentState,
+  AcpAgentTraits,
+  AcpAgentMessage,
+  AcpAgentStream,
+  AcpAgentStreamEvent,
+  AcpAgentStreamEventName,
   CustomBackendForkConfig,
   MockAnswers,
   MockAnswerSequence,
@@ -657,6 +663,7 @@ test("facade re-exports the public surface", () => {
   assert.equal(typeof AcpAgent.prototype[Symbol.asyncDispose], "function");
   assert.equal(typeof isAcpAgentTurnError, "function");
   assert.equal(typeof defineTool, "function");
+  assert.equal(typeof describeBackendTraits, "function");
   assert.equal(isAcpAgentTurnError(new WorkflowError("plain", WorkflowErrorCode.AGENT_EXECUTION_ERROR)), false);
   assert.equal(AGENTPRISM_PERSISTENCE_ROOT_ENV, "AGENTPRISM_PERSISTENCE_ROOT");
   const pathOptions: WorkflowPathOptions = { persistenceRoot: "/tmp/agentprism-workflows-test" };
@@ -953,12 +960,16 @@ test("facade re-exports the AcpAgent SDK types (compile-gated)", () => {
   const listener: AcpAgentEventListener<"agent_message_chunk"> = (event) => void event.sessionId;
   const closeEvent: AcpAgentEventMap["session_close"] | undefined = undefined;
   const forkConfig: CustomBackendForkConfig = { disposition: "id-only", cwd: "source-only" };
-  type TurnShape = Pick<AcpAgentTurn, "response" | "stopReason" | "text" | "structured" | "history">;
+  const message: AcpAgentMessage = { role: "user", content: [], toolCalls: [], thoughts: [], receivedAt: 0 };
+  const streamEventName: AcpAgentStreamEventName = "session_open";
+  type TurnShape = Pick<AcpAgentTurn, "response" | "stopReason" | "text" | "structured" | "history" | "messages">;
   type Records = [AcpAgentUpdateRecord, AcpAgentRawRecord, AcpAgentToolCall];
   type UsageShape = AcpAgentTurnUsage["session"];
   type Models = AcpAgentCatalog["models"];
   type WalledTurn = AcpAgentTurnError["turn"];
-  const shapes: [TurnShape?, Records?, UsageShape?, Models?, WalledTurn?] = [];
+  type TraitsShape = Pick<AcpAgentTraits, "backendId" | "custom" | "fork" | "systemPrompt" | "structuredOutput">;
+  type StreamShape = [AcpAgentStream, Extract<AcpAgentStreamEvent, { type: "turn" }>];
+  const shapes: [TurnShape?, Records?, UsageShape?, Models?, WalledTurn?, TraitsShape?, StreamShape?] = [];
 
   assert.equal(options.cwd, "/abs/dir");
   assert.equal(promptOptions.mode, "plan");
@@ -972,6 +983,8 @@ test("facade re-exports the AcpAgent SDK types (compile-gated)", () => {
   assert.equal(typeof listener, "function");
   assert.equal(closeEvent, undefined);
   assert.equal(forkConfig.disposition, "id-only");
+  assert.equal(message.role, "user");
+  assert.equal(streamEventName, "session_open");
   assert.equal(shapes.length, 0);
 });
 

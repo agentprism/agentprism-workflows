@@ -2,7 +2,7 @@
 // The wire order it guarantees on an id-only backend is forkSession < release(keepOpen) <
 // resume|load — so the "Session not found" trap (prompting Claude's un-reattached fork id) is
 // impossible by construction: the caller only ever receives the handle that is live.
-import type { AcpSessionOptions, PooledConnection, SessionHandle } from "../acp-client.js";
+import type { AcpSessionOptions, PooledConnection, ReattachPreference, SessionHandle } from "../acp-client.js";
 import type { Backend } from "../backend.js";
 import { forkSessionTrait, type ForkSessionTraitRow } from "../protocol-coverage.js";
 import type { BackendRegistry } from "../registry.js";
@@ -28,9 +28,11 @@ export interface AcquiredFork {
  *   - `live`: the fork response IS the session.
  *   - `id-only`: the response names a persisted copy that is not live; release the fork handle
  *     with `keepOpen` (unregister only — no `session/close`, so the reattach's `register()` never
- *     replaces a live state and the slot count stays at one), then reattach it (resume preferred,
- *     load fallback). The catalog/modes come from the reattach response; the bare fork response is
- *     never read for them.
+ *     replaces a live state and the slot count stays at one), then reattach it by `reattach` —
+ *     `resume` preferred with `load` as the fallback (the live `agent.fork()`, whose child is
+ *     seeded from the parent's snapshot), or `load` preferred with `resume` as the fallback (the
+ *     cold `AcpAgent.fork(ref)`, which has no parent to seed from and wants the replay). The
+ *     catalog/modes come from the reattach response; the bare fork response is never read for them.
  * `prepare` is re-evaluated for the reattach so it sees the same options the fork carried.
  */
 export async function acquireForkedSession(
@@ -38,11 +40,12 @@ export async function acquireForkedSession(
   sourceSessionId: string,
   opts: AcpSessionOptions,
   trait: ForkSessionTraitRow,
+  reattach: ReattachPreference = "resume",
 ): Promise<AcquiredFork> {
   const forkHandle = await connection.forkSession(sourceSessionId, opts);
   if (trait.disposition !== "id-only") return { handle: forkHandle, method: "fork" };
   const forkedId = forkHandle.sessionId;
   await forkHandle.release({ keepOpen: true });
-  const { handle, method } = await connection.openPreparedReattachedSession(forkedId, () => opts);
+  const { handle, method } = await connection.openPreparedReattachedSession(forkedId, () => opts, undefined, reattach);
   return { handle, method };
 }

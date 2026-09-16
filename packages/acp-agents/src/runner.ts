@@ -91,7 +91,7 @@ import {
 } from "./auth/auth-store.js";
 import { ProviderStore, providerVertexMeta } from "./provider-store.js";
 import type { ElicitationResolver, PermissionResolver, ToolPolicy } from "./permissions.js";
-import { resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
+import { repairPromptText, resolveStructuredOutput, type StructuredSession } from "./structured-output.js";
 import {
   STRUCTURED_OUTPUT_SERVER_NAME,
   StructuredOutputToolHost,
@@ -107,9 +107,6 @@ import type { ClientHandlers } from "./client-handlers.js";
 import type { UsageBaseline } from "./usage.js";
 
 type AnyRunOptions = RunOptions<TSchema | undefined>;
-
-const STRUCTURED_TOOL_REPROMPT_TEXT =
-  "You did not call the StructuredOutput tool. Call the StructuredOutput tool now, exactly once, with your final answer as its arguments conforming to its parameter schema. Do not reply with plain text.";
 
 const CONTINUATION_INSTRUCTION =
   "Your previous turn was interrupted before it finished — the provider paused it for a usage " +
@@ -1033,7 +1030,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
           maxSchemaRetries: opts.maxSchemaRetries,
           signal: opts.signal,
           label: opts.label,
-          ...(structuredToolActive ? { repromptText: STRUCTURED_TOOL_REPROMPT_TEXT } : {}),
+          // The same selection AcpAgent's ladder makes (tool variant vs JSON variant), bare text.
+          repromptText: repairPromptText({ toolActive: structuredToolActive }),
         });
         return result as AgentResult<S>;
       }

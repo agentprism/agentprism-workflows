@@ -499,3 +499,32 @@ test("fork inherits systemPrompt (sent on the fork and its reattach), honors an 
   );
   assert.equal(readLog().filter((entry) => entry.method === "__start").length, spawns, "the refused fork spawned nothing");
 });
+
+test("live fork (codex): systemPrompt rides session/fork _meta in the Codex dialect, an override replaces it, and no reattach follows", async () => {
+  const { cwd, readLog } = configure(
+    { lifecycleSupport: true, forkSession: { turns: [{ text: "child" }] }, turns: [{ text: "parent" }] },
+    { backends: ["codex"] },
+  );
+  const parent = track(await AcpAgent.open({ cwd, model: "codex", systemPrompt: { replace: "Reviewer.", append: "Be terse." } }));
+  await parent.prompt("p");
+  const child = track(await parent.fork());
+  let log = readLog();
+  const forkEntry = log.find((entry) => entry.method === "forkSession");
+  assert.deepEqual(
+    forkEntry?.params?._meta,
+    { baseInstructions: "Reviewer.", developerInstructions: "Be terse." },
+    "inherited on session/fork in the codex-acp dialect — the live fork's only delivery",
+  );
+  assert.equal(count(log, "resumeSession"), 0, "a live fork is never reattached");
+  assert.equal(count(log, "loadSession"), 0);
+  assert.equal(child.state, "ready");
+  assert.equal((await child.prompt("go")).text, "child");
+
+  const overridden = track(await parent.fork({ systemPrompt: { append: "Override." } }));
+  log = readLog();
+  const overriddenFork = log.filter((entry) => entry.method === "forkSession").at(-1);
+  assert.deepEqual(overriddenFork?.params?._meta, { developerInstructions: "Override." }, "the override replaced the inherited value");
+  assert.equal(count(log, "resumeSession"), 0);
+  assert.equal(count(log, "loadSession"), 0);
+  assert.equal(overridden.state, "ready");
+});

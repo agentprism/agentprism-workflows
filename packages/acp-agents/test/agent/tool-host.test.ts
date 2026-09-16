@@ -4,6 +4,7 @@
 // or a throw into an `isError` result; `abortInFlight` / `dispose` reach a running `execute`.
 import test from "node:test";
 import assert from "node:assert/strict";
+import http, { type Server as HttpServer } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Type } from "typebox";
@@ -272,6 +273,32 @@ test("dispose aborts a running execute and closes the server; listen() after dis
   await assert.rejects(fetch(url, { method: "POST", body: "{}" }), /fetch failed/);
   await assert.rejects(host.listen(), /disposed/);
   await host.dispose();
+});
+
+test("dispose during the bind window waits for the pending listen to settle and closes its socket; the racing listen() rejects", async () => {
+  // Capture the HTTP server the host creates so the socket's fate can be asserted directly: the
+  // host's own `isListening()` is false either way once its reference is dropped.
+  const created: HttpServer[] = [];
+  const createServer = http.createServer;
+  http.createServer = ((...args: Parameters<typeof http.createServer>) => {
+    const server = createServer(...args);
+    created.push(server);
+    return server;
+  }) as typeof http.createServer;
+  try {
+    const host = new AgentToolHost([lookup()], () => CONTEXT);
+    const pending = host.listen(); // `server.listen()` is issued synchronously; the bind settles on a later tick
+    await host.dispose(); // lands inside the bind window
+    await assert.rejects(pending, /agent_tools MCP server was closed while it was binding/);
+    assert.equal(created.length, 1);
+    assert.equal(created[0]!.listening, false, "the socket the pending bind produced was closed by dispose");
+    assert.equal(host.isListening(), false);
+    assert.equal(host.listeningPort(), undefined);
+    assert.equal(host.url, undefined, "no URL was handed out for a server that is gone");
+    await assert.rejects(host.listen(), /disposed/);
+  } finally {
+    http.createServer = createServer;
+  }
 });
 
 test("the token path is the only route: a different token or a nested path is 404", async () => {

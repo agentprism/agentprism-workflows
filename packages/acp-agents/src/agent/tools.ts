@@ -20,7 +20,8 @@ export function defineTool<TInput extends TSchema>(tool: AcpAgentToolDefinition<
 }
 
 /** Constructor-time validation (INVALID_ARGUMENT): an array of well-formed definitions with
- *  MCP-safe, unique names. `undefined` and `[]` are both "no tools". */
+ *  MCP-safe, unique names and an object-typed `inputSchema`. `undefined` and `[]` are both "no
+ *  tools". */
 export function validateToolDefinitions(tools: unknown, label: string | undefined): AcpAgentToolDefinition[] {
   if (tools === undefined) return [];
   if (!Array.isArray(tools)) throw agentValidationError("AcpAgent `tools` must be an array of tool definitions", label);
@@ -40,6 +41,16 @@ export function validateToolDefinitions(tools: unknown, label: string | undefine
     if (typeof description !== "string") throw agentValidationError(`tool "${name}" needs a string description`, label);
     if (inputSchema === null || typeof inputSchema !== "object") {
       throw agentValidationError(`tool "${name}" needs an inputSchema (a typebox schema object)`, label);
+    }
+    // MCP `tools/call` arguments are an object and `tools/list` advertises `inputSchema` as
+    // `type: "object"`: a schema of any other top-level type could never be satisfied by a call,
+    // so it is refused here rather than advertised.
+    const schemaType = (inputSchema as { type?: unknown }).type;
+    if (schemaType !== "object") {
+      throw agentValidationError(
+        `tool "${name}" inputSchema must be an object schema (typebox Type.Object(...), type: "object"); got type ${JSON.stringify(schemaType) ?? "undefined"}`,
+        label,
+      );
     }
     if (typeof execute !== "function") throw agentValidationError(`tool "${name}" needs an execute function`, label);
   });
