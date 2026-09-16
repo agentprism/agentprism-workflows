@@ -5,7 +5,8 @@
 ---
 
 AcpAgent SDK round 2: per-agent traits, `INVALID_ARGUMENT` for SDK misuse, system-prompt discovery,
-the message-level transcript (`turn.messages` / `agent.messages`), and `stream()`.
+the message-level transcript (`turn.messages` / `agent.messages`), `stream()`, client-side function
+tools, and the `permissions` rename.
 
 `@automatalabs/shared-types`
 
@@ -62,6 +63,33 @@ the message-level transcript (`turn.messages` / `agent.messages`), and `stream()
   turn yields its buffered events and then throws that error once; leaving early (`break`,
   `return()`, `throw()`) drops a not-yet-started turn without going on the wire and sends the one
   `session/cancel` (plus the agent's escalation) to one in flight, resolving only once it settled.
+
+- **Breaking:** `AcpAgentOptions.tools` (the headless `ToolPolicy` allow/deny auto-policy) is renamed
+  `permissions`; forks inherit it as before. There is no alias. The policy is consulted only when no
+  `onPermissionRequest` resolver is installed — a resolver answers every request (the runner's
+  default precedence); the docs previously claimed explicit lists beat the resolver and now describe
+  the real order.
+- New client-side function tools: `AcpAgentOptions.tools?: AcpAgentToolDefinition[]` —
+  `{ name, description, inputSchema (typebox), execute(input, ctx) }`, with `defineTool()` to infer
+  the input type, `AcpAgentToolContext` (`sessionId`, `backendId`, `label?`, a best-effort
+  `toolCallId?`, `signal`) and `AcpAgentToolResult` (a string, MCP content blocks, or
+  `{ content, isError? }`). Every agent with tools runs its own local tool host (`AgentToolHost`,
+  the `StructuredOutputToolHost` pattern generalized over a shared `LocalMcpHttpHost` base): an
+  in-process Streamable HTTP MCP server on `127.0.0.1` behind an unguessable token path serving
+  `tools/list` and `tools/call`, injected into `mcpServers` as `agent_tools` (`agent_tools_2`, … on a
+  caller-name collision; `AGENT_TOOLS_SERVER_NAME`) on `session/new|resume|load|fork` and the id-only
+  fork's reattach, separate from and coexisting with the `structured_output` host. Arguments are
+  validated with typebox Convert + Check before `execute`; a validation failure or a thrown
+  `execute` answers the agent with an `isError: true` result carrying the message, never a
+  transport error. Names (`^[A-Za-z0-9_-]{1,64}$`, unique; `AGENT_TOOL_NAME_PATTERN`) are validated
+  in the constructor (`INVALID_ARGUMENT` before any spawn); an agent that does not advertise
+  `mcpCapabilities.http` fails the open with `INVALID_ARGUMENT` naming the backend — tools are never
+  silently dropped. `ctx.signal` aborts on `cancel()`, a per-call signal, the agent's signal, and
+  close; forks inherit the tools on a host of their own; the host closes with the agent, waiting up
+  to one second for in-flight calls to flush. Calls surface through the backend's normal
+  `tool_call` / `tool_call_update` events (pi: `mcp__agent_tools__<name>`).
+- Both local MCP hosts now close without waiting on a peer's keep-alive socket: idle connections
+  are closed at once, requests still being answered get a bounded grace, then the rest are torn down.
 
 `@automatalabs/pi-acp`
 

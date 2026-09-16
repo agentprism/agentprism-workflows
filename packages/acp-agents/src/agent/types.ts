@@ -21,7 +21,8 @@ import type {
   SystemPromptOptions,
   WorkflowError,
 } from "@automatalabs/shared-types";
-import type { TSchema } from "typebox";
+import type { ContentBlock as McpContentBlock } from "@modelcontextprotocol/sdk/types.js";
+import type { Static, TSchema } from "typebox";
 import type { AuthStore } from "../auth/auth-store.js";
 import type { ClientHandlers } from "../client-handlers.js";
 import type { HarnessConfigReport, HarnessModelsView } from "../config-catalog.js";
@@ -37,6 +38,49 @@ import type { CustomBackendConfig } from "../registry.js";
 
 // Re-exported for callers that only import the SDK types.
 export type { SessionConfigOption, SessionModeState };
+
+/** What a function tool's `execute` receives next to its validated input. */
+export interface AcpAgentToolContext {
+  /** The ACP session id of the agent that called the tool. */
+  readonly sessionId: string;
+  /** The agent's resolved backend id. */
+  readonly backendId: string;
+  /** The agent's `label`, when set. */
+  readonly label?: string;
+  /** The ACP `tool_call` id the backend surfaced for this call, when the SDK could correlate it:
+   *  the latest not-yet-settled `tool_call` of the turn in flight whose standard `name` (or
+   *  `title`) is the tool's name or ends in `__<name>` (pi's `mcp__agent_tools__<name>` alias).
+   *  Best-effort — undefined when the backend surfaced none before calling. */
+  readonly toolCallId?: string;
+  /** Aborts when the agent's constructor `signal` fires, when the turn in flight is cancelled
+   *  (`cancel()`, a per-call `signal`, an early `stream()` exit), when the agent closes or its
+   *  process dies, and when the backend drops the HTTP request before the result was written. */
+  readonly signal: AbortSignal;
+}
+
+/** What `execute` may return: a string (one text block), MCP content blocks, or a complete
+ *  `{ content, isError? }` result — `isError: true` is passed through to the agent as-is. */
+export type AcpAgentToolResult =
+  | string
+  | McpContentBlock[]
+  | { readonly content: McpContentBlock[]; readonly isError?: boolean };
+
+/**
+ * One client-side function tool (`AcpAgentOptions.tools`). The SDK serves it to the agent as an
+ * MCP tool on the per-agent local tool host (`agent_tools`): `name` and `description` are
+ * advertised verbatim, `inputSchema` (typebox, like the `schema` option) is advertised as its
+ * JSON Schema, and every `tools/call` is validated against it (typebox Convert + Check) before
+ * `execute` runs with the converted input. A validation failure or a thrown `execute` is returned
+ * to the agent as an `isError: true` result carrying the message, never a transport error. Use
+ * `defineTool()` to infer the input type from the schema.
+ */
+export interface AcpAgentToolDefinition<TInput extends TSchema = TSchema> {
+  /** `^[A-Za-z0-9_-]{1,64}$`, unique across the agent's tools (INVALID_ARGUMENT in the constructor). */
+  name: string;
+  description: string;
+  inputSchema: TInput;
+  execute(input: Static<TInput>, ctx: AcpAgentToolContext): Promise<AcpAgentToolResult> | AcpAgentToolResult;
+}
 
 export interface AcpAgentOptions {
   /** ABSOLUTE path that exists and is a directory. Validated synchronously in the constructor and
@@ -66,10 +110,19 @@ export interface AcpAgentOptions {
   /** Client-provided MCP servers (stdio/http/sse/acp). Capability-gated by the connection exactly
    *  like the runner. */
   mcpServers?: McpServerConfig[];
-  /** Headless permission auto-policy: allow/deny lists + `defaultOutcome` (default "allow"). */
-  tools?: ToolPolicy;
-  /** Session-scoped async permission resolver; wins over `tools` unless the request matches an
-   *  explicit list (same precedence as the runner: resolver > policy). */
+  /** Client-side function tools, served to the agent over HTTP MCP from a per-agent local host
+   *  injected into `mcpServers` as `agent_tools` (`agent_tools_2`, … when a caller's server holds
+   *  the name) on `session/new|resume|load|fork` and an id-only fork's reattach. Names are
+   *  validated in the constructor (INVALID_ARGUMENT before any spawn); an agent that does not
+   *  advertise `mcpCapabilities.http` fails the open with INVALID_ARGUMENT — tools are never
+   *  silently dropped. Inherited by forks (each runs its own host); the host closes with the
+   *  agent. An empty array is the same as omitting the option. */
+  tools?: AcpAgentToolDefinition[];
+  /** Headless permission auto-policy: allow/deny lists + `defaultOutcome` (default "allow").
+   *  Consulted only when no `onPermissionRequest` resolver is installed. */
+  permissions?: ToolPolicy;
+  /** Session-scoped async permission resolver. When present it answers EVERY permission request
+   *  (the runner's default precedence); `permissions` is the headless fallback without one. */
   onPermissionRequest?: PermissionResolver;
   /** Elicitation responder; its presence is what advertises `elicitation` at initialize. */
   onElicitation?: ElicitationResolver;

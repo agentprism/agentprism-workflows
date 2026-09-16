@@ -4,7 +4,8 @@
 // forks that see everything the parent committed so far, cold reopen from an `AgentSessionRef`,
 // and the no-prompt catalog probe. It composes the same primitives the runner uses
 // (`PooledConnection`, `SessionHandle`, the backends, the routing grammar, the structured-output
-// tool host) and never touches the runner, the pool, or `InteractiveSession`.
+// tool host) plus its own per-agent function-tool host (`agent_tools`, src/agent/tool-host.ts),
+// and never touches the runner, the pool, or `InteractiveSession`.
 //
 // Semantics that are not negotiable (docs/api.md "AcpAgent SDK"):
 //   - FIFO: prompt / stream / fork / setMode / setConfigOptions / close serialize behind the
@@ -66,6 +67,8 @@ import {
   validateAgentCwd,
 } from "./routing.js";
 import { assertPerTurnSchemaAllowed, planStructured, type StructuredPlan } from "./structured.js";
+import { AgentToolHost, type AgentToolHostContext } from "./tool-host.js";
+import { planTools, validateToolDefinitions } from "./tools.js";
 import { TurnCollector, buildTurn } from "./turn.js";
 import {
   ZERO_USAGE,
@@ -83,6 +86,7 @@ import {
   type AcpAgentSteerOptions,
   type AcpAgentStream,
   type AcpAgentStreamEvent,
+  type AcpAgentToolDefinition,
   type AcpAgentTurn,
   type AcpAgentUpdateRecord,
 } from "./types.js";
@@ -208,10 +212,10 @@ function assertSessionRef(ref: AgentSessionRef, label: string | undefined, metho
 /**
  * One ACP agent session on its own dedicated backend process.
  *
- * Lazy: the constructor validates (cwd, `configOptions`, the registry, `clientHandlers`) and
- * routes the backend synchronously but spawns nothing; the first queued operation (an explicit
- * `ready()` or an implicit `prompt()`) opens the session. `state` walks
- * `idle → opening → ready ⇄ busy → closed`.
+ * Lazy: the constructor validates (cwd, `configOptions`, the registry, `clientHandlers`, the
+ * function-tool definitions) and routes the backend synchronously but spawns nothing; the first
+ * queued operation (an explicit `ready()` or an implicit `prompt()`) opens the session. `state`
+ * walks `idle → opening → ready ⇄ busy → closed`.
  */
 export class AcpAgent {
   /** The session's absolute working directory (sent on session/new|fork|resume|load). */
@@ -230,6 +234,7 @@ export class AcpAgent {
   readonly #backend: Backend;
   readonly #modelSpec: string | undefined;
   readonly #schema: TSchema | undefined;
+  readonly #tools: readonly AcpAgentToolDefinition[];
   readonly #retainHistory: boolean;
   readonly #raw: boolean;
   readonly #signal: AbortSignal | undefined;
@@ -244,6 +249,10 @@ export class AcpAgent {
   #handle: SessionHandle | undefined;
   #plan: StructuredPlan | undefined;
   #structuredHost: StructuredOutputToolHost | undefined;
+  /** The `agent_tools` host, created lazily by the first open that injects it; disposed on close. */
+  #toolHost: AgentToolHost | undefined;
+  /** The collector of the turn on the wire — what a function tool's `toolCallId` is correlated against. */
+  #activeCollector: TurnCollector | undefined;
   #sessionId: string | undefined;
   #sessionRef: AgentSessionRef | undefined;
   #sessionUsage: AgentUsage = ZERO_USAGE;
@@ -268,15 +277,15 @@ export class AcpAgent {
   #removeAbort: (() => void) | undefined;
 
   /**
-   * Lazy: validates cwd/configOptions/registry/clientHandlers synchronously, routes the backend,
-   * spawns nothing. This is the ONLY public constructor signature — seeded agents (forks, cold
-   * reopen) are built by the statics through a module-private factory.
+   * Lazy: validates cwd/configOptions/registry/clientHandlers/tools synchronously, routes the
+   * backend, spawns nothing. This is the ONLY public constructor signature — seeded agents (forks,
+   * cold reopen) are built by the statics through a module-private factory.
    */
   constructor(options: AcpAgentOptions) {
     const label = options.label;
     // Every pre-spawn guard speaks INVALID_ARGUMENT: the SDK's own throw it directly, a shared
     // validator's SCRIPT_VALIDATION_ERROR is re-coded here at the boundary.
-    const seed = validateArguments(() => {
+    const { seed, tools } = validateArguments(() => {
       validateAgentCwd(options.cwd, label, "AcpAgent");
       assertNoModelConfigOption(options.configOptions, label);
       try {
@@ -284,9 +293,11 @@ export class AcpAgent {
       } catch (error) {
         throw agentValidationError(error instanceof Error ? error.message : String(error), label);
       }
-      return constructionSeed ?? resolveNewSeed(options);
+      const tools = validateToolDefinitions(options.tools, label);
+      return { seed: constructionSeed ?? resolveNewSeed(options), tools };
     });
     this.#options = { ...options };
+    this.#tools = tools;
     this.#seed = seed;
     this.#registry = seed.registry;
     this.#backend = seed.backend;
@@ -652,11 +663,12 @@ export class AcpAgent {
     const outcome = handle.promptOutcome(turnContent, promptMeta);
     const active: ActiveTurn = { ended: outcome.then(noop, noop), aborted: false };
     this.#activeTurn = active;
+    this.#activeCollector = collector;
     const callSignal = options.signal;
     const onCallAbort = (): void => {
       active.aborted = true;
       active.abortReason = callSignal?.reason;
-      void this.#cancelTurn().catch(noop);
+      void this.#cancelTurn(callSignal?.reason).catch(noop);
     };
     callSignal?.addEventListener("abort", onCallAbort, { once: true });
 
@@ -672,6 +684,7 @@ export class AcpAgent {
       collector.stop();
       callSignal?.removeEventListener("abort", onCallAbort);
       if (this.#activeTurn === active) this.#activeTurn = undefined;
+      if (this.#activeCollector === collector) this.#activeCollector = undefined;
     }
     // An abort observed in flight rejects with the reason even when the agent answered
     // `stopReason: "cancelled"` — abort is never a resolved turn.
@@ -720,7 +733,7 @@ export class AcpAgent {
    *  `cancel()` in that window is a no-op the turn never sees. A per-call `signal` covers every
    *  window (rejects with the reason before anything is sent; `session/cancel` once in flight). */
   cancel(): Promise<void> {
-    return this.#cancelTurn();
+    return this.#cancelTurn(new Error("AcpAgent.cancel(): the turn was cancelled"));
   }
 
   /**
@@ -830,8 +843,9 @@ export class AcpAgent {
    * Close: `state` becomes `closed` immediately (no new work is admitted), the teardown waits
    * behind queued work, releases the session (`keep: true` skips the wire `session/close` so the
    * agent-persisted session stays re-openable via `sessionRef`), disposes the dedicated process,
-   * and releases the structured-output tool. Idempotent (same promise); never throws for an
-   * already-dead process; rethrows only a `child_cleanup_error` (mapped, non-recoverable).
+   * releases the structured-output tool, and closes the function-tool host (aborting any running
+   * `execute`). Idempotent (same promise); never throws for an already-dead process; rethrows
+   * only a `child_cleanup_error` (mapped, non-recoverable).
    */
   close(options: AcpAgentCloseOptions = {}): Promise<void> {
     this.#closeKeep ??= options.keep === true;
@@ -894,7 +908,7 @@ export class AcpAgent {
     return {
       cwd: this.cwd,
       schema: this.#schema,
-      policy: options.tools ?? {},
+      policy: options.permissions ?? {},
       permissionResolver: options.onPermissionRequest,
       enforceToolPolicyBeforePermissionResolver: false,
       elicitationResolver: options.onElicitation,
@@ -908,8 +922,11 @@ export class AcpAgent {
     };
   }
 
-  #planStructured(connection: PooledConnection): Promise<StructuredPlan> {
-    return planStructured(
+  /** After initialize (the capabilities are known): the structured-output injection, then the
+   *  function-tool injection appended to the same `mcpServers` — or the INVALID_ARGUMENT refusal
+   *  when the agent does not advertise HTTP MCP for the tools it was given. */
+  async #planSession(connection: PooledConnection): Promise<StructuredPlan> {
+    const structured = await planStructured(
       {
         schema: this.#schema,
         backend: this.#backend,
@@ -918,6 +935,39 @@ export class AcpAgent {
       },
       connection,
     );
+    const mcpServers = await planTools(
+      {
+        tools: this.#tools,
+        backendId: this.backendId,
+        label: this.label,
+        mcpServers: structured.mcpServers,
+        host: () => (this.#toolHost ??= new AgentToolHost(this.#tools, () => this.#toolContext())),
+      },
+      connection,
+    );
+    return { ...structured, mcpServers };
+  }
+
+  #toolContext(): AgentToolHostContext {
+    return {
+      sessionId: this.#sessionId,
+      backendId: this.backendId,
+      label: this.label,
+      resolveToolCallId: (toolName) => this.#resolveToolCallId(toolName),
+    };
+  }
+
+  /** Best-effort: the latest unsettled `tool_call` of the turn in flight whose standard `name`
+   *  (or `title`) is the tool's name or ends in `__<name>` (pi's `mcp__agent_tools__<name>`). */
+  #resolveToolCallId(toolName: string): string | undefined {
+    const calls = this.#activeCollector?.toolCalls ?? [];
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
+      if (call.status === "completed" || call.status === "failed") continue;
+      const names = [call.name, call.title].filter((value): value is string => typeof value === "string");
+      if (names.some((name) => name === toolName || name.endsWith(`__${toolName}`))) return call.toolCallId;
+    }
+    return undefined;
   }
 
   async #open(): Promise<void> {
@@ -937,13 +987,13 @@ export class AcpAgent {
       if (seed.kind === "new") {
         // `prepare` runs after initialize, so the injection decision sees the capabilities.
         handle = await connection.openPreparedSession(async (ready) => {
-          plan = await this.#planStructured(ready);
+          plan = await this.#planSession(ready);
           return this.#sessionOptions(plan);
         });
       } else {
         // The cheapest "await initialize": the injection decision needs the capabilities.
         await connection.authMethods();
-        plan = await this.#planStructured(connection);
+        plan = await this.#planSession(connection);
         const opts = this.#sessionOptions(plan);
         if (seed.kind === "fork") {
           const trait = forkTraitFor(this.#backend, this.#registry);
@@ -1020,11 +1070,14 @@ export class AcpAgent {
     this.#messagesSeed = seed.messagesSeed ?? [];
   }
 
-  #cancelTurn(): Promise<void> {
+  /** `reason` is what a running function tool's `ctx.signal` aborts with. */
+  #cancelTurn(reason?: unknown): Promise<void> {
     const active = this.#activeTurn;
     const connection = this.#connection;
     const sessionId = this.#sessionId;
     if (!active || !connection || sessionId === undefined) return Promise.resolve();
+    // A function tool running for this turn stops with it.
+    this.#toolHost?.abortInFlight(reason);
     // Settles pending permissions/elicitations + ONE session/cancel notify.
     active.cancelRequested ??= connection.cancelSession(sessionId);
     active.escalation ??= active.cancelRequested.then(async () => {
@@ -1040,7 +1093,8 @@ export class AcpAgent {
     const reason = this.#signal?.reason;
     this.#closed = true;
     this.#queue.drain(reason);
-    void this.#cancelTurn().catch(noop);
+    this.#toolHost?.abortInFlight(reason);
+    void this.#cancelTurn(reason).catch(noop);
     // An open/fork/reattach in flight: dispose the process so the raced wire call rejects.
     if (this.#handle === undefined && this.#connection) void this.#connection.dispose().catch(noop);
     // Not queued: tear down once the in-flight op settled (queued ones were just drained). A
@@ -1087,6 +1141,7 @@ export class AcpAgent {
     const connection = this.#connection;
     const plan = this.#plan;
     const host = this.#structuredHost;
+    const toolHost = this.#toolHost;
     let cleanupError: unknown;
     try {
       if (handle) await handle.release({ keepOpen: keep });
@@ -1094,14 +1149,15 @@ export class AcpAgent {
       if (isChildCleanupError(error)) cleanupError = error;
     }
     plan?.registration?.release();
-    // The process BEFORE the tool host (the runner's order: pool, then tools): the agent process
-    // holds keep-alive sockets to the host's HTTP server, and `server.close()` waits for idle
+    // The process BEFORE the tool hosts (the runner's order: pool, then tools): the agent process
+    // holds keep-alive sockets to the hosts' HTTP servers, and `server.close()` waits for idle
     // sockets to time out (seconds) unless the peer is gone first.
     if (connection) {
       await connection.dispose().catch(noop);
       releaseOnExit(connection);
     }
     if (host) await host.dispose().catch(noop);
+    if (toolHost) await toolHost.dispose().catch(noop);
     this.#removeAbort?.();
     this.#removeAbort = undefined;
     // Last, so the agent's own `session_close` (emitted by the release above) was delivered.

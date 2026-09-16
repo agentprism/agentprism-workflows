@@ -1084,3 +1084,53 @@ test("Codex and pi: systemPrompt rides session/new in each backend's own dialect
     systemPrompt: { append: "DEV" },
   });
 });
+
+// ---- permissions (the headless allow/deny auto-policy) -------------------------------------------
+
+test("permissions: the headless allow/deny policy answers the agent's permission requests; a resolver, when present, answers them all", async () => {
+  const { cwd, readLog } = configure({
+    turns: [
+      { toolCall: { title: "Bash", kind: "execute", name: "Bash", toolCallId: "tc-deny" }, text: "denied" },
+      { toolCall: { title: "Read", kind: "read", name: "Read", toolCallId: "tc-allow" }, text: "allowed" },
+    ],
+  });
+  const optionOf = (turn: AcpAgentTurn): string | undefined => {
+    const outcome = turn.permissions[0]!.outcome.outcome;
+    return outcome.outcome === "selected" ? outcome.optionId : undefined;
+  };
+  const agent = track(new AcpAgent({ cwd, model: "claude", permissions: { deny: ["Bash"] } }));
+  const denied = await agent.prompt("one");
+  assert.equal(denied.text, "denied");
+  assert.equal(optionOf(denied), "reject-1", "the deny list picks the reject option");
+  const allowed = await agent.prompt("two");
+  assert.equal(optionOf(allowed), "allow-1", "defaultOutcome allow answers the unmatched request");
+  assert.deepEqual(permissionOutcomes(readLog()), [
+    { outcome: "selected", optionId: "reject-1" },
+    { outcome: "selected", optionId: "allow-1" },
+  ]);
+
+  // A resolver next to the policy answers EVERY request (the runner's default precedence: the
+  // policy is the headless fallback, consulted only when no resolver is installed).
+  await harness.cleanup();
+  const both = configure({
+    turns: [
+      { toolCall: { title: "Bash", kind: "execute", name: "Bash", toolCallId: "tc-1" }, text: "a" },
+      { toolCall: { title: "Read", kind: "read", name: "Read", toolCallId: "tc-2" }, text: "b" },
+    ],
+  });
+  const asked: string[] = [];
+  const guarded = track(
+    new AcpAgent({
+      cwd: both.cwd,
+      model: "claude",
+      permissions: { deny: ["Bash"], defaultOutcome: "deny" },
+      onPermissionRequest: (request) => {
+        asked.push(request.toolCall.toolCallId);
+        return ALLOW;
+      },
+    }),
+  );
+  assert.equal(optionOf(await guarded.prompt("one")), "allow-1", "the resolver decided, not the deny list");
+  assert.equal(optionOf(await guarded.prompt("two")), "allow-1", "the resolver decided, not defaultOutcome");
+  assert.deepEqual(asked, ["tc-1", "tc-2"], "the resolver saw every request");
+});

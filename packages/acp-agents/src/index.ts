@@ -69,8 +69,14 @@ export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.j
 // live forks, cold reopen from a session ref, and the no-prompt catalog probe.
 export { AcpAgent } from "./agent/acp-agent.js";
 export { isAcpAgentTurnError } from "./agent/errors.js";
+// Client-side function tools: the definition helper and the injected `mcpServers` entry name.
+export { defineTool, AGENT_TOOL_NAME_PATTERN } from "./agent/tools.js";
+export { AGENT_TOOLS_SERVER_NAME } from "./agent/tool-host.js";
 export type {
   AcpAgentOptions,
+  AcpAgentToolDefinition,
+  AcpAgentToolContext,
+  AcpAgentToolResult,
   AcpAgentPromptOptions,
   AcpAgentSteerOptions,
   AcpAgentForkOptions,

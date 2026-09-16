@@ -1,12 +1,5 @@
 import { randomBytes } from "node:crypto";
-import http, {
-  type IncomingMessage,
-  type Server as HttpServer,
-  type ServerResponse,
-} from "node:http";
-import type { AddressInfo } from "node:net";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ErrorCode,
@@ -18,6 +11,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { TSchema } from "typebox";
 import { Convert, Errors } from "typebox/value";
+import { LocalMcpHttpHost } from "./local-mcp-host.js";
 import { toJsonSchema } from "./schema-strict.js";
 import { validateValue } from "./structured-output.js";
 
@@ -31,8 +25,6 @@ export const STRUCTURED_OUTPUT_TOOL_DESCRIPTION =
   "- The input must be valid JSON matching the required schema\n" +
   "- Complete all necessary research and tool calls BEFORE calling this tool\n" +
   "- This tool provides your final answer - no further actions are taken after calling it";
-
-const HOST = "127.0.0.1";
 
 interface Slot {
   readonly token: string;
@@ -52,19 +44,9 @@ export interface StructuredOutputToolRegistration {
 }
 
 /** Runner-scoped localhost MCP host. It binds only once a schema run actually needs injection. */
-export class StructuredOutputToolHost {
+export class StructuredOutputToolHost extends LocalMcpHttpHost {
+  protected readonly hostName = "StructuredOutput";
   private readonly slots = new Map<string, Slot>();
-  private server: HttpServer | undefined;
-  private listenPromise: Promise<void> | undefined;
-  private port: number | undefined;
-
-  isListening(): boolean {
-    return this.server?.listening === true;
-  }
-
-  listeningPort(): number | undefined {
-    return this.port;
-  }
 
   async register(schema: TSchema): Promise<StructuredOutputToolRegistration> {
     const token = randomBytes(16).toString("hex");
@@ -78,7 +60,7 @@ export class StructuredOutputToolHost {
     try {
       const port = await this.ensureListening();
       return {
-        url: `http://${HOST}:${port}/${token}`,
+        url: this.urlFor(token, port),
         tryCaptured: () => slot.captured,
         takeCaptured: () => {
           const captured = slot.captured;
@@ -97,89 +79,12 @@ export class StructuredOutputToolHost {
 
   async dispose(): Promise<void> {
     this.slots.clear();
-    const server = this.server;
-    this.server = undefined;
-    this.listenPromise = undefined;
-    this.port = undefined;
-    if (!server || !server.listening) return;
-    await new Promise<void>((resolve, reject) => {
-      server.close((error) => (error ? reject(error) : resolve()));
-    });
+    await this.closeServer();
   }
 
-  private async ensureListening(): Promise<number> {
-    if (!this.server) {
-      this.server = http.createServer((req, res) => {
-        void this.handleRequest(req, res);
-      });
-      this.server.unref();
-    }
-    if (!this.listenPromise) {
-      this.listenPromise = new Promise<void>((resolve, reject) => {
-        const server = this.server!;
-        const onError = (error: Error) => {
-          server.off("listening", onListening);
-          reject(error);
-        };
-        const onListening = () => {
-          server.off("error", onError);
-          const address = server.address();
-          if (!address || typeof address === "string") {
-            reject(new Error("StructuredOutput MCP server did not bind to a TCP port"));
-            return;
-          }
-          this.port = (address as AddressInfo).port;
-          resolve();
-        };
-        server.once("error", onError);
-        server.once("listening", onListening);
-        server.listen(0, HOST);
-      });
-    }
-    await this.listenPromise;
-    if (this.port === undefined) {
-      throw new Error("StructuredOutput MCP server has no listening port");
-    }
-    return this.port;
-  }
-
-  private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const slot = this.slotFor(req);
-    if (!slot) {
-      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-      res.end("not found");
-      return;
-    }
-
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    const server = createMcpServer(slot);
-    try {
-      await server.connect(transport);
-      await transport.handleRequest(req, res);
-    } catch (error) {
-      if (!res.headersSent) {
-        res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
-        res.end(error instanceof Error ? error.message : String(error));
-      } else {
-        res.destroy(error instanceof Error ? error : undefined);
-      }
-    } finally {
-      await Promise.allSettled([server.close(), transport.close()]);
-    }
-  }
-
-  private slotFor(req: IncomingMessage): Slot | undefined {
-    const rawUrl = req.url ?? "/";
-    let pathname: string;
-    try {
-      pathname = new URL(rawUrl, `http://${HOST}`).pathname;
-    } catch {
-      return undefined;
-    }
-    if (!pathname.startsWith("/") || pathname.slice(1).includes("/")) return undefined;
-    const token = pathname.slice(1);
-    if (!token) return undefined;
-    return this.slots.get(token);
+  protected mcpServerFor(token: string): Server | undefined {
+    const slot = this.slots.get(token);
+    return slot ? createMcpServer(slot) : undefined;
   }
 }
 
@@ -228,20 +133,24 @@ function textResult(text: string, isError?: boolean): CallToolResult {
   };
 }
 
-function rejectionText(value: unknown, schema: TSchema): string {
+/** The first three typebox validation errors of `value` against `schema`, one line. */
+export function describeSchemaErrors(schema: TSchema, value: unknown): string {
   let converted: unknown;
   try {
     converted = Convert(schema, value);
   } catch {
     converted = value;
   }
-  const details = Errors(schema, converted)
+  return Errors(schema, converted)
     .slice(0, 3)
     .map((error) => `${error.instancePath || "/"} ${error.message}`)
     .join("; ");
+}
+
+function rejectionText(value: unknown, schema: TSchema): string {
   return [
     "Structured output rejected: arguments do not match the required schema.",
-    details,
+    describeSchemaErrors(schema, value),
     "Fix the arguments and call StructuredOutput again.",
   ]
     .filter(Boolean)

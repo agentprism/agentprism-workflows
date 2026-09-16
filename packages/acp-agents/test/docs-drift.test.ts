@@ -386,3 +386,18 @@ test("system-prompt instruction support is documented per backend and the Codex-
   const contributing = readRepoFile("CONTRIBUTING.md");
   assert.ok(contributing.includes("`systemPrompt`"), "CONTRIBUTING must list the bare systemPrompt _meta key");
 });
+
+// The AcpAgent function-tool surface and the `permissions` rename: the SDK docs must name the
+// injected server, pi's alias for its calls, the renamed policy option, and must not describe
+// `tools` as the permission policy any more.
+test("function tools and the permissions option are documented wherever the AcpAgent SDK is described", () => {
+  for (const path of ["docs/api.md", "packages/acp-agents/README.md"]) {
+    const text = readRepoFile(path);
+    assert.ok(text.includes("`agent_tools`"), `${path} must name the injected agent_tools MCP server`);
+    assert.ok(text.includes("mcp__agent_tools__"), `${path} must document pi's mcp__agent_tools__<name> alias`);
+    assert.ok(text.includes("`permissions`"), `${path} must document the permissions option`);
+    assert.ok(text.includes("AcpAgentToolDefinition"), `${path} must name the tool definition type`);
+    assert.ok(text.includes("mcpCapabilities.http"), `${path} must document the HTTP MCP gate`);
+    assert.doesNotMatch(text, /`tools\?`[^\n]{0,120}`ToolPolicy`/, `${path} still describes \`tools\` as the ToolPolicy`);
+  }
+});

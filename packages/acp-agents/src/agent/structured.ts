@@ -3,13 +3,13 @@
 // the client-hosted StructuredOutput tool registration each agent owns, the per-turn schema gate,
 // and the no-repair result ladder (capture → native → final-message extraction → structuredError).
 import type { TSchema } from "typebox";
-import { Convert, Errors } from "typebox/value";
 import type { McpServerConfig } from "@automatalabs/shared-types";
 import type { PooledConnection } from "../acp-client.js";
 import type { Backend, StructuredSource } from "../backend.js";
 import { extractValidated, validateValue } from "../structured-output.js";
 import {
   STRUCTURED_OUTPUT_SERVER_NAME,
+  describeSchemaErrors,
   type StructuredOutputToolHost,
   type StructuredOutputToolRegistration,
 } from "../structured-tool.js";
@@ -96,19 +96,6 @@ export function assertPerTurnSchemaAllowed(backend: Backend, schema: TSchema | u
 /** The slice of a SessionHandle the result ladder reads. */
 export type StructuredHandle = StructuredSource;
 
-function describeErrors(schema: TSchema, value: unknown): string {
-  let converted: unknown;
-  try {
-    converted = Convert(schema, value);
-  } catch {
-    converted = value;
-  }
-  return Errors(schema, converted)
-    .slice(0, 3)
-    .map((error) => `${error.instancePath || "/"} ${error.message}`)
-    .join("; ");
-}
-
 /**
  * The no-repair ladder for one turn: this turn's StructuredOutput capture (already validated by
  * the tool host) → the backend's native result, validated → a validated JSON block in the final
@@ -127,7 +114,7 @@ export function resolveTurnStructured(args: {
   if (native !== undefined && native !== null) {
     const validated = validateValue(native, schema);
     if (validated !== undefined) return { structured: validated };
-    reasons.push(`native result rejected: ${describeErrors(schema, native)}`);
+    reasons.push(`native result rejected: ${describeSchemaErrors(schema, native)}`);
   }
   const extracted = extractValidated(handle.finalMessageText(), schema);
   if (extracted !== undefined) return { structured: extracted };

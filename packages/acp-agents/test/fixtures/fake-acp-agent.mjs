@@ -421,6 +421,7 @@ class FakeAgent {
     record({ method: "loadSession", params });
     // Reattaching an id-only fork id makes it live.
     this.idOnlyForkIds.delete(params.sessionId);
+    this.mcpServersBySession.set(params.sessionId, clone(params.mcpServers ?? []));
     const load = scenario.loadSession ?? {};
     if (load.delayMs) await new Promise((resolve) => setTimeout(resolve, load.delayMs));
     if (load.authRequired) throw RequestError.authRequired(clone(load.throwData), load.throw);
@@ -496,6 +497,7 @@ class FakeAgent {
     record({ method: "resumeSession", params });
     // Reattaching an id-only fork id makes it live.
     this.idOnlyForkIds.delete(params.sessionId);
+    this.mcpServersBySession.set(params.sessionId, clone(params.mcpServers ?? []));
     const resume = scenario.resumeSession ?? {};
     if (resume.delayMs) await new Promise((resolve) => setTimeout(resolve, resume.delayMs));
     if (resume.authRequired) throw RequestError.authRequired(clone(resume.throwData), resume.throw);
@@ -942,6 +944,14 @@ class FakeAgent {
       return;
     }
 
+    // `toolCallUpdate`: surface the call as a `tool_call` session update first, the way a real
+    // agent announces an MCP tool call before it goes out (pi: `mcp__<server>__<tool>`).
+    if (flow?.toolCallUpdate) {
+      await this.conn.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: "tool_call", ...clone(flow.toolCallUpdate) },
+      });
+    }
     const transport = new StreamableHTTPClientTransport(new URL(server.url));
     const client = new Client({ name: "fake-acp-agent", version: "0.0.0" }, { capabilities: {} });
     try {

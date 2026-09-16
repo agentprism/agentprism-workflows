@@ -33,6 +33,7 @@ import {
   AcpAgentRunner,
   AcpAgent,
   isAcpAgentTurnError,
+  defineTool,
   createAcpRunner,
   WorkflowManager,
   runWorkflow,
@@ -149,6 +150,9 @@ import type {
   // The AcpAgent SDK surface (its home is @automatalabs/acp-agents; the facade re-exports it like
   // InteractiveSession). Compile-gated below so a dropped re-export fails tsc.
   AcpAgentOptions,
+  AcpAgentToolDefinition,
+  AcpAgentToolContext,
+  AcpAgentToolResult,
   AcpAgentPromptOptions,
   AcpAgentSteerOptions,
   AcpAgentForkOptions,
@@ -652,6 +656,7 @@ test("facade re-exports the public surface", () => {
   }
   assert.equal(typeof AcpAgent.prototype[Symbol.asyncDispose], "function");
   assert.equal(typeof isAcpAgentTurnError, "function");
+  assert.equal(typeof defineTool, "function");
   assert.equal(isAcpAgentTurnError(new WorkflowError("plain", WorkflowErrorCode.AGENT_EXECUTION_ERROR)), false);
   assert.equal(AGENTPRISM_PERSISTENCE_ROOT_ENV, "AGENTPRISM_PERSISTENCE_ROOT");
   const pathOptions: WorkflowPathOptions = { persistenceRoot: "/tmp/agentprism-workflows-test" };
