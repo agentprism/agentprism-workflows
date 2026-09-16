@@ -192,6 +192,13 @@ the out-of-band callbacks `onUsage` / `onModelResolved` / `onModelFallback` / `o
 `onSessionOpen`. Omitted modes explicitly apply Claude `auto`, Codex `agent`, OpenCode `build`, or no Pi/custom mode. Token/cost usage is delivered via `onUsage` (it may never fire — ACP usage is
 experimental), never via the return value.
 
+For a **held-open** agent — multi-turn, forkable, resumable — use the `AcpAgent` SDK, re-exported
+here from `@automatalabs/acp-agents`: `new AcpAgent({ cwd, model })` spawns one dedicated process on
+first use, `prompt()` returns the verbatim turn (`response` with its `_meta`, every update, tool
+calls, usage), `fork()` seeds a parallel agent with everything committed so far, and
+`close({ keep: true })` + `AcpAgent.resume(ref)` reopen it on a fresh process. See
+[docs/api.md — AcpAgent SDK](../../docs/api.md#acpagent-sdk).
+
 > **Codex session instructions.** When the run routes to the Codex backend, `baseInstructions`
 > **replaces** Codex's built-in base system prompt and `developerInstructions` adds developer-role
 > instructions for the session. They ride ACP `session/new` `_meta` into Codex `thread/start` and
@@ -1010,6 +1017,8 @@ RESUME_CALL_LIVE_REASONS, RESUME_CALL_FAILED_REASONS,
 createAcpRunner,              // () => AcpAgentRunner (the default AgentRunner; has .on(...) events)
 AcpAgentRunner,               // class — implements AgentRunner over ACP
 InteractiveSession,           // held-open multi-turn ACP session returned by openSession()
+AcpAgent,                     // the SDK front door: one dedicated process per held-open agent, FIFO turns, forks, cold reopen
+isAcpAgentTurnError,          // narrow a prompt() rejection that carries the walled turn as error.turn
 selectBackend,                // pick a built-in/custom backend from a model/tier spec
 ClaudeBackend, CodexBackend, OpenCodeBackend, PiBackend, CustomAcpBackend,
 resolveBackendRegistry, BACKENDS_ENV,
@@ -1048,6 +1057,10 @@ WorkflowPathOptions, RunPersistence, RunPersistenceOptions, RunLeaseOwner,
 AcpPoolOptions, AcpRunnerOptions, AgentRunner, RunOptions, AgentResult, AgentUsage, JournalEntry,
 AgentSessionRef, AgentSessionRecord, WorkflowBackendConfig, WorkflowCallRecord, WorkflowRecordedError,
 InteractiveSessionOptions, InteractiveTurn, SteeringOutcome, ProbeConfigOptionsOptions, ProbedConfigOptions, SessionConfigOption,
+AcpAgentOptions, AcpAgentPromptOptions, AcpAgentSteerOptions, AcpAgentForkOptions, AcpAgentReopenOptions,
+AcpAgentCloseOptions, AcpAgentProbeOptions, AcpAgentCatalog, AcpAgentTurn, AcpAgentTurnError, AcpAgentToolCall,
+AcpAgentUpdateRecord, AcpAgentRawRecord, AcpAgentTurnUsage, AcpAgentEventMap, AcpAgentEventName,
+AcpAgentEventListener, AcpAgentState, CustomBackendForkConfig,
 PermissionResolver, RequestPermissionRequest, RequestPermissionResponse,
 AuthResolver, AuthContext, AuthResolution, AuthMethodDescriptor, AuthCapableRunner,
 ProviderCapableRunner,        // duck-type gate for the MCP provider tools (providers/list|set|disable)

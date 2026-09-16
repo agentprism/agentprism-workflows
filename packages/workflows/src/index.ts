@@ -236,9 +236,10 @@ export type {
   RunEventLogErrorCode,
 } from "@automatalabs/workflow-engine";
 
-// ── ACP backend: the default AgentRunner implementation, interactive sessions, backend
-//    selection, the concrete backends (built-in + custom registry), the pool/runner options,
-//    capability helpers, client handlers, permission resolvers, and JSON-Schema helpers.
+// ── ACP backend: the default AgentRunner implementation, interactive sessions, the AcpAgent
+//    SDK front door (one dedicated process per held-open agent, FIFO turns, forks, cold reopen),
+//    backend selection, the concrete backends (built-in + custom registry), the pool/runner
+//    options, capability helpers, client handlers, permission resolvers, and JSON-Schema helpers.
 //    Custom backends let ANY ACP agent serve agent() calls:
 //    `createAcpRunner({ backends: { browser: { command: "…" } } })` (or the
 //    AGENTPRISM_BACKENDS env var), then route with `agent(p, { model: "browser" })`. ──
@@ -246,6 +247,8 @@ export {
   createAcpRunner,
   AcpAgentRunner,
   InteractiveSession,
+  AcpAgent,
+  isAcpAgentTurnError,
   selectBackend,
   ClaudeBackend,
   CodexBackend,
@@ -275,6 +278,24 @@ export type {
   InteractiveSessionOptions,
   InteractiveTurn,
   SteeringResponse,
+  AcpAgentOptions,
+  AcpAgentPromptOptions,
+  AcpAgentSteerOptions,
+  AcpAgentForkOptions,
+  AcpAgentReopenOptions,
+  AcpAgentCloseOptions,
+  AcpAgentProbeOptions,
+  AcpAgentCatalog,
+  AcpAgentTurn,
+  AcpAgentTurnError,
+  AcpAgentToolCall,
+  AcpAgentUpdateRecord,
+  AcpAgentRawRecord,
+  AcpAgentTurnUsage,
+  AcpAgentEventMap,
+  AcpAgentEventName,
+  AcpAgentEventListener,
+  AcpAgentState,
   ListProvidersOptions,
   ListSessionsOptions,
   LogoutOptions,
@@ -284,6 +305,7 @@ export type {
   SetProviderOptions,
   BackendRegistry,
   CustomBackendConfig,
+  CustomBackendForkConfig,
   RegisteredBackend,
   ClientCapabilityOptions,
   ClientHandlers,

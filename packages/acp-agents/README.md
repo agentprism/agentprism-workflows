@@ -6,7 +6,7 @@ This is the layer `@automatalabs/workflows` and `@automatalabs/mcp-server` are b
 
 ## Most users want `@automatalabs/workflows`
 
-If you are orchestrating a workflow, use [`@automatalabs/workflows`](../workflows) instead — it re-exports `createAcpRunner` and wires it into the engine for you. Reach for this package directly only when you want to drive a **single** ACP agent yourself or need the low-level auth/session lifecycle APIs.
+If you are orchestrating a workflow, use [`@automatalabs/workflows`](../workflows) instead — it re-exports `createAcpRunner` and wires it into the engine for you. Reach for this package directly only when you want to drive a **single** ACP agent yourself (`run()`, or the held-open [`AcpAgent` SDK](#acpagent--the-sdk-front-door)) or need the low-level auth/session lifecycle APIs.
 
 ```bash
 npm install @automatalabs/acp-agents
@@ -228,6 +228,38 @@ try {
 }
 ```
 
+## AcpAgent — the SDK front door
+
+`AcpAgent` is the held-open counterpart of `run()`: one **dedicated** ACP process per agent (and per fork), a lazy constructor that spawns nothing until the first call, turns that serialize in a per-agent FIFO, live `fork()`s that see everything the parent committed so far, and cold reopen of a recorded session from its `AgentSessionRef`. It composes the same primitives as the runner and `InteractiveSession` (`PooledConnection`, `SessionHandle`, the backends, the routing grammar, the structured-output tool host) and owns no pool, so a parent's `close()` never affects its forks. The full reference — options, the turn shape, the abort table, forks, cold reopen, structured output, events, discovery, errors — is [docs/api.md — AcpAgent SDK](../../docs/api.md#acpagent-sdk).
+
+```ts
+import { AcpAgent } from "@automatalabs/acp-agents";
+
+const catalog = await AcpAgent.probe({ modelFilter: "opus" });  // no-prompt catalog, one process per target
+const primary = new AcpAgent({ cwd: "/abs/path/to/worktree", model: "claude/opus[1m]" }); // spawns nothing yet
+primary.on("agent_message_chunk", (e) => {                      // this agent's events only
+  if (e.content.type === "text") process.stdout.write(e.content.text);
+});
+
+const turn = await primary.prompt("Investigate the failing test.");
+turn.response;                                   // the verbatim PromptResponse, `_meta` intact
+turn.updates; turn.raw; turn.toolCalls;          // every update / vendor notification / folded tool call of the turn
+turn.usage.turn; turn.usage.session;             // this turn's tokens; the agent's running sum
+
+const planner = await primary.fork();                        // a NEW process seeded with the transcript so far
+const plan = await planner.prompt("Plan the smallest fix.", { mode: "plan" }); // per-turn mode/config passthrough
+await primary.prompt("Meanwhile, list the callers.");        // the parent keeps going, unaffected
+
+await planner.close();
+await primary.close({ keep: true });                         // process disposed; the session stays re-openable
+const again = await AcpAgent.resume(primary.sessionRef!);    // a fresh process on the same transcript
+await again.close();
+```
+
+`prompt`, `fork`, `setMode`, `setConfigOptions`, and `close` run FIFO per agent, so a fork always sees a quiescent, fully persisted parent transcript. `steer()` and `cancel()` overlap the queue: `steer()` injects into the turn in flight (`_session/steering`) and rejects when nothing is in flight; `cancel()` sends one `session/cancel` and, when the agent ignores it for the grace period, disposes the process **without** a wire `session/close` so `sessionRef` stays re-openable. `prompt()` resolves a turn for every `PromptResponse` the wire returned — no `stopReason` is thrown on — and rejects only on a wire rejection, validation, abort (`signal.reason` untouched), a closed agent, or a typed session failure (then with the complete turn attached as `error.turn`; narrow with `isAcpAgentTurnError`).
+
+`fork()` follows the backend's `FORK_SESSION_TRAITS` row ([the table under Session handoff](#what-a-sessionfork-response-is-fork_session_traits)) instead of probing: on the `id-only` backends (Claude, Codex) the child releases the bare fork handle with `keepOpen` and reattaches the new id (`session/resume`, else `session/load`) before its first turn, so the wire order is always `session/fork` < `session/resume` < `session/prompt`; on the `live` backends (pi, OpenCode) the fork handle is the session. Claude forks must keep the source cwd; a custom entry wrapping claude-agent-acp or codex-acp must declare `fork: { disposition: "id-only" }`. A per-turn `schema` is accepted only on Codex (whose schema rides each turn's `_meta.outputSchema`); every other backend binds the schema at session open, so pass it to the constructor. `AcpAgent.probe()` returns the same `HarnessConfigReport` as `probeHarnessConfig` plus a `models` view, and keeps the bare harness catalog next to a failed exact-model probe.
+
 ## Authentication lifecycle
 
 The built-in runner is auth-capable without widening the minimal `AgentRunner` interface.
@@ -317,7 +349,7 @@ From [`src/index.ts`](./src/index.ts):
 - **Auth/provider lifecycle methods** — `describeAuthMethods()`, `completeAuth()`, `runner.auth`, `authMethods()`, `authenticate()`, `listProviders()`, `setProvider()`, `disableProvider()`, and `logout()`; see [docs/api.md](../../docs/api.md) for capability gating and installed adapter support. A successful `setProvider()` records a durable routing intent (`ProviderStore`) replayed on every fresh connection's `initialize` — provider config is in-process agent state for e.g. codex-acp, so record → recycle → replay is what makes it stick across the pool.
 - **Session lifecycle methods** — `listSessions()`, `deleteSession()`, `loadSession()`, `resumeSession()`, and `forkSession()` for backends that advertise session persistence; see [docs/api.md](../../docs/api.md).
 - **`InteractiveSession` / `InteractiveSessionOptions` / `InteractiveTurn` / `SteeringResponse`** — the held-open multi-turn session surface returned by `openSession()`; `InteractiveSession.steer()` is available only while its original `prompt()` is in flight and returns the raw extension response.
-- **`AcpAgent`** (+ `AcpAgentOptions`, `AcpAgentPromptOptions`, `AcpAgentTurn`, `AcpAgentForkOptions`, `AcpAgentReopenOptions`, `AcpAgentProbeOptions`, `AcpAgentCatalog`, `AcpAgentState`, `AcpAgentTurnError` / `isAcpAgentTurnError`) — the SDK-style front door: one dedicated ACP process per agent, a per-agent FIFO (`prompt`/`fork`/`setMode`/`setConfigOptions`/`close` serialize behind the in-flight turn; `steer`/`cancel` overlap it), verbatim per-turn results (`turn.response` incl. `_meta`, every `updates`/`raw` record, folded `toolCalls`, per-turn `usage`), live `fork()` on a new process following the backend's `FORK_SESSION_TRAITS` row (id-only backends are reattached before their first turn), `close({ keep })`, `Symbol.asyncDispose`, the cold statics `AcpAgent.resume/load/fork(ref)` routed by `ref.backendId` (never the default backend), and `AcpAgent.probe()` — the same catalog `probeHarnessConfig` produces, on one disposed process per target. A typed session failure rejects `prompt()` with the runner's mapped `WorkflowError` carrying the complete turn as `error.turn`.
+- **`AcpAgent`** (+ `AcpAgentOptions`, `AcpAgentPromptOptions`, `AcpAgentTurn`, `AcpAgentForkOptions`, `AcpAgentReopenOptions`, `AcpAgentProbeOptions`, `AcpAgentCatalog`, `AcpAgentState`, `AcpAgentTurnError` / `isAcpAgentTurnError`) — the SDK-style front door: one dedicated ACP process per agent, a per-agent FIFO (`prompt`/`fork`/`setMode`/`setConfigOptions`/`close` serialize behind the in-flight turn; `steer`/`cancel` overlap it), verbatim per-turn results (`turn.response` incl. `_meta`, every `updates`/`raw` record, folded `toolCalls`, per-turn `usage`), live `fork()` on a new process following the backend's `FORK_SESSION_TRAITS` row (id-only backends are reattached before their first turn), `close({ keep })`, `Symbol.asyncDispose`, the cold statics `AcpAgent.resume/load/fork(ref)` routed by `ref.backendId` (never the default backend), and `AcpAgent.probe()` — the same catalog `probeHarnessConfig` produces, on one disposed process per target. A typed session failure rejects `prompt()` with the runner's mapped `WorkflowError` carrying the complete turn as `error.turn`. Quick start above; full reference in [docs/api.md](../../docs/api.md#acpagent-sdk). `@automatalabs/workflows` re-exports the class, `isAcpAgentTurnError`, and the types.
 - **`ProbeConfigOptionsOptions` / `ProbedConfigOptions` / `SessionConfigOption`** — the no-prompt probe controls, routed result, and verbatim ACP advertised-option wire shape.
 - **`probeHarnessConfig` / `buildHarnessModelsView` / `buildHarnessConfigSummary`** — the token-free harness config catalog (moved here from `@automatalabs/workflows`, which re-exports it): one no-prompt session per requested harness resolving to a `HarnessConfigReport` (`ValidateHarnessOptions[]` plus the bounded `authoringSummary`), the `--models` view builders (`buildModelFilter`, `selectChoicePairs`, `summarizeSelectChoices`), `formatHarnessConfigSummary`, and the `ValidateProbeRunner` seam a host passes as `probeRunner` to reuse its own live runner.
 - **`BUILTIN_BACKENDS` / `ThoughtLevelDomainSemantics`** — the built-in registry declares whether each backend's thought-level values are an `"ordered"` ladder (Claude, Codex, Pi) or an `"exact-set"` (OpenCode). `builtinThoughtLevelDomainSemantics(id)` performs an exact lookup; an absent row means a custom/unknown backend and must be handled as `"exact-set"`.
