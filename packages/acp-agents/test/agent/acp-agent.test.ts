@@ -699,6 +699,32 @@ test("cwd and configOptions are validated synchronously before any spawn", async
   assert.deepEqual(readLog(), [], "the statics reject before spawning too");
 });
 
+test("a synchronous spawn failure closes the agent and surfaces as the mapped error", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
+  // Node's spawn() rejects a command with a NUL byte synchronously, inside PooledConnection.create.
+  const agent = track(new AcpAgent({ cwd, model: "nul", backends: { nul: { command: "node x" } }, label: "sync-spawn" }));
+  assert.equal(agent.state, "idle");
+  await assert.rejects(
+    () => agent.prompt("x"),
+    isCode(WorkflowErrorCode.AGENT_EXECUTION_ERROR, (error) => {
+      assert.match(error.message, /null bytes/);
+      assert.equal(error.agentLabel, "sync-spawn");
+    }),
+  );
+  assert.equal(agent.state, "closed", "an open that failed before spawning still closes the agent");
+  await assert.rejects(
+    () => agent.prompt("y"),
+    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /is closed/)),
+  );
+  assert.deepEqual(readLog(), [], "nothing was ever spawned");
+  assert.equal(liveConnectionCount(), 0, "nothing was retained for the exit hook");
+  await agent.close();
+  await assert.rejects(
+    () => AcpAgent.open({ cwd, model: "nul", backends: { nul: { command: "node x" } } }),
+    isCode(WorkflowErrorCode.AGENT_EXECUTION_ERROR),
+  );
+});
+
 test("wire errors are mapped: AUTH_REQUIRED with authContext, PROVIDER_USAGE_LIMIT with resetHint, generic recoverable", async () => {
   {
     const { cwd, readLog } = configure({ authRequiredOnNewSession: true, authMethods: [{ id: "api-key", name: "API Key" }] });

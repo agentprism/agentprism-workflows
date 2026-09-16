@@ -772,14 +772,17 @@ export class AcpAgent {
   }
 
   async #open(): Promise<void> {
-    const connection = PooledConnection.create(this.#backend, this.#connectionDeps());
-    this.#connection = connection;
-    retainOnExit(connection);
-    this.#bus.beginAcquisition();
-    this.#collectingReplay = true;
     let handle: SessionHandle | undefined;
     let plan: StructuredPlan | undefined;
     try {
+      // Inside the try: `create` spawns synchronously and can throw before any wire traffic
+      // (spawn argument validation, missing stdio pipes, a backend's `spawnConfig()` side
+      // effects); such a failure must close the agent and map like every other open failure.
+      const connection = PooledConnection.create(this.#backend, this.#connectionDeps());
+      this.#connection = connection;
+      retainOnExit(connection);
+      this.#bus.beginAcquisition();
+      this.#collectingReplay = true;
       const seed = this.#seed;
       let replayed = false;
       if (seed.kind === "new") {
