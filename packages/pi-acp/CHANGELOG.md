@@ -1,5 +1,16 @@
 # @automatalabs/pi-acp
 
+## 0.9.0
+
+### Minor Changes
+
+- 5311099: Backend-neutral system prompt instructions: one `systemPrompt: { replace?, append? }` option (`SystemPromptOptions`) on `RunOptions`, `InteractiveSessionOptions`, and `AcpAgentOptions`, validated against the routed backend before a session opens and carried on the session `_meta` in each backend's own dialect.
+
+  - **shared-types (breaking):** `RunOptions.baseInstructions` / `developerInstructions` are removed and replaced by `systemPrompt?: SystemPromptOptions` (`replace` swaps the backend's built-in system prompt, `append` adds to it). New `META_KEYS.systemPrompt`, `ClaudeSystemPromptMeta` / `ClaudeCodeSessionMeta.systemPrompt`, and `PiSystemPromptMeta` wire types.
+  - **acp-agents (breaking):** `AcpAgentOptions.instructions` (`{ base, developer }`) is replaced by `systemPrompt`; `RunOptions` / `InteractiveSessionOptions` / `AcpSessionOptions` / `SessionMetaInputs` drop the Codex-only fields for the same shape. Every backend declares what it carries (`Backend.systemPrompt`, the executable `SYSTEM_PROMPT_SUPPORT` table pinned against the installed adapter dists and the docs): Codex maps `replace` / `append` onto its bare `baseInstructions` / `developerInstructions` keys; **Claude** now drives `claude-agent-acp`'s `_meta.systemPrompt` (a string for `replace`, `{ append }` for `append`, one joined replacement string for both); **pi** sends `_meta.systemPrompt { replace?, append? }` to pi-acp; OpenCode and custom registry backends carry no channel. `assertSystemPromptSupported` (exported) runs in `prepareSession`, the `AcpAgent` constructor, `fork()`, and the cold statics: a field the backend cannot carry, an unknown field, or a blank string is a non-recoverable `SCRIPT_VALIDATION_ERROR` naming the backend — instructions are never silently dropped, on any backend (previously Claude, pi, and OpenCode ignored them). The instructions ride `session/new`, `session/resume`, `session/load`, and `session/fork` (so an id-only fork's reattach carries them too), win over the same key in `meta`, and are inherited by forks.
+  - **pi-acp:** new session system-prompt channel. `_meta.systemPrompt` on `session/new` / `resume` / `load` / `fork` — a string or `{ replace?, append? }` — becomes pi's `DefaultResourceLoader` overrides (`replace` takes the custom-prompt slot, `append` lands after the operator's append entries); advertised at initialize as `_meta.systemPrompt: { replace: true, append: true }`. A malformed value is rejected with `-32602` / `errorKind: "invalid_system_prompt"` (`data.field` names the offender) before any session state exists.
+  - **repl-engine / workflows / workflow-engine:** the broker's structural session-options type and the facade barrels follow the seam (`SystemPromptOptions` is re-exported; the README documents the option in place of the Codex-only pair). Workflow scripts' `agent()` option whitelist is unchanged.
+
 ## 0.8.0
 
 ### Minor Changes
