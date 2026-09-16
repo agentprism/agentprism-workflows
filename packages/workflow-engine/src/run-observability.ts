@@ -20,6 +20,7 @@ import type {
   WorkflowRunStatus,
   WorkflowReplayEligibility,
 } from "@automatalabs/shared-types";
+import { redactText, truncateUtf8 } from "@automatalabs/shared-types";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { RunStatus } from "./run-persistence.js";
 
@@ -29,7 +30,6 @@ const MAX_PHASES = 64;
 const MAX_RESULT_DEPTH = 4;
 const MAX_ARRAY_ITEMS = 10;
 const MAX_OBJECT_KEYS = 20;
-const TRUNCATED_SUFFIX = "…[truncated]";
 
 export interface RunObservabilitySource {
   runId: string;
@@ -86,66 +86,6 @@ const SENSITIVE_KEY_PARTS = [
   "cookie",
   "privatekey",
 ] as const;
-
-const SENSITIVE_ASSIGNMENT =
-  /\b([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|credential|authorization|cookie|private[_-]?key)[A-Za-z0-9_.-]*)\s*([:=])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
-const PEM_PRIVATE_KEY = /-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/gi;
-const AUTH_CREDENTIAL = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+\/-]+=*/gi;
-const URL_USER_INFO = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
-const JWT = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g;
-const KNOWN_CREDENTIAL =
-  /(?<![A-Za-z0-9_-])(?:github_pat_|sk-proj-|ghp_|gho_|ghu_|ghs_|xoxb-|xoxp-|sk-|AKIA|ASIA)[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])/g;
-const OPAQUE_TOKEN =
-  /(?<![A-Za-z0-9+/_=-])(?=[A-Za-z0-9+/_=-]{32,}(?![A-Za-z0-9+/_=-]))(?=[A-Za-z0-9+/_=-]*[A-Za-z])(?=[A-Za-z0-9+/_=-]*\d)[A-Za-z0-9+/_=-]{32,}(?![A-Za-z0-9+/_=-])/g;
-
-function replaceAndTrack(value: string, pattern: RegExp, replacement: string | ((...args: string[]) => string)) {
-  let changed = false;
-  const output = value.replace(pattern, (...args: string[]) => {
-    changed = true;
-    return typeof replacement === "string" ? replacement : replacement(...args);
-  });
-  return { output, changed };
-}
-
-/** Redact credential-shaped text without offering a raw escape hatch. */
-export function redactText(value: string): { value: string; redacted: boolean } {
-  let output = value;
-  let redacted = false;
-  const apply = (pattern: RegExp, replacement: string | ((...args: string[]) => string)) => {
-    const result = replaceAndTrack(output, pattern, replacement);
-    output = result.output;
-    redacted ||= result.changed;
-  };
-
-  apply(PEM_PRIVATE_KEY, "[REDACTED]");
-  apply(AUTH_CREDENTIAL, "[REDACTED]");
-  apply(URL_USER_INFO, (_match, scheme) => `${scheme}[REDACTED]@`);
-  apply(JWT, "[REDACTED]");
-  apply(SENSITIVE_ASSIGNMENT, (_match, key, separator) => `${key}${separator}[REDACTED]`);
-  apply(KNOWN_CREDENTIAL, "[REDACTED]");
-  apply(OPAQUE_TOKEN, "[REDACTED]");
-  return { value: output, redacted };
-}
-
-/** Shorten UTF-8 text without splitting a Unicode code point. */
-export function truncateUtf8(value: string, maxBytes: number, suffix = TRUNCATED_SUFFIX): string {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-  const suffixBytes = Buffer.byteLength(suffix, "utf8");
-  if (suffixBytes >= maxBytes) {
-    let shortSuffix = "";
-    for (const point of suffix) {
-      if (Buffer.byteLength(shortSuffix + point, "utf8") > maxBytes) break;
-      shortSuffix += point;
-    }
-    return shortSuffix;
-  }
-  let kept = "";
-  for (const point of value) {
-    if (Buffer.byteLength(kept + point, "utf8") + suffixBytes > maxBytes) break;
-    kept += point;
-  }
-  return kept + suffix;
-}
 
 function sanitizeText(value: string): SanitizedText {
   const redacted = redactText(value);

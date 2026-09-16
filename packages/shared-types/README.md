@@ -158,6 +158,14 @@ From [`src/index.ts`](./src/index.ts):
 - `AgentHistoryEntry`, `AgentHistoryRole`, `AgentHistoryKind` (diagnostic, via `onHistory`).
 - `META_KEYS`, `CODEX_META_KEYS`, `ClaudeCodeSessionMeta`, `ClaudeJsonSchemaOutputFormat`.
 
+**Text sanitizers** (runtime, Node-free)
+- `redactText(value)` replaces credential-shaped text (PEM private keys, `Bearer`/`Basic`
+  credentials, URL user-info, JWTs, `key=value` secret assignments, known token prefixes, long
+  opaque tokens) with `[REDACTED]` and reports whether anything changed.
+- `truncateUtf8(value, maxBytes, suffix?)` shortens text to a UTF-8 byte budget without
+  splitting a code point, appending `...[truncated]` (or a custom suffix). Both are re-exported by
+  `@automatalabs/workflow-engine` and `@automatalabs/workflows`.
+
 ## License
 
 Apache-2.0
