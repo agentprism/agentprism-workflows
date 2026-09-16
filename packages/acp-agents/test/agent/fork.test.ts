@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ContentBlock, SessionConfigOption, SessionModeState } from "@agentclientprotocol/sdk";
 import { isWorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
+import { Type } from "typebox";
 import {
   AcpAgent,
   ClaudeBackend,
@@ -29,6 +30,7 @@ interface LogEntry {
     modeId?: string;
     value?: string | boolean;
     prompt?: ContentBlock[];
+    _meta?: Record<string, unknown>;
   };
 }
 
@@ -276,6 +278,39 @@ test("fork inherits options, suffixes the label, drops the signal, re-applies mo
   await waitFor(() => parent.state === "closed");
   assert.equal(child.state, "ready");
   assert.equal(second.state, "ready");
+  assert.equal((await child.prompt("go")).text, "child");
+});
+
+test("fork overrides set to undefined are not overrides: the child keeps the parent's schema, mode, config options, and model", async () => {
+  const schema = Type.Object({ answer: Type.Number() });
+  const { cwd, readLog } = configure({
+    lifecycleSupport: true,
+    modes: MODES,
+    configOptions: [MODEL, EFFORT],
+    forkSession: { idOnly: true, turns: [{ text: "child" }] },
+    turns: [{ text: "parent" }],
+  });
+  const parent = track(
+    await AcpAgent.open({ cwd, model: "claude/opus", label: "primary", mode: "plan", configOptions: { effort: "high" }, schema }),
+  );
+  // Every key an author might pass through from an optional variable, all `undefined`.
+  const child = track(
+    await parent.fork({ schema: undefined, mode: undefined, configOptions: undefined, model: undefined, retainHistory: undefined, meta: undefined }),
+  );
+  assert.equal(child.schema, schema, "the parent's schema survives an undefined override");
+  assert.equal(child.modes?.currentModeId, "plan");
+  assert.equal(child.configOptions.find((option) => option.id === "effort")?.currentValue, "high");
+  assert.equal(child.configOptions.find((option) => option.id === "model")?.currentValue, "opus");
+
+  const log = readLog();
+  const forkEntry = log.find((entry) => entry.method === "forkSession");
+  const forkMeta = forkEntry?.params?._meta as { claudeCode?: { options?: { outputFormat?: unknown } } } | undefined;
+  assert.ok(forkMeta?.claudeCode?.options?.outputFormat, "the session schema rode the child's session/fork _meta");
+  const resumeIndex = log.findIndex((entry) => entry.method === "resumeSession" && entry.params?.sessionId === child.sessionId);
+  const applied = entriesFor(log.slice(resumeIndex + 1), child.sessionId).map((entry) =>
+    entry.method === "setSessionConfigOption" ? `${entry.method}:${entry.params?.configId}=${String(entry.params?.value)}` : `${entry.method}:${entry.params?.modeId ?? ""}`,
+  );
+  assert.deepEqual(applied, ["setSessionConfigOption:model=opus", "setSessionConfigOption:effort=high", "setSessionMode:plan"]);
   assert.equal((await child.prompt("go")).text, "child");
 });
 

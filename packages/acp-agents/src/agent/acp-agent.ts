@@ -600,9 +600,15 @@ export class AcpAgent {
       const n = (this.#forkCount += 1);
       const label = overrides.label ?? (this.label ? `${this.label}/fork-${n}` : `fork-${n}`);
       const cwd = overrides.cwd ?? this.cwd;
+      // An override set to `undefined` means "not overridden" (`fork({ schema: maybeSchema })` with
+      // an undefined variable type-checks): drop such keys so the spread cannot erase the parent's
+      // value.
+      const defined = Object.fromEntries(
+        Object.entries(overrides).filter(([, value]) => value !== undefined),
+      ) as AcpAgentForkOptions;
       const merged: AcpAgentOptions = {
         ...this.#options,
-        ...overrides,
+        ...defined,
         cwd,
         label,
         signal: overrides.signal,
