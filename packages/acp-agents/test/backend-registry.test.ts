@@ -210,6 +210,7 @@ test("definition helper rejects profile, factory id, and profile-object mismatch
 test("source drift locks registry imports and import hygiene, including type-only syntax", () => {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
   const runner = readFileSync(resolve(root, "packages/acp-agents/src/runner.ts"), "utf8");
+  const routing = readFileSync(resolve(root, "packages/acp-agents/src/routing.ts"), "utf8");
   const catalog = readFileSync(resolve(root, "packages/acp-agents/src/config-catalog.ts"), "utf8");
   const define = readFileSync(resolve(root, "packages/acp-agents/src/backends/define.ts"), "utf8");
   const coverage = readFileSync(resolve(root, "packages/acp-agents/src/protocol-coverage.ts"), "utf8");
@@ -217,22 +218,32 @@ test("source drift locks registry imports and import hygiene, including type-onl
 
   assert.match(runner, /from "\.\/backends\/builtins\.js"/);
   assert.match(runner, /BUILTIN_BACKEND_IDS/);
-  assert.match(runner, /builtinBackend/);
   assert.match(
     runner,
     /listBackends\(\)[\s\S]*?new Set<string>\(BUILTIN_BACKEND_IDS\)/,
   );
-  assert.match(
+  // Routing moved out of the runner as a whole (routing.ts); the runner only imports it back.
+  assert.match(runner, /from "\.\/routing\.js"/);
+  assert.match(runner, /from "\.\/session-ref\.js"/);
+  assert.doesNotMatch(
     runner,
+    /function resolveModelRoute|function defaultBackend|function assertNoModelConfigOption|function sessionRefFor/,
+  );
+  assertNoConcreteBackendDependencies(runner, new Set(["builtins"]));
+  assertNoIdentityEqualityBranches(runner);
+  assert.doesNotMatch(runner, /\bfunction\s+builtinBackend\b/);
+  assert.match(routing, /builtinBackend/);
+  assert.match(
+    routing,
     /const custom = registry\?\.get\(firstSegment\);[\s\S]*?const builtIn = builtinBackend\(firstSegment\);/,
   );
   assert.match(
-    runner,
+    routing,
     /function defaultBackend[\s\S]*?registry\.get\(name\)[\s\S]*?builtinBackend\(name\)[\s\S]*?BUILTIN_BACKENDS\.claude\.create\(\)/,
   );
-  assertNoConcreteBackendDependencies(runner, new Set(["builtins", "custom"]));
-  assertNoIdentityEqualityBranches(runner);
-  assert.doesNotMatch(runner, /\bfunction\s+builtinBackend\b/);
+  assertNoConcreteBackendDependencies(routing, new Set(["builtins", "custom"]));
+  assertNoIdentityEqualityBranches(routing);
+  assert.doesNotMatch(routing, /\bfunction\s+builtinBackend\b/);
   assert.match(
     catalog,
     /from "\.\/backends\/builtins\.js"[\s\S]*?\[\.\.\.BUILTIN_BACKEND_IDS, \.\.\.registry\.keys\(\)\]/,

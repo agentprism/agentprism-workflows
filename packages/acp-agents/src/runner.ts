@@ -22,7 +22,6 @@ import {
   WorkflowErrorCode,
   type AgentResult,
   type AgentRunner,
-  type AgentSessionRef,
   type ContinuationSkipReason,
   type RunOptions,
 } from "@automatalabs/shared-types";
@@ -63,12 +62,7 @@ import {
 } from "./events.js";
 import type { Backend } from "./backend.js";
 import { InteractiveSession, type InteractiveSessionOptions } from "./interactive.js";
-import {
-  BUILTIN_BACKENDS,
-  BUILTIN_BACKEND_IDS,
-  builtinBackend,
-} from "./backends/builtins.js";
-import { CustomAcpBackend } from "./backends/custom.js";
+import { BUILTIN_BACKEND_IDS } from "./backends/builtins.js";
 import {
   registryWithRunBackends,
   resolveBackendRegistry,
@@ -76,6 +70,8 @@ import {
   type CustomBackendConfig,
 } from "./registry.js";
 import { mapThrownError } from "./errors-map.js";
+import { assertNoModelConfigOption, resolveModelRoute } from "./routing.js";
+import { sessionRefFor } from "./session-ref.js";
 import {
   buildAuthDescriptor,
   type AuthContext,
@@ -1520,67 +1516,11 @@ async function applyModelSelection(
   opts.onModelResolved?.(spec);
 }
 
-function assertNoModelConfigOption(
-  configOptions: Record<string, string | boolean> | undefined,
-  label: string | undefined,
-): void {
-  if (!configOptions || !("model" in configOptions)) return;
-  throw new WorkflowError(
-    `Agent call${label ? ` "${label}"` : ""} configOptions must not contain reserved option id "model"; use the model field instead`,
-    WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-    { recoverable: false, agentLabel: label },
-  );
-}
-
 /** Pick the backend for the effective model spec (`model` wins over `tier`). The first segment
  *  routes only when it is a registered custom or built-in harness name; everything else goes to
  *  the configured default backend without interpretation. */
 export function selectBackend(opts: { model?: string; tier?: string }, registry?: BackendRegistry): Backend {
   return resolveModelRoute(opts.model ?? opts.tier, registry).backend;
-}
-
-interface ModelRoute {
-  backend: Backend;
-  modelSpec: string | undefined;
-}
-
-/** Resolve routing and the verbatim model value together so backend choice and prefix stripping
- *  cannot drift. A registered custom name has priority over a built-in on collision. */
-function resolveModelRoute(spec: string | undefined, registry?: BackendRegistry): ModelRoute {
-  if (spec === undefined) return { backend: defaultBackend(registry), modelSpec: undefined };
-
-  const slash = spec.indexOf("/");
-  const firstSegment = asciiLowercase(slash >= 0 ? spec.slice(0, slash) : spec);
-  const inner = slash >= 0 ? spec.slice(slash + 1) : undefined;
-  const custom = registry?.get(firstSegment);
-  if (custom) return { backend: new CustomAcpBackend(custom), modelSpec: inner };
-
-  const builtIn = builtinBackend(firstSegment);
-  if (builtIn) return { backend: builtIn, modelSpec: inner };
-
-  return { backend: defaultBackend(registry), modelSpec: spec };
-}
-
-/** The re-attach handle for an open session: id + backend routing name + cwd + the
- *  agent-advertised reopen surface. Contains no secrets; JSON-round-trippable. `backendId`
- *  doubles as the `model` routing spec for loadSession/resumeSession/listSessions. */
-function sessionRefFor(session: SessionHandle, backend: Backend, cwd: string): AgentSessionRef {
-  const caps = session.capabilities;
-  return {
-    sessionId: session.sessionId,
-    backendId: backend.id,
-    poolKey: backend.poolKey ?? backend.id,
-    ...(session.initializeMeta !== undefined
-      ? { initializeMeta: session.initializeMeta }
-      : {}),
-    cwd,
-    reopen: {
-      load: caps?.supportsLoadSession === true,
-      resume: caps?.supportsResumeSession === true,
-      list: caps?.supportsListSessions === true,
-      fork: caps?.supportsForkSession === true,
-    },
-  };
 }
 
 /** Interactive sessions are public and long-lived, so fail before spawning a dedicated process
@@ -1684,24 +1624,4 @@ async function disposeBestEffort(connection: PooledConnection): Promise<void> {
   } catch {
     // Dedicated lifecycle processes are already no longer useful; never mask the request result.
   }
-}
-
-/** Resolve the default backend: a registered custom name wins (returned as a Backend), else
- *  the built-in id. An unknown/unset value falls back to "claude" (the historical default). */
-function defaultBackend(registry?: BackendRegistry): Backend {
-  const configured = process.env.AGENTPRISM_DEFAULT_BACKEND;
-  const name = configured === undefined ? undefined : asciiLowercase(configured);
-  if (name && registry) {
-    const config = registry.get(name);
-    if (config) return new CustomAcpBackend(config);
-  }
-  if (name) {
-    const builtIn = builtinBackend(name);
-    if (builtIn) return builtIn;
-  }
-  return BUILTIN_BACKENDS.claude.create();
-}
-
-function asciiLowercase(value: string): string {
-  return value.replace(/[A-Z]/g, (character) => String.fromCharCode(character.charCodeAt(0) + 32));
 }

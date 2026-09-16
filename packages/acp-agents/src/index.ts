@@ -5,6 +5,10 @@
 // @automatalabs/workflow-engine; the two siblings meet ONLY at AgentRunner, injected by the
 // @automatalabs/workflows facade (which mcp-server builds on) via createAcpRunner().
 export { AcpAgentRunner, createAcpRunner, selectBackend } from "./runner.js";
+// The full route (backend + stripped model value) behind selectBackend; `asciiLowercase`,
+// `assertNoModelConfigOption` (routing.ts) and `sessionRefFor` (session-ref.ts) stay module-internal.
+export { resolveModelRoute } from "./routing.js";
+export type { ModelRoute } from "./routing.js";
 export type {
   AcpRunnerOptions,
   AuthenticateOptions,
