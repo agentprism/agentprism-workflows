@@ -185,7 +185,7 @@ test("per-turn schema is rejected on claude, pi, opencode, and custom with a poi
       () => agent.prompt("x", { schema: SCHEMA }),
       (error: unknown) => {
         assert.ok(isWorkflowError(error));
-        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.equal(error.code, WorkflowErrorCode.INVALID_ARGUMENT);
         assert.match(error.message, new RegExp(`not supported on backend "${target.id}".*constructor`));
         return true;
       },

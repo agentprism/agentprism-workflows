@@ -74,6 +74,7 @@ import { mapThrownError } from "./errors-map.js";
 import { assertNoModelConfigOption, resolveModelRoute } from "./routing.js";
 import { assertSystemPromptSupported } from "./system-prompt.js";
 import { sessionRefFor } from "./session-ref.js";
+import { describeBackendTraits, type AcpAgentTraits } from "./traits.js";
 import {
   buildAuthDescriptor,
   type AuthContext,
@@ -155,6 +156,10 @@ export interface ProbedConfigOptions {
   options: SessionConfigOption[];
   /** Effective ACP mode catalog after normalizing the mode config-option fallback; null means unsupported. AcpAgentRunner always returns this field. */
   modes?: SessionModeState | null;
+  /** The backend's traits refined by the probe connection's initialize advertisements
+   *  (`describeBackendTraits`): pi and the Codex fork report their system-prompt channel as
+   *  `advertised`, Claude reports the table. AcpAgentRunner and the SDK probe always return it. */
+  traits?: AcpAgentTraits;
 }
 
 export interface ProbeConfigOptionsOptions {
@@ -489,10 +494,11 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
     if (this.disposed) throw new Error("ACP agent runner is disposed");
     opts.signal?.throwIfAborted();
     const cwd = opts.cwd ?? process.cwd();
+    const registry = registryWithRunBackends(this.backends, opts.backends);
     const prepared = this.prepareSession({ model: spec }, {
       cwd,
       schema: undefined,
-      registry: registryWithRunBackends(this.backends, opts.backends),
+      registry,
       signal: opts.signal,
     });
     let session: SessionHandle | undefined;
@@ -506,6 +512,7 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         ...(prepared.backend.defaultModeId === undefined ? {} : { defaultModeId: prepared.backend.defaultModeId }),
         options: session.advertisedConfigOptions,
         modes: session.modes ?? null,
+        traits: describeBackendTraits(prepared.backend, registry, session.capabilities),
       };
     } finally {
       try {

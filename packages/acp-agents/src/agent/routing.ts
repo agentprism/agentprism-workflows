@@ -1,4 +1,4 @@
-// Agent-facing routing over ../routing.js: the registry read (malformed → SCRIPT_VALIDATION_ERROR),
+// Agent-facing routing over ../routing.js: the registry read (malformed → INVALID_ARGUMENT),
 // the runner's model-spec grammar for `new AcpAgent({ model })`, the ref-driven route the cold
 // statics use (never the default backend), cwd validation that fails BEFORE a process spawns, and
 // the fresh-Backend-instance rule a fork child needs.
@@ -14,7 +14,8 @@ import { agentValidationError } from "./errors.js";
 import type { AcpAgentOptions } from "./types.js";
 
 /** The custom-backend registry for an agent: `backends` merged over `AGENTPRISM_BACKENDS`. A
- *  malformed registry is a caller error (SCRIPT_VALIDATION_ERROR), mirroring the runner's wrap. */
+ *  malformed registry is a caller error (INVALID_ARGUMENT; the runner's wrap says
+ *  SCRIPT_VALIDATION_ERROR for the same condition). */
 export function resolveAgentRegistry(
   backends: Record<string, CustomBackendConfig> | undefined,
   label?: string,

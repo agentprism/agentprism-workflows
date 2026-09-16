@@ -204,8 +204,8 @@ calls, usage), `fork()` seeds a parallel agent with everything committed so far,
 > prompt for the session on every backend that has a channel for it: `replace` swaps the built-in
 > prompt, `append` adds to it. Codex carries them as its `baseInstructions` / `developerInstructions`
 > thread params, Claude and pi as `_meta.systemPrompt`; OpenCode and custom backends have no
-> channel and **refuse** the option before a session opens (`SCRIPT_VALIDATION_ERROR`), so an
-> instruction is never silently dropped. Unlike `instructions`, which is folded into the prompt
+> channel and **refuse** the option before a session opens (`SCRIPT_VALIDATION_ERROR`; the `AcpAgent`
+> SDK says `INVALID_ARGUMENT`), so an instruction is never silently dropped. Unlike `instructions`, which is folded into the prompt
 > text for every backend. Per-backend wire details:
 > [acp-agents README — System prompt instructions](../acp-agents/README.md#system-prompt-instructions-systemprompt).
 >

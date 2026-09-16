@@ -25,7 +25,7 @@ const ref = (overrides: Partial<AgentSessionRef> = {}): AgentSessionRef => ({
 function rejects(run: () => unknown, pattern: RegExp): void {
   assert.throws(run, (error: unknown) => {
     assert.ok(isWorkflowError(error), `expected a WorkflowError, got ${String(error)}`);
-    assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+    assert.equal(error.code, WorkflowErrorCode.INVALID_ARGUMENT);
     assert.match(error.message, pattern);
     return true;
   });
@@ -93,7 +93,7 @@ test("resolveRefRoute honors custom-shadows-builtin, poolKey mismatch, same-back
 });
 
 test(
-  "validateAgentCwd reports a cwd it cannot stat (EACCES) as SCRIPT_VALIDATION_ERROR, not a raw Node error",
+  "validateAgentCwd reports a cwd it cannot stat (EACCES) as INVALID_ARGUMENT, not a raw Node error",
   { skip: process.platform === "win32" || process.getuid?.() === 0 ? "needs a non-root POSIX user" : false },
   () => {
     const parent = mkdtempSync(join(tmpdir(), "acp-agent-cwd-eacces-"));
@@ -106,7 +106,7 @@ test(
         () => new AcpAgent({ cwd: inner, label: "lbl" }),
         (error: unknown) => {
           assert.ok(isWorkflowError(error), `expected a WorkflowError, got ${String(error)}`);
-          assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+          assert.equal(error.code, WorkflowErrorCode.INVALID_ARGUMENT);
           assert.equal(error.agentLabel, "lbl");
           assert.match(error.message, /AcpAgent cwd is not accessible/);
           return true;

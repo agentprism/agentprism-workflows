@@ -39,7 +39,7 @@ export type { SessionConfigOption, SessionModeState };
 
 export interface AcpAgentOptions {
   /** ABSOLUTE path that exists and is a directory. Validated synchronously in the constructor and
-   *  the statics BEFORE any process spawns (SCRIPT_VALIDATION_ERROR otherwise). Sent as the
+   *  the statics BEFORE any process spawns (INVALID_ARGUMENT otherwise). Sent as the
    *  session/new|fork|resume|load `cwd`. */
   cwd: string;
   /** Model routing spec with the runner's grammar (`resolveModelRoute`): the first `/`-segment
@@ -48,13 +48,13 @@ export interface AcpAgentOptions {
    *  the session opens. An unrouted spec (no known first segment) goes WHOLE to the default backend
    *  (`AGENTPRISM_DEFAULT_BACKEND`, else `claude`). Omitted = default backend, no model selection. */
   model?: string;
-  /** Session mode. Explicit ids are strict (unadvertised → SCRIPT_VALIDATION_ERROR at open).
+  /** Session mode. Explicit ids are strict (unadvertised → INVALID_ARGUMENT at open).
    *  Omitted = the backend's `defaultModeId` when advertised (claude `auto`, codex `agent`,
    *  opencode `build`; pi/custom none). */
   mode?: string;
   /** Applied verbatim via `session/set_config_option` in ascending option-id order after model
-   *  selection. `"model"` is reserved (SCRIPT_VALIDATION_ERROR in the constructor). Ids not in the
-   *  advertised catalog fail at open with SCRIPT_VALIDATION_ERROR listing the advertised ids. */
+   *  selection. `"model"` is reserved (INVALID_ARGUMENT in the constructor). Ids not in the
+   *  advertised catalog fail at open with INVALID_ARGUMENT listing the advertised ids. */
   configOptions?: Record<string, string | boolean>;
   /** Session-level structured-output contract (typebox). Claude: `_meta.claudeCode.options.outputFormat`
    *  at session/new|resume|load|fork; Codex: `_meta.outputSchema` on every turn; OpenCode/pi/custom:
@@ -78,7 +78,7 @@ export interface AcpAgentOptions {
   /** Backend-neutral system prompt instructions: `replace` swaps the backend's built-in system
    *  prompt, `append` adds to it. Validated in the constructor (and `fork()` / the statics) against
    *  the routed backend's `Backend.systemPrompt` support BEFORE any process spawns — a field the
-   *  backend cannot carry is SCRIPT_VALIDATION_ERROR, never a silent no-op (Codex and Claude and pi
+   *  backend cannot carry is INVALID_ARGUMENT, never a silent no-op (Codex and Claude and pi
    *  carry both; OpenCode and custom backends carry neither). Sent on `session/new|resume|load`
    *  and the reattach of an id-only fork in the backend's dialect: Codex `_meta.baseInstructions`
    *  / `_meta.developerInstructions`, Claude `_meta.systemPrompt` (string, or `{ append }`), pi
@@ -90,7 +90,7 @@ export interface AcpAgentOptions {
   label?: string;
   /** Custom backend registry merged over `AGENTPRISM_BACKENDS` exactly like
    *  `createAcpRunner({ backends })`. Read once in the constructor; malformed →
-   *  SCRIPT_VALIDATION_ERROR. Forks inherit it and cannot override it. */
+   *  INVALID_ARGUMENT. Forks inherit it and cannot override it. */
   backends?: Record<string, CustomBackendConfig>;
   /** Agent-lifetime abort: rejects queued work with `signal.reason`, cancels an in-flight turn,
    *  then closes. Not inherited by forks. */
@@ -126,7 +126,7 @@ export interface AcpAgentPromptOptions {
   /** Applied via `session/set_mode` before this turn, inside the FIFO; sticky; strict. */
   mode?: string;
   /** Per-turn schema override. Allowed ONLY when the backend carries the schema on the turn and
-   *  does not embed it in the prompt (today: Codex). Otherwise SCRIPT_VALIDATION_ERROR naming the
+   *  does not embed it in the prompt (today: Codex). Otherwise INVALID_ARGUMENT naming the
    *  backend and pointing at the constructor `schema` option. */
   schema?: TSchema;
   /** Per-call abort: queued, or started but not yet on the wire (the lazy open, the per-turn
@@ -148,7 +148,7 @@ export interface AcpAgentCloseOptions {
 }
 
 /** Everything a fork may override. The backend is fixed by the parent: a `model` override must
- *  route to the same backend (poolKey-equal) or SCRIPT_VALIDATION_ERROR. `backends`, `authStore`,
+ *  route to the same backend (poolKey-equal) or INVALID_ARGUMENT. `backends`, `authStore`,
  *  `providerStore`, `clientHandlers` are inherited and not overridable. `label` defaults to
  *  `<parent label>/fork-<n>` (or `fork-<n>`); `signal` is never inherited. `cwd` defaults to the
  *  parent's; a different cwd is rejected on `cwd: "source-only"` backends (`FORK_SESSION_TRAITS`). */

@@ -106,8 +106,12 @@ string or an object:
 
 - a **string**, or `{ replace }`, replaces pi's built-in system prompt: it takes pi's custom-prompt
   slot (the `SYSTEM.md` / `--system-prompt` slot) through the resource loader's
-  `systemPromptOverride`, so pi's tool snippets, guidelines, context files, and skills are still
-  assembled around it exactly as for an operator-configured prompt;
+  `systemPromptOverride`, exactly as for an operator-configured prompt. With a custom prompt pi's
+  `buildSystemPrompt` **drops its default instruction text** — the "Available tools" list with its
+  snippets, its guidelines, and the pi docs/examples paths — and still appends, in this order, the
+  append-system-prompt entries, the project context files (`AGENTS.md` and friends inside
+  `<project_context>`), the skills block (when a `read` or `bash` tool is available), and the
+  `Current working directory` line;
 - `{ append }` is added as one more append-system-prompt entry **after** the operator's own
   configured entries (`appendSystemPromptOverride`), so it never displaces them;
 - `{ replace, append }` does both.

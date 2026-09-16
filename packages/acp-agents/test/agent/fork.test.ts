@@ -81,7 +81,7 @@ function isSessionNotFound(error: unknown): boolean {
 function validation(pattern: RegExp) {
   return (error: unknown): boolean => {
     assert.ok(isWorkflowError(error), `expected a WorkflowError, got ${String(error)}`);
-    assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+    assert.equal(error.code, WorkflowErrorCode.INVALID_ARGUMENT);
     assert.match(error.message, pattern);
     return true;
   };
@@ -483,7 +483,7 @@ test("fork inherits systemPrompt (sent on the fork and its reattach), honors an 
   await assert.rejects(
     () => parent.fork({ systemPrompt: { append: "  " } }),
     (error: unknown) =>
-      isWorkflowError(error) && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR && /append must be a non-empty string/.test(error.message),
+      isWorkflowError(error) && error.code === WorkflowErrorCode.INVALID_ARGUMENT && /append must be a non-empty string/.test(error.message),
   );
   assert.equal(readLog().filter((entry) => entry.method === "__start").length, spawns, "the refused fork spawned nothing");
 });

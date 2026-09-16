@@ -385,7 +385,7 @@ test("steer overlaps an in-flight turn and is rejected when idle", async () => {
   await parked;
   await assert.rejects(
     () => agent.steer("late"),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /requires a prompt\(\) in flight/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /requires a prompt\(\) in flight/)),
   );
 });
 
@@ -421,7 +421,7 @@ test("a turn that ignores cancel ends in process disposal without session/close,
     assert.ok(wire.includes("cancel"));
     assert.equal(wire.includes("closeSession"), false, "no wire session/close: the session stays re-openable");
     assert.equal(agent.sessionRef?.sessionId, agent.sessionId);
-    await assert.rejects(() => agent.prompt("z"), isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (e) => assert.match(e.message, /is closed/)));
+    await assert.rejects(() => agent.prompt("z"), isCode(WorkflowErrorCode.INVALID_ARGUMENT, (e) => assert.match(e.message, /is closed/)));
     await agent.close();
     await waitFor(() => liveConnectionCount() === 0);
   } finally {
@@ -446,11 +446,11 @@ test("per-turn configOptions/mode apply before the turn and stick; unknown ids a
   const before = readLog().length;
   await assert.rejects(
     () => agent.prompt("y", { configOptions: { model: "m" } }),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /reserved option id "model"/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /reserved option id "model"/)),
   );
   await assert.rejects(
     () => agent.prompt("y", { configOptions: { nope: true } }),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /not advertised.*model, effort/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /not advertised.*model, effort/)),
   );
   assert.equal(readLog().length, before, "the rejections never reached the wire");
   assert.equal(agent.state, "ready");
@@ -480,7 +480,7 @@ test("close({ keep: true }) skips session/close, disposes the process, and retai
   assert.equal(count(readLog(), "__exit"), 1, "a second close() is the same teardown");
   await assert.rejects(
     () => agent.prompt("z"),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /is closed/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /is closed/)),
   );
   await assert.rejects(() => agent.ready(), /is closed/);
   await assert.rejects(() => agent.fork(), /is closed/);
@@ -529,7 +529,7 @@ test("process death closes the agent, rejects queued work, and emits backend_err
   await assert.rejects(first, isCode(WorkflowErrorCode.AGENT_EXECUTION_ERROR));
   await assert.rejects(
     queued,
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /process exited/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /process exited/)),
   );
   assert.equal(agent.state, "closed");
   assert.equal(errors.length, 1, "backend_error reaches the agent's own listeners");
@@ -688,7 +688,7 @@ test("a per-call signal aborted while queued never reaches the wire; aborted in 
 
 test("cwd and configOptions are validated synchronously before any spawn", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
-  const validation = isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+  const validation = isCode(WorkflowErrorCode.INVALID_ARGUMENT);
   assert.throws(() => new AcpAgent({ cwd: "relative" }), validation);
   assert.throws(() => new AcpAgent({ cwd: "" }), validation);
   assert.throws(() => new AcpAgent({ cwd: join(cwd, "missing", "dir") }), validation);
@@ -721,7 +721,7 @@ test("a synchronous spawn failure closes the agent and surfaces as the mapped er
   assert.equal(agent.state, "closed", "an open that failed before spawning still closes the agent");
   await assert.rejects(
     () => agent.prompt("y"),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => assert.match(error.message, /is closed/)),
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => assert.match(error.message, /is closed/)),
   );
   assert.deepEqual(readLog(), [], "nothing was ever spawned");
   assert.equal(liveConnectionCount(), 0, "nothing was retained for the exit hook");
@@ -913,7 +913,7 @@ test("systemPrompt is validated in the constructor against the routed backend, b
   // OpenCode carries no channel: refused synchronously with the backend named.
   assert.throws(
     () => new AcpAgent({ cwd, model: "opencode", label: "oc", systemPrompt: { replace: "R" } }),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => {
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => {
       assert.match(error.message, /systemPrompt\.replace is not supported by backend "opencode"/);
       assert.equal(error.agentLabel, "oc");
     }),
@@ -921,13 +921,13 @@ test("systemPrompt is validated in the constructor against the routed backend, b
   // A malformed value is refused on a supporting backend too.
   assert.throws(
     () => new AcpAgent({ cwd, model: "claude", systemPrompt: { append: "" } }),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => {
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => {
       assert.match(error.message, /systemPrompt\.append must be a non-empty string/);
     }),
   );
   assert.throws(
     () => new AcpAgent({ cwd, model: "claude", systemPrompt: { base: "x" } as never }),
-    isCode(WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, (error) => {
+    isCode(WorkflowErrorCode.INVALID_ARGUMENT, (error) => {
       assert.match(error.message, /unknown field "base"/);
     }),
   );

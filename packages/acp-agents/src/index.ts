@@ -257,6 +257,10 @@ export type {
 } from "./protocol-coverage.js";
 // The one validator every front door runs on `systemPrompt` before a session opens.
 export { assertSystemPromptSupported, describeSystemPromptSupport } from "./system-prompt.js";
+// Per-agent traits: the tables before open, the live initialize advertisements after (`AcpAgent#traits`,
+// `AcpAgent.traits()`, and the `traits` field of every probe result).
+export { describeBackendTraits } from "./traits.js";
+export type { AcpAgentTraits } from "./traits.js";
 
 // ACP standard capability negotiation. Vendor initialize metadata stays raw for extension owners.
 export {

@@ -35,12 +35,19 @@ import type { NegotiatedCapabilities } from "../capabilities.js";
 import { validateClientHandlers } from "../client-handlers.js";
 import type { ErrorMapContext } from "../errors-map.js";
 import { appendPromptImages, buildRunPrompt, mergeTurnMeta, validatePromptImages } from "../prompt.js";
-import type { BackendRegistry } from "../registry.js";
+import type { BackendRegistry, CustomBackendConfig } from "../registry.js";
 import { assertNoModelConfigOption, resolveModelRoute } from "../routing.js";
 import { sessionRefFor } from "../session-ref.js";
 import { StructuredOutputToolHost } from "../structured-tool.js";
 import { assertSystemPromptSupported } from "../system-prompt.js";
-import { agentClosedError, agentTurnError, agentValidationError, mapAgentError } from "./errors.js";
+import { describeBackendTraits, type AcpAgentTraits } from "../traits.js";
+import {
+  agentClosedError,
+  agentTurnError,
+  agentValidationError,
+  mapAgentError,
+  validateArguments,
+} from "./errors.js";
 import { AgentEventBus } from "./events.js";
 import { acquireForkedSession, forkTraitFor } from "./fork.js";
 import { probeCatalog } from "./probe.js";
@@ -251,14 +258,18 @@ export class AcpAgent {
    */
   constructor(options: AcpAgentOptions) {
     const label = options.label;
-    validateAgentCwd(options.cwd, label, "AcpAgent");
-    assertNoModelConfigOption(options.configOptions, label);
-    try {
-      validateClientHandlers(options.clientHandlers);
-    } catch (error) {
-      throw agentValidationError(error instanceof Error ? error.message : String(error), label);
-    }
-    const seed = constructionSeed ?? resolveNewSeed(options);
+    // Every pre-spawn guard speaks INVALID_ARGUMENT: the SDK's own throw it directly, a shared
+    // validator's SCRIPT_VALIDATION_ERROR is re-coded here at the boundary.
+    const seed = validateArguments(() => {
+      validateAgentCwd(options.cwd, label, "AcpAgent");
+      assertNoModelConfigOption(options.configOptions, label);
+      try {
+        validateClientHandlers(options.clientHandlers);
+      } catch (error) {
+        throw agentValidationError(error instanceof Error ? error.message : String(error), label);
+      }
+      return constructionSeed ?? resolveNewSeed(options);
+    });
     this.#options = { ...options };
     this.#seed = seed;
     this.#registry = seed.registry;
@@ -323,6 +334,18 @@ export class AcpAgent {
     return probeCatalog(options);
   }
 
+  /** The table-based traits of the backend `spec` routes to — exactly the constructor's routing
+   *  (`backends` merged over `AGENTPRISM_BACKENDS`, a registered name wins, an unrouted spec goes
+   *  to the default backend) — without spawning anything. The instance getter refines the same
+   *  shape with the live initialize advertisements once the agent is open. */
+  static traits(spec?: string, options: { backends?: Record<string, CustomBackendConfig> } = {}): AcpAgentTraits {
+    return validateArguments(() => {
+      const registry = resolveAgentRegistry(options.backends);
+      const route = resolveAgentRoute({ model: spec }, registry);
+      return describeBackendTraits(route.backend, registry);
+    });
+  }
+
   /** `session/resume` of `ref.sessionId` on a fresh dedicated process of `ref.backendId`
    *  (routed by name — never the default backend — and pool-key checked). `cwd` defaults to
    *  `ref.cwd`; `model` must stay on the ref's backend. */
@@ -351,23 +374,23 @@ export class AcpAgent {
   ): Promise<AcpAgent> {
     const label = options.label;
     const method = `AcpAgent.${kind}`;
-    assertSessionRef(ref, label, method);
-    const cwd = options.cwd ?? ref.cwd;
-    validateAgentCwd(cwd, label, method);
-    const registry = resolveAgentRegistry(options.backends, label);
-    const route = resolveRefRoute(ref, options.model, registry, label);
-    assertSystemPromptSupported(route.backend, options.systemPrompt, label);
-    const base = { registry, backend: route.backend, modelSpec: route.modelSpec };
-    let seed: ResolvedSeed;
-    if (kind === "fork") {
-      const trait = forkTraitFor(route.backend, registry);
-      if (trait.cwd === "source-only" && cwd !== ref.cwd) {
-        throw agentValidationError(`fork on ${route.backend.id} must keep the source cwd (${ref.cwd})`, label);
+    const { cwd, seed } = validateArguments(() => {
+      assertSessionRef(ref, label, method);
+      const cwd = options.cwd ?? ref.cwd;
+      validateAgentCwd(cwd, label, method);
+      const registry = resolveAgentRegistry(options.backends, label);
+      const route = resolveRefRoute(ref, options.model, registry, label);
+      assertSystemPromptSupported(route.backend, options.systemPrompt, label);
+      const base = { registry, backend: route.backend, modelSpec: route.modelSpec };
+      if (kind === "fork") {
+        const trait = forkTraitFor(route.backend, registry);
+        if (trait.cwd === "source-only" && cwd !== ref.cwd) {
+          throw agentValidationError(`fork on ${route.backend.id} must keep the source cwd (${ref.cwd})`, label);
+        }
+        return { cwd, seed: { kind, sourceSessionId: ref.sessionId, ...base } satisfies ResolvedSeed };
       }
-      seed = { kind, sourceSessionId: ref.sessionId, ...base };
-    } else {
-      seed = { kind, sessionId: ref.sessionId, ...base };
-    }
+      return { cwd, seed: { kind, sessionId: ref.sessionId, ...base } satisfies ResolvedSeed };
+    });
     return AcpAgent.#opened(AcpAgent.#seeded({ ...options, cwd }, seed));
   }
 
@@ -399,6 +422,13 @@ export class AcpAgent {
   /** Capabilities negotiated on this agent's dedicated connection. */
   get capabilities(): NegotiatedCapabilities | undefined {
     return this.#connection?.capabilities;
+  }
+
+  /** This backend's traits (`describeBackendTraits`): the tables before open, refined by the live
+   *  initialize advertisements once the connection is up (retained after close). A fresh frozen
+   *  object per read. */
+  get traits(): AcpAgentTraits {
+    return describeBackendTraits(this.#backend, this.#registry, this.#connection?.capabilities);
   }
 
   /** The latest echoed session config-option catalog (verbatim ACP wire shapes). */
@@ -491,10 +521,12 @@ export class AcpAgent {
       const backend = this.#backend;
       const label = this.label;
 
-      validatePromptImages(options.images, label);
-      assertPerTurnSchemaAllowed(backend, options.schema, label);
-      assertNoModelConfigOption(options.configOptions, label);
-      assertKnownConfigOptionIds(options.configOptions, handle.advertisedConfigOptions, this.backendId, label);
+      validateArguments(() => {
+        validatePromptImages(options.images, label);
+        assertPerTurnSchemaAllowed(backend, options.schema, label);
+        assertNoModelConfigOption(options.configOptions, label);
+        assertKnownConfigOptionIds(options.configOptions, handle.advertisedConfigOptions, this.backendId, label);
+      });
       try {
         if (options.configOptions) {
           await handle.setConfigOptions(options.configOptions);
@@ -571,7 +603,7 @@ export class AcpAgent {
   }
 
   /** Inject content into the turn in flight (`_session/steering`). Overlaps the FIFO; requires a
-   *  `prompt()` in flight (SCRIPT_VALIDATION_ERROR otherwise). The complete raw response is returned. */
+   *  `prompt()` in flight (INVALID_ARGUMENT otherwise). The complete raw response is returned. */
   async steer(content: string | ContentBlock[], options: AcpAgentSteerOptions = {}): Promise<SteeringResponse> {
     this.#signal?.throwIfAborted();
     if (this.#closed) throw this.#closedError();
@@ -579,7 +611,7 @@ export class AcpAgent {
     if (!this.#activeTurn || !handle) {
       throw agentValidationError("AcpAgent.steer() requires a prompt() in flight", this.label);
     }
-    validatePromptImages(options.images, this.label);
+    validateArguments(() => validatePromptImages(options.images, this.label));
     try {
       return await handle.steer(appendPromptImages(content, options.images), options.meta);
     } catch (error) {
@@ -635,25 +667,28 @@ export class AcpAgent {
         providerStore: this.#options.providerStore,
         clientHandlers: this.#options.clientHandlers,
       };
-      validateAgentCwd(cwd, this.label, "AcpAgent.fork");
-      if (trait.cwd === "source-only" && cwd !== this.cwd) {
-        throw agentValidationError(`fork on ${this.backendId} must keep the source cwd (${this.cwd})`, this.label);
-      }
-      let route: ReturnType<typeof resolveModelRoute> | undefined;
-      if (overrides.model !== undefined) {
-        route = resolveModelRoute(overrides.model, this.#registry);
-        const samePool = (route.backend.poolKey ?? route.backend.id) === (this.#backend.poolKey ?? this.backendId);
-        if (route.backend.id !== this.backendId || !samePool) {
-          throw agentValidationError(
-            `fork model "${overrides.model}" must stay on backend "${this.backendId}"`,
-            this.label,
-          );
+      const route = validateArguments(() => {
+        validateAgentCwd(cwd, this.label, "AcpAgent.fork");
+        if (trait.cwd === "source-only" && cwd !== this.cwd) {
+          throw agentValidationError(`fork on ${this.backendId} must keep the source cwd (${this.cwd})`, this.label);
         }
-      }
-      assertNoModelConfigOption(merged.configOptions, label);
-      // The backend is fixed by the parent, so an inherited value already passed; an override
-      // is validated here, before the child's process spawns.
-      assertSystemPromptSupported(this.#backend, merged.systemPrompt, label);
+        let route: ReturnType<typeof resolveModelRoute> | undefined;
+        if (overrides.model !== undefined) {
+          route = resolveModelRoute(overrides.model, this.#registry);
+          const samePool = (route.backend.poolKey ?? route.backend.id) === (this.#backend.poolKey ?? this.backendId);
+          if (route.backend.id !== this.backendId || !samePool) {
+            throw agentValidationError(
+              `fork model "${overrides.model}" must stay on backend "${this.backendId}"`,
+              this.label,
+            );
+          }
+        }
+        assertNoModelConfigOption(merged.configOptions, label);
+        // The backend is fixed by the parent, so an inherited value already passed; an override
+        // is validated here, before the child's process spawns.
+        assertSystemPromptSupported(this.#backend, merged.systemPrompt, label);
+        return route;
+      });
       const child = AcpAgent.#seeded(merged, {
         kind: "fork",
         sourceSessionId: handle.sessionId,
@@ -667,7 +702,7 @@ export class AcpAgent {
     });
   }
 
-  /** `session/set_mode` (queued; strict — an unadvertised id is a SCRIPT_VALIDATION_ERROR). */
+  /** `session/set_mode` (queued; strict — an unadvertised id is INVALID_ARGUMENT). */
   setMode(modeId: string): Promise<void> {
     return this.#enqueue(async () => {
       await this.#ensureOpen();
@@ -687,8 +722,10 @@ export class AcpAgent {
       await this.#ensureOpen();
       this.#signal?.throwIfAborted();
       const handle = this.#handle!;
-      assertNoModelConfigOption(options, this.label);
-      assertKnownConfigOptionIds(options, handle.advertisedConfigOptions, this.backendId, this.label);
+      validateArguments(() => {
+        assertNoModelConfigOption(options, this.label);
+        assertKnownConfigOptionIds(options, handle.advertisedConfigOptions, this.backendId, this.label);
+      });
       try {
         await handle.setConfigOptions(options);
       } catch (error) {

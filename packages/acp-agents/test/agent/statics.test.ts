@@ -34,7 +34,7 @@ function withoutSessionId(ref: AgentSessionRef): Omit<AgentSessionRef, "sessionI
 function validation(pattern: RegExp) {
   return (error: unknown): boolean => {
     assert.ok(isWorkflowError(error), `expected a WorkflowError, got ${String(error)}`);
-    assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+    assert.equal(error.code, WorkflowErrorCode.INVALID_ARGUMENT);
     assert.match(error.message, pattern);
     return true;
   };
