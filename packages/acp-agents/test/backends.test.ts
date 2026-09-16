@@ -40,6 +40,15 @@ test("ClaudeBackend: no schema => no critical session _meta; never carries schem
   assert.equal(backend.id, "claude");
 });
 
+test("rawMessagesMeta: Claude switches its vendor stream on; the other built-ins have no such stream", () => {
+  // The AcpAgent SDK layers this UNDER the caller's meta when `raw` is on (the default), so a
+  // schema-less Claude session still emits `_claude/sdkMessage` for `raw_message` / `turn.raw`.
+  assert.deepEqual(new ClaudeBackend().rawMessagesMeta(), { claudeCode: { emitRawSDKMessages: true } });
+  for (const backend of [new CodexBackend(), new OpenCodeBackend(), new PiBackend()] as Backend[]) {
+    assert.equal(backend.rawMessagesMeta?.(), undefined, `${backend.id} advertises no vendor notification stream`);
+  }
+});
+
 test("ClaudeBackend gives engine runs a stable title so the adapter spends no hidden title turn", () => {
   const backend: Backend = new ClaudeBackend();
   assert.equal(backend.sessionMetaDefaults?.(), undefined, "interactive sessions retain generated titles");

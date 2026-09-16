@@ -176,7 +176,7 @@ The five packages below are **internal building blocks**. Most are composed by t
 
 | Package | What it is |
 |---|---|
-| **`@automatalabs/acp-agents`** | The ACP client + Claude/Codex/OpenCode/pi/custom backends (the `AgentRunner` implementation, connection pooling, auth/session lifecycle, structured output, permissions, usage). Internal — public entry is `@automatalabs/workflows`. |
+| **`@automatalabs/acp-agents`** | The ACP client + Claude/Codex/OpenCode/pi/custom backends (the `AgentRunner` implementation, connection pooling, auth/session lifecycle, structured output, permissions, usage) and the `AcpAgent` SDK (one dedicated process per held-open agent, forks, cold reopen). Internal — public entry is `@automatalabs/workflows`. |
 | **`@automatalabs/workflow-engine`** | The deterministic engine: the script realm, `parallel`/`pipeline`, journal/resume, and worktree isolation. Internal — public entry is `@automatalabs/workflows`. |
 | **`@automatalabs/repl-engine`** | The published REPL orchestrator engine: a persistent JavaScript REPL in a capability-free QuickJS-in-WASM VM (workspace lifecycle, eval + job drain, per-VM memory limits, per-eval interrupts, trap-free completion reads, the append-only call store and enveloped snapshots). Its `repl` MCP tool is registered in `mcp-server` (the roadmap's `repl-orchestrator`, phase E — implemented); it depends on `workflows`, `acp-agents` (subagents are ACP sessions), and `shared-types`. |
 | **`@automatalabs/codex-acp`** | The workspace fork of `agentclientprotocol/codex-acp` (imported with full history) — the ACP server the Codex backend spawns, baking turn-level `outputSchema` forwarding into its shipped dist. Consumed by `@automatalabs/acp-agents` as `workspace:*`; you never depend on it directly. |
@@ -255,6 +255,8 @@ const data = await runner.run("Summarize this repo as JSON {summary}.", {
 // data is typed/validated against the schema (a plain object, not text)
 await runner.dispose();   // closes pooled backend processes
 ```
+
+For a held-open agent with forks and cold resume, use the `AcpAgent` SDK from `@automatalabs/acp-agents` (re-exported by `@automatalabs/workflows`): `new AcpAgent({ cwd, model: "codex/gpt-5.6-sol" })` spawns one dedicated process on first use, `prompt()` returns the verbatim turn, `fork()` seeds a parallel agent with everything committed so far, and `close({ keep: true })` + `AcpAgent.resume(ref)` reopen it later — see [docs/api.md](docs/api.md#acpagent-sdk).
 
 ---
 

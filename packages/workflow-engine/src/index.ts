@@ -208,10 +208,9 @@ export {
   normalizeInspectionOptions,
   projectRunEventForPersistence,
   projectWorkflowRunStatus,
-  redactText,
-  truncateUtf8,
   type RunObservabilitySource,
 } from "./run-observability.js";
+export { redactText, truncateUtf8 } from "@automatalabs/shared-types";
 export {
   AGENT_PROGRESS_HEARTBEAT_MS,
   AGENT_PROGRESS_MIN_INTERVAL_MS,

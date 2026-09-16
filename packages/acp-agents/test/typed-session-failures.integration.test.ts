@@ -17,7 +17,12 @@ import {
   isWorkflowError,
   type AgentUsage,
 } from "@automatalabs/shared-types";
-import { TYPED_SESSION_FAILURE_CLIENT_CAPABILITY, type TypedSessionFailure } from "../src/index.js";
+import {
+  CodexBackend,
+  PooledConnection,
+  TYPED_SESSION_FAILURE_CLIENT_CAPABILITY,
+  type TypedSessionFailure,
+} from "../src/index.js";
 import { createFakeAgentHarness } from "./helpers/fake-agent.js";
 
 const SCHEMA = Type.Object({ ok: Type.Boolean() });
@@ -231,6 +236,74 @@ test("a terminal failure still reports the tokens the walled turn burned", async
   assert.equal(usages[0]?.input, 11);
   assert.equal(usages[0]?.output, 3);
   assert.equal(usages[0]?.total, 14);
+});
+
+test("SessionHandle.promptOutcome resolves { response, failure } where prompt() throws, for both channels", async () => {
+  const terminal = failure({
+    id: "turn-1:error",
+    category: "connection",
+    title: "Connection to Codex was lost.",
+    actions: ["retry", "new_session"],
+  });
+  const latched = failure({
+    id: "fake-session:error:epoch-1",
+    category: "request",
+    title: "The request was blocked by provider policy.",
+    actions: [],
+  });
+  const { cwd } = configure({
+    turns: [
+      // 1) terminal delivery: the failure rides the PromptResponse `_meta`
+      { usage: { inputTokens: 11, outputTokens: 3, totalTokens: 14 }, responseMeta: failureMeta(terminal) },
+      // 2) the same terminal delivery, consumed through prompt() on the same session
+      { usage: { inputTokens: 5, outputTokens: 1, totalTokens: 6 }, responseMeta: failureMeta(terminal) },
+      // 3) asynchronous delivery on an empty turn: the turn-raised latch is the failure
+      { updates: [failureUpdate(latched)] },
+      // 4) a healthy turn: no failure key at all
+      { text: "the answer" },
+    ],
+  });
+  const connection = harness.track(PooledConnection.create(new CodexBackend(), { onDead: () => undefined }));
+  const handle = await connection.openSession({ cwd, schema: undefined, policy: {}, label: "typed-outcome" });
+  try {
+    // The non-throwing split hands back the verbatim response (its `_meta` and `usage` intact)
+    // next to the parsed failure, and still records the usage the walled turn burned.
+    const outcome = await handle.promptOutcome("hi");
+    assert.equal(outcome.response.stopReason, "end_turn");
+    assert.deepEqual(outcome.response._meta, failureMeta(terminal), "response _meta is verbatim");
+    assert.deepEqual(outcome.response.usage, { inputTokens: 11, outputTokens: 3, totalTokens: 14 });
+    assert.deepEqual(outcome.failure, terminal);
+    assert.equal(handle.usage.toAgentUsage().total, 14);
+
+    // prompt() is exactly promptOutcome() plus the throw: the mapped WorkflowError carries the same
+    // parsed record as `details`, and the usage of the walled turn is recorded before it is raised.
+    await assert.rejects(
+      () => handle.prompt("again"),
+      (err: unknown) => {
+        assert.ok(isWorkflowError(err));
+        assert.equal(err.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+        assert.equal(err.recoverable, true);
+        assert.equal(err.agentLabel, "typed-outcome");
+        assert.match(err.message, /Connection to Codex was lost\./);
+        assert.deepEqual(err.details, outcome.failure);
+        return true;
+      },
+    );
+    assert.equal(handle.usage.toAgentUsage().total, 6, "PromptResponse.usage replaces the session total");
+
+    // The asynchronous latch takes the same path: an empty turn resolves with the failure it raised.
+    const async = await handle.promptOutcome("silent");
+    assert.equal("_meta" in async.response, false, "no terminal record on the response");
+    assert.deepEqual(async.failure, latched);
+
+    // A turn that answers has no `failure` key at all (not `failure: undefined`).
+    const healthy = await handle.promptOutcome("ok");
+    assert.equal("failure" in healthy, false);
+    assert.equal(healthy.response.stopReason, "end_turn");
+    assert.equal(handle.foldedTurnText(), "the answer");
+  } finally {
+    await handle.release();
+  }
 });
 
 // ---- asynchronous delivery (session_info_update) ---------------------------------------

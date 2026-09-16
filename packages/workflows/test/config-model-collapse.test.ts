@@ -1,5 +1,6 @@
 // Oversized model-catalog collapsing for `agentprism-workflows config` / `validate`
-// (see ./src/validate.ts summarize/collapse helpers and ./src/config.ts --models view).
+// (see ./src/validate.ts collapse helpers and ./src/config.ts renderers; the grouping and
+// --models view builders themselves are covered in @automatalabs/acp-agents).
 // A harness with a huge model list (pi, opencode) must not flood an agent's context on
 // ANY rendered surface — human table or --json — while the complete catalog stays in the
 // in-memory report and is reachable only through the explicit `--models[=<filter>]` path.
@@ -9,21 +10,12 @@ import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import {
   MAX_INLINE_SELECT_CHOICES,
-  summarizeSelectChoices,
   isOversizedSelect,
-  selectChoicePairs,
   collapseHarnessOptionsForOutput,
   type CollapsedSelectOption,
 } from "../src/validate.js";
-import {
-  probeHarnessConfig,
-  formatHarnessConfigReport,
-  buildHarnessModelsView,
-  formatHarnessModels,
-  buildModelFilter,
-} from "../src/config.js";
-import { setValidateProbeFactoryForTests } from "../src/validate-internal.js";
-import type { SessionConfigOption } from "@automatalabs/acp-agents";
+import { formatHarnessConfigReport, formatHarnessModels } from "../src/config.js";
+import { buildHarnessModelsView, selectChoicePairs, type SessionConfigOption } from "@automatalabs/acp-agents";
 
 const ROOT = resolve(import.meta.dirname, "../../..");
 const CLI = resolve(import.meta.dirname, "../src/cli.ts");
@@ -41,22 +33,6 @@ function flatModelOption(providers: string[], perProvider: number): SessionConfi
     category: "model",
     currentValue: `${providers[0]}/model-0`,
     options,
-  };
-}
-
-/** A model select whose leaves are carried in advertised optgroups (with human names). */
-function groupedModelOption(groups: Array<{ id: string; name: string; count: number }>): SessionConfigOption {
-  return {
-    id: "model",
-    type: "select",
-    name: "Model",
-    category: "model",
-    currentValue: `${groups[0].id}/m0`,
-    options: groups.map((group) => ({
-      group: group.id,
-      name: group.name,
-      options: Array.from({ length: group.count }, (_, i) => ({ value: `${group.id}/m${i}`, name: `m${i}` })),
-    })),
   };
 }
 
@@ -85,45 +61,7 @@ const SMALL_OPTIONS: SessionConfigOption[] = [
   },
 ];
 
-// ── pure helpers ─────────────────────────────────────────────────────────────
-
-test("summarizeSelectChoices groups flat ids by their provider prefix, largest-first", () => {
-  const option = flatModelOption(["anthropic", "openai", "google"], 20);
-  assert.equal(option.type, "select");
-  const summary = summarizeSelectChoices(option as Extract<SessionConfigOption, { type: "select" }>);
-  assert.equal(summary.total, 60);
-  assert.deepEqual(summary.groups, [
-    { group: "anthropic", count: 20 },
-    { group: "openai", count: 20 },
-    { group: "google", count: 20 },
-  ]);
-});
-
-test("summarizeSelectChoices prefers advertised optgroup names and sorts by count", () => {
-  const option = groupedModelOption([
-    { id: "openai", name: "OpenAI", count: 31 },
-    { id: "anthropic", name: "Anthropic", count: 23 },
-  ]);
-  const summary = summarizeSelectChoices(option as Extract<SessionConfigOption, { type: "select" }>);
-  assert.equal(summary.total, 54);
-  assert.deepEqual(summary.groups, [
-    { group: "OpenAI", count: 31 },
-    { group: "Anthropic", count: 23 },
-  ]);
-});
-
-test("a slash-less id falls into the (ungrouped) bucket", () => {
-  const option: SessionConfigOption = {
-    id: "model",
-    type: "select",
-    name: "Model",
-    category: "model",
-    currentValue: "solo",
-    options: Array.from({ length: 30 }, (_, i) => ({ value: `solo-${i}`, name: `Solo ${i}` })),
-  };
-  const summary = summarizeSelectChoices(option as Extract<SessionConfigOption, { type: "select" }>);
-  assert.deepEqual(summary.groups, [{ group: "(ungrouped)", count: 30 }]);
-});
+// ── print-boundary helpers ───────────────────────────────────────────────────
 
 test("isOversizedSelect trips strictly above the inline bound", () => {
   const atBound = flatModelOption(["p"], MAX_INLINE_SELECT_CHOICES); // exactly 24 → inline
@@ -195,15 +133,8 @@ const MODELS_REPORT = {
   harnessOptions: [{ backendId: "opencode", probed: true, options: [flatModelOption(["anthropic", "openai"], 20)] }],
 };
 
-test("buildHarnessModelsView with no filter returns the group breakdown, never leaf ids", () => {
+test("formatHarnessModels renders the unfiltered breakdown without leaf ids", () => {
   const [view] = buildHarnessModelsView(MODELS_REPORT);
-  assert.equal(view.hasModelOption, true);
-  assert.equal(view.total, 40);
-  assert.deepEqual(view.groups, [
-    { group: "anthropic", count: 20 },
-    { group: "openai", count: 20 },
-  ]);
-  assert.equal(view.matches, undefined);
   const text = formatHarnessModels([view]);
   assert.match(text, /^opencode: 40 models in 2 group\(s\):$/m);
   assert.match(text, /^  anthropic \(20\)$/m);
@@ -211,23 +142,14 @@ test("buildHarnessModelsView with no filter returns the group breakdown, never l
   assert.doesNotMatch(text, /anthropic\/model-0/); // breakdown carries no leaves
 });
 
-test("buildHarnessModelsView with a substring filter returns matching leaves", () => {
+test("formatHarnessModels lists the leaves matching a filter", () => {
   const [view] = buildHarnessModelsView(MODELS_REPORT, "openai");
-  assert.equal(view.total, undefined);
-  assert.equal(view.matches?.length, 20);
-  assert.ok(view.matches?.every((value) => value.startsWith("openai/")));
   const text = formatHarnessModels([view]);
   assert.match(text, /^opencode: 20 model\(s\) matching "openai":$/m);
   assert.match(text, /^  openai\/model-3$/m);
 });
 
-test("a /regex/ filter is honored case-insensitively; a bad regex throws", () => {
-  const [view] = buildHarnessModelsView(MODELS_REPORT, "/^ANTHROPIC\\/model-1$/");
-  assert.deepEqual(view.matches, ["anthropic/model-1"]);
-  assert.throws(() => buildModelFilter("/(/"), TypeError);
-});
-
-test("--models reports harnesses that advertise no model option", () => {
+test("formatHarnessModels reports harnesses that advertise no model option", () => {
   const view = buildHarnessModelsView({
     ok: true,
     exitCode: 0,
@@ -235,24 +157,6 @@ test("--models reports harnesses that advertise no model option", () => {
   });
   assert.equal(view[0].hasModelOption, false);
   assert.match(formatHarnessModels(view), /^codex: no model option advertised$/m);
-});
-
-// ── programmatic probe stays complete; only the CLI print collapses ──────────
-
-test("probeHarnessConfig keeps the full catalog in memory (collapse is print-only)", async () => {
-  const restore = setValidateProbeFactoryForTests(() => ({
-    async probeConfigOptions(spec) {
-      return { backendId: spec ?? "claude", options: [flatModelOption(["anthropic", "openai"], 30)] };
-    },
-    async dispose() {},
-  }));
-  try {
-    const report = await probeHarnessConfig({ harnesses: ["opencode"] });
-    const model = report.harnessOptions[0].options![0];
-    assert.ok(model.type === "select" && model.options.length === 60, "in-memory report is not collapsed");
-  } finally {
-    restore();
-  }
 });
 
 // ── CLI wiring against the fake agent (small catalog) ────────────────────────

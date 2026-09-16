@@ -144,6 +144,16 @@ export function createFakeAgentHarness(defaults: FakeAgentHarnessOptions = {}): 
   };
 }
 
+/** Track an `AcpAgent`-shaped object (anything with `close()`) on a harness so `cleanup()` closes
+ *  it: the harness disposes `{ dispose() }` items, and the SDK class exposes `close()` instead. */
+export function trackAgent<T extends { close(): Promise<void> }>(
+  harness: { track: <D extends Disposable>(disposable: D) => D },
+  agent: T,
+): T {
+  harness.track({ dispose: () => agent.close() });
+  return agent;
+}
+
 export function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -491,6 +491,13 @@ class SessionState {
     return this.foldedTextFrom(this.turnStartIndex);
   }
 
+  /** The whole retained log folded the same way (`foldedTurnText()` from
+   *  index 0): every retained assistant message, a replayed transcript
+   *  included, with distinct messages joined by "\n\n". */
+  foldedText(): string {
+    return this.foldedTextFrom(0);
+  }
+
   private foldedTextFrom(startIndex: number): string {
     let folded = "";
     for (let index = startIndex; index < this.textChunks.length; index += 1) {
@@ -2837,8 +2844,16 @@ export class SessionHandle implements StructuredSource {
     this.state.modes = modeStateFromConfigOption(modeOption, modeId);
   }
 
-  /** Send a prompt turn and drain it; returns the final PromptResponse. */
-  async prompt(content: string | ContentBlock[], promptMeta?: Record<string, unknown>): Promise<PromptResponse> {
+  /**
+   * The wire outcome of a prompt turn: the verbatim `PromptResponse` plus the terminal typed
+   * session failure it carried, if any. Never throws for a typed failure — the response (its
+   * `_meta`, `usage`, `stopReason`) is handed back alongside the parsed failure so a caller can
+   * keep everything the turn produced. `prompt()` is this plus the throw the runner relies on.
+   */
+  async promptOutcome(
+    content: string | ContentBlock[],
+    promptMeta?: Record<string, unknown>,
+  ): Promise<{ response: PromptResponse; failure?: TypedSessionFailure }> {
     this.opts.signal?.throwIfAborted();
     this.state.beginTurn();
     let resolveEnded!: () => void;
@@ -2862,12 +2877,19 @@ export class SessionHandle implements StructuredSource {
       const response = await this.pooled.prompt(request);
       this.state.usage.recordPromptUsage(response.usage);
       const failure = this.terminalTypedSessionFailure(response);
-      if (failure) throw this.typedSessionFailureError(failure);
-      return response;
+      return failure ? { response, failure } : { response };
     } finally {
       if (this.activeTurn === turn) this.activeTurn = undefined;
       turn.resolveEnded();
     }
+  }
+
+  /** Send a prompt turn and drain it; returns the final PromptResponse. A terminal typed session
+   *  failure is raised as the mapped `WorkflowError` (see `promptOutcome` for the non-throwing split). */
+  async prompt(content: string | ContentBlock[], promptMeta?: Record<string, unknown>): Promise<PromptResponse> {
+    const { response, failure } = await this.promptOutcome(content, promptMeta);
+    if (failure) throw this.typedSessionFailureError(failure);
+    return response;
   }
 
   /**
@@ -2939,6 +2961,14 @@ export class SessionHandle implements StructuredSource {
    *  returns; consecutive chunks of one message join with ""). */
   foldedTurnText(): string {
     return this.state.foldedTurnText();
+  }
+
+  /** The retained session log's assistant text with the same message
+   *  joiner as `foldedTurnText()`, over the whole log (a `session/load`
+   *  replay included). What `AcpAgent.text` reads; `text` stays the raw
+   *  chunk concatenation. */
+  foldedText(): string {
+    return this.state.foldedText();
   }
 
   /** StructuredSource — the latest turn's FINAL assistant message (see SessionState). */

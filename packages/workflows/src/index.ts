@@ -112,26 +112,25 @@ export type {
   UnusedMockAnswer,
   ValidateWorkflowOptions,
   ValidateWorkflowReport,
-  ValidateHarnessOptions,
   ValidatedAgentCall,
   ValidatedCheckpoint,
   ValidatedMockAnswerRule,
   ValidatedMockAnswers,
   ValidatedMockAnswerUse,
 } from "./validate.js";
-export type { ValidateProbeRunner } from "./validate-internal.js";
 
 // ── Harness config discovery: validate's sibling (`agentprism-workflows config`) — probe
 //    any routable ACP harness's advertised config-option catalog (model ids, effort levels,
-//    modes, …) without authoring a script. ──
+//    modes, …) without authoring a script. The catalog core lives in @automatalabs/acp-agents;
+//    this facade re-export is the supported surface. ──
 export {
   probeHarnessConfig,
-  formatHarnessConfigReport,
   buildHarnessModelsView,
   buildModelFilter,
   buildHarnessConfigSummary,
   formatHarnessConfigSummary,
-} from "./config.js";
+} from "@automatalabs/acp-agents";
+export { formatHarnessConfigReport } from "./config.js";
 export type {
   ProbeHarnessConfigOptions,
   HarnessConfigReport,
@@ -140,7 +139,9 @@ export type {
   HarnessConfigSummaryEntry,
   HarnessConfigSummaryModel,
   HarnessConfigSummaryGroup,
-} from "./config.js";
+  ValidateHarnessOptions,
+  ValidateProbeRunner,
+} from "@automatalabs/acp-agents";
 export type {
   WorkflowRunOptions,
   WorkflowRoutingSnapshot,
@@ -235,9 +236,10 @@ export type {
   RunEventLogErrorCode,
 } from "@automatalabs/workflow-engine";
 
-// ── ACP backend: the default AgentRunner implementation, interactive sessions, backend
-//    selection, the concrete backends (built-in + custom registry), the pool/runner options,
-//    capability helpers, client handlers, permission resolvers, and JSON-Schema helpers.
+// ── ACP backend: the default AgentRunner implementation, interactive sessions, the AcpAgent
+//    SDK front door (one dedicated process per held-open agent, FIFO turns, forks, cold reopen),
+//    backend selection, the concrete backends (built-in + custom registry), the pool/runner
+//    options, capability helpers, client handlers, permission resolvers, and JSON-Schema helpers.
 //    Custom backends let ANY ACP agent serve agent() calls:
 //    `createAcpRunner({ backends: { browser: { command: "…" } } })` (or the
 //    AGENTPRISM_BACKENDS env var), then route with `agent(p, { model: "browser" })`. ──
@@ -245,6 +247,8 @@ export {
   createAcpRunner,
   AcpAgentRunner,
   InteractiveSession,
+  AcpAgent,
+  isAcpAgentTurnError,
   selectBackend,
   ClaudeBackend,
   CodexBackend,
@@ -274,6 +278,24 @@ export type {
   InteractiveSessionOptions,
   InteractiveTurn,
   SteeringResponse,
+  AcpAgentOptions,
+  AcpAgentPromptOptions,
+  AcpAgentSteerOptions,
+  AcpAgentForkOptions,
+  AcpAgentReopenOptions,
+  AcpAgentCloseOptions,
+  AcpAgentProbeOptions,
+  AcpAgentCatalog,
+  AcpAgentTurn,
+  AcpAgentTurnError,
+  AcpAgentToolCall,
+  AcpAgentUpdateRecord,
+  AcpAgentRawRecord,
+  AcpAgentTurnUsage,
+  AcpAgentEventMap,
+  AcpAgentEventName,
+  AcpAgentEventListener,
+  AcpAgentState,
   ListProvidersOptions,
   ListSessionsOptions,
   LogoutOptions,
@@ -283,6 +305,7 @@ export type {
   SetProviderOptions,
   BackendRegistry,
   CustomBackendConfig,
+  CustomBackendForkConfig,
   RegisteredBackend,
   ClientCapabilityOptions,
   ClientHandlers,

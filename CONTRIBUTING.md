@@ -53,9 +53,10 @@ Design from first principles for the request at hand; the rule and its constrain
 
 ## Testing
 
-`pnpm test` runs the full deterministic suite without credentials. Six files contain live tests, and all are skipped unless `AGENTPRISM_LIVE_E2E=1` is set:
+`pnpm test` runs the full deterministic suite without credentials. Seven files contain live tests, and all are skipped unless `AGENTPRISM_LIVE_E2E=1` is set:
 
 - `packages/mcp-server/test/live-backend.e2e.test.ts` drives real Claude, OpenCode, and pi structured-output/pooling paths; `packages/acp-agents/test/steering.live.e2e.test.ts` drives native held-open `_session/steering` for real Claude. Both suites also carry Codex legs that are opt-in on top of the live gate (`AGENTPRISM_LIVE_E2E_CODEX=1`, needing Codex plan or API credits): run them before changing the codex backend or the `codex-acp` fork, and expect the pre-push hook to skip them.
+- `packages/acp-agents/test/agent.live.e2e.test.ts` drives the `AcpAgent` SDK on real Claude, OpenCode, and pi (Codex opt-in): open → prompt a codeword → two parallel forks answer it → a follow-up → a later fork sees both → `close({ keep: true })` → `AcpAgent.resume(ref)` answers again.
 - `packages/acp-agents/test/auth.live.e2e.test.ts` drives the four built-in auth profiles; individual cases have additional credential/gateway gates.
 - `packages/workflows/test/continuation.live.e2e.test.ts` drives a real continuation flow and additionally requires `AGENTPRISM_PI_E2E_MODEL` plus that model's provider key.
 - `packages/workflows/test/isolation.live.e2e.test.ts` drives real concurrent-worktree isolation through the default backend; `AGENTPRISM_ISOLATION_E2E_MODEL` may reroute its isolated leg.
@@ -63,13 +64,14 @@ Design from first principles for the request at hand; the rule and its constrain
 
 One more test is opt-in for a different reason: `packages/mcp-server/test/ui-monitor-host.test.ts` drives the real run-monitor UI in a real Chrome over CDP. A browser's cold start on a shared CI runner is not deterministic, so the default suite skips it; set `AGENTPRISM_UI_E2E=1` to run it (and `AGENTPRISM_UI_CHROME` for a nonstandard install). The pre-push hook runs it, so it still gates every push from a developer machine.
 
-Run the pre-push live backend and steering gate explicitly with real auth (add
-`AGENTPRISM_LIVE_E2E_CODEX=1` to include the opt-in Codex legs):
+Run the pre-push live backend, steering, and `AcpAgent` fork/resume gate explicitly with real
+auth (add `AGENTPRISM_LIVE_E2E_CODEX=1` to include the opt-in Codex legs):
 
 ```bash
 AGENTPRISM_LIVE_E2E=1 npx tsx --test \
   packages/mcp-server/test/live-backend.e2e.test.ts \
-  packages/acp-agents/test/steering.live.e2e.test.ts
+  packages/acp-agents/test/steering.live.e2e.test.ts \
+  packages/acp-agents/test/agent.live.e2e.test.ts
 ```
 
 CI must leave `AGENTPRISM_LIVE_E2E` unset.
@@ -84,7 +86,7 @@ Because CI has no agent auth, a **pre-push hook** (`.githooks/pre-push`, wired b
    - *wrapped runtime freshness*: an adapter can be at npm `latest` while exact-pinning a stale agent runtime inside it (e.g. `@agentclientprotocol/claude-agent-acp` wraps `@anthropic-ai/claude-agent-sdk` — the runtime that actually answers prompts), which the freshness check can't see. The gate compares the lockfile's *transitive* resolution of each wrapped runtime against the runtime's npm `latest`. Fix when behind: bump the adapter if its latest already wraps a current runtime, else add a root `pnpm.overrides` pin (then `pnpm install` + run the acp-agents live e2e before pushing). The check warns once an override becomes redundant so versions drift back to upstream-managed.
 
    The gate **fails closed**: if the registry or GitHub API is unreachable after retries, staleness cannot be ruled out and the push is blocked. **There is no bypass.** The same gate also runs as a step of the required **Build & test** CI job — while any tracked dependency is stale, *every* PR merge is blocked — and at the top of `release.yml`, where a failure blocks versioning/publishing, leaves any open Version PR open, and files/updates a "Release blocked: ACP dependency gate failed" issue with the gate output.
-3. **MCP live suite + native steering smoke**: builds the workspace and drives Claude, OpenCode, and pi (~60–120s, spends real tokens), then verifies real Claude top-level steering advertisement and a held-open `_session/steering` call. The Codex legs of both suites are opt-in (`AGENTPRISM_LIVE_E2E_CODEX=1`) because Codex plan or API credits are not guaranteed on developer machines; the hook does not set it, so Codex changes must be verified explicitly before they are pushed. The auth live suite stays separately env-gated because its provider/gateway credentials vary by developer. There is no skip for the gated legs: if one fails on authentication (stalling turns usually mean an expired OAuth login), re-authenticate and push again. Legs whose default model rides limited credentials can be rerouted — not skipped — via `AGENTPRISM_OPENCODE_E2E_MODEL` / `AGENTPRISM_PI_E2E_MODEL`. On failure the hook re-prints the failing-test section (assertion + per-leg diagnostics) as the last output and keeps the full runner log at `.git/pre-push-live-e2e.log`.
+3. **MCP live suite + native steering smoke + `AcpAgent` fork/resume smoke**: builds the workspace and drives Claude, OpenCode, and pi (~2–5 min, spends real tokens), then verifies real Claude top-level steering advertisement and a held-open `_session/steering` call, and the `AcpAgent` fork/resume smoke on Claude, OpenCode, and pi. The Codex legs of all three suites are opt-in (`AGENTPRISM_LIVE_E2E_CODEX=1`) because Codex plan or API credits are not guaranteed on developer machines; the hook does not set it, so Codex changes must be verified explicitly before they are pushed. The auth live suite stays separately env-gated because its provider/gateway credentials vary by developer. There is no skip for the gated legs: if one fails on authentication (stalling turns usually mean an expired OAuth login), re-authenticate and push again. Legs whose default model rides limited credentials can be rerouted — not skipped — via `AGENTPRISM_OPENCODE_E2E_MODEL` / `AGENTPRISM_PI_E2E_MODEL`. On failure the hook re-prints the failing-test section (assertion + per-leg diagnostics) as the last output and keeps the full runner log at `.git/pre-push-live-e2e.log`.
 
 CI pushes are exempt from the *hook* automatically (`CI` env guard) because CI enforces the dependency gate itself in the required job and the release workflow.
 
@@ -218,7 +220,7 @@ pnpm release          # pnpm build && changeset publish (runs in release.yml's p
 
    Guard tests are executable documentation: on a dependency bump, the pin-contract tests (`packages/pi-acp/test/packaging.test.ts`, `packages/pi-acp/test/fixtures/provider-error-strings.ts`) and the docs-drift tests (`packages/acp-agents/test/docs-drift.test.ts`) fail loudly, naming every file that must move with the bump. Fix what they name; never loosen them. The complete inventory of generated artifacts and welded doc surfaces lives in "Generated artifacts and the doc-sync map" above.
 3. **Add a changeset** — `pnpm changeset`, selecting every package whose *published artifact or behavior* changes, with the semver bump each deserves. Workspace dependents are bumped automatically at version time (`updateInternalDependencies: "patch"` in `.changeset/config.json`), so list direct changes only. Check yourself with `pnpm changeset status --since=origin/main`: it previews exactly which packages will release, and it **errors** when packages changed but no changeset covers them (use `pnpm changeset add --empty` to deliberately release nothing). No changeset ⇒ merging releases nothing (correct for docs/CI-only PRs).
-4. **Push** — the pre-push hook (Testing above) runs the dependency gate and the live 4-backend e2e (~60–120 s, real tokens, no bypass).
+4. **Push** — the pre-push hook (Testing above) runs the dependency gate and the live 4-backend e2e (~2–5 min, real tokens, no bypass).
 5. **Open the PR and merge it** — the required check is `Build & test` (that exact string — the ruleset matches it verbatim). `gh pr merge --squash --auto` is the normal path.
 6. **Automation takes over on the push to `main`** ([`release.yml`](.github/workflows/release.yml); its header comments are the authoritative mechanics):
    - The dependency gate runs FIRST and fails closed: a red gate files/updates a **"Release blocked: ACP dependency gate failed"** issue, comments on any open Version PR, and nothing versions or publishes until a maintenance PR lands (runbook above).

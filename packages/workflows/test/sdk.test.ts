@@ -31,6 +31,8 @@ process.on("exit", () => {
 // Import EXCLUSIVELY from the SDK barrel — this is the facade under test.
 import {
   AcpAgentRunner,
+  AcpAgent,
+  isAcpAgentTurnError,
   createAcpRunner,
   WorkflowManager,
   runWorkflow,
@@ -144,6 +146,27 @@ import type {
   WorkflowAgentEventSink,
   WorkflowAgentEventSource,
   SteeringResponse,
+  // The AcpAgent SDK surface (its home is @automatalabs/acp-agents; the facade re-exports it like
+  // InteractiveSession). Compile-gated below so a dropped re-export fails tsc.
+  AcpAgentOptions,
+  AcpAgentPromptOptions,
+  AcpAgentSteerOptions,
+  AcpAgentForkOptions,
+  AcpAgentReopenOptions,
+  AcpAgentCloseOptions,
+  AcpAgentProbeOptions,
+  AcpAgentCatalog,
+  AcpAgentTurn,
+  AcpAgentTurnError,
+  AcpAgentToolCall,
+  AcpAgentUpdateRecord,
+  AcpAgentRawRecord,
+  AcpAgentTurnUsage,
+  AcpAgentEventMap,
+  AcpAgentEventName,
+  AcpAgentEventListener,
+  AcpAgentState,
+  CustomBackendForkConfig,
   MockAnswers,
   MockAnswerSequence,
   ValidatedMockAnswerUse,
@@ -619,6 +642,17 @@ test("facade re-exports the public surface", () => {
   assert.equal(typeof WorkflowError, "function");
   assert.equal(WorkflowErrorCode.AGENT_CANCELLED, "AGENT_CANCELLED");
   assert.equal(typeof toJsonSchema, "function");
+  // The AcpAgent SDK front door rides the facade like InteractiveSession (docs/api.md "AcpAgent SDK").
+  assert.equal(typeof AcpAgent, "function");
+  for (const name of ["open", "probe", "resume", "load", "fork"] as const) {
+    assert.equal(typeof AcpAgent[name], "function", `AcpAgent.${name} is a static`);
+  }
+  for (const name of ["ready", "prompt", "steer", "cancel", "fork", "setMode", "setConfigOptions", "close"] as const) {
+    assert.equal(typeof AcpAgent.prototype[name], "function", `AcpAgent#${name}`);
+  }
+  assert.equal(typeof AcpAgent.prototype[Symbol.asyncDispose], "function");
+  assert.equal(typeof isAcpAgentTurnError, "function");
+  assert.equal(isAcpAgentTurnError(new WorkflowError("plain", WorkflowErrorCode.AGENT_EXECUTION_ERROR)), false);
   assert.equal(AGENTPRISM_PERSISTENCE_ROOT_ENV, "AGENTPRISM_PERSISTENCE_ROOT");
   const pathOptions: WorkflowPathOptions = { persistenceRoot: "/tmp/agentprism-workflows-test" };
   const runPersistenceOptions: RunPersistenceOptions = pathOptions;
@@ -897,6 +931,43 @@ test("facade re-exports the §4.2 runner-facing auth types", () => {
   assert.equal(typeof resolver, "function");
   assert.equal(controller, undefined);
   assert.equal(capable, undefined);
+});
+
+test("facade re-exports the AcpAgent SDK types (compile-gated)", () => {
+  // Every AcpAgent typedef the facade re-exports is referenced here so a dropped or renamed
+  // re-export fails `tsc -p tsconfig.test.json`, exactly like the auth surface above.
+  const options: AcpAgentOptions = { cwd: "/abs/dir", model: "claude", retainHistory: true, raw: true };
+  const promptOptions: AcpAgentPromptOptions = { mode: "plan", configOptions: { effort: "high" } };
+  const steerOptions: AcpAgentSteerOptions = { meta: { note: true } };
+  const forkOptions: AcpAgentForkOptions = { label: "child" };
+  const reopenOptions: AcpAgentReopenOptions = { retainHistory: false };
+  const closeOptions: AcpAgentCloseOptions = { keep: true };
+  const probeOptions: AcpAgentProbeOptions = { modelFilter: "opus", harnesses: ["claude"] };
+  const state: AcpAgentState = "idle";
+  const eventName: AcpAgentEventName = "session_open";
+  const listener: AcpAgentEventListener<"agent_message_chunk"> = (event) => void event.sessionId;
+  const closeEvent: AcpAgentEventMap["session_close"] | undefined = undefined;
+  const forkConfig: CustomBackendForkConfig = { disposition: "id-only", cwd: "source-only" };
+  type TurnShape = Pick<AcpAgentTurn, "response" | "stopReason" | "text" | "structured" | "history">;
+  type Records = [AcpAgentUpdateRecord, AcpAgentRawRecord, AcpAgentToolCall];
+  type UsageShape = AcpAgentTurnUsage["session"];
+  type Models = AcpAgentCatalog["models"];
+  type WalledTurn = AcpAgentTurnError["turn"];
+  const shapes: [TurnShape?, Records?, UsageShape?, Models?, WalledTurn?] = [];
+
+  assert.equal(options.cwd, "/abs/dir");
+  assert.equal(promptOptions.mode, "plan");
+  assert.equal(steerOptions.meta?.note, true);
+  assert.equal(forkOptions.label, "child");
+  assert.equal(reopenOptions.retainHistory, false);
+  assert.equal(closeOptions.keep, true);
+  assert.equal(probeOptions.modelFilter, "opus");
+  assert.equal(state, "idle");
+  assert.equal(eventName, "session_open");
+  assert.equal(typeof listener, "function");
+  assert.equal(closeEvent, undefined);
+  assert.equal(forkConfig.disposition, "id-only");
+  assert.equal(shapes.length, 0);
 });
 
 test("createAcpRunner exposes a typed ACP event bus (on/once/off/listenerCount) via the barrel", async () => {

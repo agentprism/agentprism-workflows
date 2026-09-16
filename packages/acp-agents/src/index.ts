@@ -5,6 +5,10 @@
 // @automatalabs/workflow-engine; the two siblings meet ONLY at AgentRunner, injected by the
 // @automatalabs/workflows facade (which mcp-server builds on) via createAcpRunner().
 export { AcpAgentRunner, createAcpRunner, selectBackend } from "./runner.js";
+// The full route (backend + stripped model value) behind selectBackend; `asciiLowercase`,
+// `assertNoModelConfigOption` (routing.ts) and `sessionRefFor` (session-ref.ts) stay module-internal.
+export { resolveModelRoute } from "./routing.js";
+export type { ModelRoute } from "./routing.js";
 export type {
   AcpRunnerOptions,
   AuthenticateOptions,
@@ -60,6 +64,31 @@ export {
   isLoadedTurnStillRunningError,
 } from "./interactive.js";
 export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
+
+// The SDK-style AcpAgent front door (src/agent/): one dedicated ACP process per agent, FIFO turns,
+// live forks, cold reopen from a session ref, and the no-prompt catalog probe.
+export { AcpAgent } from "./agent/acp-agent.js";
+export { isAcpAgentTurnError } from "./agent/errors.js";
+export type {
+  AcpAgentOptions,
+  AcpAgentPromptOptions,
+  AcpAgentSteerOptions,
+  AcpAgentForkOptions,
+  AcpAgentReopenOptions,
+  AcpAgentCloseOptions,
+  AcpAgentProbeOptions,
+  AcpAgentCatalog,
+  AcpAgentTurn,
+  AcpAgentTurnError,
+  AcpAgentToolCall,
+  AcpAgentUpdateRecord,
+  AcpAgentRawRecord,
+  AcpAgentTurnUsage,
+  AcpAgentEventMap,
+  AcpAgentEventName,
+  AcpAgentEventListener,
+  AcpAgentState,
+} from "./agent/types.js";
 
 export { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
 export type {
@@ -140,7 +169,32 @@ export type {
 
 // The custom-backend registry: run ANY ACP agent as an agent() target.
 export { BACKENDS_ENV, registryWithRunBackends, resolveBackendRegistry } from "./registry.js";
-export type { BackendRegistry, CustomBackendConfig, RegisteredBackend } from "./registry.js";
+export type { BackendRegistry, CustomBackendConfig, CustomBackendForkConfig, RegisteredBackend } from "./registry.js";
+
+// Harness config catalog discovery (moved here from @automatalabs/workflows; the facade re-exports it).
+export {
+  probeHarnessConfig,
+  buildHarnessModelsView,
+  buildModelFilter,
+  buildHarnessConfigSummary,
+  formatHarnessConfigSummary,
+  selectChoicePairs,
+  summarizeSelectChoices,
+  DEFAULT_PROBE_TIMEOUT_MS,
+} from "./config-catalog.js";
+export type {
+  ProbeHarnessConfigOptions,
+  HarnessConfigReport,
+  ValidateHarnessOptions,
+  HarnessModelsView,
+  HarnessConfigSummary,
+  HarnessConfigSummaryEntry,
+  HarnessConfigSummaryModel,
+  HarnessConfigSummaryGroup,
+  SelectChoiceGroup,
+  SelectChoiceSummary,
+  ValidateProbeRunner,
+} from "./config-catalog.js";
 
 export {
   CANCEL_NOT_HONORED_GRACE_MS,
@@ -180,7 +234,12 @@ export {
   HANDLED_AUTH_METHOD_TYPES,
   PI_ACP_PROTOCOL_CONTRACT,
   BUILTIN_PROTOCOL_COVERAGE,
+  FORK_SESSION_TRAITS,
+  FORK_SESSION_TRAIT_DEFAULT,
+  PROMPT_USAGE_SCOPES,
   assertAuthCapabilityShape,
+  forkSessionTrait,
+  promptUsageScope,
 } from "./protocol-coverage.js";
 export type {
   AgentMethodCoverage,
@@ -188,6 +247,8 @@ export type {
   AuthMetaMatrixRow,
   BuiltinProtocolCoverageRow,
   ClientMethodCoverage,
+  ForkSessionTraitRow,
+  PromptUsageScopeRow,
 } from "./protocol-coverage.js";
 
 // ACP standard capability negotiation. Vendor initialize metadata stays raw for extension owners.

@@ -296,6 +296,107 @@ export const ACP_EXTENSION_SUPPORT_MATRIX: readonly AcpExtensionSupportMatrixRow
   ACP_EXTENSION_SUPPORT_MATRIX_ROWS.map((row) => Object.freeze(row)),
 );
 
+/** How each installed agent answers `session/fork`, read from its adapter source, and what the
+ *  AcpAgent SDK must do with the response. `id-only`: the response names a persisted copy that
+ *  is not live — claude-agent-acp returns `{ sessionId }` from `dist/fork-session.js` and `prompt`
+ *  on it throws "Session not found"; codex-acp installs state but unsubscribes the thread
+ *  (`threadUnsubscribe`) and publishes no updates until resume/load. `live`: the fork handle is
+ *  the session (pi constructs it in-process; OpenCode by live verification only). `reattach`
+ *  names the reopen an `id-only` fork needs before its first turn. `cwd`: whether the fork may
+ *  re-home — claude's transcript store is keyed by the source cwd. Data for the SDK's fork
+ *  choreography; the runner's `forkSession()` returns the raw fork handle and never consults it. */
+export interface ForkSessionTraitRow {
+  readonly agent: string;
+  readonly disposition: "id-only" | "live";
+  readonly reattach: "resume-or-load" | "none";
+  readonly cwd: "source-only" | "free";
+  /** Installed distributions whose fork implementation is probed by the protocol coverage
+   *  suite (opencode ships a compiled binary; grounded by live-e2e only). */
+  readonly distProbe?: "claude" | "codex" | "pi";
+}
+
+const FORK_SESSION_TRAIT_ROWS = [
+  { agent: "claude", disposition: "id-only", reattach: "resume-or-load", cwd: "source-only", distProbe: "claude" },
+  { agent: "codex", disposition: "id-only", reattach: "resume-or-load", cwd: "free", distProbe: "codex" },
+  { agent: "opencode", disposition: "live", reattach: "none", cwd: "free" },
+  { agent: "pi", disposition: "live", reattach: "none", cwd: "free", distProbe: "pi" },
+] satisfies readonly ForkSessionTraitRow[];
+
+/** Per-built-in `session/fork` dispositions. Pinned against the installed adapter dists by the
+ *  protocol coverage suite and against the public docs by the docs-drift suite. */
+export const FORK_SESSION_TRAITS: readonly ForkSessionTraitRow[] = Object.freeze(
+  FORK_SESSION_TRAIT_ROWS.map((row) => Object.freeze(row)),
+);
+
+/** Unknown agents: a fork response is treated as live (the ACP contract), cwd free. */
+export const FORK_SESSION_TRAIT_DEFAULT: ForkSessionTraitRow = Object.freeze({
+  agent: "*",
+  disposition: "live",
+  reattach: "none",
+  cwd: "free",
+});
+
+/** The built-in row for `agent`, or — when `declared` is given (a custom registry entry's `fork`
+ *  field, `CustomBackendConfig.fork`) — the row the declaration describes. A declaration always
+ *  wins over the name: a custom entry named `claude` is a different program from the built-in and
+ *  never inherits its row. An undeclared unknown agent gets `FORK_SESSION_TRAIT_DEFAULT`. */
+export function forkSessionTrait(
+  agent: string,
+  declared?: { readonly disposition: ForkSessionTraitRow["disposition"]; readonly cwd?: ForkSessionTraitRow["cwd"] },
+): ForkSessionTraitRow {
+  if (declared) {
+    return Object.freeze({
+      agent,
+      disposition: declared.disposition,
+      reattach: declared.disposition === "id-only" ? "resume-or-load" : "none",
+      cwd: declared.cwd ?? "free",
+    });
+  }
+  return FORK_SESSION_TRAITS.find((row) => row.agent === agent) ?? FORK_SESSION_TRAIT_DEFAULT;
+}
+
+/** What `PromptResponse.usage` covers on each installed agent, read from its adapter source.
+ *  Every source-verified agent reports THE TURN (the SDK's own type doc says "across session";
+ *  the adapters do not follow it): claude-agent-acp resets its accumulator at every turn
+ *  activation, codex-acp reports the turn's last token count, pi sums the assistant messages
+ *  after the turn's start index. A session total is therefore the client's own running sum of
+ *  per-turn reports. OpenCode ships a compiled binary: `turn` by live verification and by the
+ *  client's existing per-turn accumulator contract (`usage.ts` `recordPromptUsage` replaces,
+ *  never sums) only. The `scope` union has one member on purpose: exactly one arithmetic is
+ *  implemented, and a second member needs a live proof before it exists. */
+export interface PromptUsageScopeRow {
+  readonly agent: string;
+  readonly scope: "turn";
+  /** Installed distributions whose usage reporting is probed by the protocol coverage suite. */
+  readonly distProbe?: "claude" | "codex" | "pi";
+}
+
+const PROMPT_USAGE_SCOPE_ROWS = [
+  { agent: "claude", scope: "turn", distProbe: "claude" },
+  { agent: "codex", scope: "turn", distProbe: "codex" },
+  { agent: "opencode", scope: "turn" },
+  { agent: "pi", scope: "turn", distProbe: "pi" },
+] satisfies readonly PromptUsageScopeRow[];
+
+/** Per-built-in `PromptResponse.usage` scope. Pinned against the installed adapter dists so an
+ *  adapter that starts reporting cumulative usage fails the build instead of silently doubling
+ *  a client-side session sum. */
+export const PROMPT_USAGE_SCOPES: readonly PromptUsageScopeRow[] = Object.freeze(
+  PROMPT_USAGE_SCOPE_ROWS.map((row) => Object.freeze(row)),
+);
+
+/** Unknown agents: the ACP-client contract (`recordPromptUsage` keeps the latest per-turn report). */
+const PROMPT_USAGE_SCOPE_DEFAULT: PromptUsageScopeRow = Object.freeze({ agent: "*", scope: "turn" });
+
+function promptUsageScopeRow(agent: string): PromptUsageScopeRow {
+  return PROMPT_USAGE_SCOPES.find((row) => row.agent === agent) ?? PROMPT_USAGE_SCOPE_DEFAULT;
+}
+
+/** The usage scope `agent` reports on `session/prompt`; custom agents follow the ACP-client contract. */
+export function promptUsageScope(agent: string): PromptUsageScopeRow["scope"] {
+  return promptUsageScopeRow(agent).scope;
+}
+
 /** One built-in's reference to universal ACP classifications and backend-specific live evidence. */
 export interface BuiltinProtocolCoverageRow {
   readonly clientMethods: Readonly<Record<string, ClientMethodCoverage>>;
@@ -304,6 +405,10 @@ export interface BuiltinProtocolCoverageRow {
   readonly extensions: readonly AcpExtensionSupportMatrixRow[];
   readonly installedDistProbes: readonly string[];
   readonly liveProbes: readonly string[];
+  /** This built-in's `session/fork` disposition (the same frozen `FORK_SESSION_TRAITS` row). */
+  readonly fork: ForkSessionTraitRow;
+  /** This built-in's `PromptResponse.usage` scope (the same frozen `PROMPT_USAGE_SCOPES` row). */
+  readonly promptUsage: PromptUsageScopeRow;
 }
 
 function coverageRow(
@@ -321,6 +426,8 @@ function coverageRow(
     ),
     installedDistProbes: Object.freeze([...installedDistProbes]),
     liveProbes: Object.freeze([id]),
+    fork: forkSessionTrait(id),
+    promptUsage: promptUsageScopeRow(id),
   });
 }
 

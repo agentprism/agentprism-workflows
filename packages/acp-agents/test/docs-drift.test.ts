@@ -8,6 +8,7 @@ import {
   ACP_EXTENSION_SUPPORT_MATRIX,
   AUTH_META_MATRIX,
   CODEX_SPAWN_AUTH_ENV,
+  FORK_SESSION_TRAITS,
   PI_ACP_PROTOCOL_CONTRACT,
 } from "../src/index.js";
 
@@ -69,6 +70,27 @@ test("the executable AUTH_META_MATRIX stays in lockstep with docs/api.md", () =>
   }
   assert.ok(api.includes(CODEX_SPAWN_AUTH_ENV), "docs/api.md must cite the DEFAULT_AUTH_REQUEST channel");
   assert.ok(api.includes("-32000"), "docs/api.md must document the -32000 auth-required code");
+});
+
+// The per-backend fork dispositions and the prompt-usage scope are executable data in
+// protocol-coverage.ts; the public docs that describe the SDK must carry the same rows and the
+// per-turn statement, so a trait change cannot land without its prose.
+test("fork traits and prompt-usage scope are documented per backend wherever the SDK is described", () => {
+  for (const path of ["docs/api.md", "packages/acp-agents/README.md"]) {
+    const text = readRepoFile(path);
+    assert.ok(text.includes("`FORK_SESSION_TRAITS`"), `${path} must name the fork trait table`);
+    for (const row of FORK_SESSION_TRAITS) {
+      const cells = [row.agent, row.disposition, row.reattach, row.cwd]
+        .map((cell) => `\\|\\s*\`${escapeRegExp(cell)}\`\\s*`)
+        .join("");
+      assert.match(text, new RegExp(`${cells}\\|`), `${path} must carry the ${row.agent} fork trait row`);
+    }
+    assert.match(
+      text,
+      /`PROMPT_USAGE_SCOPES`[^\n]*per-turn/,
+      `${path} must state that prompt usage is per-turn (PROMPT_USAGE_SCOPES)`,
+    );
+  }
 });
 
 test("adapter versions cited in docs match the installed acp-agents dependencies", () => {

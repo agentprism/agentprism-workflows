@@ -90,6 +90,45 @@ test("registry: validates names and config field types while allowing built-in-n
     () => resolveBackendRegistry({ b: { command: "x", structuredOutputTool: "yes" } as never }),
     /"structuredOutputTool" must be a boolean/,
   );
+  const forkShape = /"fork" must be \{ disposition: "id-only" \| "live", cwd\?: "source-only" \| "free" \}/;
+  for (const fork of ["id-only", null, [], {}, { disposition: "persisted" }, { disposition: "live", cwd: "anywhere" }, { cwd: "free" }]) {
+    assert.throws(
+      () => resolveBackendRegistry({ b: { command: "x", fork } as never }),
+      forkShape,
+      `fork ${JSON.stringify(fork)} must be rejected`,
+    );
+  }
+  assert.throws(
+    () => resolveBackendRegistry(undefined, envWith('{"b": {"command": "x", "fork": {"disposition": "id-only", "cwd": 1}}}')),
+    /AGENTPRISM_BACKENDS: backend "b" "fork" must be/,
+  );
+});
+
+test("registry: carries a declared fork disposition verbatim and leaves it absent when undeclared", () => {
+  const registry = resolveBackendRegistry(
+    {
+      wrapped: { command: "claude-agent-acp", fork: { disposition: "id-only", cwd: "source-only" } },
+      live: { command: "x", fork: { disposition: "live" } },
+      plain: { command: "x" },
+    },
+    envWith('{"env-declared": {"command": "codex-acp", "fork": {"disposition": "id-only"}}}'),
+  );
+  assert.deepEqual(registry.get("wrapped")?.fork, { disposition: "id-only", cwd: "source-only" });
+  assert.deepEqual(registry.get("live")?.fork, { disposition: "live" });
+  assert.deepEqual(registry.get("env-declared")?.fork, { disposition: "id-only" });
+  assert.equal(Object.hasOwn(registry.get("plain") ?? {}, "fork"), false, "undeclared entries carry no fork key");
+  // the entry holds a validated copy, not the caller's object.
+  const declared = { disposition: "live" as const };
+  const copied = resolveBackendRegistry({ b: { command: "x", fork: declared } }).get("b")?.fork;
+  assert.notStrictEqual(copied, declared);
+  assert.deepEqual(copied, declared);
+  // run-scoped (script-declared) backends validate the same way and carry it too.
+  const layered = registryWithRunBackends(registry, { scripted: { command: "x", fork: { disposition: "id-only" } } });
+  assert.deepEqual(layered.get("scripted")?.fork, { disposition: "id-only" });
+  assert.throws(
+    () => registryWithRunBackends(registry, { bad: { command: "x", fork: { disposition: "maybe" } } as never }),
+    /script backends \(meta\.backends\): backend "bad" "fork" must be/,
+  );
 });
 
 test("registry: validates structuredOutputTool and defaults custom backends to injection-enabled", () => {

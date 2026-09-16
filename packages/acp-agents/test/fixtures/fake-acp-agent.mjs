@@ -244,6 +244,59 @@ class FakeAgent {
     // Per-session cancellation: a `waitForCancel` turn parks until session/cancel arrives.
     this.cancelled = new Set();
     this.cancelWaiters = new Map();
+    // Fork bookkeeping. `forkedIds` holds every id THIS process minted through session/fork (it
+    // survives an id-only reattach) so `forkSession.turns` can serve those ids their own script
+    // through `forkTurnIndex` — `turnIndex` is per PROCESS, and a forked session that is its own
+    // process would otherwise be served the parent's first turn. `idOnlyForkIds` holds ids minted
+    // under `forkSession.idOnly`: they are NOT live until session/resume or session/load reattaches
+    // them (the Claude adapter shape — its fork response is `{ sessionId }` alone and the id is
+    // unknown to the agent until reattached).
+    this.forkedIds = new Set();
+    this.forkTurnIndex = 0;
+    this.idOnlyForkIds = new Set();
+  }
+
+  /** Reject a session method aimed at an id-only fork id that was never reattached. A plain
+   *  Error (not a RequestError) so the SDK maps it exactly like the Claude adapter's own
+   *  `throw new Error("Session not found")`: internalError with `data.details`. */
+  assertLiveForkId(sessionId) {
+    if (this.idOnlyForkIds.has(sessionId)) throw new Error("Session not found");
+  }
+
+  /** Replay scripted history for `sessionId` BEFORE the caller's response is returned: each
+   *  `replay` entry becomes a user/agent message chunk (a plain string is an assistant chunk), then
+   *  `updates` are emitted verbatim. Shared by session/load and session/fork. */
+  async replaySession(sessionId, replay, updates) {
+    const entries = replay === undefined ? [] : Array.isArray(replay) ? replay : [replay];
+    for (const entry of entries) {
+      // A plain string replays an assistant message chunk (the historical
+      // shape); an object may carry `{ role: "user"|"assistant", text }` so
+      // a test can replay the founding turn's PROMPT (user_message_chunk)
+      // alongside its outcome — the transcript shape the re-attach arm's
+      // observability probe keys on, mirroring how a real agent replays
+      // persisted history (getSessionMessages → toAcpNotifications).
+      if (entry && typeof entry === "object") {
+        const role = entry.role === "user" ? "user" : "assistant";
+        await this.conn.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: role === "user" ? "user_message_chunk" : "agent_message_chunk",
+            content: { type: "text", text: entry.text },
+          },
+        });
+      } else {
+        await this.conn.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: String(entry) },
+          },
+        });
+      }
+    }
+    for (const update of Array.isArray(updates) ? updates : []) {
+      await this.conn.sessionUpdate({ sessionId, update: clone(update) });
+    }
   }
 
   async initialize(params) {
@@ -293,6 +346,7 @@ class FakeAgent {
   async extMethod(method, params) {
     const fixture = scenario.extensionRequest;
     record({ method: "extensionRequest", extensionMethod: method, params });
+    if (method === "_session/steering") this.assertLiveForkId(params?.sessionId);
     // The loaded-turn terminal-state query (the re-attach arm's
     // authoritative founding-turn classification): answered from the
     // scenario's scripted per-session loaded-turn state.
@@ -365,6 +419,8 @@ class FakeAgent {
 
   async loadSession(params) {
     record({ method: "loadSession", params });
+    // Reattaching an id-only fork id makes it live.
+    this.idOnlyForkIds.delete(params.sessionId);
     const load = scenario.loadSession ?? {};
     if (load.delayMs) await new Promise((resolve) => setTimeout(resolve, load.delayMs));
     if (load.authRequired) throw RequestError.authRequired(clone(load.throwData), load.throw);
@@ -391,41 +447,7 @@ class FakeAgent {
       record({ method: "permissionOutcome", phase: "load", outcome: response.outcome });
     }
 
-    const replay =
-      load.replay === undefined
-        ? []
-        : Array.isArray(load.replay)
-          ? load.replay
-          : [load.replay];
-    for (const entry of replay) {
-      // A plain string replays an assistant message chunk (the historical
-      // shape); an object may carry `{ role: "user"|"assistant", text }` so
-      // a test can replay the founding turn's PROMPT (user_message_chunk)
-      // alongside its outcome — the transcript shape the re-attach arm's
-      // observability probe keys on, mirroring how a real agent replays
-      // persisted history (getSessionMessages → toAcpNotifications).
-      if (entry && typeof entry === "object") {
-        const role = entry.role === "user" ? "user" : "assistant";
-        await this.conn.sessionUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: role === "user" ? "user_message_chunk" : "agent_message_chunk",
-            content: { type: "text", text: entry.text },
-          },
-        });
-      } else {
-        await this.conn.sessionUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: String(entry) },
-          },
-        });
-      }
-    }
-    for (const update of Array.isArray(load.updates) ? load.updates : []) {
-      await this.conn.sessionUpdate({ sessionId: params.sessionId, update: clone(update) });
-    }
+    await this.replaySession(params.sessionId, load.replay, load.updates);
     // Post-response LIVE continuation: a real agent whose founding turn is still in flight
     // keeps streaming session/update notifications AFTER the session/load response (the
     // replay ends at the last persisted chunk; the live turn continues). The re-attach arm
@@ -472,6 +494,8 @@ class FakeAgent {
 
   async resumeSession(params) {
     record({ method: "resumeSession", params });
+    // Reattaching an id-only fork id makes it live.
+    this.idOnlyForkIds.delete(params.sessionId);
     const resume = scenario.resumeSession ?? {};
     if (resume.delayMs) await new Promise((resolve) => setTimeout(resolve, resume.delayMs));
     if (resume.authRequired) throw RequestError.authRequired(clone(resume.throwData), resume.throw);
@@ -513,11 +537,27 @@ class FakeAgent {
       typeof fork.sessionId === "string"
         ? fork.sessionId
         : `fake-fork-${process.pid}-${(this.sessionCounter += 1)}`;
+    this.forkedIds.add(sessionId);
+    this.mcpServersBySession.set(sessionId, clone(params.mcpServers ?? []));
+
+    // Pre-response replay under the NEW id (`fork.replay` / `fork.updates`, same shapes as
+    // session/load): a real agent may stream the seeded transcript before the fork response
+    // carries the id the client would route it by, so the client only ever sees these as
+    // unroutable updates it has to buffer or drop.
+    await this.replaySession(sessionId, fork.replay, fork.updates);
+
+    if (fork.idOnly === true) {
+      // The Claude adapter shape end to end: the response is `{ sessionId }` ALONE (no
+      // configOptions, no modes — the catalog exists only on the reattached handle) and the id is
+      // not live until session/resume or session/load reattaches it (see assertLiveForkId).
+      this.idOnlyForkIds.add(sessionId);
+      return { sessionId };
+    }
+
     const modes = scenarioModesFor(fork);
     if (modes) this.modesBySession.set(sessionId, modes);
     const configOptions = scenarioConfigOptionsFor(fork, this.configOptions);
     this.configOptions = configOptions;
-    this.mcpServersBySession.set(sessionId, clone(params.mcpServers ?? []));
     return {
       sessionId,
       configOptions,
@@ -601,6 +641,7 @@ class FakeAgent {
 
   setSessionMode(params) {
     record({ method: "setSessionMode", params });
+    this.assertLiveForkId(params.sessionId);
     const modes = this.modesBySession.get(params.sessionId);
     const ids = modes?.availableModes?.map((mode) => mode.id) ?? [];
     if (!modes || !ids.includes(params.modeId)) {
@@ -612,6 +653,7 @@ class FakeAgent {
 
   setSessionConfigOption(params) {
     record({ method: "setSessionConfigOption", params });
+    this.assertLiveForkId(params.sessionId);
     if (scenario.setConfigOptionError) {
       throw RequestError.invalidParams(params, String(scenario.setConfigOptionError));
     }
@@ -624,9 +666,17 @@ class FakeAgent {
 
   async prompt(params) {
     record({ method: "prompt", params });
-    const turns = scenario.turns ?? [{ text: "ok" }];
-    const turn = turns[Math.min(this.turnIndex, turns.length - 1)] ?? {};
-    this.turnIndex += 1;
+    this.assertLiveForkId(params.sessionId);
+    // Ids minted by THIS process's session/fork get their own script (`forkSession.turns`) and
+    // cursor when the scenario provides one; everything else shares `scenario.turns` and the
+    // process-wide cursor.
+    const forkTurns = scenario.forkSession?.turns;
+    const servesForkTurns = Array.isArray(forkTurns) && this.forkedIds.has(params.sessionId);
+    const turns = servesForkTurns ? forkTurns : (scenario.turns ?? [{ text: "ok" }]);
+    const cursor = servesForkTurns ? this.forkTurnIndex : this.turnIndex;
+    const turn = turns[Math.min(cursor, turns.length - 1)] ?? {};
+    if (servesForkTurns) this.forkTurnIndex += 1;
+    else this.turnIndex += 1;
     this.turnBySession.set(params.sessionId, turn);
 
     // 0) crash path: simulate the backend process dying mid-turn (before responding). With a
@@ -648,7 +698,9 @@ class FakeAgent {
     // 0.5) cancellable turn: park until the client sends session/cancel for this session, then
     // settle the turn as "cancelled" — exactly how a real agent honors session/cancel. The PROCESS
     // stays alive (cancel does not close the connection), so the pool can reuse it afterward.
-    if (turn.waitForCancel) {
+    // `ignoreCancel` parks the same way but session/cancel never releases it (see cancel()): the
+    // turn only ends when the client kills the process — the agent-owned escalation path.
+    if (turn.waitForCancel || turn.ignoreCancel) {
       if (!this.cancelled.has(params.sessionId)) {
         await new Promise((resolve) => this.cancelWaiters.set(params.sessionId, resolve));
       }
@@ -658,14 +710,17 @@ class FakeAgent {
       await new Promise((resolve) => setTimeout(resolve, turn.delayMs));
     }
 
-    // 1) optional permission round-trip (agent -> client request)
+    // 1) optional permission round-trip (agent -> client request). `toolCallId` and `name` are
+    // forwarded verbatim when scripted so a test can correlate the permission request with a
+    // `tool_call` session update carrying the same id/name.
     if (turn.toolCall) {
       const response = await this.conn.requestPermission({
         sessionId: params.sessionId,
         toolCall: {
-          toolCallId: "tc-1",
+          toolCallId: turn.toolCall.toolCallId ?? "tc-1",
           title: turn.toolCall.title,
           kind: turn.toolCall.kind,
+          ...(turn.toolCall.name ? { name: turn.toolCall.name } : {}),
           ...(turn.toolCall.meta ? { _meta: turn.toolCall.meta } : {}),
         },
         options: turn.toolCall.options ?? [

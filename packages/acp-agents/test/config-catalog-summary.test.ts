@@ -1,13 +1,14 @@
+// The bounded authoring summary and the probe scheduler of src/config-catalog.ts
+// (moved here from @automatalabs/workflows together with the code).
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate } from "node:timers/promises";
 import {
   buildHarnessConfigSummary, formatHarnessConfigSummary, buildHarnessModelsView,
-  probeHarnessConfig,
-} from "../src/config.js";
-import { setValidateProbeFactoryForTests } from "../src/validate-internal.js";
-import type { ValidateHarnessOptions } from "../src/validate.js";
-import type { ProbedConfigOptions } from "@automatalabs/acp-agents";
+  probeHarnessConfig, setConfigProbeFactoryForTests,
+} from "../src/config-catalog.js";
+import type { ValidateHarnessOptions } from "../src/config-catalog.js";
+import type { ProbedConfigOptions } from "../src/index.js";
 
 function catalog(backendId: string, ids: string[], metadata?: Record<string, unknown>): ValidateHarnessOptions {
   return {
@@ -86,7 +87,7 @@ test("timeout aborts a stalled peer and retains healthy catalogs and late reject
 test("owned-runner disposal is bounded even when cleanup stalls", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   let disposing = false;
-  const restore = setValidateProbeFactoryForTests(() => ({
+  const restore = setConfigProbeFactoryForTests(() => ({
     async probeConfigOptions() { return { backendId: "claude", options: [] }; },
     async dispose() { disposing = true; return new Promise(() => {}); },
   }));
@@ -127,7 +128,7 @@ test("shared cancellation preserves completed catalogs and never starts queued p
 test("cancellation still initiates owned disposal without awaiting stalled cleanup", async () => {
   const controller = new AbortController();
   let disposing = false;
-  const restore = setValidateProbeFactoryForTests(() => ({
+  const restore = setConfigProbeFactoryForTests(() => ({
     async probeConfigOptions() { return new Promise(() => {}); },
     async dispose() { disposing = true; return new Promise(() => {}); },
   }));

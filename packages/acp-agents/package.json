@@ -37,7 +37,7 @@
   },
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
     "test": "tsx --test \"test/**/*.test.ts\"",
     "prepublishOnly": "tsc -b"
   },

@@ -6,9 +6,9 @@ Packages (all published to npm, Apache-2.0, ESM-only, Node >= 22):
 
 | Package | What it is | Depend on it when |
 |---|---|---|
-| `@automatalabs/workflows` | Facade re-exporting the supported orchestration surface (`runDynamicWorkflow`, `createAcpRunner`, `WorkflowManager`, auth/session types) | You want the SDK. **Start here.** |
+| `@automatalabs/workflows` | Facade re-exporting the supported orchestration surface (`runDynamicWorkflow`, `createAcpRunner`, `WorkflowManager`, `AcpAgent`, auth/session types) | You want the SDK. **Start here.** |
 | `@automatalabs/workflow-engine` | The deterministic script engine + `WorkflowManager` (no agent construction — the runner is injected) | You bring your own `AgentRunner` and don't want ACP deps |
-| `@automatalabs/acp-agents` | The ACP runner: pooled Claude/Codex/OpenCode/pi ACP processes, model routing, structured output, events, interactive sessions | You want agent execution without the workflow engine |
+| `@automatalabs/acp-agents` | The ACP runner: pooled Claude/Codex/OpenCode/pi ACP processes, model routing, structured output, events, interactive sessions, the no-prompt harness config catalog (`probeHarnessConfig`), and the [`AcpAgent` SDK](#acpagent-sdk) (one dedicated process per held-open agent, forks, cold reopen) | You want agent execution without the workflow engine |
 | `@automatalabs/acp-server` | ACP V1 proxy over stdio, Streamable HTTP, or WebSocket, with negotiated backend discovery and one backend pinned per operational connection | You want one extension-aware ACP endpoint for all configured backends |
 | `@automatalabs/shared-types` | The seam contracts: `AgentRunner`, `RunOptions`, `WorkflowError` (+ codes), workflow result/meta types | You implement a custom runner or need `instanceof WorkflowError` across packages |
 | `@automatalabs/mcp-server` | Stdio MCP server (bin `agentprism-workflow`) exposing the `workflow` tool (asynchronous run/resume, setup response, bounded status/result, live permission response, stop, and an Apps monitor) and the `repl` tool (a persistent per-project JavaScript REPL for live subagent orchestration) | You drive workflows from Claude Code / an MCP client |
@@ -50,7 +50,7 @@ Inputs are limited to 256 KiB raw CLI UTF-8 and canonical programmatic JSON, 256
 
 The CLI adds mutually exclusive `--mock-answers <json>` and `--mock-answers-file <path>` to the existing `npx @automatalabs/workflows validate <file-or-name> [--args <json> | --args-file <path>] [--workflows-dir <dir>]… [--parse-only] [--cwd <dir>] [--max-agents <n>] [--json]` surface (`3` = usage error). With `--workflows-dir` the positional may be a workflow name and nested `workflow("<name>")` calls resolve. The package exports `MockAnswerJson`, `MockAnswerSequence`, `MockAnswerRule`, `MockAnswers`, `ValidatedMockAnswerUse`, `ValidatedMockAnswerRule`, `UnusedMockAnswer`, and `ValidatedMockAnswers`, along with the existing validation types and `fabricateFromSchema()` / `formatValidateReport()` helpers.
 
-**Harness config discovery (token-free):** `probeHarnessConfig({ harnesses?, modelSpecs?, backends?, cwd?, probeRunner?, probeTimeoutMs?, probeConcurrency?, signal? })` runs validate's no-prompt config probe standalone — no script — and resolves to a `HarnessConfigReport` (`{ ok, exitCode, harnessOptions, authoringSummary? }`, per-harness entries in the same `ValidateHarnessOptions` shape with `modes?: SessionModeState | null` and `options?: SessionConfigOption[]`). A successful built-in probe always reports modes explicitly after normalizing ACP's mode config-option fallback; `null` means unsupported, so callers must omit `mode` rather than infer a default. Default targets are the built-in harnesses plus every registered custom backend; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner`. A per-harness spawn/auth/session failure or timeout (default 60 000 ms) reports `probed:false` without throwing; only a malformed registry or invalid options throw. `probed:true` means the no-prompt session/config path succeeded, not that every adapter proved first-prompt authentication. `formatHarnessConfigReport(report, { includeSummary? })` renders the CLI's human table and includes the authoring summary by default; composition roots can render that summary separately. CLI: `npx @automatalabs/workflows config [harness ...] [--cwd <dir>] [--json]` — exit `0` all probed, `1` at least one probe failed, `3` usage error.
+**Harness config discovery (token-free):** `probeHarnessConfig` lives in `@automatalabs/acp-agents` and is re-exported by `@automatalabs/workflows`; `probeHarnessConfig({ harnesses?, modelSpecs?, backends?, cwd?, probeRunner?, probeTimeoutMs?, probeConcurrency?, signal? })` runs validate's no-prompt config probe standalone — no script — and resolves to a `HarnessConfigReport` (`{ ok, exitCode, harnessOptions, authoringSummary? }`, per-harness entries in the same `ValidateHarnessOptions` shape with `modes?: SessionModeState | null` and `options?: SessionConfigOption[]`). A successful built-in probe always reports modes explicitly after normalizing ACP's mode config-option fallback; `null` means unsupported, so callers must omit `mode` rather than infer a default. Default targets are the built-in harnesses plus every registered custom backend; `backends` merges over `AGENTPRISM_BACKENDS` exactly like `createAcpRunner`. A per-harness spawn/auth/session failure or timeout (default 60 000 ms) reports `probed:false` without throwing; only a malformed registry or invalid options throw. `probed:true` means the no-prompt session/config path succeeded, not that every adapter proved first-prompt authentication. `formatHarnessConfigReport(report, { includeSummary? })` renders the CLI's human table and includes the authoring summary by default; composition roots can render that summary separately. CLI: `npx @automatalabs/workflows config [harness ...] [--cwd <dir>] [--json]` — exit `0` all probed, `1` at least one probe failed, `3` usage error.
 
 Probes run concurrently with independent cancellation deadlines. `probeTimeoutMs` defaults to
 60,000 ms and must be a positive timer-safe integer; `probeConcurrency` defaults to 4 and accepts
@@ -1261,6 +1261,17 @@ Raw `request()` rejects the session-stateful methods that would create or reopen
 
 `AGENT_METHOD_COVERAGE` and `CLIENT_METHOD_COVERAGE` classify every method constant exported by the installed ACP SDK. Agent methods are `"driven"`, `"passthrough"`, or `"guarded"`; guarded means no safe driven wrapper exists. Agent coverage is 16 operational driven methods plus `initialize`, 0 guarded methods, and passthrough for `nes/*`, `document/*`, and `mcp/message`. The raw guards for session-stateful `session/new`, `session/load`, `session/resume`, `session/fork`, and `_session/steering` require their driven wrappers. `ACP_EXTENSION_SUPPORT_MATRIX` separately documents built-in vendor-extension advertisements (Claude, Codex, and pi advertise steering; OpenCode does not), so it is never counted as a standard `AGENT_METHODS` method and never gates runtime behavior. Client methods are currently 14/14 served. A tripwire test compares the standard manifests against `AGENT_METHODS` / `CLIENT_METHODS`, and probes installed Claude/Codex extension advertisements. Arbitrary agent extensions use the existing generic overloads `session.request<Response, Params>(method, params)` and `session.notify<Params>(method, params)`; method strings, params, responses, and agent-provided numeric errors pass through unchanged, while notifications have no response.
 
+`FORK_SESSION_TRAITS` pins, per built-in, what a `session/fork` response *is*, read from each adapter's source: `id-only` means the response names a persisted copy that is not live (Claude returns `{ sessionId }` alone and prompting it fails with "Session not found"; Codex installs state but unsubscribes the forked thread until it is reopened), so the fork must be reopened — `session/resume`, else `session/load` — before its first turn; `live` means the fork handle is the session. The `cwd` column says whether the fork may re-home (Claude's transcript store is keyed by the source cwd). `forkSessionTrait(agent, declared?)` resolves a row: a built-in's own row, the row a custom backend's `fork` declaration describes (a declaration always wins over a name that shadows a built-in), else `FORK_SESSION_TRAIT_DEFAULT` (`live` / `free`, the plain ACP contract). Data for a fork choreography built on `PooledConnection`; `AcpAgentRunner.forkSession()` returns the raw fork handle and never consults it.
+
+| agent | `session/fork` disposition | reattach | fork cwd |
+|---|---|---|---|
+| `claude` | `id-only` | `resume-or-load` | `source-only` |
+| `codex` | `id-only` | `resume-or-load` | `free` |
+| `opencode` | `live` | `none` | `free` |
+| `pi` | `live` | `none` | `free` |
+
+`PROMPT_USAGE_SCOPES` pins that `PromptResponse.usage` is per-turn on every built-in (the SDK's own `Usage` doc says "across session"; the installed adapters report the turn — Claude resets its accumulator at turn activation, Codex reports the turn's last token count, pi sums the assistant messages after the turn's start index; OpenCode by live verification only), so a session total is the client's own running sum of turn reports and `UsageAccumulator.recordPromptUsage` replaces rather than sums. `promptUsageScope(agent)` answers `"turn"` for built-ins and custom agents alike. Both tables are probed in the installed Claude/Codex/pi dists and welded to this document by the drift suite.
+
 ### <a name="runner-events"></a>Events (`runner.on(name, listener)`)
 
 Typed bus; returns an unsubscribe thunk. Names are the ACP `sessionUpdate` discriminants verbatim (`agent_message_chunk`, `tool_call`, `tool_call_update`, `plan`, `usage_update`, …) plus cross-cutting events: `session_update` (catch-all), `permission_pending`, `permission_request`, `elicitation_pending`, `elicitation_request`, `elicitation_complete`, `raw_message`, `steering`, `session_open`, `session_close`, `backend_error`. `steering` carries normal session context plus `{ response }`, the complete raw `_session/steering` response, after every resolved request; it never exposes the request's prompt or metadata, and thrown requests emit nothing. Every session-scoped payload carries `AcpEventContext`: `{ sessionId, backendId, label?, runId?, callIndex?, initializeMeta? }` — the engine stamps `runId`/`label`/`callIndex` on workflow agents, and `initializeMeta` is the session's stable initialize-response snapshot. `backend_error` remains connection-scoped with exactly `{ backendId, error }`.
@@ -1356,6 +1367,155 @@ Installed backend status verified from the packaged dists: `@agentclientprotocol
 
 ---
 
+## <a name="acpagent-sdk"></a>AcpAgent SDK
+
+`AcpAgent` (exported from `@automatalabs/acp-agents`, its home; `@automatalabs/workflows` re-exports it like `InteractiveSession`) is the SDK front door for a **held-open** agent: one dedicated ACP process per agent (and per fork), a lazy constructor that spawns nothing until first use, turns that serialize in a per-agent FIFO, live forks that see everything the parent committed so far, and cold reopen of a recorded session from its `AgentSessionRef`. It composes the same primitives as `AcpAgentRunner` and `InteractiveSession` — `PooledConnection`, `SessionHandle`, the backends, the model-routing grammar, the structured-output tool host — but owns no pool: every agent is its own process, a parent's `close()` never affects its forks, and a long-lived agent never starves `run()` calls. Claude, Codex, OpenCode, pi, and registered custom backends are all first class.
+
+### Quick start
+
+```ts
+import { AcpAgent } from "@automatalabs/acp-agents";
+
+const catalog = await AcpAgent.probe({ modelFilter: "opus" });   // like the MCP workflow tool action:"config"
+const primary = new AcpAgent({ cwd: "/abs/path/to/project", model: "claude/opus[1m]" }); // nothing spawned yet
+primary.on("agent_message_chunk", (e) => {                        // streaming / events, this agent only
+  if (e.content.type === "text") process.stdout.write(e.content.text);
+});
+
+const turn = await primary.prompt("Help me investigate the flaky test in src/queue.ts.");
+turn.response;   // the verbatim PromptResponse, `_meta` intact
+turn.text;       // this turn's assistant text
+
+const planner = await primary.fork();                    // a NEW process seeded with everything committed so far
+const plan = await planner.prompt("Plan the implementation of the fix.", {
+  mode: "plan",                     // sticky: applies to this and every later turn of `planner`
+  meta: { trace: "plan-1" },        // turn `_meta`, passed through verbatim
+});
+await primary.prompt("Meanwhile, list the callers of enqueue()."); // primary keeps going, unaffected
+const reviewer = await primary.fork();                   // includes the follow-up too
+// plan.response / plan.updates / plan.raw carry everything the harness sent back — nothing is stripped
+
+await Promise.all([planner.close(), reviewer.close()]);
+await primary.close({ keep: true });                     // the process is gone; the session stays re-openable
+// The same session on a fresh process. The ref carries no model, so pass the agent's back; `resume`
+// replays nothing (history/text start empty) — `AcpAgent.load(ref)` replays the transcript instead.
+const again = await AcpAgent.resume(primary.sessionRef!, { model: primary.model });
+```
+
+`await using agent = new AcpAgent({ cwd })` closes the agent at scope exit (`Symbol.asyncDispose` is `close()`). `AcpAgent.open(options)` is `new AcpAgent(options)` + `ready()`; on an open failure the agent is closed and the mapped error rethrown.
+
+### Options — `AcpAgentOptions`
+
+- `cwd` (required) — an **absolute** path that exists and is a directory, validated synchronously in the constructor and the statics **before** any process spawns (`SCRIPT_VALIDATION_ERROR` otherwise); sent as the `session/new|fork|resume|load` `cwd`.
+- `model?` — a routing spec with the runner's grammar (`resolveModelRoute`): the first `/`-segment routes to a registered custom backend (wins) or a built-in; the remainder is the backend's model id **verbatim**, sent as `session/set_config_option { configId: "model" }` right after the session opens. An unrouted spec (no known first segment) goes whole to the default backend (`AGENTPRISM_DEFAULT_BACKEND`, else `claude`). Omitted = default backend, no model selection.
+- `mode?` — explicit ids are strict (an unadvertised id fails at open); omitted = the backend's default when the live catalog advertises it (Claude `auto`, Codex `agent`, OpenCode `build`; pi/custom none).
+- `configOptions?` — applied verbatim via `session/set_config_option` in ascending id order after model selection. `"model"` is reserved (rejected in the constructor); an id the agent did not advertise fails at open with `SCRIPT_VALIDATION_ERROR` listing the advertised ids.
+- `schema?` — a session-level [typebox](https://github.com/sinclairzx81/typebox) contract (see [Structured output](#acpagent-structured-output)).
+- `mcpServers?` — client-provided MCP servers (stdio/http/sse/acp), capability-gated exactly like the runner.
+- `tools?` / `onPermissionRequest?` / `onElicitation?` — the headless `ToolPolicy` auto-policy, the session-scoped async permission resolver (resolver wins over the policy unless the request matches an explicit allow/deny list — the runner's precedence), and the elicitation responder (its presence is what advertises `elicitation` at initialize).
+- `meta?` — generic `session/new` `_meta` passthrough, layered under backend-computed keys and, when `raw !== false`, over `backend.rawMessagesMeta()`. `instructions?: { base?, developer? }` — Codex-only session instructions (`_meta.baseInstructions` / `_meta.developerInstructions`).
+- `label?` — stamped on every event context and every `WorkflowError.agentLabel`, never on the wire.
+- `backends?` — a custom-backend registry merged over `AGENTPRISM_BACKENDS` like `createAcpRunner({ backends })`; read once in the constructor (malformed = `SCRIPT_VALIDATION_ERROR`); forks inherit it and cannot override it.
+- `signal?` — agent-lifetime abort (see the table below); never inherited by forks.
+- `retainHistory?` (default `true`) — keep the session log across turns so `history`/`text` are cumulative and a fork can seed its child; `false` keeps only the latest turn.
+- `raw?` (default `true`) — ask the backend for its vendor notification stream (`Backend.rawMessagesMeta()`; the Claude backend answers `{ claudeCode: { emitRawSDKMessages: true } }`) so `_claude/sdkMessage` reaches `on("raw_message")` and `turn.raw`. A session `schema` turns them on for Claude regardless, because the native schema channel needs them.
+- `authStore?` / `providerStore?` — optional shared stores. Auth is **default-off**: without them each agent uses its own login, and an ACP `-32000` surfaces as `AUTH_REQUIRED`. Forks share the parent's stores.
+- `clientHandlers?` — client-side fs/terminal/mcp handlers advertised at initialize (validated like the runner's).
+
+Read-only members: `backendId`, `cwd`, `label`, `model` (the model this agent selects at open as a routing spec that leads back to the same backend — `<backendId>/<model id>`, e.g. `"claude/opus[1m]"` — or `undefined` when none was selected; inherited by forks, and what a cold reopen needs back), `state` (`idle` → `opening` → `ready` ⇄ `busy` → `closed`), `sessionId` / `sessionRef` (retained after close — they drive the cold statics), `capabilities` (`NegotiatedCapabilities`), `configOptions` (the latest echoed catalog), `modes`, `history` / `text` (the retained log, seeded from the parent on a fork; `history` is per chunk — one entry per streamed `agent_message_chunk` and per `tool_call`, so its length is not a message count — and `text` folds the same retained assistant messages exactly like `turn.text`: distinct messages joined by a blank line, a `load` replay included), `replay` (verbatim `session/update` records received before the session was ready — a `load` replay or a fork's pre-response replay), `usage` (the running session sum), and `schema`.
+
+### <a name="acpagent-turns"></a>Turns — `prompt()` and `AcpAgentTurn`
+
+`prompt(content, options?)` sends one `session/prompt` and resolves an `AcpAgentTurn` for **every** `PromptResponse` the wire returned. Nothing is stripped and no `stopReason` is thrown on:
+
+- `response` — the wire `PromptResponse` object with `_meta` intact (Claude's quota meta, Codex's typed-failure meta, anything else the adapter attaches). `stopReason` is `response.stopReason` (`refusal`, `max_tokens`, `cancelled` included — unlike `run()`, none of them is an error here).
+- `text` — this turn's assistant messages joined by a blank line (the `run()` fold).
+- `updates` — every `session/update` of the turn as `{ update, receivedAt }`, structuredClone'd so nested `_meta` survives.
+- `raw` — every vendor notification of the turn as `{ method, message, receivedAt }`. Today only Claude's `_claude/sdkMessage` exists; the `_session/loaded_turn/ended` notification is consumed by the seam and never appears here.
+- `toolCalls` — `tool_call` and `tool_call_update` folded by `toolCallId` in first-seen order: `{ toolCallId, name?, title, kind?, status, rawInput?, rawOutput?, content?, locations?, meta? }`, where `meta` is the shallow merge of every `_meta` seen for that id and `status` is the last one seen (`pending` when the agent sent none).
+- `permissions` / `elicitations` — the resolved permission and elicitation events of the turn.
+- `usage` — `{ turn, session, response? }`. **`turn` is this turn's `response.usage`** mapped to `AgentUsage` (every installed adapter reports the turn, not the session — the `PROMPT_USAGE_SCOPES` pin; the ACP SDK's own "across session" doc is not what the adapters send), with `cost` as the clamped delta of the cumulative `usage_update` cost gauge across the turn; when the response carries no `usage`, tokens fall back to the context-token gauge delta exactly like `UsageAccumulator.delta()`. **`session` is the running per-field sum of the turns this agent ran** (starting at zero at open/fork/resume/load — replayed history and the parent's turns are not counted; `cost` is the latest gauge value). `response` is `response.usage` verbatim.
+- `structured?` / `structuredError?` — when a schema was active: the validated object, or why it is absent. There is no repair ladder and no re-prompt.
+- `history` — this turn's accumulator entries (copies). They are **per chunk**, not per message: one `assistant`/`text` entry per `agent_message_chunk` the agent streamed and one `tool`/`toolCall` entry per `tool_call`, so `history.length` is not a message count (a two-chunk answer is two entries) — `text` is the folded, per-message view of the same chunks.
+
+`AcpAgentPromptOptions`: `images?` (appended as image blocks, degraded like the runner when unadvertised), `meta?` (turn `_meta` passthrough — backend keys win direct collisions like `mergeTurnMeta`), `configOptions?` and `mode?` (applied via `session/set_config_option` / `session/set_mode` **before** the turn, inside the FIFO, with the constructor's validation — they are **sticky** for the rest of the session), `schema?` (a per-turn override, Codex only — see below), `signal?`.
+
+**Typed session failures reject.** When the agent walls the turn with codex-acp's negotiated typed session failure (a terminal `_meta` record, or the turn-raised latch on an empty turn), `prompt()` rejects with the runner's mapped `WorkflowError` (`mapTypedSessionFailure`: the same `code`, `recoverable`, `details`, `providerUsageLimitContext` contract) carrying the **complete** turn as a non-enumerable `error.turn` — verbatim `response` incl. `_meta`, `usage`, `updates`, `raw`, `toolCalls`, `history`. Narrow with `isAcpAgentTurnError(error)`. The walled turn's tokens are still added to `usage.session` before the rejection, and the agent stays `ready`.
+
+### Serialization, steering, cancellation, abort
+
+`prompt`, `fork`, `setMode`, `setConfigOptions`, and `close` run **FIFO** per agent: each waits behind every earlier queued operation, and the first of them (or `ready()`) opens the session. `steer(content, { images?, meta? })` and `cancel()` overlap the queue: `steer` sends the `_session/steering` extension for the turn in flight and returns the raw response (with no turn in flight it rejects with `SCRIPT_VALIDATION_ERROR`); `cancel()` sends **one** `session/cancel` for the turn in flight (a no-op otherwise) and resolves at the notify boundary — the in-flight `prompt()` then resolves with `stopReason: "cancelled"` when the agent honors it. A turn that ignores the cancel for the `CANCEL_NOT_HONORED_GRACE_MS` grace ends in **process disposal without a wire `session/close`**: the in-flight turn rejects, the agent is closed, and `sessionRef` stays re-openable because nothing was closed on the wire. `cancel()` never touches queued turns, and it reaches only a turn whose `session/prompt` is **on the wire**: a `prompt()` that has started (`state` is `busy`) but is still opening the session (the lazy first turn) or applying its per-turn `configOptions`/`mode` is not cancellable yet, and a `cancel()` in that window is a no-op the turn never sees. A per-call `signal` covers every window — while queued it rejects without sending, in the pre-wire window it rejects with the reason at the next check with nothing sent for that turn, and in flight it sends the one `session/cancel` — so use per-call signals to stop a specific turn. `setMode(id)` and `setConfigOptions(record)` apply the same strict/advertised-id validation as the constructor and stick for the session.
+
+| Signal | Aborted before the call | Aborted while queued | Aborted in flight | Result |
+|---|---|---|---|---|
+| constructor `signal` | every operation rejects with `signal.reason`; nothing spawns (`ready()` too) | every queued promise rejects with `signal.reason` | an in-flight `prompt` gets one `session/cancel`; an in-flight open/fork/reattach has its process disposed | the affected promises reject with `signal.reason` untouched (never a `WorkflowError`, never a resolved `cancelled` turn); `state` is `closed` at once and the agent tears down like `close()` after the in-flight operation settles |
+| `prompt({ signal })` | rejects with the reason, nothing sent | the entry is removed and rejected, nothing sent | one `session/cancel`; the turn rejects with `signal.reason` after the wire settles, even if the agent answered `cancelled` | the agent stays `ready` |
+| `fork({ signal })` | becomes the **child's** constructor signal (never the fork operation's) | — | the child's open is aborted and `fork()` rejects with the reason | the parent is unaffected |
+| statics `{ signal }` | the new agent's constructor signal | — | the open is aborted, the process disposed | — |
+| `probe({ signal })` | `probeHarnessConfig` semantics: completed catalogs are kept, active probes aborted, queued targets report `probed: false` | | | the report, never a throw for per-target aborts |
+
+A constructor-signal abort rejects every queued promise synchronously inside `signal.abort()`, so attach handlers up front (`Promise.allSettled`) when you queue several operations and then abort — the SDK does not pre-attach a `catch` to your promises. `close()` and `cancel()` are unaffected by aborts; `close()` never throws for an aborted or dead agent.
+
+### Forks
+
+`agent.fork(overrides?)` spawns a **new dedicated process**, sends `session/fork` for the parent's session id, and resolves a child `AcpAgent` whose transcript is everything the parent committed so far. The fork point is implicit: `fork()` is queued behind the in-flight turn, so the parent's persisted transcript is always complete and quiescent when the fork is taken (pi rejects busy forks; Claude would copy a partial turn). The parent keeps going, and closing either side never affects the other, so one recorded session can seed N parallel agents while the original stays open. `fork()` requires the agent to advertise `sessionCapabilities.fork` (otherwise the lifecycle `WorkflowError` naming the backend and `session/fork`, before anything is sent).
+
+The child inherits every constructor option except `label` (suffixed `<parent label>/fork-<n>`, or `fork-<n>`) and `signal`. `overrides` (`AcpAgentForkOptions`) may change anything but the backend — `backends`, `authStore`, `providerStore`, and `clientHandlers` are typed out; a `model` override must route to the same backend (poolKey-equal) or `SCRIPT_VALIDATION_ERROR`; `cwd` defaults to the parent's and a different cwd is rejected on backends whose fork cwd is `source-only`. The child's `configOptions`/`mode`/model are re-applied on the live forked session in wire order. Its `history`/`text` are seeded from a snapshot of the parent's retained log when the fork response carries no replay (so `retainHistory: false` on the parent leaves the child with only the parent's latest turn); a pre-response replay the agent streams under the new id (OpenCode) is buffered and lands in `child.replay` and the accumulator instead.
+
+What a `session/fork` response *is* differs per adapter, and the SDK follows the welded `FORK_SESSION_TRAITS` table under [Protocol passthrough & coverage](#protocol-passthrough--coverage) rather than probing: on `id-only` backends — **Claude** (`{ sessionId }` alone; prompting it fails with "Session not found") and **Codex** (the forked thread is unsubscribed until it is reopened) — the child releases the bare fork handle with `keepOpen` (no wire `session/close`) and reattaches the new id (`session/resume` preferred, `session/load` fallback) **before** applying model/config/mode and before its first turn, so the wire order is always `session/fork` < `session/resume` < `session/prompt` and the trap is impossible by construction; on `live` backends — **pi** and **OpenCode** — the fork handle is the session. Claude's fork cwd is `source-only` (its transcript store is keyed by the source cwd); Codex, OpenCode, and pi accept a different cwd. **Custom backends** declare their disposition as data on the registry entry — `fork: { disposition: "id-only" | "live", cwd?: "source-only" | "free" }` — and an entry wrapping claude-agent-acp or codex-acp **must** declare `id-only`; an undeclared entry is treated as `live`/`free` (the plain ACP contract). A declaration always beats a name that shadows a built-in.
+
+### Cold reopen — `AcpAgent.resume` / `load` / `fork(ref)`
+
+The statics rebuild an agent from a persisted `AgentSessionRef` (from `agent.sessionRef`, `InteractiveSession.sessionRef`, or `WorkflowRunResult.agentSessions`) on a fresh dedicated process: `resume(ref, options?)` sends `session/resume` (no replay), `load(ref, options?)` sends `session/load` (the agent replays the transcript before the response; it lands in `history`/`text`/`replay`, and the load boundary is marked so the re-attach classification holds), and `fork(ref, options?)` runs the trait-driven fork choreography on the recorded session without a history seed — on an id-only backend the child's `history` starts empty unless the reattach fell back to `session/load`; to seed a cold fork with the transcript, `load(ref)` then `fork()`.
+
+Routing is by `ref.backendId` through the built-ins and the registry and **never falls back to the default backend**: an unknown backend id, a `poolKey` that does not match the currently resolved backend, or a `model` option whose first segment routes elsewhere all reject with `SCRIPT_VALIDATION_ERROR` before any process spawns (a `model` on the ref's own backend selects that model; an unrouted spec goes verbatim to the ref's backend). `cwd` defaults to `ref.cwd`; a cold `fork` must keep it on `source-only` backends. `AcpAgentReopenOptions` is `Partial<AcpAgentOptions>`. An `AgentSessionRef` carries **no model**: a reopen without `model` runs on the backend's current default, so pass the original agent's back — `AcpAgent.resume(ref, { model: agent.model })` — to keep the session on the model it was running. A backend that does not advertise the requested lifecycle method fails through the same capability gate as the runner (`SCRIPT_VALIDATION_ERROR` naming the method) and leaves no process behind.
+
+### <a name="acpagent-structured-output"></a>Structured output
+
+A session `schema` drives each backend's native channel exactly like `run()`; the SDK adds no repair ladder — each turn reports `structured` or `structuredError` and never re-prompts.
+
+| Backend | session-level `schema` | per-turn `schema` | result read from |
+|---|---|---|---|
+| `claude` | `_meta.claudeCode.options.outputFormat` on `session/new|resume|load|fork` (with `emitRawSDKMessages`) | rejected | the native result in the `_claude/sdkMessage` stream, validated |
+| `codex` | nothing at `session/new`; `_meta.outputSchema` merged on **every** turn | allowed — replaces that turn's `outputSchema` | the final assistant message parsed as JSON, validated |
+| `opencode` / `pi` / custom | the client-hosted `StructuredOutput` HTTP MCP tool injected into `mcpServers` when the agent advertises `mcpCapabilities.http`, plus the in-prompt contract (OpenCode and custom entries also forward `_meta.outputSchema`) | rejected | this turn's tool capture → the backend's native result (none on pi), validated → a validated final-text fallback (the last JSON object in the final message) |
+
+The per-turn `schema` rule: allowed only where the backend carries the schema on the turn and does not embed it in the prompt (Codex among the built-ins); elsewhere `prompt()` rejects with `SCRIPT_VALIDATION_ERROR` naming the backend and pointing at the constructor option. The injected tool is registered on one `StructuredOutputToolHost` per agent (created lazily, disposed on `close()`; forks own their own), named `structured_output` (or `structured_output_2`, … when a caller's `mcpServers` already uses the name), and a capture belongs to **one** turn: it is consumed by the turn that produced it and a stale capture from a rejected turn is discarded before the next `session/prompt`. `structuredError` names every channel that applied (`no StructuredOutput capture; native result rejected: …; no JSON object in the final message`).
+
+### Events — `on(name, listener)`
+
+`on()` / `once()` return an unsubscribe thunk; `off()` removes one listener. The names and payloads are the runner's (`AcpAgentEventMap = AcpRunnerEventMap`; see [Events](#runner-events)) — there are no SDK-specific event names, and turn boundaries are the `prompt()` promise. The bus is **per agent**: it delivers only events carrying this agent's session id (forks get their own emitter), so listening on a parent never shows a child's stream. Because the process is dedicated, `backend_error` (connection-scoped, `{ backendId, error }`) is delivered too — `InteractiveSession` drops it only because its bus is shared. `session_open` is **sticky**: a listener registered after the session opened receives it once on the next microtask, and a listener that saw it live never sees it twice. `session_close` fires once, when the agent's own session is released (`close()`, the constructor abort, or process death); the id-only fork hand-off — the bare fork handle's `keepOpen` release and the reattach's second `session_open` — is never surfaced. Updates that arrive before the session is ready (a `load` replay, an OpenCode fork's pre-response replay) are buffered under the not-yet-known id and adopted once the open resolves — because `fork()` and the statics return only after that, they are observable through `replay`/`history`, not through `on()`. Listeners are isolated: a throwing listener never affects the turn or its siblings.
+
+### Discovery — `AcpAgent.probe()`
+
+`AcpAgent.probe({ model?, models?, harnesses?, modelFilter?, backends?, cwd?, probeTimeoutMs?, probeConcurrency?, signal? })` resolves an `AcpAgentCatalog = HarnessConfigReport & { models: HarnessModelsView[] }` — the same no-prompt catalog `probeHarnessConfig` produces and the MCP `action:"config"` is projected from, plus the per-harness `models` view (`modelFilter` is a substring or `/regex/` over leaf model ids → `models[*].matches`). Every target runs on its own dedicated process (spawn, initialize, one `session/new`, model selection for exact specs, release, dispose — the SDK owns no pool); `model`/`models` are exact routed specs selected before the catalog is read, `harnesses` are backend-only targets, and the default (no targets) is every built-in plus every registered custom backend. A failed exact-model probe still carries the bare harness catalog next to the failure (`ok: false`, the failed entry `probed: false` with a redacted `error`), the same fallback the MCP `action:"config"` applies, so a caller can pick a valid id. A per-target spawn/auth/timeout failure never throws; a malformed `modelFilter`/`probeTimeoutMs`/`probeConcurrency` throws a `TypeError` and a malformed registry `SCRIPT_VALIDATION_ERROR`, both before any spawn. The MCP byte-budgeted projection stays in `@automatalabs/mcp-server`.
+
+### Errors
+
+SDK misuse is uniformly a `WorkflowError` (`SCRIPT_VALIDATION_ERROR`); wire failures go through the runner's `mapThrownError` ladder; an abort is never mapped.
+
+| Situation | Error |
+|---|---|
+| bad `cwd`, `"model"` in `configOptions`, malformed `backends`, bad `clientHandlers` | `SCRIPT_VALIDATION_ERROR` — thrown synchronously by the constructor; the statics and `probe` reject with it — always before any spawn |
+| unknown config option id (constructor, `setConfigOptions`, per-turn) | `SCRIPT_VALIDATION_ERROR`: `config option "<id>" is not advertised by <backend>; advertised: <ids>` |
+| unknown mode | `SessionHandle.setMode`'s mode-selection `SCRIPT_VALIDATION_ERROR` |
+| per-turn `schema` on a backend other than Codex | `SCRIPT_VALIDATION_ERROR` pointing at the constructor option |
+| `fork`: not advertised / `model` routes elsewhere / cwd override on `source-only` | lifecycle `WorkflowError` / `SCRIPT_VALIDATION_ERROR` / `SCRIPT_VALIDATION_ERROR` |
+| cold statics: unknown `ref.backendId`, `poolKey` mismatch, `model` routes elsewhere, empty `sessionId`/`backendId` | `SCRIPT_VALIDATION_ERROR` — never a silent reroute to the default backend |
+| `steer()` with no turn in flight | `SCRIPT_VALIDATION_ERROR`: `AcpAgent.steer() requires a prompt() in flight` |
+| any operation after `close()`, an abort, or process death | `SCRIPT_VALIDATION_ERROR`: `AcpAgent (<backendId>) is closed[: process exited]`; `close()` itself resolves |
+| a queued operation when the process dies | `AcpAgent (<backendId>) is closed: process exited before the queued operation ran` |
+| wire rejection (open, prompt, steer, setMode, setConfigOptions, fork, reattach) | `mapThrownError`: `-32000` → `AUTH_REQUIRED` (with `authContext`); the backend classifier → `PROVIDER_USAGE_LIMIT` (+ `resetHint`); child cleanup → non-recoverable `AGENT_EXECUTION_ERROR`; else recoverable `AGENT_EXECUTION_ERROR` |
+| typed session failure (Codex) | `prompt()` **rejects** with the mapped `WorkflowError` carrying `error.turn` (see [Turns](#acpagent-turns)) |
+| `stopReason` ∈ `refusal` / `max_tokens` / `max_turn_requests` / `cancelled` | **not** an error — `turn.stopReason` |
+| structured output absent or invalid | **not** an error — `turn.structuredError` |
+| abort (constructor or per-call signal) | `signal.reason` rethrown untouched |
+| `close()`: a `child_cleanup_error` from the release | non-recoverable `AGENT_EXECUTION_ERROR`, thrown after the process is disposed |
+
+Every `AcpAgent` and probe connection is registered with a single module-level `process.once("exit")` hook that kills any still-live dedicated process, so a crashing host leaves no orphaned agents.
+
+---
+
 ## ACP aggregation server
 
 `@automatalabs/acp-server` exports `serveAcpServer(options?)`,
@@ -1401,7 +1561,7 @@ for every new first-class row.
 | `codex` | `require.resolve("@automatalabs/codex-acp")` — the installed dep, no config needed | `AGENTPRISM_CODEX_ACP_BIN` (path), or `AGENTPRISM_CODEX_ACP_CMD` / `_ARGS` (full command) |
 | `opencode` | `AGENTPRISM_OPENCODE_ACP_CMD`, else host-installed `opencode-ai/bin/opencode` if resolvable, else `opencode` on PATH; non-override paths pass `acp` | `AGENTPRISM_OPENCODE_ACP_CMD` / `_ARGS` (full command) |
 | `pi` | `AGENTPRISM_PI_ACP_CMD` override; else resolved `@automatalabs/pi-acp/dist/index.js` under `process.execPath`; else `npx -y @automatalabs/pi-acp` | `AGENTPRISM_PI_ACP_CMD` / `_ARGS` (full command) |
-| custom | `backends` option or `AGENTPRISM_BACKENDS` (JSON) | `CustomBackendConfig`: `command`, `args?`, `env?` (a **scoped overlay** for the child only — put per-backend secrets here, never in the ambient env), `sessionMeta?`, `structuredOutputTool?` |
+| custom | `backends` option or `AGENTPRISM_BACKENDS` (JSON) | `CustomBackendConfig`: `command`, `args?`, `env?` (a **scoped overlay** for the child only — put per-backend secrets here, never in the ambient env), `sessionMeta?`, `structuredOutputTool?`, `fork?` (`{ disposition: "id-only" \| "live", cwd?: "source-only" \| "free" }` — how the agent answers `session/fork`, see `FORK_SESSION_TRAITS`; omitted = `live`/`free`; an entry wrapping claude-agent-acp or codex-acp must declare `{ disposition: "id-only" }`) |
 
 Workflow scripts may *declare* backends via `meta.backends`, but declarations are inert until the composition root approves them (`allowScriptBackends` / `ExecOptions.scriptBackends` / `AGENTPRISM_ALLOW_SCRIPT_BACKENDS=1`).
 

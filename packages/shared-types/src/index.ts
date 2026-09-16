@@ -7,3 +7,4 @@ export * from "./agent-runner.js"; // AgentRunner — THE SEAM
 export * from "./meta.js"; // META_KEYS, CODEX_META_KEYS, CODEX_AIR_META_KEYS, ClaudeCodeSessionMeta
 export * from "./workflow-result.js"; // WorkflowRunResult, WorkflowCallRecord, RunStatus, WorkflowMeta, TokenUsage, JournalEntry
 export * from "./run-events.js";
+export * from "./redact.js"; // redactText, truncateUtf8 — credential redaction and code-point-safe truncation

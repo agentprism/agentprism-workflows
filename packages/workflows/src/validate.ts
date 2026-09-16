@@ -25,18 +25,23 @@ import {
   registryWithRunBackends,
   resolveBackendRegistry,
   selectBackend,
+  selectChoicePairs,
+  summarizeSelectChoices,
 } from "@automatalabs/acp-agents";
 import type {
   BackendRegistry,
   CustomBackendConfig,
+  SelectChoiceSummary,
   SessionConfigOption,
   SessionModeState,
   ThoughtLevelDomainSemantics,
+  ValidateHarnessOptions,
+  ValidateProbeRunner,
 } from "@automatalabs/acp-agents";
 import type { WorkflowDir } from "@automatalabs/workflow-engine";
 import type { AgentRunner, AgentUsage, WorkflowMeta } from "@automatalabs/shared-types";
 import { Check, Errors } from "typebox/value";
-import { createValidateProbeRunner, type ValidateProbeRunner } from "./validate-internal.js";
+import { createValidateProbeRunner } from "./validate-internal.js";
 
 export type MockAnswerJson =
   | null
@@ -155,20 +160,6 @@ function boundedPromptPreview(prompt: string): string {
     preview += character;
   }
   return `${preview}…`;
-}
-
-export interface ValidateHarnessOptions {
-  backendId: string;
-  /** AgentPrism's explicit mode when the call omits mode; absent for no-mode/custom backends. */
-  defaultModeId?: string;
-  /** The call's verbatim selected model; absent means the harness/session default. */
-  model?: string;
-  probed: boolean;
-  /** Present when probed=false: the harness's spawn/auth/session error. */
-  error?: string;
-  /** Effective advertised ACP modes; null means this backend/model supports no session modes. */
-  modes?: SessionModeState | null;
-  options?: SessionConfigOption[];
 }
 
 export interface ValidatedCheckpoint {
@@ -1414,13 +1405,6 @@ function selectChoiceValues(option: SelectConfigOption): string[] {
   return option.options.flatMap((entry) => ("options" in entry ? entry.options : [entry])).map((entry) => entry.value);
 }
 
-/** Every leaf {value,label} the select advertises, flattening any advertised optgroups. */
-export function selectChoicePairs(option: SelectConfigOption): { value: string; label?: string }[] {
-  return option.options
-    .flatMap((entry) => ("options" in entry ? entry.options : [entry]))
-    .map((entry) => ({ value: entry.value, label: entry.name }));
-}
-
 /**
  * Above this many advertised choices, a select's inline enumeration is replaced by a
  * grouped summary in every RENDERED surface — the human table AND `--json` — so a harness
@@ -1431,48 +1415,6 @@ export function selectChoicePairs(option: SelectConfigOption): { value: string; 
  * this bound and render verbatim, unchanged.
  */
 export const MAX_INLINE_SELECT_CHOICES = 24;
-
-export interface SelectChoiceGroup {
-  group: string;
-  count: number;
-}
-
-export interface SelectChoiceSummary {
-  total: number;
-  groups: SelectChoiceGroup[];
-}
-
-/** The group a bare (ungrouped) choice value belongs to: its first "/"-segment
- *  (pi/opencode ids are "<provider>/<model>"); a value with no "/" is "(ungrouped)". */
-function groupOfValue(value: string): string {
-  const slash = value.indexOf("/");
-  return slash > 0 ? value.slice(0, slash) : "(ungrouped)";
-}
-
-/**
- * Group a select's choices for summary display. Prefers the harness-advertised optgroup
- * labels; absent those, groups by the first "/"-segment of each value. Groups come back
- * largest-first, ties broken by first appearance.
- */
-export function summarizeSelectChoices(option: SelectConfigOption): SelectChoiceSummary {
-  const counts = new Map<string, number>();
-  const order: string[] = [];
-  const bump = (name: string, n: number): void => {
-    if (!counts.has(name)) order.push(name);
-    counts.set(name, (counts.get(name) ?? 0) + n);
-  };
-  const hasAdvertisedGroups = option.options.some((entry) => "options" in entry);
-  for (const entry of option.options) {
-    if ("options" in entry) bump(entry.name ?? entry.group, entry.options.length);
-    else if (hasAdvertisedGroups) bump(groupOfValue(entry.value), 1); // stray leaf beside groups
-    else bump(groupOfValue(entry.value), 1);
-  }
-  const total = [...counts.values()].reduce((sum, n) => sum + n, 0);
-  const groups = order
-    .map((group) => ({ group, count: counts.get(group) ?? 0 }))
-    .sort((a, b) => b.count - a.count || order.indexOf(a.group) - order.indexOf(b.group));
-  return { total, groups };
-}
 
 /** A select whose leaf-choice count exceeds the inline bound — rendered as a summary. */
 export function isOversizedSelect(option: SessionConfigOption): option is SelectConfigOption {

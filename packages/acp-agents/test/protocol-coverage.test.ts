@@ -12,13 +12,19 @@ import {
   AUTH_CAPABILITY_KEYS,
   AUTH_META_CONVENTION_KEYS,
   AUTH_META_MATRIX,
+  BUILTIN_PROTOCOL_COVERAGE,
   CLIENT_METHOD_COVERAGE,
   CODEX_SPAWN_AUTH_ENV,
+  FORK_SESSION_TRAITS,
+  FORK_SESSION_TRAIT_DEFAULT,
   HANDLED_AUTH_METHOD_TYPES,
   PI_ACP_PROTOCOL_CONTRACT,
+  PROMPT_USAGE_SCOPES,
   SESSION_STEERING_METHOD,
   assertAuthCapabilityShape,
   clientCapabilitiesFor,
+  forkSessionTrait,
+  promptUsageScope,
 } from "../src/index.js";
 
 type Expect<T extends true> = T;
@@ -244,6 +250,114 @@ test("the executable ACP extension matrix documents installed advertisements wit
       assert.ok(!dist.includes(row.method), `${row.agent} dist must NOT implement ${row.method} until the matrix is updated`);
     }
   }
+});
+
+// The per-backend `session/fork` trait table. `id-only` adapters answer the fork with a persisted
+// copy that is not live (claude, codex); `live` adapters construct it on the serving process (pi;
+// opencode by live verification only). The rows are pinned exactly, then grounded in the installed
+// adapter dists so an adapter bump that changes what a fork response IS fails the build.
+const CLAUDE_FORK_DIST = readDist("@agentclientprotocol/claude-agent-acp/dist/fork-session.js"); // a DIFFERENT file from acp-agent.js
+const BUILTIN_IDS = ["claude", "codex", "opencode", "pi"] as const;
+
+test("FORK_SESSION_TRAITS pins the exact per-agent fork dispositions", () => {
+  assert.deepEqual(
+    FORK_SESSION_TRAITS.map(({ agent, disposition, reattach, cwd }) => ({ agent, disposition, reattach, cwd })),
+    [
+      { agent: "claude", disposition: "id-only", reattach: "resume-or-load", cwd: "source-only" },
+      { agent: "codex", disposition: "id-only", reattach: "resume-or-load", cwd: "free" },
+      { agent: "opencode", disposition: "live", reattach: "none", cwd: "free" },
+      { agent: "pi", disposition: "live", reattach: "none", cwd: "free" },
+    ],
+  );
+  assert.ok(Object.isFrozen(FORK_SESSION_TRAITS));
+  for (const row of FORK_SESSION_TRAITS) assert.ok(Object.isFrozen(row), `${row.agent} row is frozen`);
+  // unknown agents: the ACP contract (a fork response is live; cwd free).
+  assert.strictEqual(forkSessionTrait("browser"), FORK_SESSION_TRAIT_DEFAULT);
+  assert.deepEqual(FORK_SESSION_TRAIT_DEFAULT, { agent: "*", disposition: "live", reattach: "none", cwd: "free" });
+  // a declaration wins over the name (a custom entry called "claude" is not the built-in)
+  assert.deepEqual(forkSessionTrait("claude", { disposition: "live" }), {
+    agent: "claude",
+    disposition: "live",
+    reattach: "none",
+    cwd: "free",
+  });
+  assert.deepEqual(forkSessionTrait("wrapped", { disposition: "id-only", cwd: "source-only" }), {
+    agent: "wrapped",
+    disposition: "id-only",
+    reattach: "resume-or-load",
+    cwd: "source-only",
+  });
+  assert.deepEqual(forkSessionTrait("wrapped", { disposition: "id-only" }), {
+    agent: "wrapped",
+    disposition: "id-only",
+    reattach: "resume-or-load",
+    cwd: "free",
+  });
+  assert.ok(Object.isFrozen(forkSessionTrait("wrapped", { disposition: "id-only" })));
+  // the central coverage row carries the SAME frozen trait row (reference identity).
+  for (const id of BUILTIN_IDS) assert.strictEqual(BUILTIN_PROTOCOL_COVERAGE[id].fork, forkSessionTrait(id));
+});
+
+test("fork traits are grounded in the installed agent dists", () => {
+  for (const row of FORK_SESSION_TRAITS) {
+    if (row.distProbe === undefined) {
+      assert.equal(row.agent, "opencode", "only the compiled-binary agent has no fork dist probe");
+    }
+  }
+  // claude: the fork returns only the persisted copy's id, read through the SDK keyed by the source cwd.
+  assert.ok(CLAUDE_DIST.includes('import { forkSession } from "./fork-session.js";'));
+  assert.ok(CLAUDE_FORK_DIST.includes("return { sessionId: forked.sessionId };"));
+  assert.ok(CLAUDE_FORK_DIST.includes("forkClaudeSession(params.sessionId, {"));
+  assert.ok(CLAUDE_FORK_DIST.includes("dir: params.cwd"));
+  // codex: the forked thread is unsubscribed and never publishes updates until resume/load re-subscribes.
+  assert.equal(CODEX_DIST.split("threadUnsubscribe({ threadId: response.thread.id })").length - 1, 1);
+  assert.ok(CODEX_DIST.includes('const canPublishSessionUpdates = operation !== "fork";'));
+  // pi: the fork is constructed live on the serving process and refuses a source with a turn in flight.
+  assert.ok(PI_AGENT_DIST.includes("sessionCapabilities: { resume: {}, fork: {}, list: {}, close: {} }"));
+  assert.ok(PI_AGENT_DIST.includes('adapterError("session_busy")'));
+});
+
+// The per-backend `PromptResponse.usage` scope. The SDK's own `Usage` doc says "across session";
+// every installed adapter reports THE TURN, so a client-side session total is the client's own
+// running sum. Pinned in the dists so an adapter that flips to cumulative reporting fails the
+// build instead of silently doubling that sum.
+const PI_SESSION_DIST = readFileSync(join(PI_DIST_DIR, "session.js"), "utf8");
+
+test("prompt usage is per-turn on every source-verified agent", () => {
+  assert.deepEqual(
+    PROMPT_USAGE_SCOPES.map(({ agent, scope }) => ({ agent, scope })),
+    [
+      { agent: "claude", scope: "turn" },
+      { agent: "codex", scope: "turn" },
+      { agent: "opencode", scope: "turn" },
+      { agent: "pi", scope: "turn" },
+    ],
+  );
+  assert.ok(Object.isFrozen(PROMPT_USAGE_SCOPES));
+  for (const id of BUILTIN_IDS) {
+    assert.equal(promptUsageScope(id), "turn");
+    assert.strictEqual(
+      BUILTIN_PROTOCOL_COVERAGE[id].promptUsage,
+      PROMPT_USAGE_SCOPES.find((row) => row.agent === id),
+      `${id} coverage row carries the same frozen usage-scope row`,
+    );
+  }
+  // custom agents: the ACP-client contract (per-turn).
+  assert.equal(promptUsageScope("browser"), "turn");
+  // claude: the accumulator the prompt response is read from is reset to the carried-over scratch at turn activation.
+  assert.equal(CLAUDE_DIST.split("session.accumulatedUsage = session.activeTurn?.carriedUsage ?? {").length - 1, 1);
+  assert.equal(CLAUDE_DIST.split("usage: sessionUsage(session),").length - 1, 1);
+  // codex: the response carries the turn's last token count, nulled at turn start.
+  assert.ok(CODEX_DIST.includes("usage: this.buildPromptUsage(sessionState.lastTokenUsage)"));
+  assert.ok(CODEX_DIST.includes("sessionState.lastTokenUsage = null;"));
+  // pi: only the assistant messages after the turn's start index are summed.
+  assert.ok(PI_SESSION_DIST.includes("usage: promptUsage(messages)"));
+  assert.ok(PI_SESSION_DIST.includes("agentMessages(this.pi).slice(turn.startMessageIndex)"));
+  // the client side: recordPromptUsage replaces (never sums), so a session sum is the caller's own job.
+  assert.match(
+    readFileSync(new URL("../src/usage.ts", import.meta.url), "utf8"),
+    /recordPromptUsage\(usage[^)]*\): void \{\s*if \(usage\) this\.promptUsage = usage;/,
+  );
 });
 
 // §4.6.4 item 5 — the code-only matcher (§1.5) relies on `-32000` being auth-exclusive.

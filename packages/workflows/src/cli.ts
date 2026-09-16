@@ -27,11 +27,10 @@ import { validateWorkflowScript, formatValidateReport, collapseHarnessOptionsFor
 import type { ValidateWorkflowOptions } from "./validate.js";
 import {
   probeHarnessConfig,
-  formatHarnessConfigReport,
   buildHarnessModelsView,
-  formatHarnessModels,
-} from "./config.js";
-import type { ProbeHarnessConfigOptions } from "./config.js";
+  type ProbeHarnessConfigOptions,
+} from "@automatalabs/acp-agents";
+import { formatHarnessConfigReport, formatHarnessModels } from "./config.js";
 
 const ROOT_USAGE = `Usage: agentprism-workflows <command> …
 

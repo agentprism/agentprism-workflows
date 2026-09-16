@@ -1,12 +1,12 @@
-import type {
-  EngineRunEvent,
-  RunAgentProgressPayload,
-  RunEventLogRecord,
+import {
+  truncateUtf8,
+  type EngineRunEvent,
+  type RunAgentProgressPayload,
+  type RunEventLogRecord,
 } from "@automatalabs/shared-types";
 import {
   MAX_OBSERVABILITY_SCALAR_BYTES,
   projectRunEventForPersistence,
-  truncateUtf8,
 } from "./run-observability.js";
 
 export const AGENT_PROGRESS_MIN_INTERVAL_MS = 1_000 as const;

@@ -114,6 +114,12 @@ export interface Backend {
    *  keys win over the generic user passthrough. `inputs` carries optional per-session extras
    *  (e.g. Codex base/developer instructions); a backend that has no use for them ignores it. */
   sessionMeta(schema: TSchema | undefined, inputs?: SessionMetaInputs): Record<string, unknown> | undefined;
+  /** OPTIONAL session `_meta` that switches the agent's vendor notification stream on (the
+   *  `raw_message` events — Claude's `_claude/sdkMessage`). Undefined when the agent has no such
+   *  stream. The AcpAgent SDK layers it UNDER the caller's `meta` and OVER `sessionMetaDefaults`
+   *  when `raw` is on; the one-shot runner never sends it (a schema run already enables the stream
+   *  through `sessionMeta`). */
+  rawMessagesMeta?(): Record<string, unknown> | undefined;
   /** Protocol-critical `_meta` for session/prompt (undefined when this backend carries the schema
    *  at session/new). These keys win direct collisions with caller prompt metadata; unrelated
    *  caller keys are transported unchanged. */
