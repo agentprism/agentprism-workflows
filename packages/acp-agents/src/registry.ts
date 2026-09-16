@@ -25,6 +25,19 @@ export interface CustomBackendConfig {
   /** Enable client-hosted StructuredOutput MCP tool injection when schema runs negotiate HTTP MCP.
    *  Default true; set false for custom agents that should use only the generic prompt/_meta path. */
   structuredOutputTool?: boolean;
+  /** How the custom agent answers `session/fork` (see `FORK_SESSION_TRAITS`). Omitted = `live` /
+   *  `free`: the plain ACP contract. Entries wrapping claude-agent-acp or codex-acp MUST declare
+   *  `{ disposition: "id-only" }` — a registered name is a different program from the built-in it
+   *  may shadow and never inherits the built-in's row. */
+  fork?: CustomBackendForkConfig;
+}
+
+/** A custom backend's declared `session/fork` disposition — data, never probed. `id-only`: the fork
+ *  response names a persisted copy that must be reopened (resume, else load) before its first turn.
+ *  `live`: the fork handle is the session. `cwd` says whether the fork may re-home (default `free`). */
+export interface CustomBackendForkConfig {
+  disposition: "id-only" | "live";
+  cwd?: "source-only" | "free";
 }
 
 /** A validated registry entry: the (lowercased) name plus its config. */
@@ -114,6 +127,12 @@ function validateEntry(rawName: string, config: unknown, source: string): [strin
   if (c.structuredOutputTool !== undefined && typeof c.structuredOutputTool !== "boolean") {
     throw new Error(`${source}: backend "${rawName}" "structuredOutputTool" must be a boolean`);
   }
+  const fork = c.fork !== undefined ? validateFork(c.fork) : undefined;
+  if (c.fork !== undefined && fork === undefined) {
+    throw new Error(
+      `${source}: backend "${rawName}" "fork" must be { disposition: "id-only" | "live", cwd?: "source-only" | "free" }`,
+    );
+  }
   return [
     name,
     {
@@ -123,8 +142,26 @@ function validateEntry(rawName: string, config: unknown, source: string): [strin
       ...(c.env !== undefined ? { env: c.env as Record<string, string> } : {}),
       ...(c.sessionMeta !== undefined ? { sessionMeta: c.sessionMeta as Record<string, unknown> } : {}),
       ...(c.structuredOutputTool !== undefined ? { structuredOutputTool: c.structuredOutputTool as boolean } : {}),
+      ...(fork !== undefined ? { fork } : {}),
     },
   ];
+}
+
+function isForkDisposition(value: unknown): value is CustomBackendForkConfig["disposition"] {
+  return value === "id-only" || value === "live";
+}
+
+function isForkCwdRule(value: unknown): value is NonNullable<CustomBackendForkConfig["cwd"]> {
+  return value === "source-only" || value === "free";
+}
+
+/** The validated copy of a `fork` declaration (only the declared keys), or `undefined` when malformed. */
+function validateFork(value: unknown): CustomBackendForkConfig | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const { disposition, cwd } = value as Record<string, unknown>;
+  if (!isForkDisposition(disposition)) return undefined;
+  if (cwd !== undefined && !isForkCwdRule(cwd)) return undefined;
+  return { disposition, ...(cwd !== undefined ? { cwd } : {}) };
 }
 
 function asciiLowercase(value: string): string {

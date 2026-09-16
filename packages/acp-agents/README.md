@@ -260,6 +260,29 @@ transcript usage is baselined away, so only continuation-turn usage is reported.
 never opens the fresh fallback. The runner also exposes `listSessions()` and `deleteSession()` where
 advertised; inspect `reopen` rather than assuming every ACP agent persists state.
 
+### What a `session/fork` response is (`FORK_SESSION_TRAITS`)
+
+`forkSession()` returns whatever the agent answered, and the answer differs per adapter. `FORK_SESSION_TRAITS`
+pins each built-in's disposition from its source: `id-only` forks (Claude, Codex) name a persisted copy that is
+not live — Claude answers `{ sessionId }` alone and prompting it fails with "Session not found"; Codex installs
+state but unsubscribes the forked thread — so they must be reopened (`session/resume`, else `session/load`)
+before their first turn; `live` forks (pi; OpenCode by live verification) are the session. `fork cwd` says
+whether the fork may re-home (Claude's transcript store is keyed by the source cwd).
+
+| agent | `session/fork` disposition | reattach | fork cwd |
+|---|---|---|---|
+| `claude` | `id-only` | `resume-or-load` | `source-only` |
+| `codex` | `id-only` | `resume-or-load` | `free` |
+| `opencode` | `live` | `none` | `free` |
+| `pi` | `live` | `none` | `free` |
+
+`forkSessionTrait(agent, declared?)` resolves a row — a built-in's own, the row a custom backend's `fork`
+declaration describes (a declaration always wins over a name that shadows a built-in), else
+`FORK_SESSION_TRAIT_DEFAULT` (`live` / `free`, the plain ACP contract). Custom entries that wrap
+claude-agent-acp or codex-acp must declare `fork: { disposition: "id-only" }`.
+
+`PROMPT_USAGE_SCOPES` pins that `PromptResponse.usage` is per-turn on every built-in (the SDK's `Usage` doc says "across session"; the installed adapters report the turn), so a session total is your own running sum of turn reports — `UsageAccumulator.recordPromptUsage` replaces, never sums. `promptUsageScope(agent)` answers `"turn"` for built-ins and custom agents alike. Both tables are probed in the installed Claude/Codex/pi dists by the protocol coverage suite.
+
 ## Listening in: live ACP events
 
 `AcpAgentRunner` is also a typed event bus — `runner.on(name, listener)` bubbles up the live ACP stream of every run (streaming text, tool calls, usage, permissions, elicitations). Event names are the ACP `sessionUpdate` discriminants (`agent_message_chunk`, `tool_call`, `usage_update`, …) plus the cross-cutting `session_update` (catch-all), `permission_pending`, `permission_request`, `elicitation_pending`, `elicitation_request`, `elicitation_complete`, `raw_message`, `steering`, `session_open` / `session_close`, and `backend_error`. Each payload carries a `{ sessionId, backendId, label?, runId?, callIndex?, initializeMeta? }` context envelope (a pooled runner multiplexes many runs at once). `steering` carries `{ response }` with the complete raw server response after a resolved request, never the request prompt content or request metadata. `permission_pending` / `elicitation_pending` are resolver-only and carry `{ request }` before the host resolver is invoked; `permission_request` / `elicitation_request` fire exactly once with the final `{ request, outcome }` returned to the agent; `elicitation_complete` carries `{ notification }` for URL completions. `on()` / `once()` return an unsubscribe thunk; `off()` and `removeAllListeners()` round it out. Listeners are best-effort observers — a throwing listener never affects the run.
@@ -300,12 +323,13 @@ From [`src/index.ts`](./src/index.ts):
 - **`AcpRunnerOptions.onElicitation`** — runner-wide ACP elicitation responder; sessions can override with `InteractiveSessionOptions.onElicitation`.
 - **`selectBackend({ model, tier }, registry?)`** — deterministic first-segment routing; registered custom names take priority, then the four built-ins, otherwise the configured default.
 - **`ClaudeBackend` / `CodexBackend` / `OpenCodeBackend` / `PiBackend`** — the four built-in backend strategies (spawn config + per-backend schema/auth wiring). OpenCode is host-resolved rather than bundled; pi uses bundled `@automatalabs/pi-acp`.
-- **`CustomAcpBackend` / `resolveBackendRegistry` / `BACKENDS_ENV`** — the custom-backend registry: run **any** ACP agent as a named backend via `createAcpRunner({ backends: { name: { command, args?, env?, sessionMeta?, structuredOutputTool? } } })` or the `AGENTPRISM_BACKENDS` env var (JSON, same shape; the option wins per name; names may shadow built-ins). Custom backends carry a `schema` as turn-level `_meta.outputSchema` and read the result off the final message as JSON. No host-side vendor capability declaration is required.
+- **`CustomAcpBackend` / `resolveBackendRegistry` / `BACKENDS_ENV`** — the custom-backend registry: run **any** ACP agent as a named backend via `createAcpRunner({ backends: { name: { command, args?, env?, sessionMeta?, structuredOutputTool?, fork? } } })` or the `AGENTPRISM_BACKENDS` env var (JSON, same shape; the option wins per name; names may shadow built-ins). `fork?` (`CustomBackendForkConfig`, `{ disposition: "id-only" | "live", cwd?: "source-only" | "free" }`) declares how the agent answers `session/fork` — see `FORK_SESSION_TRAITS` above; omitted means `live`/`free`. Custom backends carry a `schema` as turn-level `_meta.outputSchema` and read the result off the final message as JSON. No host-side vendor capability declaration is required.
 - **Auth contracts and lifecycle** — `AuthStore`, `BackendAuthMachine`, `buildAuthDescriptors`, the built-in auth profiles, and the `AuthContext` / `AuthResolution` / `AuthMethodDescriptor` / `AuthCapableRunner` types.
 - **Permission APIs** — `PermissionResolver` parks a request for an async host decision; `selectPermissionOption(request, optionId)` validates one exact advertised option. `decidePermission` remains the SDK/headless auto-policy. Provider effects and persistence are never inferred from labels, `kind`, or response metadata.
 - **`clientCapabilitiesFor` + the `ClientHandlers` / `FsHandlers` / `TerminalHandlers` / `AcpSessionContext` types** — the client-side fs/terminal interposition surface (see above).
 - **`negotiateCapabilities` / `adaptPromptContent` / `unsupportedMcpServer` + `NegotiatedCapabilities`** — the standard ACP capability-negotiation primitives; the negotiated record for a live connection is exposed on `PooledConnection.capabilities`, with vendor initialize metadata retained only as raw `initializeMeta`.
 - **`AGENT_METHOD_COVERAGE` / `CLIENT_METHOD_COVERAGE` / `ACP_EXTENSION_SUPPORT_MATRIX`** — manifests classifying the installed ACP SDK method surface and documenting built-in vendor-extension advertisements. The extension matrix is evidence for probes and never routes runtime behavior.
+- **`FORK_SESSION_TRAITS` / `FORK_SESSION_TRAIT_DEFAULT` / `forkSessionTrait(agent, declared?)`** and **`PROMPT_USAGE_SCOPES` / `promptUsageScope(agent)`** — the per-built-in `session/fork` disposition table and the per-turn `PromptResponse.usage` scope pin (see [Session handoff](#session-handoff)); both also ride each `BUILTIN_PROTOCOL_COVERAGE` row as `fork` / `promptUsage`. Executable data probed in the installed adapter dists, never a runtime branch.
 - **`toJsonSchema(schema)` / `toStrictJsonSchema(schema)`** — turn a typebox schema into on-the-wire shapes: plain JSON Schema for Claude and the Pi/OpenCode injected HTTP MCP tool, and an OpenAI-strict-normalized schema for Codex `outputSchema`. Pi retains the common prompt/validated-last-text fallback.
 
 Also exported: `AcpAgentPool` / `resolvePoolSize` (including the same deadline-only `forceKill()` emergency path), `PooledConnection` / `SessionHandle`, `decidePermission`, `UsageAccumulator`, `resolveStructuredOutput` / `extractValidated` / `findJsonBlock` / `validateValue`, `errorText` / `mapThrownError`, and the event surface `TypedEventEmitter` / `AcpRunnerEventMap` / `AcpEventName` / `AcpEventListener` / `AcpEventContext` / `AcpSessionUpdate` (+ the per-event payload types, including `AcpPermissionPendingEvent`), plus their associated types.
@@ -315,7 +339,7 @@ Also exported: `AcpAgentPool` / `resolvePoolSize` (including the same deadline-o
 | Variable | Effect |
 | --- | --- |
 | `AGENTPRISM_DEFAULT_BACKEND` | Backend for specs whose first segment is not registered (`claude`, `codex`, `opencode`, `pi`, or a registered custom name; unknown values fall back to Claude). |
-| `AGENTPRISM_BACKENDS` | Custom ACP backends as JSON: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}, "structuredOutputTool": true}}`. |
+| `AGENTPRISM_BACKENDS` | Custom ACP backends as JSON: `{"<name>": {"command": "…", "args": […], "env": {…}, "sessionMeta": {…}, "structuredOutputTool": true, "fork": { "disposition": "id-only" }}}` (`fork` optional; declare `id-only` for entries wrapping claude-agent-acp or codex-acp). |
 | `AGENTPRISM_ACP_INIT_TIMEOUT_MS` | Deadline (default `60000`) for a backend's one-time ACP `initialize` handshake — a non-ACP command fails fast instead of hanging. |
 | `AGENTPRISM_ACP_POOL_SIZE` | Long-lived processes to keep per backend (default `1`). |
 | `AGENTPRISM_CLAUDE_ACP_CMD` / `AGENTPRISM_CLAUDE_ACP_ARGS` | Override the command (and args) used to spawn the Claude ACP server. |
