@@ -139,7 +139,7 @@ test("load(ref) replays into history/replay and marks the load boundary", async 
   const turn = await loaded.prompt("go");
   assert.equal(turn.text, "after");
   assert.equal(turn.history.length, 1);
-  assert.equal(loaded.text, "aafter");
+  assert.equal(loaded.text, "a\n\nafter", "the replayed message and the new turn fold like turn.text");
   assert.equal(loaded.history.length, 2);
   assert.equal(loaded.usage.total, 0, "replayed history is never counted as usage");
 });

@@ -223,6 +223,7 @@ test("prompt returns the verbatim response with _meta, every update, raw message
     { toolCallId: "tc-1", name: "read_file", title: "Read", kind: "read", status: "completed", rawOutput: "x", meta: { vendor: 1 } },
   ]);
   assert.equal(turn.text, "narration\n\nanswer", "distinct assistant messages join with a blank line");
+  assert.equal(agent.text, turn.text, "the session text uses the same fold");
   assert.deepEqual(turn.usage.response, usage);
   assert.deepEqual(turn.usage.turn, { input: 3, output: 2, cacheRead: 0, cacheWrite: 0, total: 5, cost: 0 });
   assert.equal(turn.history.length, 3, "two text entries + one tool call");
@@ -793,7 +794,8 @@ test("history/text are cumulative by default and per-turn with retainHistory:fal
     const agent = track(new AcpAgent({ cwd, model: "claude" }));
     const t1 = await agent.prompt("1");
     const t2 = await agent.prompt("2");
-    assert.equal(agent.text, "onetwo");
+    assert.equal(agent.text, "one\n\ntwo", "agent.text folds like turn.text: distinct messages join with a blank line");
+    assert.equal(agent.text, [t1.text, t2.text].join("\n\n"));
     assert.equal(agent.history.length, 2);
     assert.equal(t1.history.length, 1);
     assert.equal(t2.history.length, 1, "each turn's slice holds only its own entry");

@@ -204,7 +204,7 @@ test("live fork (pi): the fork handle is the session and the parent's history se
   assert.equal(turn.history.length, 1, "the turn's own slice never includes the seed");
   assert.equal(child.history.length, 2);
   assert.equal(child.history[1]!.text, "child");
-  assert.equal(child.text, "parentchild");
+  assert.equal(child.text, "parent\n\nchild", "the seed and the child's own messages fold like turn.text");
   assert.equal(parent.history.length, 1, "the parent is untouched by the child's turn");
 });
 

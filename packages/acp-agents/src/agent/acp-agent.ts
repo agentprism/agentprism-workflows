@@ -423,9 +423,11 @@ export class AcpAgent {
     return this.#replay;
   }
 
-  /** The parent's seed text (live fork) + this session's retained assistant text. */
+  /** The retained assistant text — the parent's seed (live fork) and this session's messages —
+   *  folded exactly like `turn.text`: chunks of one message concatenate, distinct messages join
+   *  with "\n\n". */
   get text(): string {
-    return this.#textSeed + (this.#handle?.text ?? "");
+    return [this.#textSeed, this.#handle?.foldedText() ?? ""].filter((part) => part !== "").join("\n\n");
   }
 
   /** Running per-field sum of every turn this agent ran; `ZERO_USAGE` before the first turn. */

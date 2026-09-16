@@ -491,6 +491,13 @@ class SessionState {
     return this.foldedTextFrom(this.turnStartIndex);
   }
 
+  /** The whole retained log folded the same way (`foldedTurnText()` from
+   *  index 0): every retained assistant message, a replayed transcript
+   *  included, with distinct messages joined by "\n\n". */
+  foldedText(): string {
+    return this.foldedTextFrom(0);
+  }
+
   private foldedTextFrom(startIndex: number): string {
     let folded = "";
     for (let index = startIndex; index < this.textChunks.length; index += 1) {
@@ -2954,6 +2961,14 @@ export class SessionHandle implements StructuredSource {
    *  returns; consecutive chunks of one message join with ""). */
   foldedTurnText(): string {
     return this.state.foldedTurnText();
+  }
+
+  /** The retained session log's assistant text with the same message
+   *  joiner as `foldedTurnText()`, over the whole log (a `session/load`
+   *  replay included). What `AcpAgent.text` reads; `text` stays the raw
+   *  chunk concatenation. */
+  foldedText(): string {
+    return this.state.foldedText();
   }
 
   /** StructuredSource — the latest turn's FINAL assistant message (see SessionState). */
