@@ -504,7 +504,7 @@ export class AcpAgent {
       const promptMeta = mergeTurnMeta(options.meta, backend.promptMeta(turnSchema));
 
       // SYNCHRONOUSLY before the wire call: the collector's tap sees every update of the turn.
-      const collector = new TurnCollector(this.#bus, handle);
+      const collector = new TurnCollector(this.#bus, handle, { retainHistory: this.#retainHistory });
       // A capture left by a turn that rejected (wire error/abort) must not leak into this turn.
       plan.registration?.takeCaptured();
 
@@ -914,11 +914,14 @@ export class AcpAgent {
       if (isChildCleanupError(error)) cleanupError = error;
     }
     plan?.registration?.release();
-    if (host) await host.dispose().catch(noop);
+    // The process BEFORE the tool host (the runner's order: pool, then tools): the agent process
+    // holds keep-alive sockets to the host's HTTP server, and `server.close()` waits for idle
+    // sockets to time out (seconds) unless the peer is gone first.
     if (connection) {
       await connection.dispose().catch(noop);
       releaseOnExit(connection);
     }
+    if (host) await host.dispose().catch(noop);
     this.#removeAbort?.();
     this.#removeAbort = undefined;
     // Last, so the agent's own `session_close` (emitted by the release above) was delivered.

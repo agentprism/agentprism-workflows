@@ -56,9 +56,11 @@ export class TurnCollector {
   #active = true;
   readonly #untap: () => void;
 
-  /** Registers the tap SYNCHRONOUSLY — construct before the wire call so nothing is missed. */
-  constructor(bus: Pick<AgentEventBus, "tap">, handle: TurnHandle) {
-    this.historyStart = handle.history.length;
+  /** Registers the tap SYNCHRONOUSLY — construct before the wire call so nothing is missed.
+   *  `retainHistory: false` (the session's `retainSessionLog: false`) means the handle CLEARS its
+   *  accumulator at `beginTurn()`, so this turn's slice starts at 0, not at the previous length. */
+  constructor(bus: Pick<AgentEventBus, "tap">, handle: TurnHandle, options: { retainHistory?: boolean } = {}) {
+    this.historyStart = options.retainHistory === false ? 0 : handle.history.length;
     this.gaugeBefore = handle.usage.baseline();
     this.#untap = bus.tap((name, event) => {
       if (!this.#active) return;
