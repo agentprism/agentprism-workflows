@@ -16,9 +16,11 @@ import {
   PI_CHILD_CLEANUP_DEADLINE_MS,
   PI_CLOSE_SESSION_TIMEOUT_MS,
   PooledConnection,
+  SESSION_STEERING_METHOD,
+  type AcpEventSink,
   type AcpSessionOptions,
 } from "../src/index.js";
-import { createFakeAgentHarness } from "./helpers/fake-agent.js";
+import { createFakeAgentHarness, waitFor } from "./helpers/fake-agent.js";
 
 const ALLOW: RequestPermissionResponse = { outcome: { outcome: "selected", optionId: "allow-1" } };
 const ELICITATION_ACCEPT: CreateElicitationResponse = {
@@ -51,6 +53,15 @@ interface LogEntry {
     mcpServers?: unknown[];
     _meta?: Record<string, unknown>;
   };
+}
+
+/** The fake's id-only fork rejection as the SDK maps a plain `Error("Session not found")`:
+ *  `internalError({ details })` on the wire; the handle's prompt path folds `data.details` into
+ *  the classifiable message while raw wire methods surface the RequestError itself. */
+function isSessionNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const details = (error as { data?: { details?: unknown } } | null)?.data?.details;
+  return /Session not found/.test(message) || details === "Session not found";
 }
 
 const harness = createFakeAgentHarness({ prefix: "acp-session-lifecycle-it-", backends: ["claude"] });
@@ -420,6 +431,214 @@ test("forkSession keepSession remains loadable after release without closing the
   const loadCall = readLog().find((entry) => entry.method === "loadSession");
   assert.equal(loadCall?.params?.sessionId, forkedSessionId);
   await loaded.release();
+});
+
+// ---- fixture self-tests: the fork knobs the AcpAgent suite relies on ------------------------
+
+test("forkSession.idOnly returns a bare { sessionId } whose id is dead until session/resume reattaches it", async () => {
+  const { cwd, readLog } = configure({
+    lifecycleSupport: true,
+    modes: MODES,
+    forkSession: { idOnly: true, turns: [{ text: "child after resume" }] },
+    extensionRequest: { method: SESSION_STEERING_METHOD, response: { outcome: "accepted" } },
+    turns: [{ text: "never served to the fork" }],
+  });
+  const sessionOptions: AcpSessionOptions = { cwd, schema: undefined, policy: {} };
+  const connection = harness.track(
+    PooledConnection.create(new ClaudeBackend(), { onDead: () => undefined }),
+  );
+
+  const fork = await connection.forkSession("id-only-source", sessionOptions);
+  assert.match(fork.sessionId, /^fake-fork-/);
+  assert.deepEqual(fork.advertisedConfigOptions, [], "the fork response carries no catalog");
+  assert.equal(fork.modes, undefined, "the fork response carries no modes");
+
+  // Every session method aimed at the un-reattached id fails the Claude way.
+  await assert.rejects(() => fork.prompt("hi"), isSessionNotFound);
+  await assert.rejects(() => fork.steer("nudge"), isSessionNotFound);
+  await assert.rejects(
+    () => connection.setSessionMode({ sessionId: fork.sessionId, modeId: "plan" }),
+    isSessionNotFound,
+  );
+  await assert.rejects(
+    () =>
+      connection.setSessionConfigOption({
+        sessionId: fork.sessionId,
+        configId: "model",
+        value: "claude-opus-4-1",
+      }),
+    isSessionNotFound,
+  );
+  assert.equal(fork.currentTurnText(), "");
+
+  // Reattaching the id makes it live and hands back the catalog; the forked id keeps its own
+  // turn script across the reattach (forkSession.turns, not scenario.turns).
+  await fork.release({ keepOpen: true });
+  const resumed = await connection.resumeSession(fork.sessionId, sessionOptions);
+  assert.equal(resumed.sessionId, fork.sessionId);
+  assert.ok(resumed.advertisedConfigOptions.length > 0, "the catalog arrives with the reattach");
+  assert.deepEqual(resumed.modes?.availableModes.map((mode) => mode.id), ["default", "plan"]);
+  await resumed.setMode("plan");
+  assert.equal((await resumed.prompt("go")).stopReason, "end_turn");
+  assert.equal(resumed.currentTurnText(), "child after resume");
+  assert.deepEqual(await resumed.steer("nudge again"), { outcome: "accepted" });
+  await resumed.release();
+
+  const log = readLog();
+  const wire = methods(log);
+  assert.equal(wire.includes("loadSession"), false);
+  assert.equal(wire.filter((method) => method === "closeSession").length, 1, "only the live handle closes");
+  const failingPrompt = wire.indexOf("prompt");
+  const resume = wire.indexOf("resumeSession");
+  assert.ok(wire.indexOf("forkSession") < failingPrompt, "the dead prompt reached the wire after the fork");
+  assert.ok(failingPrompt < resume, "the rejections happened before the reattach");
+  assert.ok(resume < wire.lastIndexOf("prompt"), "the live prompt followed the reattach");
+  assert.ok(resume < wire.indexOf("setSessionMode", resume));
+  assert.equal(log.find((entry) => entry.method === "resumeSession")?.params?.sessionId, fork.sessionId);
+  for (const entry of log) {
+    if (["prompt", "resumeSession", "setSessionMode", "extensionRequest"].includes(entry.method)) {
+      assert.equal(entry.params?.sessionId, fork.sessionId, `${entry.method} targets the forked id`);
+    }
+  }
+});
+
+test("forkSession.idOnly is reattachable through session/load as well", async () => {
+  const { cwd, readLog } = configure({
+    lifecycleSupport: true,
+    resumeSessionSupport: false,
+    forkSession: { idOnly: true },
+    loadSession: { replay: [{ role: "user", text: "q" }, "replayed"] },
+    turns: [{ text: "after load" }],
+  });
+  const sessionOptions: AcpSessionOptions = { cwd, schema: undefined, policy: {} };
+  const connection = harness.track(
+    PooledConnection.create(new ClaudeBackend(), { onDead: () => undefined }),
+  );
+  const fork = await connection.forkSession("id-only-load-source", sessionOptions);
+  await assert.rejects(() => fork.prompt("hi"), isSessionNotFound);
+  await fork.release({ keepOpen: true });
+
+  const loaded = await connection.loadSession(fork.sessionId, sessionOptions);
+  assert.equal(loaded.text, "replayed");
+  assert.equal((await loaded.prompt("go")).stopReason, "end_turn");
+  assert.equal(loaded.currentTurnText(), "after load");
+  await loaded.release();
+  const wire = methods(readLog());
+  assert.equal(wire.includes("resumeSession"), false);
+  assert.ok(wire.indexOf("forkSession") < wire.indexOf("loadSession"));
+  assert.ok(wire.indexOf("loadSession") < wire.lastIndexOf("prompt"));
+});
+
+test("forkSession.turns serves ids minted by session/fork their own script; other ids keep scenario.turns", async () => {
+  const { cwd, readLog } = configure({
+    lifecycleSupport: true,
+    forkSession: { turns: [{ text: "child one" }, { text: "child two" }] },
+    turns: [{ text: "parent" }],
+  });
+  const runner = makeRunner();
+
+  const parent = await runner.openSession({ cwd });
+  assert.equal((await parent.prompt("p1")).text, "parent");
+  const child = await runner.forkSession({ cwd, sessionId: parent.sessionId });
+  assert.equal((await child.prompt("c1")).text, "child one", "the fork's first prompt is its own turns[0]");
+  assert.equal((await child.prompt("c2")).text, "child two");
+  assert.equal((await child.prompt("c3")).text, "child two", "the last fork turn repeats");
+  assert.equal((await parent.prompt("p2")).text, "parent", "the parent's cursor is untouched by the fork");
+
+  const prompts = readLog().filter((entry) => entry.method === "prompt");
+  assert.deepEqual(
+    prompts.map((entry) => entry.params?.sessionId === child.sessionId),
+    [false, true, true, true, false],
+  );
+  await child.release();
+  await parent.release();
+});
+
+test("forkSession.replay and forkSession.updates stream under the NEW id before the fork response", async () => {
+  const { cwd } = configure({
+    lifecycleSupport: true,
+    forkSession: {
+      replay: [{ role: "user", text: "q" }, "a"],
+      updates: [{ sessionUpdate: "usage_update", used: 1, size: 10 }],
+    },
+    turns: [{ text: "unused" }],
+  });
+  const seen: Array<{ sessionId: string; kind: string; beforeResponse: boolean }> = [];
+  let forkResponded = false;
+  const onEvent: AcpEventSink = (name, event) => {
+    if (name !== "session_update") return;
+    const { sessionId, update } = event as { sessionId: string; update: { sessionUpdate: string } };
+    seen.push({ sessionId, kind: update.sessionUpdate, beforeResponse: !forkResponded });
+  };
+  const connection = harness.track(
+    PooledConnection.create(new ClaudeBackend(), { onDead: () => undefined, onEvent }),
+  );
+
+  const fork = await connection.forkSession("replay-source", { cwd, schema: undefined, policy: {} });
+  forkResponded = true;
+
+  assert.deepEqual(seen, [
+    { sessionId: fork.sessionId, kind: "user_message_chunk", beforeResponse: true },
+    { sessionId: fork.sessionId, kind: "agent_message_chunk", beforeResponse: true },
+    { sessionId: fork.sessionId, kind: "usage_update", beforeResponse: true },
+  ]);
+  // The id is registered only after the response, so pre-response updates never fold into the
+  // handle's accumulator — the seam an AcpAgent has to buffer around.
+  assert.equal(fork.text, "");
+  assert.deepEqual(fork.history, []);
+  await fork.release();
+});
+
+test("the turn permission request forwards toolCall.name and toolCallId verbatim and defaults the id to tc-1", async () => {
+  const { cwd, readLog } = configure({
+    turns: [
+      { toolCall: { title: "Write", kind: "edit", name: "write_file", toolCallId: "tc-9" }, text: "named" },
+      { toolCall: { title: "Read", kind: "read" }, text: "default" },
+    ],
+  });
+  const requests: Array<{ toolCallId: string; name?: string | null }> = [];
+  const runner = makeRunner();
+  const session = await runner.openSession({
+    cwd,
+    onPermissionRequest: (request) => {
+      requests.push({ toolCallId: request.toolCall.toolCallId, name: request.toolCall.name });
+      return ALLOW;
+    },
+  });
+  assert.equal((await session.prompt("one")).text, "named");
+  assert.equal((await session.prompt("two")).text, "default");
+  assert.deepEqual(requests, [
+    { toolCallId: "tc-9", name: "write_file" },
+    { toolCallId: "tc-1", name: undefined },
+  ]);
+  assert.deepEqual(permissionOutcomes(readLog()), [ALLOW.outcome, ALLOW.outcome]);
+  await session.release();
+});
+
+test("a turn with ignoreCancel alone parks and stays parked after session/cancel", async () => {
+  const { cwd, readLog } = configure({ turns: [{ ignoreCancel: true }] });
+  const connection = harness.track(
+    PooledConnection.create(new ClaudeBackend(), { onDead: () => undefined }),
+  );
+  const session = await connection.openSession({ cwd, schema: undefined, policy: {} });
+  let settled = false;
+  const prompt = session.prompt("park").finally(() => {
+    settled = true;
+  });
+  await waitFor(() => readLog().some((entry) => entry.method === "prompt"));
+
+  await connection.cancelSession(session.sessionId);
+  await waitFor(() => readLog().some((entry) => entry.method === "cancel"));
+  assert.equal(settled, false, "session/cancel did not release the parked turn");
+
+  // Only killing the process ends the turn.
+  const rejected = assert.rejects(() => prompt);
+  await connection.dispose();
+  await rejected;
+  await waitFor(() => readLog().some((entry) => entry.method === "__exit"));
+  const wire = methods(readLog());
+  assert.deepEqual(wire.filter((method) => method === "cancel"), ["cancel"]);
+  assert.ok(wire.indexOf("prompt") < wire.indexOf("cancel"));
 });
 
 test("sessionRef.reopen.fork mirrors the initialize advertisement", async () => {
