@@ -23,6 +23,7 @@ import {
   AcpAgent,
   isAcpAgentTurnError,
   mapTypedSessionFailure,
+  type AcpAgentMessage,
   type AcpAgentTurn,
   type TypedSessionFailure,
 } from "../../src/index.js";
@@ -90,6 +91,17 @@ const count = (log: LogEntry[], method: string): number => methods(log).filter((
 const permissionOutcomes = (log: LogEntry[]) =>
   log.filter((entry) => entry.method === "permissionOutcome").map((entry) => entry.outcome);
 const find = (log: LogEntry[], method: string): LogEntry | undefined => log.find((entry) => entry.method === method);
+
+/** Messages without their wall-clock field (the agent's tap and the turn's tap each read the clock). */
+const undated = (messages: readonly AcpAgentMessage[]) => messages.map(({ receivedAt: _receivedAt, ...message }) => message);
+const textOf = (message: AcpAgentMessage): string =>
+  message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
+/** The documented relationship: the TEXT-BEARING assistant messages joined by a blank line. */
+const assistantText = (messages: readonly AcpAgentMessage[]): string =>
+  messages
+    .filter((message) => message.role === "assistant" && message.content.some((block) => block.type === "text"))
+    .map(textOf)
+    .join("\n\n");
 
 function isCode(code: WorkflowErrorCode, extra?: (error: Error & Record<string, unknown>) => void) {
   return (error: unknown): boolean => {
@@ -224,6 +236,22 @@ test("prompt returns the verbatim response with _meta, every update, raw message
   ]);
   assert.equal(turn.text, "narration\n\nanswer", "distinct assistant messages join with a blank line");
   assert.equal(agent.text, turn.text, "the session text uses the same fold");
+  assert.deepEqual(
+    turn.messages.map(({ receivedAt, ...message }) => ({ ...message, dated: typeof receivedAt === "number" })),
+    [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "narration" }],
+        toolCalls: [{ toolCallId: "tc-1", name: "read_file", title: "Read", kind: "read", status: "completed", rawOutput: "x", meta: { vendor: 1 } }],
+        thoughts: [],
+        dated: true,
+      },
+      { role: "assistant", content: [{ type: "text", text: "answer" }], toolCalls: [], thoughts: [], dated: true },
+    ],
+    "messages: the same fold per message, with the tool call attached to the message that issued it",
+  );
+  assert.equal(turn.messages[0]!.receivedAt, turn.updates[0]!.receivedAt, "dated by its first update");
+  assert.deepEqual(undated(agent.messages), undated(turn.messages), "the retained transcript is this one turn");
   assert.deepEqual(turn.usage.response, usage);
   assert.deepEqual(turn.usage.turn, { input: 3, output: 2, cacheRead: 0, cacheWrite: 0, total: 5, cost: 0 });
   assert.equal(turn.history.length, 3, "two text entries + one tool call");
@@ -231,6 +259,76 @@ test("prompt returns the verbatim response with _meta, every update, raw message
   assert.deepEqual(turn.permissions, []);
   assert.deepEqual(turn.elicitations, []);
   assert.equal("structured" in turn, false, "no schema → no structured keys");
+});
+
+test("turn.messages splits exactly where turn.text splits: the assistant messages joined by a blank line ARE turn.text", async () => {
+  const chunk = (text: string) => ({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+  const thought = (text: string) => ({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text } });
+  const { cwd } = configure({
+    turns: [
+      {
+        // Interleaved thoughts, tool calls (with a later update), a plan, a user echo (a steer's), and
+        // text that streams in several chunks — the real accumulator folds `text`, the message fold
+        // folds `messages`; the two must agree on every boundary.
+        updates: [
+          thought("plan it"),
+          chunk("A1"),
+          chunk("A2"),
+          { sessionUpdate: "tool_call", toolCallId: "tc-1", title: "Read", kind: "read", status: "in_progress" },
+          { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed", rawOutput: "x" },
+          thought("then"),
+          chunk("B"),
+          { sessionUpdate: "tool_call", toolCallId: "tc-2", title: "Edit", kind: "edit", status: "in_progress" },
+          { sessionUpdate: "plan", entries: [] },
+          chunk("C"),
+          { sessionUpdate: "user_message_chunk", content: { type: "text", text: "steer" } },
+          chunk("D1"),
+          chunk("D2"),
+        ],
+        text: [],
+      },
+      // A turn that starts with a tool call: a leading assistant message with no text, which the
+      // text fold never sees — the join over the TEXT-BEARING messages is the exact statement.
+      { updates: [{ sessionUpdate: "tool_call", toolCallId: "tc-3", title: "Grep", kind: "search", status: "completed" }], text: "E" },
+    ],
+  });
+  const agent = track(new AcpAgent({ cwd, model: "claude" }));
+  const t1 = await agent.prompt("one");
+  assert.equal(t1.text, "A1A2\n\nB\n\nC\n\nD1D2");
+  assert.equal(t1.messages.filter((m) => m.role === "assistant").map(textOf).join("\n\n"), t1.text);
+  assert.deepEqual(
+    t1.messages.map((m) => ({
+      role: m.role,
+      text: textOf(m),
+      tools: m.toolCalls.map((c) => `${c.toolCallId}:${c.status}`),
+      thoughts: m.thoughts.map((block) => (block.type === "text" ? block.text : block.type)),
+    })),
+    [
+      { role: "assistant", text: "A1A2", tools: ["tc-1:completed"], thoughts: ["plan it"] },
+      { role: "assistant", text: "B", tools: ["tc-2:in_progress"], thoughts: ["then"] },
+      { role: "assistant", text: "C", tools: [], thoughts: [] },
+      { role: "user", text: "steer", tools: [], thoughts: [] },
+      { role: "assistant", text: "D1D2", tools: [], thoughts: [] },
+    ],
+  );
+  assert.deepEqual(t1.toolCalls.map((c) => c.toolCallId), ["tc-1", "tc-2"], "turn.toolCalls is the flattening of the messages' tool calls");
+  assert.deepEqual(t1.history.map((e) => e.kind), ["text", "text", "toolCall", "text", "toolCall", "text", "text", "text"], "history stays per chunk");
+
+  const t2 = await agent.prompt("two");
+  assert.equal(t2.text, "E");
+  assert.deepEqual(
+    t2.messages.map((m) => ({ text: textOf(m), tools: m.toolCalls.map((c) => c.toolCallId) })),
+    [{ text: "", tools: ["tc-3"] }, { text: "E", tools: [] }],
+  );
+  assert.equal(assistantText(t2.messages), t2.text);
+
+  // The retained transcript is the concatenation of the turns' messages and folds like agent.text.
+  assert.deepEqual(undated(agent.messages), [...undated(t1.messages), ...undated(t2.messages)]);
+  assert.equal(agent.text, "A1A2\n\nB\n\nC\n\nD1D2\n\nE");
+  assert.equal(assistantText(agent.messages), agent.text);
+  const snapshot = agent.messages;
+  (snapshot[0]!.content[0] as { text: string }).text = "mutated";
+  assert.equal(textOf(agent.messages[0]!), "A1A2", "messages hands out copies");
 });
 
 test("a typed session failure rejects with the mapped error carrying the complete turn and the verbatim response", async () => {
@@ -796,6 +894,8 @@ test("history/text are cumulative by default and per-turn with retainHistory:fal
     const t2 = await agent.prompt("2");
     assert.equal(agent.text, "one\n\ntwo", "agent.text folds like turn.text: distinct messages join with a blank line");
     assert.equal(agent.text, [t1.text, t2.text].join("\n\n"));
+    assert.deepEqual(undated(agent.messages), [...undated(t1.messages), ...undated(t2.messages)], "messages are cumulative too");
+    assert.equal(assistantText(agent.messages), agent.text);
     assert.equal(agent.history.length, 2);
     assert.equal(t1.history.length, 1);
     assert.equal(t2.history.length, 1, "each turn's slice holds only its own entry");
@@ -813,6 +913,7 @@ test("history/text are cumulative by default and per-turn with retainHistory:fal
     const t2 = await agent.prompt("2");
     assert.equal(agent.text, "two");
     assert.equal(agent.history.length, 1);
+    assert.deepEqual(undated(agent.messages), undated(t2.messages), "messages hold only the latest turn, like the accumulator");
     assert.equal(t2.text, "two");
     assert.equal(t2.history.length, 1, "the turn's slice starts at 0 after the accumulator was cleared");
     assert.equal(t2.history[0]!.text, "two");

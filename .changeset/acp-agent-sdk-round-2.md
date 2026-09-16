@@ -4,7 +4,8 @@
 "@automatalabs/pi-acp": patch
 ---
 
-AcpAgent SDK round 2: per-agent traits, `INVALID_ARGUMENT` for SDK misuse, system-prompt discovery.
+AcpAgent SDK round 2: per-agent traits, `INVALID_ARGUMENT` for SDK misuse, system-prompt discovery,
+the message-level transcript (`turn.messages` / `agent.messages`), and `stream()`.
 
 `@automatalabs/shared-types`
 
@@ -39,6 +40,28 @@ AcpAgent SDK round 2: per-agent traits, `INVALID_ARGUMENT` for SDK misuse, syste
 - Docs: the system-prompt tables now say what survives `replace` on each backend (Claude: nothing
   of the `claude_code` preset; pi: the append entries, project context files, skills, and cwd line;
   Codex: its other instruction layers, per the app-server protocol's documented field semantics).
+- New `AcpAgentMessage` and the message-level transcript: `turn.messages` (folded from the turn's
+  update records) and `agent.messages` (the retained log — cumulative, a `load` replay included with
+  its user prompts, seeded from the parent's snapshot on a live fork exactly like `history`/`text`,
+  only the latest turn under `retainHistory: false`). `{ role: "user" | "assistant", content,
+  toolCalls, thoughts, receivedAt }`: the assistant-message boundary is exactly the `text` fold's
+  (a `tool_call` / `tool_call_update` / `agent_thought_chunk` / `plan*` / `user_message_chunk`
+  event or a changed ACP `messageId`), so `turn.text` is the text-bearing assistant messages joined
+  by a blank line; consecutive text chunks fold into one text block; tool calls attach to the
+  assistant message in progress (opening one when none is — a tool-first turn has a leading
+  message with no text); thoughts attach to the assistant message that receives the next assistant
+  content; a run of `user_message_chunk`s is one user message. `turn.toolCalls` is now the
+  flattening of `messages[*].toolCalls` — one fold, same order and contents as before.
+- New `agent.stream(content, options?)`: the same turn as `prompt()` (same FIFO position, options,
+  and `AcpAgentTurn`) as an `AcpAgentStream` — an async iterable that is its own iterator — of
+  `AcpAgentStreamEvent`s: every bus event of THIS turn tagged `type` (an update once, under its
+  `sessionUpdate` kind; never the `session_update` catch-all; permission / elicitation /
+  raw_message and a concurrent `steer()`'s `steering` included), then the terminal
+  `{ type: "turn", turn }`. The observer is attached the instant the turn is dequeued, so a queued
+  stream never sees the previous turn's events; events are buffered without dropping; a rejected
+  turn yields its buffered events and then throws that error once; leaving early (`break`,
+  `return()`, `throw()`) drops a not-yet-started turn without going on the wire and sends the one
+  `session/cancel` (plus the agent's escalation) to one in flight, resolving only once it settled.
 
 `@automatalabs/pi-acp`
 

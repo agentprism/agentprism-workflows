@@ -132,6 +132,12 @@ test("load(ref) replays into history/replay and marks the load boundary", async 
   assert.equal(loaded.text, "a");
   assert.equal(loaded.replay.length, 2);
   assert.deepEqual(loaded.replay.map((record) => record.update.sessionUpdate), ["user_message_chunk", "agent_message_chunk"]);
+  assert.deepEqual(
+    loaded.messages.map((message) => [message.role, message.content]),
+    [["user", [{ type: "text", text: "q" }]], ["assistant", [{ type: "text", text: "a" }]]],
+    "the replay lands in messages too — the user prompt included, unlike history/text",
+  );
+  assert.equal(loaded.messages[0]!.receivedAt, loaded.replay[0]!.receivedAt, "dated by the replayed record");
   assert.equal(readLog().find((entry) => entry.method === "loadSession")?.params?.sessionId, "recorded-session");
   assert.equal(methods(readLog()).includes("resumeSession"), false);
 
@@ -139,8 +145,13 @@ test("load(ref) replays into history/replay and marks the load boundary", async 
   const turn = await loaded.prompt("go");
   assert.equal(turn.text, "after");
   assert.equal(turn.history.length, 1);
+  assert.equal(turn.messages.length, 1, "the turn's messages are its own, not the replay's");
   assert.equal(loaded.text, "a\n\nafter", "the replayed message and the new turn fold like turn.text");
   assert.equal(loaded.history.length, 2);
+  assert.deepEqual(
+    loaded.messages.map((message) => message.content),
+    [[{ type: "text", text: "q" }], [{ type: "text", text: "a" }], [{ type: "text", text: "after" }]],
+  );
   assert.equal(loaded.usage.total, 0, "replayed history is never counted as usage");
 });
 

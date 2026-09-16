@@ -7,12 +7,14 @@
 // tool host) and never touches the runner, the pool, or `InteractiveSession`.
 //
 // Semantics that are not negotiable (docs/api.md "AcpAgent SDK"):
-//   - FIFO: prompt / fork / setMode / setConfigOptions / close serialize behind the in-flight
-//     turn; steer and cancel overlap it. A fork therefore always sees a quiescent, fully
+//   - FIFO: prompt / stream / fork / setMode / setConfigOptions / close serialize behind the
+//     in-flight turn; steer and cancel overlap it. A fork therefore always sees a quiescent, fully
 //     persisted parent transcript (pi rejects busy forks; Claude would copy a partial turn).
 //   - `prompt()` resolves a turn for EVERY PromptResponse the wire returned — no stopReason is
 //     ever thrown on — and rejects only on a wire rejection, validation, abort, closed, or a typed
-//     session failure (then with the complete turn attached, `isAcpAgentTurnError`).
+//     session failure (then with the complete turn attached, `isAcpAgentTurnError`). `stream()`
+//     is the same turn observed as an async iterable: its tap is attached inside the queued
+//     operation, the instant the turn is dequeued, so it yields THIS turn's events and no other's.
 //   - The agent never calls `SessionHandle.cancel()`: it sends one `session/cancel` through
 //     `PooledConnection.cancelSession` and owns the escalation (process disposal, no wire
 //     `session/close`) so `close({ keep: true })` semantics survive an ignored cancel.
@@ -34,6 +36,7 @@ import type { Backend } from "../backend.js";
 import type { NegotiatedCapabilities } from "../capabilities.js";
 import { validateClientHandlers } from "../client-handlers.js";
 import type { ErrorMapContext } from "../errors-map.js";
+import type { AcpSessionUpdate } from "../events.js";
 import { appendPromptImages, buildRunPrompt, mergeTurnMeta, validatePromptImages } from "../prompt.js";
 import type { BackendRegistry, CustomBackendConfig } from "../registry.js";
 import { assertNoModelConfigOption, resolveModelRoute } from "../routing.js";
@@ -50,9 +53,11 @@ import {
 } from "./errors.js";
 import { AgentEventBus } from "./events.js";
 import { acquireForkedSession, forkTraitFor } from "./fork.js";
+import { MessageFolder, copyMessage } from "./messages.js";
 import { probeCatalog } from "./probe.js";
 import { releaseOnExit, retainOnExit } from "./process-registry.js";
 import { SerialQueue } from "./queue.js";
+import { TurnStream } from "./stream.js";
 import {
   freshBackendFor,
   resolveAgentRegistry,
@@ -69,12 +74,15 @@ import {
   type AcpAgentEventListener,
   type AcpAgentEventName,
   type AcpAgentForkOptions,
+  type AcpAgentMessage,
   type AcpAgentOptions,
   type AcpAgentProbeOptions,
   type AcpAgentPromptOptions,
   type AcpAgentReopenOptions,
   type AcpAgentState,
   type AcpAgentSteerOptions,
+  type AcpAgentStream,
+  type AcpAgentStreamEvent,
   type AcpAgentTurn,
   type AcpAgentUpdateRecord,
 } from "./types.js";
@@ -89,6 +97,7 @@ type AcpAgentSeed =
       readonly sourceSessionId: string;
       readonly historySeed?: AgentHistoryEntry[];
       readonly textSeed?: string;
+      readonly messagesSeed?: AcpAgentMessage[];
     };
 type ResolvedSeed = AcpAgentSeed & {
   readonly registry: BackendRegistry;
@@ -240,6 +249,13 @@ export class AcpAgent {
   #sessionUsage: AgentUsage = ZERO_USAGE;
   #historySeed: AgentHistoryEntry[] = [];
   #textSeed = "";
+  #messagesSeed: AcpAgentMessage[] = [];
+  /** The retained transcript as messages — the same updates the handle's accumulator folds into
+   *  `history`/`text`, folded per message. Live once the session is registered; a `load` replay
+   *  is folded from `#replay` at that point (the accumulator saw it too); a fork's pre-response
+   *  replay is not (the accumulator never saw it — it lands in `replay` only). */
+  readonly #transcript = new MessageFolder();
+  #transcriptLive = false;
   #collectingReplay = false;
   #activeTurn: ActiveTurn | undefined;
   #closePromise: Promise<void> | undefined;
@@ -284,10 +300,15 @@ export class AcpAgent {
     this.#signal = options.signal;
     // Verbatim session/update records received before the session was ready (a load's replay, a
     // fork's pre-response replay) — adopted from the acquisition buffer, observable as `replay`.
+    // Once the session is registered, every update is folded into the message transcript.
     this.#bus.tap((name, event) => {
-      if (name !== "session_update" || !this.#collectingReplay) return;
-      const { update } = event as { update: AcpAgentUpdateRecord["update"] };
-      this.#replay.push({ update: structuredClone(update), receivedAt: Date.now() });
+      if (name !== "session_update") return;
+      const { update } = event as { update: AcpSessionUpdate };
+      if (this.#collectingReplay) {
+        this.#replay.push({ update: structuredClone(update), receivedAt: Date.now() });
+      } else if (this.#transcriptLive) {
+        this.#transcript.apply(structuredClone(update), Date.now());
+      }
     });
     if (options.signal) {
       const signal = options.signal;
@@ -463,6 +484,14 @@ export class AcpAgent {
     return [this.#textSeed, this.#handle?.foldedText() ?? ""].filter((part) => part !== "").join("\n\n");
   }
 
+  /** The retained transcript as messages (`AcpAgentMessage`, copies on read): `[...seed, ...this
+   *  session's messages]` — the same retained log `history`/`text` describe, folded per message
+   *  with the turn fold's boundary, a `load` replay included, seeded from the parent's snapshot on
+   *  a live fork, and holding only the latest turn under `retainHistory: false`. */
+  get messages(): readonly AcpAgentMessage[] {
+    return [...this.#messagesSeed.map(copyMessage), ...this.#transcript.snapshot()];
+  }
+
   /** Running per-field sum of every turn this agent ran; `ZERO_USAGE` before the first turn. */
   get usage(): AgentUsage {
     return this.#sessionUsage;
@@ -512,94 +541,156 @@ export class AcpAgent {
    * a turn already on the wire.
    */
   prompt(content: string | ContentBlock[], options: AcpAgentPromptOptions = {}): Promise<AcpAgentTurn> {
-    return this.#enqueue(async () => {
-      await this.#ensureOpen();
-      options.signal?.throwIfAborted();
-      this.#signal?.throwIfAborted();
-      const handle = this.#handle!;
-      const plan = this.#plan!;
-      const backend = this.#backend;
-      const label = this.label;
+    return this.#enqueue(() => this.#promptTurn(content, options), options.signal);
+  }
 
-      validateArguments(() => {
-        validatePromptImages(options.images, label);
-        assertPerTurnSchemaAllowed(backend, options.schema, label);
-        assertNoModelConfigOption(options.configOptions, label);
-        assertKnownConfigOptionIds(options.configOptions, handle.advertisedConfigOptions, this.backendId, label);
+  /**
+   * The same turn as `prompt()`, observed as an async iterable of this turn's events: every bus
+   * event emitted while the turn's operation runs — from the instant it is dequeued (a lazy
+   * open's `session_open`, a per-turn `mode`'s `current_mode_update` included) until the wire
+   * settles — each tagged `{ type: <event name>, ...payload }` (an update once, under its kind;
+   * never the `session_update` catch-all; a concurrent `steer()`'s `steering` event and the
+   * permission / elicitation / raw_message events included), then the terminal
+   * `{ type: "turn", turn }` with exactly the `AcpAgentTurn` `prompt()` would have resolved.
+   * The turn is queued (FIFO) by this call, exactly like `prompt()`; events are buffered without
+   * dropping until consumed. When the turn rejects, the iterator yields the buffered events, then
+   * throws that same error. Leaving early — `break`, `return()`, `throw()` — aborts the turn's
+   * per-call signal: a turn still queued or not yet on the wire is dropped with nothing sent, a
+   * turn in flight gets the one `session/cancel` (and the agent's escalation), and the call
+   * resolves only once the turn settled, so no turn keeps running unobserved.
+   */
+  stream(content: string | ContentBlock[], options: AcpAgentPromptOptions = {}): AcpAgentStream {
+    // The consumer's exit is not an error: the turn rejects with this marker, which never leaves
+    // the stream (a caller's own `options.signal` reason does — the iterator throws it).
+    const left = new Error("AcpAgent.stream(): the consumer stopped iterating");
+    const controller = new AbortController();
+    const outer = options.signal;
+    const forward = (): void => controller.abort(outer?.reason);
+    if (outer?.aborted) controller.abort(outer.reason);
+    else outer?.addEventListener("abort", forward, { once: true });
+
+    const stream = new TurnStream(() => {
+      controller.abort(left);
+      return settled.then(noop, noop);
+    });
+    // The tap is attached INSIDE the queued operation, the instant this turn is dequeued: from
+    // outside the queue it would observe the previous turn's events too.
+    const settled = this.#enqueue(async () => {
+      const untap = this.#bus.tap((name, event) => {
+        if (name === "session_update") return;
+        stream.push({ type: name, ...(event as object) } as AcpAgentStreamEvent);
       });
       try {
-        if (options.configOptions) {
-          await handle.setConfigOptions(options.configOptions);
-          options.signal?.throwIfAborted();
-          this.#signal?.throwIfAborted();
-        }
-        if (options.mode !== undefined) {
-          await handle.setMode(options.mode);
-          options.signal?.throwIfAborted();
-          this.#signal?.throwIfAborted();
-        }
-      } catch (error) {
-        throw mapAgentError(error, this.#errorContext(), options.signal?.aborted ? options.signal : this.#signal);
-      }
-
-      const turnSchema = options.schema ?? this.#schema;
-      // Same request shaping as the runner: a generic backend whose agent may ignore the `_meta`
-      // forward gets the contract stated in-band; backend turn meta wins only direct collisions.
-      const shaped =
-        typeof content === "string" && turnSchema !== undefined && backend.embedSchemaInPrompt
-          ? buildRunPrompt(content, {}, turnSchema, backend, plan.toolActive)
-          : content;
-      const turnContent = appendPromptImages(shaped, options.images);
-      const promptMeta = mergeTurnMeta(options.meta, backend.promptMeta(turnSchema));
-
-      // SYNCHRONOUSLY before the wire call: the collector's tap sees every update of the turn.
-      const collector = new TurnCollector(this.#bus, handle, { retainHistory: this.#retainHistory });
-      // A capture left by a turn that rejected (wire error/abort) must not leak into this turn.
-      plan.registration?.takeCaptured();
-
-      const outcome = handle.promptOutcome(turnContent, promptMeta);
-      const active: ActiveTurn = { ended: outcome.then(noop, noop), aborted: false };
-      this.#activeTurn = active;
-      const callSignal = options.signal;
-      const onCallAbort = (): void => {
-        active.aborted = true;
-        active.abortReason = callSignal?.reason;
-        void this.#cancelTurn().catch(noop);
-      };
-      callSignal?.addEventListener("abort", onCallAbort, { once: true });
-
-      let response: Awaited<typeof outcome>["response"];
-      let failure: Awaited<typeof outcome>["failure"];
-      try {
-        ({ response, failure } = await outcome);
-      } catch (error) {
-        if (active.aborted) throw active.abortReason;
-        if (this.#signal?.aborted) throw this.#signal.reason;
-        throw mapAgentError(error, this.#errorContext());
+        const turn = await this.#promptTurn(content, { ...options, signal: controller.signal });
+        stream.push({ type: "turn", turn });
+        return turn;
       } finally {
-        collector.stop();
-        callSignal?.removeEventListener("abort", onCallAbort);
-        if (this.#activeTurn === active) this.#activeTurn = undefined;
+        untap();
       }
-      // An abort observed in flight rejects with the reason even when the agent answered
-      // `stopReason: "cancelled"` — abort is never a resolved turn.
+    }, controller.signal);
+    void settled.then(
+      () => stream.end(),
+      (error: unknown) => {
+        if (error === left) stream.end();
+        else stream.fail(error);
+      },
+    );
+    void settled.then(noop, noop).finally(() => outer?.removeEventListener("abort", forward));
+    return stream;
+  }
+
+  /** The body of one turn — runs inside the FIFO (`prompt()` queues it directly, `stream()` under
+   *  its tap). `options.signal` is the per-call signal; `stream()` hands in its own combined one. */
+  async #promptTurn(content: string | ContentBlock[], options: AcpAgentPromptOptions): Promise<AcpAgentTurn> {
+    await this.#ensureOpen();
+    options.signal?.throwIfAborted();
+    this.#signal?.throwIfAborted();
+    const handle = this.#handle!;
+    const plan = this.#plan!;
+    const backend = this.#backend;
+    const label = this.label;
+
+    validateArguments(() => {
+      validatePromptImages(options.images, label);
+      assertPerTurnSchemaAllowed(backend, options.schema, label);
+      assertNoModelConfigOption(options.configOptions, label);
+      assertKnownConfigOptionIds(options.configOptions, handle.advertisedConfigOptions, this.backendId, label);
+    });
+    try {
+      if (options.configOptions) {
+        await handle.setConfigOptions(options.configOptions);
+        options.signal?.throwIfAborted();
+        this.#signal?.throwIfAborted();
+      }
+      if (options.mode !== undefined) {
+        await handle.setMode(options.mode);
+        options.signal?.throwIfAborted();
+        this.#signal?.throwIfAborted();
+      }
+    } catch (error) {
+      throw mapAgentError(error, this.#errorContext(), options.signal?.aborted ? options.signal : this.#signal);
+    }
+
+    const turnSchema = options.schema ?? this.#schema;
+    // Same request shaping as the runner: a generic backend whose agent may ignore the `_meta`
+    // forward gets the contract stated in-band; backend turn meta wins only direct collisions.
+    const shaped =
+      typeof content === "string" && turnSchema !== undefined && backend.embedSchemaInPrompt
+        ? buildRunPrompt(content, {}, turnSchema, backend, plan.toolActive)
+        : content;
+    const turnContent = appendPromptImages(shaped, options.images);
+    const promptMeta = mergeTurnMeta(options.meta, backend.promptMeta(turnSchema));
+
+    // SYNCHRONOUSLY before the wire call: the collector's tap sees every update of the turn, and
+    // the transcript marks the turn boundary exactly where the handle's accumulator does
+    // (`SessionState.beginTurn()` inside `promptOutcome`) — nothing can interleave.
+    const collector = new TurnCollector(this.#bus, handle, { retainHistory: this.#retainHistory });
+    this.#transcript.beginTurn(this.#retainHistory);
+    // A capture left by a turn that rejected (wire error/abort) must not leak into this turn.
+    plan.registration?.takeCaptured();
+
+    const outcome = handle.promptOutcome(turnContent, promptMeta);
+    const active: ActiveTurn = { ended: outcome.then(noop, noop), aborted: false };
+    this.#activeTurn = active;
+    const callSignal = options.signal;
+    const onCallAbort = (): void => {
+      active.aborted = true;
+      active.abortReason = callSignal?.reason;
+      void this.#cancelTurn().catch(noop);
+    };
+    callSignal?.addEventListener("abort", onCallAbort, { once: true });
+
+    let response: Awaited<typeof outcome>["response"];
+    let failure: Awaited<typeof outcome>["failure"];
+    try {
+      ({ response, failure } = await outcome);
+    } catch (error) {
       if (active.aborted) throw active.abortReason;
       if (this.#signal?.aborted) throw this.#signal.reason;
+      throw mapAgentError(error, this.#errorContext());
+    } finally {
+      collector.stop();
+      callSignal?.removeEventListener("abort", onCallAbort);
+      if (this.#activeTurn === active) this.#activeTurn = undefined;
+    }
+    // An abort observed in flight rejects with the reason even when the agent answered
+    // `stopReason: "cancelled"` — abort is never a resolved turn.
+    if (active.aborted) throw active.abortReason;
+    if (this.#signal?.aborted) throw this.#signal.reason;
 
-      const turn = buildTurn({
-        response,
-        collector,
-        handle,
-        backend,
-        schema: turnSchema,
-        captured: plan.registration?.takeCaptured(),
-        sessionBefore: this.#sessionUsage,
-      });
-      // A walled turn still counts the tokens it burned.
-      this.#sessionUsage = turn.usage.session;
-      if (failure) throw agentTurnError(failure, turn, this.#errorContext());
-      return turn;
-    }, options.signal);
+    const turn = buildTurn({
+      response,
+      collector,
+      handle,
+      backend,
+      schema: turnSchema,
+      captured: plan.registration?.takeCaptured(),
+      sessionBefore: this.#sessionUsage,
+    });
+    // A walled turn still counts the tokens it burned.
+    this.#sessionUsage = turn.usage.session;
+    if (failure) throw agentTurnError(failure, turn, this.#errorContext());
+    return turn;
   }
 
   /** Inject content into the turn in flight (`_session/steering`). Overlaps the FIFO; requires a
@@ -697,6 +788,7 @@ export class AcpAgent {
         modelSpec: route ? route.modelSpec : this.#modelSpec,
         historySeed: this.history.map((entry) => ({ ...entry })),
         textSeed: this.text,
+        messagesSeed: [...this.messages],
       });
       return AcpAgent.#opened(child);
     });
@@ -873,9 +965,17 @@ export class AcpAgent {
       this.#sessionId = handle.sessionId;
       this.#bus.endAcquisition(handle.sessionId);
       this.#collectingReplay = false;
+      // The transcript follows the handle's accumulator: a replay the registered session applied
+      // (`session/load`, the id-only fork's load fallback) is folded from the adopted records; a
+      // pre-response fork replay was never applied there and stays in `replay` alone. Live from
+      // here on — synchronously, so no later update can slip between the two.
+      if (replayed) {
+        for (const { update, receivedAt } of this.#replay) this.#transcript.apply(structuredClone(update), receivedAt);
+      }
+      this.#transcriptLive = true;
       this.#signal?.throwIfAborted();
       await this.#applyPostOpen(handle);
-      if (seed.kind === "fork") this.#seedHistory(seed.historySeed, seed.textSeed, handle);
+      if (seed.kind === "fork") this.#seedHistory(seed, handle);
       this.#sessionRef = sessionRefFor(handle, this.#backend, this.cwd);
       this.#sessionUsage = ZERO_USAGE;
     } catch (error) {
@@ -911,12 +1011,13 @@ export class AcpAgent {
     this.#signal?.throwIfAborted();
   }
 
-  /** Seed a live fork's history/text from the parent's snapshot — only when the child's own
-   *  accumulator is empty (a `session/load` fallback already replayed the transcript). */
-  #seedHistory(seed: AgentHistoryEntry[] | undefined, text: string | undefined, handle: SessionHandle): void {
-    if (!seed || handle.history.length > 0) return;
-    this.#historySeed = seed;
-    this.#textSeed = text ?? "";
+  /** Seed a live fork's history/text/messages from the parent's snapshot — only when the child's
+   *  own accumulator is empty (a `session/load` fallback already replayed the transcript). */
+  #seedHistory(seed: Extract<AcpAgentSeed, { kind: "fork" }>, handle: SessionHandle): void {
+    if (!seed.historySeed || handle.history.length > 0) return;
+    this.#historySeed = seed.historySeed;
+    this.#textSeed = seed.textSeed ?? "";
+    this.#messagesSeed = seed.messagesSeed ?? [];
   }
 
   #cancelTurn(): Promise<void> {

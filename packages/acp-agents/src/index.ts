@@ -81,12 +81,16 @@ export type {
   AcpAgentTurn,
   AcpAgentTurnError,
   AcpAgentToolCall,
+  AcpAgentMessage,
   AcpAgentUpdateRecord,
   AcpAgentRawRecord,
   AcpAgentTurnUsage,
   AcpAgentEventMap,
   AcpAgentEventName,
   AcpAgentEventListener,
+  AcpAgentStream,
+  AcpAgentStreamEvent,
+  AcpAgentStreamEventName,
   AcpAgentState,
 } from "./agent/types.js";
 

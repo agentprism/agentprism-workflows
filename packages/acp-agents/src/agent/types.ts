@@ -2,6 +2,7 @@
 // here beyond `ZERO_USAGE`; the class itself is in acp-agent.ts and the internal seed type that
 // statics hand to the constructor is module-private there (never part of this surface).
 import type {
+  ContentBlock,
   PromptResponse,
   SessionConfigOption,
   SessionModeState,
@@ -95,9 +96,9 @@ export interface AcpAgentOptions {
   /** Agent-lifetime abort: rejects queued work with `signal.reason`, cancels an in-flight turn,
    *  then closes. Not inherited by forks. */
   signal?: AbortSignal;
-  /** Default true: the session log is retained across turns so `history`/`text` are cumulative
-   *  and a fork can seed its child. `false` maps to `retainSessionLog: false` (history/text hold
-   *  only the latest turn). */
+  /** Default true: the session log is retained across turns so `history`/`text`/`messages` are
+   *  cumulative and a fork can seed its child. `false` maps to `retainSessionLog: false`
+   *  (history/text/messages hold only the latest turn). */
   retainHistory?: boolean;
   /** Default true: ask the backend to emit its vendor notifications (`_claude/sdkMessage` on
    *  Claude) so they reach `on("raw_message")` and `turn.raw`. `false` skips
@@ -205,6 +206,34 @@ export interface AcpAgentToolCall {
   readonly meta?: Record<string, unknown>;
 }
 
+/**
+ * One message of the transcript, folded from the session/update stream (`turn.messages` for a
+ * turn, `agent.messages` for the retained log). The assistant-message boundary is EXACTLY the
+ * `text` fold's: text chunks concatenate into one message until a `tool_call`, `tool_call_update`,
+ * `agent_thought_chunk`, `plan*` or `user_message_chunk` event (or a changed ACP `messageId`)
+ * marks a boundary, and the next text chunk opens a new message — so `turn.text` is the
+ * text-bearing assistant messages of the turn joined by `"\n\n"`. Tool calls attach to the
+ * assistant message in progress (a turn that starts with a tool call has a leading message with
+ * no text); thoughts lead and attach to the assistant message that receives the next assistant
+ * content (a trailing thought is a message of its own); a run of `user_message_chunk`s is one
+ * user message.
+ */
+export interface AcpAgentMessage {
+  readonly role: "user" | "assistant";
+  /** The ordered blocks of this message. Consecutive text chunks fold into one text block (the
+   *  first chunk's fields, the concatenated text); other blocks are kept as sent. The verbatim
+   *  chunks stay in `updates`. */
+  readonly content: ContentBlock[];
+  /** Assistant only: the tool calls this message issued, folded by `toolCallId` (first-seen
+   *  order; a later `tool_call_update` updates the call where it lives). Empty for user messages. */
+  readonly toolCalls: readonly AcpAgentToolCall[];
+  /** Assistant only: the `agent_thought_chunk` blocks that preceded this message's content,
+   *  consecutive text chunks folded like `content`. Empty for user messages. */
+  readonly thoughts: ContentBlock[];
+  /** The `receivedAt` of the first update folded into this message. */
+  readonly receivedAt: number;
+}
+
 export interface AcpAgentTurnUsage {
   /** THIS turn's tokens: `response.usage` mapped to `AgentUsage` (every installed adapter reports
    *  the turn, not the session — `PROMPT_USAGE_SCOPES`); `cost` = the clamped delta of the
@@ -230,8 +259,12 @@ export interface AcpAgentTurn {
   readonly updates: ReadonlyArray<AcpAgentUpdateRecord>;
   /** Every `raw_message` of this turn (Claude `_claude/sdkMessage`). */
   readonly raw: ReadonlyArray<AcpAgentRawRecord>;
-  /** tool_call ⊕ tool_call_update folded by toolCallId, first-seen order. */
+  /** tool_call ⊕ tool_call_update folded by toolCallId, first-seen order (the flattening of
+   *  `messages[*].toolCalls`). */
   readonly toolCalls: ReadonlyArray<AcpAgentToolCall>;
+  /** This turn's messages, folded from `updates` (`AcpAgentMessage`): the per-message view of
+   *  the same chunks `text` folds, with each message's tool calls and thoughts attached. */
+  readonly messages: ReadonlyArray<AcpAgentMessage>;
   readonly permissions: ReadonlyArray<AcpPermissionEvent>;
   readonly elicitations: ReadonlyArray<AcpElicitationEvent>;
   readonly usage: AcpAgentTurnUsage;
@@ -248,8 +281,8 @@ export interface AcpAgentTurn {
 /** A `prompt()` rejection for a turn the agent walled with a typed session failure (codex-acp's
  *  negotiated extension): the runner's mapped `WorkflowError` (`mapTypedSessionFailure`, so codes,
  *  `recoverable` and `details` keep their tested contract) carrying the COMPLETE turn — verbatim
- *  `response` incl. `_meta`, `usage`, `updates`, `raw`, `toolCalls`, `history` — so nothing is
- *  stripped. Narrow with `isAcpAgentTurnError`. */
+ *  `response` incl. `_meta`, `usage`, `updates`, `raw`, `toolCalls`, `messages`, `history` — so
+ *  nothing is stripped. Narrow with `isAcpAgentTurnError`. */
 export type AcpAgentTurnError = WorkflowError & { readonly turn: AcpAgentTurn };
 
 /** Same keys/payloads as the runner bus (no new cross-cutting names); turn boundaries are the
@@ -257,6 +290,36 @@ export type AcpAgentTurnError = WorkflowError & { readonly turn: AcpAgentTurn };
 export type AcpAgentEventMap = AcpRunnerEventMap;
 export type AcpAgentEventName = keyof AcpAgentEventMap;
 export type AcpAgentEventListener<K extends AcpAgentEventName> = (event: AcpAgentEventMap[K]) => void;
+
+/** The event names `stream()` yields: every bus event except the `session_update` catch-all (an
+ *  update is yielded once, under its `sessionUpdate` kind). */
+export type AcpAgentStreamEventName = Exclude<AcpAgentEventName, "session_update">;
+
+/**
+ * One item of `agent.stream()`: a bus event of this turn tagged with its name as `type` (the
+ * payload is the same object `on(name)` delivers — an ACP update variant plus the event context,
+ * or a permission / elicitation / raw_message / steering / session_open / session_close /
+ * backend_error payload), or the terminal `{ type: "turn", turn }` carrying the `AcpAgentTurn`
+ * `prompt()` would have resolved. Narrow on `type`.
+ */
+export type AcpAgentStreamEvent =
+  | { [K in AcpAgentStreamEventName]: { readonly type: K } & AcpAgentEventMap[K] }[AcpAgentStreamEventName]
+  | { readonly type: "turn"; readonly turn: AcpAgentTurn };
+
+/** What `stream()` returns: an async iterable that is its own iterator, with `return()` and
+ *  `throw()` always present (leaving early is part of the contract — both cancel the turn and
+ *  resolve once it settled; `throw(error)` then rethrows `error`). */
+export interface AcpAgentStream extends AsyncIterableIterator<AcpAgentStreamEvent> {
+  next(): Promise<IteratorResult<AcpAgentStreamEvent, undefined>>;
+  return(): Promise<IteratorResult<AcpAgentStreamEvent, undefined>>;
+  throw(error?: unknown): Promise<IteratorResult<AcpAgentStreamEvent, undefined>>;
+  [Symbol.asyncIterator](): AcpAgentStream;
+}
+
+/** Compile-time guard: the terminal discriminant can never be shadowed by an ACP update kind or a
+ *  cross-cutting event name (a collision would make `type: "turn"` ambiguous). */
+type AssertNever<T extends never> = T;
+type StreamTerminalIsDistinct = AssertNever<Extract<AcpAgentEventName, "turn">>;
 
 /** `idle` (constructed, nothing spawned) → `opening` → `ready` ⇄ `busy` (a queued op is executing)
  *  → `closed` (set the instant `close()` is called, the constructor signal aborts, or the process

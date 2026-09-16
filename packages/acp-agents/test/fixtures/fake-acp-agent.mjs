@@ -700,11 +700,12 @@ class FakeAgent {
     // stays alive (cancel does not close the connection), so the pool can reuse it afterward.
     // `ignoreCancel` parks the same way but session/cancel never releases it (see cancel()): the
     // turn only ends when the client kills the process — the agent-owned escalation path.
-    if (turn.waitForCancel || turn.ignoreCancel) {
-      if (!this.cancelled.has(params.sessionId)) {
-        await new Promise((resolve) => this.cancelWaiters.set(params.sessionId, resolve));
-      }
-      return { stopReason: "cancelled" };
+    // `parkAfterUpdates` moves the park behind the scripted `updates`/`text` (step 3.5/3) so a
+    // test can observe a turn's streamed output BEFORE it cancels — a partial turn, as a real
+    // agent interrupted mid-answer produces.
+    const parksForCancel = turn.waitForCancel || turn.ignoreCancel;
+    if (parksForCancel && !turn.parkAfterUpdates) {
+      return this.parkUntilCancelled(params.sessionId);
     }
     if (typeof turn.delayMs === "number" && turn.delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, turn.delayMs));
@@ -801,6 +802,9 @@ class FakeAgent {
         sessionId: params.sessionId,
         update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
       });
+    }
+    if (parksForCancel && turn.parkAfterUpdates) {
+      return this.parkUntilCancelled(params.sessionId);
     }
 
     // 4) optional usage_update notification (carries the cumulative cost)
@@ -960,6 +964,15 @@ class FakeAgent {
         // best-effort test client teardown
       }
     }
+  }
+
+  /** Park the turn until session/cancel arrives for `sessionId` (or forever under `ignoreCancel`),
+   *  then settle it as a real agent honoring the cancel would. */
+  async parkUntilCancelled(sessionId) {
+    if (!this.cancelled.has(sessionId)) {
+      await new Promise((resolve) => this.cancelWaiters.set(sessionId, resolve));
+    }
+    return { stopReason: "cancelled" };
   }
 
   cancel(params) {
