@@ -26,7 +26,8 @@
 #    Triage runbook: CONTRIBUTING.md "When the dependency gate blocks".
 #
 # 3. LIVE backend e2e (packages/mcp-server/test/live-backend.e2e.test.ts) plus native steering
-#    smoke (packages/acp-agents/test/steering.live.e2e.test.ts) against the REAL Claude + Codex +
+#    smoke (packages/acp-agents/test/steering.live.e2e.test.ts) and the `AcpAgent` fork/resume
+#    smoke (packages/acp-agents/test/agent.live.e2e.test.ts) against the REAL Claude + Codex +
 #    OpenCode + pi agents. CI cannot run these (no agent auth —
 #    AGENTPRISM_LIVE_E2E stays unset there), so this hook is the only place the
 #    structured-output cruxes get exercised against real backends pre-merge. If a leg
@@ -83,7 +84,7 @@ if ! node scripts/check-acp-deps.mjs; then
   exit 1
 fi
 
-echo "pre-push: building workspace, then LIVE backend (Claude, OpenCode, pi) + Claude steering e2e (real agents, real tokens; ~60-120s; Codex legs are opt-in via AGENTPRISM_LIVE_E2E_CODEX=1)..." >&2
+echo "pre-push: building workspace, then LIVE backend (Claude, OpenCode, pi) + Claude steering + AcpAgent fork/resume e2e (real agents, real tokens; ~2-5 min; Codex legs are opt-in via AGENTPRISM_LIVE_E2E_CODEX=1)..." >&2
 pnpm build >/dev/null 2>&1
 
 # The full runner output is tee'd to a log, and on failure the failing-test section is
@@ -97,8 +98,10 @@ E2E_LOG="$(git rev-parse --git-dir)/pre-push-live-e2e.log"
 # picker, and the steering leg runs in a fresh temp cwd where no project settings apply. This
 # env var is what makes the model selectable there; the test files name it explicitly so a leg
 # fails loudly rather than silently falling back to whatever the CLI would have picked.
-# timeout: an expired agent login must fail the push loudly, not hang it forever.
-if ! AGENTPRISM_LIVE_E2E=1 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8 timeout 420 npx tsx --test packages/mcp-server/test/live-backend.e2e.test.ts packages/acp-agents/test/steering.live.e2e.test.ts 2>&1 | tee "$E2E_LOG" >&2; then
+# timeout: an expired agent login must fail the push loudly, not hang it forever. 600 s (was 420 s)
+# because the AcpAgent fork/resume file adds three real legs (Claude, OpenCode, pi), each a
+# seven-step open/fork/resume conversation.
+if ! AGENTPRISM_LIVE_E2E=1 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8 timeout 600 npx tsx --test packages/mcp-server/test/live-backend.e2e.test.ts packages/acp-agents/test/steering.live.e2e.test.ts packages/acp-agents/test/agent.live.e2e.test.ts 2>&1 | tee "$E2E_LOG" >&2; then
   echo "" >&2
   echo "pre-push: LIVE backend e2e FAILED — push blocked. Exact failure:" >&2
   if grep -q "failing tests:" "$E2E_LOG"; then
@@ -106,7 +109,7 @@ if ! AGENTPRISM_LIVE_E2E=1 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8 timeout 
     # message, and the diag() dump (status/errors/stderr tail per failing leg).
     sed -n '/failing tests:/,$p' "$E2E_LOG" >&2
   else
-    echo "  (runner produced no failing-tests summary — likely killed by the 420s timeout; last 40 lines:)" >&2
+    echo "  (runner produced no failing-tests summary — likely killed by the 600s timeout; last 40 lines:)" >&2
     tail -40 "$E2E_LOG" >&2
   fi
   echo "" >&2

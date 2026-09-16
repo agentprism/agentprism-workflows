@@ -1,6 +1,6 @@
 {
-  // Type-checks src AND the AcpAgent SDK test tree (test/agent/**) plus the catalog tests moved
-  // down from workflows — the config behind the compile gate `test/agent/typecheck.test.ts`
+  // Type-checks src AND the AcpAgent SDK test tree (test/agent/**, its live leg) plus the catalog
+  // tests moved down from workflows — the config behind the compile gate `test/agent/typecheck.test.ts`
   // spawns and the package `typecheck` script. Narrow on purpose: the legacy test tree is not
   // type-clean (27 pre-existing errors in 13 files as of 2026-09-15; separate maintenance), so
   // it stays out until it is. The build tsconfig.json stays src-only: composite/declaration emit
@@ -13,5 +13,5 @@
     "noEmit": true,
     "rootDir": "."
   },
-  "include": ["src/**/*", "test/agent/**/*", "test/config-catalog*.test.ts"]
+  "include": ["src/**/*", "test/agent/**/*", "test/agent.live.e2e.test.ts", "test/config-catalog*.test.ts"]
 }
