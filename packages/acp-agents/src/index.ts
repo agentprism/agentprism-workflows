@@ -65,6 +65,31 @@ export {
 } from "./interactive.js";
 export type { InteractiveSessionOptions, InteractiveTurn } from "./interactive.js";
 
+// The SDK-style AcpAgent front door (src/agent/): one dedicated ACP process per agent, FIFO turns,
+// live forks, cold reopen from a session ref, and the no-prompt catalog probe.
+export { AcpAgent } from "./agent/acp-agent.js";
+export { isAcpAgentTurnError } from "./agent/errors.js";
+export type {
+  AcpAgentOptions,
+  AcpAgentPromptOptions,
+  AcpAgentSteerOptions,
+  AcpAgentForkOptions,
+  AcpAgentReopenOptions,
+  AcpAgentCloseOptions,
+  AcpAgentProbeOptions,
+  AcpAgentCatalog,
+  AcpAgentTurn,
+  AcpAgentTurnError,
+  AcpAgentToolCall,
+  AcpAgentUpdateRecord,
+  AcpAgentRawRecord,
+  AcpAgentTurnUsage,
+  AcpAgentEventMap,
+  AcpAgentEventName,
+  AcpAgentEventListener,
+  AcpAgentState,
+} from "./agent/types.js";
+
 export { AGENT_METHODS, CLIENT_METHODS } from "@agentclientprotocol/sdk";
 export type {
   AgentNotificationMethod,

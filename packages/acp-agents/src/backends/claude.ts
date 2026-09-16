@@ -104,6 +104,12 @@ export class ClaudeBackend implements Backend {
     return undefined;
   }
 
+  rawMessagesMeta(): Record<string, unknown> | undefined {
+    // claude-agent-acp emits `_claude/sdkMessage` only when the session asks for it; a schema
+    // session already sets this through sessionMeta (the result rides that stream).
+    return { claudeCode: { emitRawSDKMessages: true } } satisfies ClaudeCodeSessionMeta;
+  }
+
   nativeStructured(source: StructuredSource): unknown {
     return source.rawStructuredOutput();
   }
