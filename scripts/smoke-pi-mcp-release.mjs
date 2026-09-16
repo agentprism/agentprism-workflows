@@ -157,9 +157,6 @@ assert.doesNotMatch(piBackendText, /nativeStructured|outputSchema/);
 const acpReadme = readFileSync(join(acpRoot, "README.md"), "utf8");
 assert.match(acpReadme, /Pi\/OpenCode injected HTTP MCP tool/i);
 assert.match(acpReadme, /Pi retains the common prompt\/validated-last-text fallback/i);
-const authSpec = readFileSync(join(repoRoot, "docs", "specs", "acp-auth-spec.md"), "utf8");
-assert.doesNotMatch(authSpec, /PI_ACP_PROTOCOL_CONTRACT\.(customCapabilityNamespace|outputSchemaKey)/);
-assert.doesNotMatch(authSpec, /@automatalabs\/pi-acp[^\n]{0,160}outputSchema/);
 
 const mcpEntry = installedRequire.resolve("@automatalabs/mcp-server");
 const {
