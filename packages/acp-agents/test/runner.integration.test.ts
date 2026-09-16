@@ -1350,15 +1350,14 @@ test("(#5b) Codex session/new carries the runId _meta even though the schema rid
   assert.ok(entries.find((e) => e.method === "prompt")?.params?._meta?.["outputSchema"]);
 });
 
-// ---- (#instr) Codex base/developer instructions ride session/new _meta as bare keys ---
+// ---- (#instr) the neutral systemPrompt rides session/new _meta in each backend's dialect ---
 
-test("(#instr) RunOptions base/developerInstructions reach Codex session/new _meta (bare keys)", async () => {
+test("(#instr) RunOptions.systemPrompt reaches Codex session/new _meta as the BARE base/developer keys", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
   await makeRunner().run("hi", {
     model: "codex/gpt-5.6-luna",
     cwd,
-    baseInstructions: "You only write Rust.",
-    developerInstructions: "Prefer iterators.",
+    systemPrompt: { replace: "You only write Rust.", append: "Prefer iterators." },
   });
   const newSession = readLog().find((e) => e.method === "newSession");
   // Bare keys (the codex-acp fork's contract).
@@ -1376,7 +1375,7 @@ test("(#instr) instructions coexist with the runId stamp at Codex session/new", 
     model: "codex/gpt-5.6-luna",
     cwd,
     runId: "run-xyz",
-    baseInstructions: "BASE",
+    systemPrompt: { replace: "BASE" },
   });
   assert.deepEqual(readLog().find((e) => e.method === "newSession")?.params?._meta, {
     baseInstructions: "BASE",
@@ -1384,14 +1383,39 @@ test("(#instr) instructions coexist with the runId stamp at Codex session/new", 
   });
 });
 
-test("(#instr) Claude ignores base/developer instructions (no such _meta at session/new)", async () => {
+test("(#instr) Claude carries systemPrompt on `_meta.systemPrompt`: append => preset options, replace => a string", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "ok" }, { text: "ok" }] });
+  const runner = makeRunner();
+  await runner.run("hi", { model: "claude/claude-opus-4-1", cwd, systemPrompt: { append: "DEV" } });
+  assert.deepEqual(readLog().find((e) => e.method === "newSession")?.params?._meta, { systemPrompt: { append: "DEV" } });
+  await runner.run("hi", { model: "claude/claude-opus-4-1", cwd, systemPrompt: { replace: "BASE", append: "DEV" } });
+  const sessions = readLog().filter((e) => e.method === "newSession");
+  assert.deepEqual(sessions[1]?.params?._meta, { systemPrompt: "BASE\n\nDEV" });
+});
+
+test("(#instr) pi carries systemPrompt VERBATIM under `_meta.systemPrompt`", async () => {
   const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
-  await makeRunner().run("hi", {
-    model: "claude/claude-opus-4-1",
-    cwd,
-    baseInstructions: "BASE",
-    developerInstructions: "DEV",
+  await makeRunner().run("hi", { model: "pi", cwd, systemPrompt: { replace: "BASE", append: "DEV" } });
+  assert.deepEqual(readLog().find((e) => e.method === "newSession")?.params?._meta, {
+    systemPrompt: { replace: "BASE", append: "DEV" },
   });
-  // No schema, no runId, and Claude has no instruction channel => no _meta at all.
-  assert.equal(readLog().find((e) => e.method === "newSession")?.params?._meta ?? undefined, undefined);
+});
+
+test("(#instr) OpenCode refuses systemPrompt before anything spawns; a malformed value is refused on every backend", async () => {
+  const { cwd, readLog } = configure({ turns: [{ text: "ok" }] });
+  const runner = makeRunner();
+  await assert.rejects(
+    () => runner.run("hi", { model: "opencode", cwd, label: "oc", systemPrompt: { replace: "BASE" } }),
+    (error: unknown) =>
+      isWorkflowError(error) &&
+      error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR &&
+      /systemPrompt\.replace is not supported by backend "opencode"/.test(error.message) &&
+      error.agentLabel === "oc",
+  );
+  await assert.rejects(
+    () => runner.run("hi", { model: "codex", cwd, systemPrompt: { append: "" } }),
+    (error: unknown) =>
+      isWorkflowError(error) && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR && /append must be a non-empty string/.test(error.message),
+  );
+  assert.equal(readLog().length, 0, "refused before any process was spawned");
 });

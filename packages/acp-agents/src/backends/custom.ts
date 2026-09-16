@@ -11,8 +11,9 @@
 //   - config-level `_meta`: the registry entry's static `sessionMeta` rides every session/new
 //                  (per-call RunOptions.meta merges over it in the ACP client; backend-computed
 //                  keys and the runId stamp win over both).
-// SessionMetaInputs (Codex base/developer instruction overrides) are IGNORED — they are a
-// codex-acp vendor contract; a custom agent's knobs travel through the generic meta channels.
+// The neutral `systemPrompt` instructions are NOT carried (`Backend.systemPrompt` undefined): ACP
+// has no standard system-prompt key, so the validators refuse them for a custom backend up front
+// and a custom agent's own knobs travel through the generic meta channels instead.
 import { createHash } from "node:crypto";
 import type { TSchema } from "typebox";
 import { META_KEYS } from "@automatalabs/shared-types";

@@ -723,3 +723,60 @@ test("T20 MCP bridge enumerates every page, rejects cursor cycles, and closes pa
     (error) => kind(error) === "unsupported_mcp_transport",
   );
 });
+
+test("T19b `_meta.systemPrompt` on session/new becomes pi's loader overrides; a malformed value creates no session", async () => {
+  const setup = fakeDeps();
+  const agent = new PiAcpAgent(setup.deps);
+  const loader = (index: number) => setup.createOptions[index]?.resourceLoader;
+
+  const both = await agent.newSession(context({
+    cwd: setup.cwd,
+    mcpServers: [],
+    _meta: { systemPrompt: { replace: "You are a reviewer.", append: "Answer in one line." } },
+  }));
+  assert.equal(typeof both.sessionId, "string");
+  assert.equal(loader(0)?.getSystemPrompt(), "You are a reviewer.");
+  assert.deepEqual(loader(0)?.getAppendSystemPrompt().slice(-1), ["Answer in one line."]);
+
+  // A bare string is the replace form (claude-agent-acp's wire shape).
+  await agent.newSession(context({ cwd: setup.cwd, mcpServers: [], _meta: { systemPrompt: "Only Rust." } }));
+  assert.equal(loader(1)?.getSystemPrompt(), "Only Rust.");
+  assert.equal(loader(1)?.getAppendSystemPrompt().includes("Answer in one line."), false, "sessions do not leak instructions");
+
+  // Absent => pi's own configuration (an empty agent dir here: no custom prompt, no appends).
+  await agent.newSession(context({ cwd: setup.cwd, mcpServers: [] }));
+  assert.equal(loader(2)?.getSystemPrompt(), undefined);
+  assert.deepEqual(loader(2)?.getAppendSystemPrompt(), []);
+
+  // Malformed => -32602 invalid_system_prompt BEFORE the journal or the session exist.
+  const created = setup.createOptions.length;
+  assert.throws(
+    () => agent.newSession(context({ cwd: setup.cwd, mcpServers: [], _meta: { systemPrompt: { replace: "" } } })),
+    (error) => kind(error) === "invalid_system_prompt",
+  );
+  assert.equal(setup.createOptions.length, created, "no session was constructed for the refused request");
+  await agent.dispose();
+});
+
+test("T19c `_meta.systemPrompt` is honored on session/load and session/resume as well", async () => {
+  const setup = fakeDeps();
+  const id = "reattach-system-prompt";
+  const manager = SessionManager.create(setup.cwd, setup.sessionDir, { id });
+  setup.deps.sessions.list = async () => [{
+    path: `${setup.sessionDir}/session.jsonl`, id, cwd: setup.cwd, created: new Date(), modified: new Date(),
+    messageCount: 0, firstMessage: "", allMessagesText: "",
+  }];
+  setup.deps.sessions.open = () => manager;
+  const agent = new PiAcpAgent(setup.deps);
+  await agent.loadSession(context({ cwd: setup.cwd, sessionId: id, mcpServers: [], _meta: { systemPrompt: { append: "Loaded." } } }));
+  assert.deepEqual(setup.createOptions[0]?.resourceLoader?.getAppendSystemPrompt(), ["Loaded."]);
+  await agent.closeSession(context({ sessionId: id }));
+  await agent.resumeSession(context({ cwd: setup.cwd, sessionId: id, mcpServers: [], _meta: { systemPrompt: "Resumed." } }));
+  assert.equal(setup.createOptions[1]?.resourceLoader?.getSystemPrompt(), "Resumed.");
+  await agent.closeSession(context({ sessionId: id }));
+  assert.throws(
+    () => agent.resumeSession(context({ cwd: setup.cwd, sessionId: id, mcpServers: [], _meta: { systemPrompt: { nope: "x" } } })),
+    (error) => kind(error) === "invalid_system_prompt",
+  );
+  await agent.dispose();
+});

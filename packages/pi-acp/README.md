@@ -96,6 +96,31 @@ assistant message is the turn's FINAL message — authoritative, never a quiet-g
 `interrupted` otherwise (the journal shows an interrupted/abandoned turn — nothing is running, so
 re-issue is safe). A query for an unknown session is the standard `unknown_session` error.
 
+### Session system prompt (`_meta.systemPrompt`)
+
+Pi advertises a session system-prompt channel at top-level initialize metadata as
+`_meta: { systemPrompt: { replace: true, append: true } }`. A client sets `_meta.systemPrompt` on
+`session/new`, `session/resume`, `session/load`, or `session/fork` — the same bare key
+`claude-agent-acp` reads, so a client can keep one wire shape across the two servers — as either a
+string or an object:
+
+- a **string**, or `{ replace }`, replaces pi's built-in system prompt: it takes pi's custom-prompt
+  slot (the `SYSTEM.md` / `--system-prompt` slot) through the resource loader's
+  `systemPromptOverride`, so pi's tool snippets, guidelines, context files, and skills are still
+  assembled around it exactly as for an operator-configured prompt;
+- `{ append }` is added as one more append-system-prompt entry **after** the operator's own
+  configured entries (`appendSystemPromptOverride`), so it never displaces them;
+- `{ replace, append }` does both.
+
+The instructions are per session: they shape only the session the request opens and are read
+again on every reattach, so a `session/resume` without the key runs on pi's own configuration. A
+malformed value — a non-string/non-object, a blank string, a non-string field, or any field other
+than `replace` / `append` — is rejected with JSON-RPC `-32602` and
+`data.errorKind = "invalid_system_prompt"` (`data.field` names the offender) **before** any journal
+or session state exists; an unusable instruction never runs under the default prompt. The
+`@automatalabs/acp-agents` `pi` backend drives this channel from the backend-neutral
+`systemPrompt: { replace?, append? }` option.
+
 ## Development
 
 The `pnpm test` script intentionally runs `tsc -p tsconfig.type-tests.json` before the runtime test suite. This is a small deviation from the test-script example in the frozen specification and ensures the T2b public type-contract check is enforced in local and CI test runs.

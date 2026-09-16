@@ -12,6 +12,7 @@ export type ErrorKind =
   | "invalid_config_type"
   | "unknown_config_option"
   | "invalid_cwd"
+  | "invalid_system_prompt"
   | "unknown_session"
   | "session_already_open"
   | "session_terminated"
@@ -38,6 +39,7 @@ const LABELS: Record<ErrorKind, string> = {
   invalid_config_type: "invalid config option",
   unknown_config_option: "invalid config option",
   invalid_cwd: "invalid working directory",
+  invalid_system_prompt: "invalid system prompt instructions",
   unknown_session: "unknown session id",
   session_already_open: "session already open",
   session_terminated: "session terminated",
@@ -61,6 +63,7 @@ const INVALID_KINDS = new Set<ErrorKind>([
   "invalid_config_type",
   "unknown_config_option",
   "invalid_cwd",
+  "invalid_system_prompt",
   "unknown_session",
   "session_already_open",
   "session_terminated",
@@ -92,19 +95,23 @@ export function redactedDiagnostics(diagnostics: readonly DiagnosticLike[] | und
 type DiagnosticDetails = { details?: Array<{ type: string; timestamp: number }> };
 type ServerDetails = { server: string };
 type ChildDetails = { details: { remainingChildren: number } };
+type FieldDetails = { field: string };
 
 export function adapterError(kind: "mcp_init_error" | "unsupported_mcp_transport", extras: ServerDetails): RequestError;
 export function adapterError(kind: "provider_error" | "internal_error", extras?: DiagnosticDetails): RequestError;
 export function adapterError(kind: "child_cleanup_error", extras: ChildDetails): RequestError;
+export function adapterError(kind: "invalid_system_prompt", extras: FieldDetails): RequestError;
 export function adapterError(kind: Exclude<ErrorKind,
-  "mcp_init_error" | "unsupported_mcp_transport" | "provider_error" | "internal_error" | "child_cleanup_error"
+  | "mcp_init_error" | "unsupported_mcp_transport" | "provider_error" | "internal_error" | "child_cleanup_error"
+  | "invalid_system_prompt"
 >): RequestError;
 export function adapterError(
   kind: ErrorKind,
-  extras: ServerDetails | DiagnosticDetails | ChildDetails = {},
+  extras: ServerDetails | DiagnosticDetails | ChildDetails | FieldDetails = {},
 ): RequestError {
   const data: Record<string, unknown> = { errorKind: kind, message: LABELS[kind] };
   if ("server" in extras) data.server = extras.server;
+  if ("field" in extras) data.field = extras.field;
   if ("details" in extras && extras.details !== undefined) data.details = extras.details;
   if (kind === "auth_error") return RequestError.authRequired(data);
   if (INVALID_KINDS.has(kind)) return RequestError.invalidParams(data);

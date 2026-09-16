@@ -290,6 +290,7 @@ export {
 export type {
   AgentRunner,
   RunOptions,
+  SystemPromptOptions,
   AgentResult,
   AgentRunOptions,
   AgentRunResult,

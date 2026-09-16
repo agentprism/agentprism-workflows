@@ -24,6 +24,7 @@ import {
   type AgentRunner,
   type ContinuationSkipReason,
   type RunOptions,
+  type SystemPromptOptions,
 } from "@automatalabs/shared-types";
 import type {
   AuthenticateRequest,
@@ -71,6 +72,7 @@ import {
 } from "./registry.js";
 import { mapThrownError } from "./errors-map.js";
 import { assertNoModelConfigOption, resolveModelRoute } from "./routing.js";
+import { assertSystemPromptSupported } from "./system-prompt.js";
 import { sessionRefFor } from "./session-ref.js";
 import {
   buildAuthDescriptor,
@@ -126,8 +128,7 @@ interface SessionPreparationOptions {
   runId?: string;
   label?: string;
   callIndex?: number;
-  baseInstructions?: string;
-  developerInstructions?: string;
+  systemPrompt?: SystemPromptOptions;
 }
 
 interface SessionPreparationConfig {
@@ -1387,6 +1388,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
   private prepareSession(opts: SessionPreparationOptions, config: SessionPreparationConfig): PreparedSession {
     const route = resolveModelRoute(opts.model ?? opts.tier, config.registry);
     const backend = route.backend;
+    // Refuse instructions the routed backend cannot carry BEFORE anything is acquired or sent.
+    const systemPrompt = assertSystemPromptSupported(backend, opts.systemPrompt, opts.label);
     const policy: ToolPolicy = {
       allow: opts.toolNames,
       deny: opts.disallowedToolNames,
@@ -1412,10 +1415,9 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
         label: opts.label,
         // Direct engine-call correlation on emitted events only; never sent on the ACP wire.
         callIndex: opts.callIndex,
-        // CODEX-ONLY session instruction overrides -> session/new _meta bare keys. Additive;
-        // never hashed. The Claude backend ignores them.
-        baseInstructions: opts.baseInstructions,
-        developerInstructions: opts.developerInstructions,
+        // Backend-neutral system prompt instructions -> the backend's own session `_meta` keys
+        // (validated above). Additive; never hashed.
+        systemPrompt,
         retainSessionLog: config.retainSessionLog,
       },
     };

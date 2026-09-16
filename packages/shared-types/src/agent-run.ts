@@ -67,6 +67,30 @@ export interface PromptImage {
 }
 
 /**
+ * Backend-neutral session system-prompt instructions (`RunOptions.systemPrompt`,
+ * `InteractiveSessionOptions.systemPrompt`, `AcpAgentOptions.systemPrompt`). Each field is
+ * independently optional; a backend maps them onto its own channel:
+ *
+ * | backend | `replace`                                   | `append`                                        |
+ * |---------|---------------------------------------------|-------------------------------------------------|
+ * | codex   | `_meta.baseInstructions` (base prompt)      | `_meta.developerInstructions` (developer role)  |
+ * | claude  | `_meta.systemPrompt` string                 | `_meta.systemPrompt.append` (claude_code preset) |
+ * | pi      | `_meta.systemPrompt.replace`                | `_meta.systemPrompt.append`                     |
+ * | opencode / custom | not supported — SCRIPT_VALIDATION_ERROR before a session opens        |
+ *
+ * `replace` + `append` together mean "the built-in prompt becomes `replace`, followed by
+ * `append`": Codex and pi carry both natively; Claude receives the two joined by a blank line as
+ * its single replacement string (its object form cannot carry a custom base). Empty strings are
+ * rejected — use `meta` for a backend's own extras (e.g. Claude's `excludeDynamicSections`).
+ */
+export interface SystemPromptOptions {
+  /** Replace the backend's built-in system prompt with this text. */
+  replace?: string;
+  /** Add this text on top of the built-in (or replaced) system prompt. */
+  append?: string;
+}
+
+/**
  * The opts side of the AgentRunner seam — exactly the bag the engine passes at
  * workflow.ts:465 (cast `as any` there; frozen-typed here). Inputs flow IN
  * (prompt/schema/images/model/tier/cwd/signal/instructions/tool policy); telemetry flows
@@ -82,7 +106,7 @@ export interface PromptImage {
  * onUsage, and onHistory. Plus ADDITIVE run inputs that wire
  * infrastructure / shape the backend, so none enters the resume identity hash (hashAgentCall): `mcpServers`,
  * `runId`, the generic ACP `_meta` passthroughs `meta` / `promptMeta`, the run-scoped custom
- * backend registry `backends`, the Codex-only `baseInstructions` / `developerInstructions`,
+ * backend registry `backends`, the backend-neutral `systemPrompt` instructions,
  * and the session hand-off fields `keepSession` / `onSessionOpen` / `continueFromSession`.
  * `maxSchemaRetries` is runner-internal (the engine never passes it). Pi's
  * `tools?: ToolDefinition[]` is DROPPED — a pi-coding-agent type with no ACP analog (ACP
@@ -166,35 +190,30 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
   /** Generic ACP `_meta` passthrough, SESSION-scoped: merged into the outgoing ACP
    *  `session/new` `_meta` so a workflow can drive ANY ACP agent's custom extension surface
    *  (the protocol reserves `_meta` for exactly this). Merge precedence: these keys are laid
-   *  down FIRST, then backend-computed keys (the Claude `claudeCode` schema channel, the Codex
-   *  `baseInstructions`/`developerInstructions` forwards, the `runId` stamp) override on
-   *  conflict — user meta can never break the structured-output or correlation channels.
+   *  down FIRST, then backend-computed keys (the Claude `claudeCode` schema channel, the
+   *  `systemPrompt` instruction forwards, the `runId` stamp) override on conflict — user meta
+   *  can never break the structured-output, instruction, or correlation channels.
    *  ADDITIVE and NOT part of the resume identity hash (hashAgentCall): it shapes the agent,
    *  not the logical call. Omitted => the request `_meta` is whatever the backend set.
-   *  The bare keys `outputSchema`, `baseInstructions`, `developerInstructions` are RESERVED
-   *  negotiation-gated names: an agent advertising the `@automatalabs/codex-acp` capability
-   *  namespace with the same-named flag not `true` drops that key before sending (see
-   *  CODEX_CUSTOM_CAPABILITY_NAMESPACE in meta.ts). */
+   *  The bare keys `outputSchema`, `systemPrompt`, `baseInstructions`, and
+   *  `developerInstructions` are RESERVED backend-computed names (META_KEYS / CODEX_META_KEYS in
+   *  meta.ts): drive them through `schema` and `systemPrompt`, not through this passthrough. */
   meta?: Record<string, unknown>;
   /** Generic ACP `_meta` passthrough, TURN-scoped: merged into the outgoing ACP
    *  `session/prompt` `_meta` (the extension point where e.g. the Codex `outputSchema`
    *  forward rides). Same merge precedence as `meta`: user keys first, backend-computed keys
    *  (e.g. `outputSchema` when a schema is set) win on conflict. ADDITIVE and NOT hashed.
-   *  Omitted => the prompt `_meta` is whatever the backend set. The bare keys `outputSchema`,
-   *  `baseInstructions`, `developerInstructions` are RESERVED negotiation-gated names: an agent
-   *  advertising the `@automatalabs/codex-acp` capability namespace with the same-named flag not
-   *  `true` drops that key before sending (see CODEX_CUSTOM_CAPABILITY_NAMESPACE in meta.ts). */
+   *  Omitted => the prompt `_meta` is whatever the backend set. */
   promptMeta?: Record<string, unknown>;
-  /** CODEX-ONLY. Replaces Codex's built-in base system prompt for the session. The runner forwards
-   *  it on ACP `session/new` `_meta.baseInstructions`, which the @automatalabs/codex-acp adapter
-   *  threads into `thread/start.baseInstructions`. ADDITIVE and NOT hashed (it shapes the agent,
-   *  not the logical call identity). Ignored by the Claude backend. Omitted => Codex default. */
-  baseInstructions?: string;
-  /** CODEX-ONLY. Injects developer-role instructions for the session (added ON TOP of the base
-   *  prompt, unlike `baseInstructions` which replaces it). Forwarded on ACP `session/new`
-   *  `_meta.developerInstructions` -> `thread/start.developerInstructions`. ADDITIVE and NOT
-   *  hashed. Ignored by the Claude backend. Omitted => Codex default. */
-  developerInstructions?: string;
+  /** Backend-neutral system prompt instructions for the session (see `SystemPromptOptions`):
+   *  `replace` swaps the backend's built-in system prompt for the given text, `append` adds text
+   *  on top of it. The runner carries them on ACP `session/new|resume|load|fork` `_meta` in each
+   *  backend's own dialect — Codex `baseInstructions` / `developerInstructions` (the
+   *  @automatalabs/codex-acp thread params), Claude and pi `systemPrompt`. A backend that supports
+   *  neither field (OpenCode, custom registry backends) rejects with SCRIPT_VALIDATION_ERROR before
+   *  a session opens; nothing is ever silently dropped. ADDITIVE and NOT hashed (it shapes the
+   *  agent, not the logical call identity). Omitted => the backend's built-in prompt. */
+  systemPrompt?: SystemPromptOptions;
   /** Base64 image attachments appended to the prompt as ACP image ContentBlocks. When the
    *  connected agent does not advertise promptCapabilities.image, each attachment DEGRADES to a
    *  bracketed text note (never an error, never silently dropped) per the ACP rule that the client

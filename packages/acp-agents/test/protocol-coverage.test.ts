@@ -21,10 +21,12 @@ import {
   PI_ACP_PROTOCOL_CONTRACT,
   PROMPT_USAGE_SCOPES,
   SESSION_STEERING_METHOD,
+  SYSTEM_PROMPT_SUPPORT,
   assertAuthCapabilityShape,
   clientCapabilitiesFor,
   forkSessionTrait,
   promptUsageScope,
+  systemPromptSupport,
 } from "../src/index.js";
 
 type Expect<T extends true> = T;
@@ -380,4 +382,34 @@ test("the first-class Pi backend pins the frozen pi-acp capability/auth/error su
   for (const errorKind of PI_ACP_PROTOCOL_CONTRACT.providerErrorKinds) {
     assert.ok(PI_ERRORS_DIST.includes(errorKind), `installed pi-acp errors dist must contain ${errorKind}`);
   }
+});
+
+// The per-backend system-prompt instruction channel (`SYSTEM_PROMPT_SUPPORT`): each row is read
+// from its adapter's source, so pin the reader in the installed dists — an adapter bump that drops
+// or renames its `_meta` key must fail here, never silently run the agent under its default prompt.
+test("system-prompt support rows are grounded in the installed agent dists", () => {
+  for (const row of SYSTEM_PROMPT_SUPPORT) {
+    if (row.distProbe === undefined) {
+      assert.equal(row.agent, "opencode", "only the compiled-binary agent has no system-prompt dist probe");
+      assert.deepEqual({ replace: row.replace, append: row.append }, { replace: false, append: false });
+      assert.deepEqual(row.metaKeys, []);
+      continue;
+    }
+    assert.ok(row.replace && row.append, `${row.agent} carries both halves`);
+  }
+  // claude: `_meta.systemPrompt` — a string replaces the prompt, an object is merged into the
+  // claude_code preset (so `{ append }` extends it) with type/preset locked.
+  assert.ok(CLAUDE_DIST.includes("if (params._meta?.systemPrompt) {"));
+  assert.ok(CLAUDE_DIST.includes('if (typeof customPrompt === "string") {'));
+  assert.ok(CLAUDE_DIST.includes('preset: "claude_code",'));
+  // codex: the bare base/developer keys are read on every thread start/resume.
+  assert.match(CODEX_DIST, /readOptionalInstruction\(\w+, "baseInstructions"\)/);
+  assert.match(CODEX_DIST, /readOptionalInstruction\(\w+, "developerInstructions"\)/);
+  // pi: the reader runs on new/resume|load/fork and the loader overrides realize the instructions.
+  assert.equal(PI_AGENT_DIST.split("readSystemPromptMeta(context.params._meta)").length - 1, 3);
+  assert.ok(PI_AGENT_DIST.includes("...systemPromptLoaderOverrides(systemPrompt)"));
+  assert.ok(PI_AGENT_DIST.includes("[SYSTEM_PROMPT_META_KEY]: { ...SYSTEM_PROMPT_ADVERTISEMENT }"));
+  assert.deepEqual(systemPromptSupport("pi"), { replace: true, append: true });
+  assert.deepEqual(systemPromptSupport("unknown-custom"), { replace: false, append: false });
+  assert.ok(Object.isFrozen(SYSTEM_PROMPT_SUPPORT) && SYSTEM_PROMPT_SUPPORT.every((row) => Object.isFrozen(row)));
 });

@@ -21,7 +21,7 @@ import type {
   StructuredSource,
 } from "../backend.js";
 import { splitArgs } from "../backend.js";
-import { BUILTIN_PROTOCOL_COVERAGE } from "../protocol-coverage.js";
+import { BUILTIN_PROTOCOL_COVERAGE, systemPromptSupport } from "../protocol-coverage.js";
 import { toStrictJsonSchema } from "../schema-strict.js";
 import { parseFinalJson } from "../structured-output.js";
 import { TYPED_SESSION_FAILURE_CLIENT_CAPABILITY } from "../typed-failures.js";
@@ -93,15 +93,21 @@ export class CodexBackend implements Backend {
     return { command: process.execPath, args: [bin], env };
   }
 
+  /** The fork reads bare `_meta.baseInstructions` (replaces Codex's base system prompt) and
+   *  `_meta.developerInstructions` (developer-role instructions on top of it) at session/new,
+   *  resume, and load — the reattach an id-only fork needs, so forks carry them too. */
+  readonly systemPrompt = systemPromptSupport("codex");
+
   sessionMeta(_schema: TSchema | undefined, inputs?: SessionMetaInputs): Record<string, unknown> | undefined {
     // Codex carries the SCHEMA on the turn (see promptMeta), so nothing schema-related rides
-    // session/new. But the optional base/developer instruction overrides ARE session-scoped: the
-    // @automatalabs/codex-acp fork reads these bare `_meta` keys and threads them into
-    // thread/start.{baseInstructions,developerInstructions}. Emit them only when set so an
-    // unconfigured run sends no `_meta` at all (preserving the "Codex default" path).
+    // session/new. The neutral system-prompt instructions ARE session-scoped: the
+    // @automatalabs/codex-acp fork reads the bare `_meta` keys and threads them into
+    // thread/{start,resume}.{baseInstructions,developerInstructions}. Emit them only when set so
+    // an unconfigured run sends no `_meta` at all (preserving the "Codex default" path).
     const meta: Record<string, unknown> = {};
-    if (inputs?.baseInstructions !== undefined) meta[CODEX_META_KEYS.baseInstructions] = inputs.baseInstructions;
-    if (inputs?.developerInstructions !== undefined) meta[CODEX_META_KEYS.developerInstructions] = inputs.developerInstructions;
+    const systemPrompt = inputs?.systemPrompt;
+    if (systemPrompt?.replace !== undefined) meta[CODEX_META_KEYS.baseInstructions] = systemPrompt.replace;
+    if (systemPrompt?.append !== undefined) meta[CODEX_META_KEYS.developerInstructions] = systemPrompt.append;
     return Object.keys(meta).length > 0 ? meta : undefined;
   }
 

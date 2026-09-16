@@ -93,10 +93,11 @@ export interface BrokerOpenSessionOptions {
   runId?: string;
   /** Generic session-scoped ACP `_meta` passthrough. */
   meta?: Record<string, unknown>;
-  /** CODEX-ONLY base instruction override. */
-  baseInstructions?: string;
-  /** CODEX-ONLY developer instruction override. */
-  developerInstructions?: string;
+  /** Backend-neutral system prompt instructions (`replace` / `append`): the
+   *  structural twin of shared-types' `SystemPromptOptions`, spelled out here
+   *  so the published type graph stays self-contained (public-types test);
+   *  the runner refuses them before open when the backend carries neither. */
+  systemPrompt?: { replace?: string; append?: string };
   /** Tool allow-list used by the headless permission auto-responder. */
   toolNames?: string[];
   /** Tool deny-list, applied after the allow-list. */

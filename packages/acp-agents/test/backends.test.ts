@@ -4,8 +4,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Type } from "typebox";
-import { META_KEYS } from "@automatalabs/shared-types";
-import { ClaudeBackend, CodexBackend, OpenCodeBackend, PiBackend, selectBackend, toStrictJsonSchema } from "../src/index.js";
+import { CODEX_META_KEYS, META_KEYS } from "@automatalabs/shared-types";
+import {
+  ClaudeBackend,
+  CodexBackend,
+  CustomAcpBackend,
+  OpenCodeBackend,
+  PiBackend,
+  SYSTEM_PROMPT_SUPPORT,
+  SYSTEM_PROMPT_UNSUPPORTED,
+  selectBackend,
+  systemPromptSupport,
+  toStrictJsonSchema,
+} from "../src/index.js";
 import type { Backend, StructuredSource } from "../src/index.js";
 
 const SCHEMA = Type.Object({ city: Type.String({ minLength: 1 }), hot: Type.Boolean() });
@@ -94,30 +105,71 @@ test("CodexBackend: no schema => no prompt _meta; never carries schema at sessio
   assert.equal(backend.id, "codex");
 });
 
-test("CodexBackend.sessionMeta emits base/developer instructions as BARE session/new _meta keys", () => {
+// ---- system prompt instructions: one neutral shape, four dialects ----------------------
+
+test("every built-in declares its SYSTEM_PROMPT_SUPPORT row; a custom backend declares none", () => {
+  assert.deepEqual(new ClaudeBackend().systemPrompt, { replace: true, append: true });
+  assert.deepEqual(new CodexBackend().systemPrompt, { replace: true, append: true });
+  assert.deepEqual(new PiBackend().systemPrompt, { replace: true, append: true });
+  assert.deepEqual(new OpenCodeBackend().systemPrompt, { replace: false, append: false });
+  for (const backend of [new ClaudeBackend(), new CodexBackend(), new PiBackend(), new OpenCodeBackend()] as Backend[]) {
+    assert.deepEqual(backend.systemPrompt, systemPromptSupport(backend.id), `${backend.id} reads its own row`);
+  }
+  const custom = new CustomAcpBackend({ name: "mine", command: "mine-acp" });
+  assert.equal(custom.systemPrompt, undefined);
+  assert.deepEqual(systemPromptSupport("mine"), SYSTEM_PROMPT_UNSUPPORTED);
+  assert.deepEqual(
+    SYSTEM_PROMPT_SUPPORT.map(({ agent, replace, append, metaKeys }) => ({ agent, replace, append, metaKeys })),
+    [
+      { agent: "claude", replace: true, append: true, metaKeys: ["systemPrompt"] },
+      { agent: "codex", replace: true, append: true, metaKeys: ["baseInstructions", "developerInstructions"] },
+      { agent: "opencode", replace: false, append: false, metaKeys: [] },
+      { agent: "pi", replace: true, append: true, metaKeys: ["systemPrompt"] },
+    ],
+  );
+});
+
+test("CodexBackend.sessionMeta maps replace/append onto the BARE baseInstructions/developerInstructions keys", () => {
   const backend: Backend = new CodexBackend();
   // No inputs (or empty inputs) => nothing at session/new; the schema still rides the turn.
   assert.equal(backend.sessionMeta(SCHEMA), undefined);
   assert.equal(backend.sessionMeta(undefined, {}), undefined);
-  // Both present => bare keys the codex-acp fork reads.
-  assert.deepEqual(backend.sessionMeta(SCHEMA, { baseInstructions: "BASE", developerInstructions: "DEV" }), {
-    baseInstructions: "BASE",
-    developerInstructions: "DEV",
+  assert.equal(backend.sessionMeta(undefined, { systemPrompt: {} }), undefined);
+  // Both present => the two bare keys the codex-acp fork reads.
+  assert.deepEqual(backend.sessionMeta(SCHEMA, { systemPrompt: { replace: "BASE", append: "DEV" } }), {
+    [CODEX_META_KEYS.baseInstructions]: "BASE",
+    [CODEX_META_KEYS.developerInstructions]: "DEV",
   });
-  // Only the provided key is emitted (each is independently optional).
-  assert.deepEqual(backend.sessionMeta(undefined, { baseInstructions: "BASE" }), { baseInstructions: "BASE" });
-  assert.deepEqual(backend.sessionMeta(undefined, { developerInstructions: "DEV" }), { developerInstructions: "DEV" });
+  // Only the provided half is emitted (each is independently optional).
+  assert.deepEqual(backend.sessionMeta(undefined, { systemPrompt: { replace: "BASE" } }), { baseInstructions: "BASE" });
+  assert.deepEqual(backend.sessionMeta(undefined, { systemPrompt: { append: "DEV" } }), { developerInstructions: "DEV" });
 });
 
-test("ClaudeBackend.sessionMeta ignores Codex session instruction inputs", () => {
+test("ClaudeBackend.sessionMeta drives claude-agent-acp's `_meta.systemPrompt` slot", () => {
   const backend: Backend = new ClaudeBackend();
-  // Instructions are Codex-only: with no schema Claude sends no _meta despite the inputs...
-  assert.equal(backend.sessionMeta(undefined, { baseInstructions: "BASE", developerInstructions: "DEV" }), undefined);
-  // ...and with a schema, the claudeCode channel is untouched — no instruction keys leak in.
-  const meta = backend.sessionMeta(SCHEMA, { baseInstructions: "BASE" }) as Record<string, unknown>;
-  assert.ok(meta.claudeCode, "schema channel preserved");
+  assert.equal(backend.sessionMeta(undefined, { systemPrompt: {} }), undefined);
+  // replace => a string (the adapter replaces the whole prompt).
+  assert.deepEqual(backend.sessionMeta(undefined, { systemPrompt: { replace: "R" } }), { [META_KEYS.systemPrompt]: "R" });
+  // append => the preset-options object (the adapter appends to its claude_code preset).
+  assert.deepEqual(backend.sessionMeta(undefined, { systemPrompt: { append: "A" } }), { systemPrompt: { append: "A" } });
+  // both => one replacement string: the replaced prompt followed by the appended text.
+  assert.deepEqual(backend.sessionMeta(undefined, { systemPrompt: { replace: "R", append: "A" } }), { systemPrompt: "R\n\nA" });
+  // With a schema the two channels coexist as sibling top-level keys.
+  const meta = backend.sessionMeta(SCHEMA, { systemPrompt: { append: "A" } }) as Record<string, unknown>;
+  assert.ok((meta.claudeCode as { options: { outputFormat: unknown } }).options.outputFormat, "schema channel preserved");
+  assert.deepEqual(meta.systemPrompt, { append: "A" });
   assert.equal("baseInstructions" in meta, false);
-  assert.equal("developerInstructions" in meta, false);
+});
+
+test("PiBackend.sessionMeta forwards the neutral object VERBATIM under `_meta.systemPrompt`", () => {
+  const backend: Backend = new PiBackend();
+  assert.equal(backend.sessionMeta(SCHEMA), undefined);
+  assert.equal(backend.sessionMeta(undefined, { systemPrompt: {} }), undefined);
+  assert.deepEqual(backend.sessionMeta(SCHEMA, { systemPrompt: { replace: "R", append: "A" } }), {
+    [META_KEYS.systemPrompt]: { replace: "R", append: "A" },
+  });
+  assert.deepEqual(backend.sessionMeta(undefined, { systemPrompt: { append: "A" } }), { systemPrompt: { append: "A" } });
+  assert.deepEqual(backend.sessionMeta(undefined, { systemPrompt: { replace: "R" } }), { systemPrompt: { replace: "R" } });
 });
 
 test("CodexBackend.nativeStructured parses the constrained final message (pure JSON, then block)", () => {

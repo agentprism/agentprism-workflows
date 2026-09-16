@@ -6,7 +6,12 @@
 // `_claude/sdkMessage` extension notification (the runner's ACP client captures it).
 import { createRequire } from "node:module";
 import type { TSchema } from "typebox";
-import type { ClaudeCodeSessionMeta } from "@automatalabs/shared-types";
+import {
+  META_KEYS,
+  type ClaudeCodeSessionMeta,
+  type ClaudeSystemPromptMeta,
+  type SystemPromptOptions,
+} from "@automatalabs/shared-types";
 import type { AuthProfile } from "../auth/auth-profile.js";
 import type {
   Backend,
@@ -17,7 +22,7 @@ import type {
   StructuredSource,
 } from "../backend.js";
 import { splitArgs } from "../backend.js";
-import { BUILTIN_PROTOCOL_COVERAGE } from "../protocol-coverage.js";
+import { BUILTIN_PROTOCOL_COVERAGE, systemPromptSupport } from "../protocol-coverage.js";
 import { toAnthropicJsonSchema } from "../schema-strict.js";
 import { defineBuiltinBackend } from "./define.js";
 
@@ -76,27 +81,33 @@ export class ClaudeBackend implements Backend {
     return { claudeCode: { options: { title } } } satisfies ClaudeCodeSessionMeta;
   }
 
+  /** claude-agent-acp reads `_meta.systemPrompt` at session creation (new, resume, load, and the
+   *  reattach an id-only fork needs): a string replaces the prompt, `{ append }` extends the
+   *  `claude_code` preset. */
+  readonly systemPrompt = systemPromptSupport("claude");
+
   sessionMeta(schema: TSchema | undefined, inputs?: SessionMetaInputs): Record<string, unknown> | undefined {
-    // Claude has no analog to Codex's base/developer instruction overrides. For engine runs, set
-    // the SDK session title up front: claude-agent-acp >=0.71 otherwise launches an unobserved
-    // background small-model title-generation call after the first turn. Interactive sessions
-    // have no runId and retain the adapter's generated-title behavior.
-    if (!schema) return undefined;
-    // Anthropic structured outputs accept only a JSON-Schema subset (additionalProperties:false
-    // required on every object; numeric/string/array constraints rejected). Normalize the wire
-    // copy so the native constraint always engages — an incompatible schema would fail the SDK
-    // constraint and silently degrade the run to unconstrained text + the repair ladder.
-    const title = workflowSessionTitle(inputs);
-    const meta: ClaudeCodeSessionMeta = {
-      claudeCode: {
+    const meta: ClaudeCodeSessionMeta = {};
+    if (schema) {
+      // Anthropic structured outputs accept only a JSON-Schema subset (additionalProperties:false
+      // required on every object; numeric/string/array constraints rejected). Normalize the wire
+      // copy so the native constraint always engages — an incompatible schema would fail the SDK
+      // constraint and silently degrade the run to unconstrained text + the repair ladder.
+      // For engine runs, set the SDK session title up front: claude-agent-acp >=0.71 otherwise
+      // launches an unobserved background small-model title-generation call after the first
+      // turn. Interactive sessions have no runId and retain the adapter's generated-title behavior.
+      const title = workflowSessionTitle(inputs);
+      meta.claudeCode = {
         options: {
           ...(title ? { title } : {}),
           outputFormat: { type: "json_schema", schema: toAnthropicJsonSchema(schema) },
         },
         emitRawSDKMessages: true,
-      },
-    };
-    return meta;
+      };
+    }
+    const systemPrompt = claudeSystemPromptMeta(inputs?.systemPrompt);
+    if (systemPrompt !== undefined) meta[META_KEYS.systemPrompt] = systemPrompt;
+    return Object.keys(meta).length > 0 ? meta : undefined;
   }
 
   promptMeta(): Record<string, unknown> | undefined {
@@ -113,6 +124,20 @@ export class ClaudeBackend implements Backend {
   nativeStructured(source: StructuredSource): unknown {
     return source.rawStructuredOutput();
   }
+}
+
+/** Fold the neutral instructions into claude-agent-acp's single `systemPrompt` slot. The adapter
+ *  takes EITHER a full replacement string OR preset options (`{ append }` on the `claude_code`
+ *  preset) — there is no "custom base plus append" form — so `replace` + `append` together become
+ *  one replacement string: the replaced prompt followed by the appended text, joined by a blank
+ *  line (exactly what the caller asked for; the seam documents the join). */
+function claudeSystemPromptMeta(options: SystemPromptOptions | undefined): ClaudeSystemPromptMeta | undefined {
+  if (!options) return undefined;
+  const { replace, append } = options;
+  if (replace !== undefined && append !== undefined) return `${replace}\n\n${append}`;
+  if (replace !== undefined) return replace;
+  if (append !== undefined) return { append };
+  return undefined;
 }
 
 function workflowSessionTitle(inputs: SessionMetaInputs | undefined): string | undefined {

@@ -37,6 +37,13 @@ import { PiSession } from "./session.js";
 import { ChildProcessRegistrySlot, createTrackedBashOperations } from "./child-process-registry.js";
 import type { SteeringRequest, SteeringResponse } from "./steering.js";
 import type { LoadedTurnQueryRequest, LoadedTurnStatus } from "./loaded-turn.js";
+import {
+  SYSTEM_PROMPT_ADVERTISEMENT,
+  SYSTEM_PROMPT_META_KEY,
+  readSystemPromptMeta,
+  systemPromptLoaderOverrides,
+  type SystemPromptOverrides,
+} from "./system-prompt.js";
 import { PKG_VERSION } from "./version.js";
 
 export { PKG_VERSION } from "./version.js";
@@ -193,7 +200,11 @@ export class PiAcpAgent {
         sessionCapabilities: { resume: {}, fork: {}, list: {}, close: {} },
       },
       authMethods: AUTH_METHODS,
-      _meta: { steering: { supported: true }, loadedTurn: { supported: true } },
+      _meta: {
+        steering: { supported: true },
+        loadedTurn: { supported: true },
+        [SYSTEM_PROMPT_META_KEY]: { ...SYSTEM_PROMPT_ADVERTISEMENT },
+      },
     };
   }
 
@@ -286,6 +297,7 @@ export class PiAcpAgent {
     mcpServers: readonly McpServer[],
     replay: boolean,
     preconnected?: PreparedMcp,
+    systemPrompt?: SystemPromptOverrides,
   ): Promise<PiSession> {
     const id = manager.getSessionId();
     if (opening.id === undefined) {
@@ -329,6 +341,9 @@ export class PiAcpAgent {
         cwd,
         agentDir,
         settingsManager,
+        // The client's `_meta.systemPrompt` instructions: `replace` takes pi's custom-prompt
+        // slot; `append` lands after the operator's configured append entries.
+        ...systemPromptLoaderOverrides(systemPrompt),
         extensionFactories: [bridge.inlineExtension, controlExtension],
         extensionsOverride: (base) => {
           const matches = base.extensions.filter(({ path }) => path === "<inline:agentprism-pi-acp-mcp>");
@@ -467,6 +482,8 @@ export class PiAcpAgent {
 
   newSession(context: AgentRequestContext<NewSessionRequest>) {
     validateCwd(context.params.cwd);
+    // Parsed before the journal is created so a malformed instruction leaves no session behind.
+    const systemPrompt = readSystemPromptMeta(context.params._meta);
     let manager: SessionManager;
     try {
       manager = this.deps.sessions.create(context.params.cwd, this.deps.sessionDir);
@@ -489,6 +506,8 @@ export class PiAcpAgent {
       context.client,
       context.params.mcpServers,
       false,
+      undefined,
+      systemPrompt,
     ).then((session) => ({ sessionId: session.sessionId, configOptions: session.configOptions(), modes: null }))
       .catch((error) => this.openingError(error));
     return this.track(task);
@@ -499,6 +518,7 @@ export class PiAcpAgent {
     replay: boolean,
   ) {
     validateCwd(context.params.cwd);
+    const systemPrompt = readSystemPromptMeta(context.params._meta);
     const opening = this.beginOpening(context.signal);
     try {
       this.reserve(context.params.sessionId, opening);
@@ -528,6 +548,8 @@ export class PiAcpAgent {
           context.client,
           context.params.mcpServers ?? [],
           replay,
+          undefined,
+          systemPrompt,
         );
         return { configOptions: session.configOptions(), modes: null };
       } catch (error) {
@@ -555,6 +577,7 @@ export class PiAcpAgent {
     const liveSource = this.live.get(context.params.sessionId);
     if (liveSource?.busy) throw adapterError("session_busy");
     validateCwd(context.params.cwd);
+    const systemPrompt = readSystemPromptMeta(context.params._meta);
     const opening = this.beginOpening(context.signal);
     const task = (async () => {
       let prepared: PreparedMcp | undefined;
@@ -606,6 +629,7 @@ export class PiAcpAgent {
           context.params.mcpServers ?? [],
           false,
           prepared,
+          systemPrompt,
         );
         return { sessionId: session.sessionId, configOptions: session.configOptions(), modes: null };
       } catch (error) {

@@ -17,6 +17,7 @@ import type {
   AgentUsage,
   McpServerConfig,
   PromptImage,
+  SystemPromptOptions,
   WorkflowError,
 } from "@automatalabs/shared-types";
 import type { TSchema } from "typebox";
@@ -74,8 +75,16 @@ export interface AcpAgentOptions {
   /** Generic session/new `_meta` passthrough. Layered UNDER backend-computed keys (shallow, like
    *  the runner) and, when `raw !== false`, OVER `backend.rawMessagesMeta()`. */
   meta?: Record<string, unknown>;
-  /** Codex-only session instructions → bare `_meta.baseInstructions` / `_meta.developerInstructions`. */
-  instructions?: { base?: string; developer?: string };
+  /** Backend-neutral system prompt instructions: `replace` swaps the backend's built-in system
+   *  prompt, `append` adds to it. Validated in the constructor (and `fork()` / the statics) against
+   *  the routed backend's `Backend.systemPrompt` support BEFORE any process spawns — a field the
+   *  backend cannot carry is SCRIPT_VALIDATION_ERROR, never a silent no-op (Codex and Claude and pi
+   *  carry both; OpenCode and custom backends carry neither). Sent on `session/new|resume|load`
+   *  and the reattach of an id-only fork in the backend's dialect: Codex `_meta.baseInstructions`
+   *  / `_meta.developerInstructions`, Claude `_meta.systemPrompt` (string, or `{ append }`), pi
+   *  `_meta.systemPrompt` `{ replace?, append? }`. Wins over the same key in `meta`. Inherited by
+   *  forks (overridable). */
+  systemPrompt?: SystemPromptOptions;
   /** Human label stamped on every event context and every WorkflowError `agentLabel`; never on
    *  the wire. */
   label?: string;

@@ -8,6 +8,8 @@ import type {
   CheckpointContext,
   JournalCallMetadata,
   JournalEntry,
+  RunOptions,
+  SystemPromptOptions,
   WorkflowCheckpointTaken,
   WorkflowLogTail,
   WorkflowRunFallback,
@@ -21,6 +23,18 @@ test("@automatalabs/shared-types public entry is reachable via ../src", () => {
   // Keys are bare (un-namespaced), mirroring the target Codex param names.
   assert.equal(META_KEYS.outputSchema, "outputSchema");
   assert.equal(META_KEYS.runId, "runId");
+  // The bare session system-prompt key claude-agent-acp and pi-acp both read.
+  assert.equal(META_KEYS.systemPrompt, "systemPrompt");
+});
+
+test("SystemPromptOptions is the backend-neutral instruction shape on RunOptions", () => {
+  const options: RunOptions = { systemPrompt: { replace: "You only write Rust.", append: "Prefer iterators." } };
+  const instructions: SystemPromptOptions = options.systemPrompt!;
+  assert.equal(instructions.replace, "You only write Rust.");
+  assert.equal(instructions.append, "Prefer iterators.");
+  // The retired Codex-only fields are gone from the seam (no aliases, no hidden acceptance path).
+  assert.equal("baseInstructions" in options, false);
+  assert.equal("developerInstructions" in options, false);
 });
 
 test("CheckpointContext is exported from the public barrel", () => {

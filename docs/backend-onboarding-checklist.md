@@ -25,6 +25,10 @@ reason; topology, absent custom auth, or similarity to another backend never mak
 - [ ] Link a complete initialize-capabilities and custom `_meta` inspection. Link the central
   protocol-coverage row, installed-distribution probes where source exists, auth profile,
   auth/meta matrix disposition, and capability tests; explicitly record empty/unsupported areas.
+- [ ] Declare the backend's `SYSTEM_PROMPT_SUPPORT` row (`replace` / `append` and the session
+  `_meta` keys it reads) and set `Backend.systemPrompt` from it; a backend with no channel declares
+  both `false` so the option is refused before a session opens. Link the dist probe, the
+  `Backend.sessionMeta` mapping test, and the `docs/api.md` table row.
 - [ ] Link tests or live evidence for permissions, elicitation, fs/terminal/MCP handlers, session
   lifecycle, cancellation, structured output, provider errors, auth, pool reuse, and generic
   request/notification extension passthrough. A claim of shared behavior requires a test.

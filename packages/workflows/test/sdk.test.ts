@@ -1002,14 +1002,15 @@ test("createAcpRunner exposes a typed ACP event bus (on/once/off/listenerCount) 
   }
 });
 
-test("RunOptions exposes Codex instructions through the SDK barrel", () => {
+test("RunOptions exposes the backend-neutral systemPrompt instructions through the SDK barrel", () => {
   // Compile-gate: additive seam fields are typed on RunOptions as re-exported by the facade.
   const opts: RunOptions = {
-    baseInstructions: "You only write Rust.",
-    developerInstructions: "Prefer iterators.",
+    systemPrompt: { replace: "You only write Rust.", append: "Prefer iterators." },
   };
-  assert.equal(opts.baseInstructions, "You only write Rust.");
-  assert.equal(opts.developerInstructions, "Prefer iterators.");
+  assert.equal(opts.systemPrompt?.replace, "You only write Rust.");
+  assert.equal(opts.systemPrompt?.append, "Prefer iterators.");
+  // The retired Codex-only field names are gone from the seam.
+  assert.equal("baseInstructions" in opts, false);
 });
 
 test("runDynamicWorkflow runs a 1-agent script through a stub runner", async () => {

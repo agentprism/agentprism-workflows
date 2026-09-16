@@ -17,7 +17,7 @@ import type {
   StructuredSource,
 } from "../backend.js";
 import { splitArgs } from "../backend.js";
-import { BUILTIN_PROTOCOL_COVERAGE } from "../protocol-coverage.js";
+import { BUILTIN_PROTOCOL_COVERAGE, systemPromptSupport } from "../protocol-coverage.js";
 import { toJsonSchema } from "../schema-strict.js";
 import { parseFinalJson } from "../structured-output.js";
 import { defineBuiltinBackend } from "./define.js";
@@ -134,6 +134,11 @@ export class OpenCodeBackend implements Backend {
     const bin = resolveOpenCodePackageBin();
     return { command: bin ?? "opencode", args: ["acp"], env };
   }
+
+  /** `opencode acp` reads no session `_meta` (its ACP service consults `_meta` only for
+   *  terminal-auth at initialize); system prompts live in OpenCode's own config and agent
+   *  definitions. Declared unsupported so a `systemPrompt` is refused, never dropped. */
+  readonly systemPrompt = systemPromptSupport("opencode");
 
   sessionMeta(): Record<string, unknown> | undefined {
     // OpenCode ignores session _meta today; there is no protocol-critical session channel.

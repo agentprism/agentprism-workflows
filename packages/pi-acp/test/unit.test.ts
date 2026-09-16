@@ -23,6 +23,7 @@ import { installPermissionWrapper } from "../src/permissions.js";
 import { convertPromptContent } from "../src/prompt-content.js";
 import { replayEntry } from "../src/replay.js";
 import { stopReasonFor } from "../src/stop-reason.js";
+import { readSystemPromptMeta, systemPromptLoaderOverrides } from "../src/system-prompt.js";
 import { contentItems, mapKind, toContent, translateEvent } from "../src/translate.js";
 import { promptUsage, usageUpdate } from "../src/usage.js";
 import { context, fakeDeps, fakeSession } from "./helpers/fakes.js";
@@ -172,15 +173,23 @@ test("T7 stop taxonomy rejects errors and maps every successful terminal reason"
 test("T8 error rows retain reserved codes, fixed labels, precedence, and redaction", () => {
   const invalid: ErrorKind[] = [
     "invalid_model", "empty_prompt", "session_busy", "invalid_config_value", "invalid_config_type",
-    "unknown_config_option", "invalid_cwd", "unknown_session", "session_already_open", "session_terminated",
-    "session_not_forkable", "unsupported_mcp_transport", "invalid_cursor", "unknown_auth_method",
+    "unknown_config_option", "invalid_cwd", "invalid_system_prompt", "unknown_session", "session_already_open",
+    "session_terminated", "session_not_forkable", "unsupported_mcp_transport", "invalid_cursor", "unknown_auth_method",
   ];
   const internal: ErrorKind[] = [
     "rate_limit", "billing_error", "provider_error", "session_corrupt", "mcp_init_error",
     "extension_setup_error", "child_cleanup_error", "notification_error", "internal_error",
   ];
   assert.equal(adapterError("auth_error").code, -32000);
-  for (const kind of invalid) assert.equal(adapterError(kind).code, -32602, kind);
+  for (const kind of invalid) {
+    const error = kind === "invalid_system_prompt" ? adapterError(kind, { field: "append" }) : adapterError(kind);
+    assert.equal(error.code, -32602, kind);
+  }
+  assert.deepEqual(wire(adapterError("invalid_system_prompt", { field: "append" })).data, {
+    errorKind: "invalid_system_prompt",
+    message: "invalid system prompt instructions",
+    field: "append",
+  });
   for (const kind of internal) {
     const error = kind === "mcp_init_error"
       ? adapterError(kind, { server: "s" })
@@ -231,6 +240,54 @@ test("T10 initialize advertises only the exact implemented capabilities", () => 
     sessionCapabilities: { resume: {}, fork: {}, list: {}, close: {} },
   });
   assert.equal("additionalDirectories" in initialized.agentCapabilities, false);
+  // Vendor extensions ride top-level initialize `_meta`: steering, loaded-turn, and the session
+  // system-prompt channel (`_meta.systemPrompt` on session/new|resume|load|fork).
+  assert.deepEqual(initialized._meta, {
+    steering: { supported: true },
+    loadedTurn: { supported: true },
+    systemPrompt: { replace: true, append: true },
+  });
+});
+
+test("T10b readSystemPromptMeta accepts a string or { replace?, append? } and rejects everything else loudly", () => {
+  assert.equal(readSystemPromptMeta(undefined), undefined);
+  assert.equal(readSystemPromptMeta(null), undefined);
+  assert.equal(readSystemPromptMeta({}), undefined);
+  assert.equal(readSystemPromptMeta({ systemPrompt: null }), undefined);
+  assert.equal(readSystemPromptMeta({ systemPrompt: {} }), undefined, "an object asking for nothing is nothing");
+  assert.equal(readSystemPromptMeta({ other: "ignored" }), undefined);
+  assert.deepEqual(readSystemPromptMeta({ systemPrompt: "R" }), { replace: "R" });
+  assert.deepEqual(readSystemPromptMeta({ systemPrompt: { replace: "R" } }), { replace: "R" });
+  assert.deepEqual(readSystemPromptMeta({ systemPrompt: { append: "A" } }), { append: "A" });
+  assert.deepEqual(readSystemPromptMeta({ systemPrompt: { replace: "R", append: "A" } }), { replace: "R", append: "A" });
+  const rejects = (meta: unknown, field: string) =>
+    assert.throws(() => readSystemPromptMeta(meta), (error) => {
+      assert.ok(error instanceof RequestError);
+      assert.equal(error.code, -32602);
+      assert.deepEqual(error.data, { errorKind: "invalid_system_prompt", message: "invalid system prompt instructions", field });
+      return true;
+    });
+  rejects({ systemPrompt: "" }, "replace");
+  rejects({ systemPrompt: "   " }, "replace");
+  rejects({ systemPrompt: 42 }, "systemPrompt");
+  rejects({ systemPrompt: ["x"] }, "systemPrompt");
+  rejects({ systemPrompt: { replace: "" } }, "replace");
+  rejects({ systemPrompt: { append: 7 } }, "append");
+  rejects({ systemPrompt: { base: "x" } }, "base");
+  rejects({ systemPrompt: { replace: "R", excludeDynamicSections: true } }, "excludeDynamicSections");
+});
+
+test("T10c systemPromptLoaderOverrides realizes replace as the custom prompt and append after the operator's entries", () => {
+  assert.deepEqual(systemPromptLoaderOverrides(undefined), {});
+  const replace = systemPromptLoaderOverrides({ replace: "R" });
+  assert.equal(replace.systemPromptOverride?.("operator SYSTEM.md"), "R");
+  assert.equal(replace.appendSystemPromptOverride, undefined);
+  const append = systemPromptLoaderOverrides({ append: "A" });
+  assert.equal(append.systemPromptOverride, undefined);
+  assert.deepEqual(append.appendSystemPromptOverride?.(["operator APPEND.md"]), ["operator APPEND.md", "A"]);
+  const both = systemPromptLoaderOverrides({ replace: "R", append: "A" });
+  assert.equal(both.systemPromptOverride?.(undefined), "R");
+  assert.deepEqual(both.appendSystemPromptOverride?.([]), ["A"]);
 });
 
 test("T11 permission wrapper drains first, delegates fresh/cached allows, and denies malformed selections", async () => {

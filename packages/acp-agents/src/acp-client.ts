@@ -107,6 +107,7 @@ import {
   WorkflowErrorCode,
   type AgentHistoryEntry,
   type McpServerConfig,
+  type SystemPromptOptions,
 } from "@automatalabs/shared-types";
 import type {
   Backend,
@@ -1535,10 +1536,10 @@ export interface AcpSessionOptions {
   label?: string;
   /** `RunOptions.callIndex`, propagated onto emitted events as context. NOT sent on the wire. */
   callIndex?: number;
-  /** CODEX-ONLY session instruction overrides. The backend folds these into session/new `_meta`
-   *  (bare keys) for the codex-acp adapter; the Claude backend ignores them. Omitted => unset. */
-  baseInstructions?: string;
-  developerInstructions?: string;
+  /** Backend-neutral system prompt instructions, validated against `Backend.systemPrompt` by the
+   *  caller (`assertSystemPromptSupported`) before the session opens. The backend folds them into
+   *  its own `_meta` dialect on new/resume/load/fork. Omitted => the backend's built-in prompt. */
+  systemPrompt?: SystemPromptOptions;
   /** Retain accumulated assistant text/tool history for the lifetime of this ACP session.
    *  Default true preserves run()'s diagnostic history contract. Held-open interactive sessions
    *  pass false because hosts stream live events / keep their own transcript; retaining old turns
@@ -1836,8 +1837,7 @@ export class PooledConnection {
 
   private sessionRequestMeta(opts: AcpSessionOptions): Record<string, unknown> | undefined {
     const inputs: SessionMetaInputs = {
-      baseInstructions: opts.baseInstructions,
-      developerInstructions: opts.developerInstructions,
+      systemPrompt: opts.systemPrompt,
       runId: opts.runId,
       label: opts.label,
     };
