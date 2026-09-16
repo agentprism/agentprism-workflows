@@ -1,5 +1,12 @@
 # @automatalabs/acp-server
 
+## 0.2.13
+
+### Patch Changes
+
+- Updated dependencies [5311099]
+  - @automatalabs/acp-agents@2.0.0
+
 ## 0.2.12
 
 ### Patch Changes
