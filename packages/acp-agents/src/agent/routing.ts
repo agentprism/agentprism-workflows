@@ -93,7 +93,17 @@ export function validateAgentCwd(cwd: unknown, label: string | undefined, method
   if (typeof cwd !== "string" || cwd.trim() === "" || !isAbsolute(cwd)) {
     throw agentValidationError(`${method} requires cwd to be a non-empty absolute path`, label);
   }
-  if (statSync(cwd, { throwIfNoEntry: false })?.isDirectory() !== true) {
+  let stat: ReturnType<typeof statSync> | undefined;
+  try {
+    stat = statSync(cwd, { throwIfNoEntry: false });
+  } catch (error) {
+    // `throwIfNoEntry` only suppresses ENOENT; EACCES / ELOOP / ENOTDIR on a parent are caller
+    // errors too, not raw Node errors.
+    const code = (error as { code?: unknown }).code;
+    const detail = typeof code === "string" ? code : error instanceof Error ? error.message : String(error);
+    throw agentValidationError(`${method} cwd is not accessible: ${cwd} (${detail})`, label);
+  }
+  if (stat?.isDirectory() !== true) {
     throw agentValidationError(`${method} cwd does not exist or is not a directory: ${cwd}`, label);
   }
 }

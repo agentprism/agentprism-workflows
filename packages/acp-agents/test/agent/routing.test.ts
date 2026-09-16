@@ -2,12 +2,13 @@
 // that keeps the helpers the SDK shares with the runner from drifting apart silently.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentSessionRef } from "@automatalabs/shared-types";
 import { isWorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
-import { ClaudeBackend, CodexBackend, CustomAcpBackend, resolveBackendRegistry } from "../../src/index.js";
+import { AcpAgent, ClaudeBackend, CodexBackend, CustomAcpBackend, resolveBackendRegistry } from "../../src/index.js";
 import { resolveRefRoute, resolveAgentRegistry, freshBackendFor, validateAgentCwd } from "../../src/agent/routing.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -90,6 +91,33 @@ test("resolveRefRoute honors custom-shadows-builtin, poolKey mismatch, same-back
   rejects(() => validateAgentCwd("relative", undefined, "X"), /X requires cwd to be a non-empty absolute path/);
   rejects(() => validateAgentCwd("/definitely/missing/dir", undefined, "X"), /does not exist or is not a directory/);
 });
+
+test(
+  "validateAgentCwd reports a cwd it cannot stat (EACCES) as SCRIPT_VALIDATION_ERROR, not a raw Node error",
+  { skip: process.platform === "win32" || process.getuid?.() === 0 ? "needs a non-root POSIX user" : false },
+  () => {
+    const parent = mkdtempSync(join(tmpdir(), "acp-agent-cwd-eacces-"));
+    const inner = join(parent, "inner");
+    mkdirSync(inner);
+    chmodSync(parent, 0o000);
+    try {
+      rejects(() => validateAgentCwd(inner, "lbl", "X"), /^X cwd is not accessible: .*inner \(EACCES\)$/);
+      assert.throws(
+        () => new AcpAgent({ cwd: inner, label: "lbl" }),
+        (error: unknown) => {
+          assert.ok(isWorkflowError(error), `expected a WorkflowError, got ${String(error)}`);
+          assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+          assert.equal(error.agentLabel, "lbl");
+          assert.match(error.message, /AcpAgent cwd is not accessible/);
+          return true;
+        },
+      );
+    } finally {
+      chmodSync(parent, 0o700);
+      rmSync(parent, { recursive: true, force: true });
+    }
+  },
+);
 
 test("the helpers copied from runner.ts cannot drift silently", () => {
   const runner = src("runner.ts");
