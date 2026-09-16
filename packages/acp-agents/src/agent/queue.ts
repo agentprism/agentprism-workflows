@@ -1,5 +1,5 @@
-// The per-agent FIFO. `prompt`, `fork`, `setMode`, `setConfigOptions`, `close` and the implicit
-// open all run through one SerialQueue so no two of them ever overlap (a second concurrent
+// The per-agent FIFO. `prompt`, `fork`, `setModel`, `setMode`, `setConfigOptions`, `close` and the
+// implicit open all run through one SerialQueue so no two of them ever overlap (a second concurrent
 // `SessionHandle.prompt` would clobber the handle's active turn; pi rejects a fork while the
 // source has a turn in flight; Claude would copy a partial transcript). Pure: no ACP imports.
 

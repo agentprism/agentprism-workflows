@@ -8,9 +8,14 @@
 // and never touches the runner, the pool, or `InteractiveSession`.
 //
 // Semantics that are not negotiable (docs/api.md "AcpAgent SDK"):
-//   - FIFO: prompt / stream / fork / setMode / setConfigOptions / close serialize behind the
-//     in-flight turn; steer and cancel overlap it. A fork therefore always sees a quiescent, fully
-//     persisted parent transcript (pi rejects busy forks; Claude would copy a partial turn).
+//   - FIFO: prompt / stream / fork / setModel / setMode / setConfigOptions / close serialize
+//     behind the in-flight turn; steer and cancel overlap it. A fork therefore always sees a
+//     quiescent, fully persisted parent transcript (pi rejects busy forks; Claude would copy a
+//     partial turn).
+//   - The model is a session setting, not an identity: `setModel(spec)` and a per-turn `model`
+//     re-route through the fork rule (same backend, same poolKey) and send the routed remainder
+//     verbatim as `session/set_config_option { configId: "model" }` — exactly how open selects —
+//     then `agent.model` moves to the routed spec, so forks and cold reopens inherit the switch.
 //   - `prompt()` resolves a turn for EVERY PromptResponse the wire returned — no stopReason is
 //     ever thrown on — and rejects only on a wire rejection, validation, abort, closed, or a typed
 //     session failure (then with the complete turn attached, `isAcpAgentTurnError`). `stream()`
@@ -40,7 +45,7 @@ import type { ErrorMapContext } from "../errors-map.js";
 import type { AcpSessionUpdate } from "../events.js";
 import { appendPromptImages, buildRunPrompt, mergeTurnMeta, validatePromptImages } from "../prompt.js";
 import type { BackendRegistry, CustomBackendConfig } from "../registry.js";
-import { assertNoModelConfigOption, resolveModelRoute } from "../routing.js";
+import { assertNoModelConfigOption, type ModelRoute } from "../routing.js";
 import { sessionRefFor } from "../session-ref.js";
 import { StructuredOutputToolHost } from "../structured-tool.js";
 import { assertSystemPromptSupported } from "../system-prompt.js";
@@ -63,7 +68,9 @@ import {
   freshBackendFor,
   resolveAgentRegistry,
   resolveAgentRoute,
+  resolveModelSwitch,
   resolveRefRoute,
+  resolveSameBackendModel,
   validateAgentCwd,
 } from "./routing.js";
 import { assertPerTurnSchemaAllowed, planStructured, type StructuredPlan } from "./structured.js";
@@ -222,17 +229,16 @@ export class AcpAgent {
   readonly cwd: string;
   /** The human label stamped on event contexts and error `agentLabel`; never on the wire. */
   readonly label: string | undefined;
-  /** The model this agent selects at open, as a routing spec that leads back to the same backend
-   *  (`<backendId>/<model id>`, e.g. `"claude/opus[1m]"`), or `undefined` when no model was
-   *  selected (the backend's default). Inherited by forks. An `AgentSessionRef` carries no model,
-   *  so a cold reopen keeps it only when told: `AcpAgent.resume(agent.sessionRef!, { model: agent.model })`. */
-  readonly model: string | undefined;
 
   readonly #options: AcpAgentOptions;
   readonly #seed: AcpAgentSeed;
   readonly #registry: BackendRegistry;
   readonly #backend: Backend;
-  readonly #modelSpec: string | undefined;
+  /** The verbatim model id this agent is on (what open sends and a switch replaces); `undefined`
+   *  = no selection. Read by open's post-open apply and by `fork()` for the child's seed. */
+  #modelSpec: string | undefined;
+  /** `#modelSpec` in its routed spec form (`<backendId>/<id>`) — what the `model` getter returns. */
+  #model: string | undefined;
   readonly #schema: TSchema | undefined;
   readonly #tools: readonly AcpAgentToolDefinition[];
   readonly #retainHistory: boolean;
@@ -304,7 +310,7 @@ export class AcpAgent {
     this.#modelSpec = seed.modelSpec;
     this.cwd = options.cwd;
     this.label = label;
-    this.model = seed.modelSpec === undefined ? undefined : `${seed.backend.id}/${seed.modelSpec}`;
+    this.#model = seed.modelSpec === undefined ? undefined : `${seed.backend.id}/${seed.modelSpec}`;
     this.#schema = options.schema;
     this.#retainHistory = options.retainHistory ?? true;
     this.#raw = options.raw ?? true;
@@ -433,6 +439,16 @@ export class AcpAgent {
     return this.#backend.id;
   }
 
+  /** The model this agent is on, as a routing spec that leads back to the same backend
+   *  (`<backendId>/<model id>`, e.g. `"claude/opus[1m]"`): the constructor's `model` until a
+   *  `setModel()` or a per-turn `model` applied, then the switched one; `undefined` when nothing
+   *  was ever selected (the backend's default). Inherited by forks taken after the switch. An
+   *  `AgentSessionRef` carries no model, so a cold reopen keeps it only when told:
+   *  `AcpAgent.resume(agent.sessionRef!, { model: agent.model })`. */
+  get model(): string | undefined {
+    return this.#model;
+  }
+
   /** `idle` → `opening` → `ready` ⇄ `busy` → `closed` (set the instant `close()` is called,
    *  the constructor signal aborts, or the process dies). */
   get state(): AcpAgentState {
@@ -546,10 +562,10 @@ export class AcpAgent {
    * cancelled included). Rejects only on a wire rejection (mapped like the runner), validation,
    * abort (`signal.reason` untouched), a closed agent, or a typed session failure (the mapped
    * `WorkflowError` carrying the complete turn as `error.turn`; see `isAcpAgentTurnError`).
-   * `configOptions`/`mode` are applied before the turn and stick for the session. To stop a
-   * specific turn use `options.signal`: it rejects while queued or before the turn reached the
-   * wire (nothing is sent) and sends one `session/cancel` once in flight — `cancel()` reaches only
-   * a turn already on the wire.
+   * `model`/`configOptions`/`mode` are applied before the turn, in that order, and stick for the
+   * session. To stop a specific turn use `options.signal`: it rejects while queued or before the
+   * turn reached the wire (nothing is sent) and sends one `session/cancel` once in flight —
+   * `cancel()` reaches only a turn already on the wire.
    */
   prompt(content: string | ContentBlock[], options: AcpAgentPromptOptions = {}): Promise<AcpAgentTurn> {
     return this.#enqueue(() => this.#promptTurn(content, options), options.signal);
@@ -621,13 +637,24 @@ export class AcpAgent {
     const backend = this.#backend;
     const label = this.label;
 
-    validateArguments(() => {
+    // Every per-turn option is validated up front — a rejected turn sends nothing, not even the
+    // options that would have passed.
+    const modelSwitch = validateArguments(() => {
       validatePromptImages(options.images, label);
       assertPerTurnSchemaAllowed(backend, options.schema, label);
       assertNoModelConfigOption(options.configOptions, label);
       assertKnownConfigOptionIds(options.configOptions, handle.advertisedConfigOptions, this.backendId, label);
+      return options.model === undefined
+        ? undefined
+        : resolveModelSwitch(options.model, backend, this.#registry, label, "AcpAgent.prompt({ model })");
     });
     try {
+      // The open's order, verbatim: model, config options, mode.
+      if (modelSwitch) {
+        await this.#applyModelSwitch(handle, modelSwitch);
+        options.signal?.throwIfAborted();
+        this.#signal?.throwIfAborted();
+      }
       if (options.configOptions) {
         await handle.setConfigOptions(options.configOptions);
         options.signal?.throwIfAborted();
@@ -729,8 +756,8 @@ export class AcpAgent {
    *  grace period ends in process disposal WITHOUT a wire `session/close` (the session stays
    *  re-openable through `sessionRef`); the turn then rejects and the agent is closed. Queued
    *  turns are untouched, and so is a turn that has started (`state === "busy"`) but has not
-   *  reached the wire yet — the lazy first open, or its per-turn `configOptions`/`mode` — a
-   *  `cancel()` in that window is a no-op the turn never sees. A per-call `signal` covers every
+   *  reached the wire yet — the lazy first open, or its per-turn `model`/`configOptions`/`mode` —
+   *  a `cancel()` in that window is a no-op the turn never sees. A per-call `signal` covers every
    *  window (rejects with the reason before anything is sent; `session/cancel` once in flight). */
   cancel(): Promise<void> {
     return this.#cancelTurn(new Error("AcpAgent.cancel(): the turn was cancelled"));
@@ -776,16 +803,9 @@ export class AcpAgent {
         if (trait.cwd === "source-only" && cwd !== this.cwd) {
           throw agentValidationError(`fork on ${this.backendId} must keep the source cwd (${this.cwd})`, this.label);
         }
-        let route: ReturnType<typeof resolveModelRoute> | undefined;
+        let route: ModelRoute | undefined;
         if (overrides.model !== undefined) {
-          route = resolveModelRoute(overrides.model, this.#registry);
-          const samePool = (route.backend.poolKey ?? route.backend.id) === (this.#backend.poolKey ?? this.backendId);
-          if (route.backend.id !== this.backendId || !samePool) {
-            throw agentValidationError(
-              `fork model "${overrides.model}" must stay on backend "${this.backendId}"`,
-              this.label,
-            );
-          }
+          route = resolveSameBackendModel(overrides.model, this.#backend, this.#registry, this.label, "AcpAgent.fork()");
         }
         assertNoModelConfigOption(merged.configOptions, label);
         // The backend is fixed by the parent, so an inherited value already passed; an override
@@ -798,12 +818,43 @@ export class AcpAgent {
         sourceSessionId: handle.sessionId,
         registry: this.#registry,
         backend: route?.backend ?? freshBackendFor(this.#backend, this.#registry),
+        // The model the parent is on NOW (a `setModel` / per-turn switch included), not its
+        // constructor option — `merged.model` is never read for a seeded child.
         modelSpec: route ? route.modelSpec : this.#modelSpec,
         historySeed: this.history.map((entry) => ({ ...entry })),
         textSeed: this.text,
         messagesSeed: [...this.messages],
       });
       return AcpAgent.#opened(child);
+    });
+  }
+
+  /**
+   * Switch the session's model (queued, FIFO like `setMode`; sticky). `spec` is resolved with the
+   * fork rule — the runner's routing grammar, and it must land on this agent's backend and poolKey
+   * (`"<backendId>/<model id>"`; an unrouted spec goes to the default backend and passes only when
+   * that is this one) — otherwise INVALID_ARGUMENT naming both backends, before anything is sent.
+   * A backend-only spec is INVALID_ARGUMENT too: there is no wire form for "unselect". Applied
+   * exactly like open's selection — `session/set_config_option { configId: "model" }` with the
+   * routed remainder verbatim; no aliases, coercion, catalog matching, or fallback; the agent's
+   * catalog and validation are authoritative and a wire rejection maps through the normal error
+   * path with `model` unchanged. On success `model` becomes the routed spec, so later forks and a
+   * cold reopen passing `agent.model` back inherit the switch. `"model"` stays reserved in
+   * `configOptions`; this is the one way to move it after open.
+   */
+  setModel(spec: string): Promise<void> {
+    return this.#enqueue(async () => {
+      await this.#ensureOpen();
+      this.#signal?.throwIfAborted();
+      const handle = this.#handle!;
+      const modelSwitch = validateArguments(() =>
+        resolveModelSwitch(spec, this.#backend, this.#registry, this.label, "AcpAgent.setModel()"),
+      );
+      try {
+        await this.#applyModelSwitch(handle, modelSwitch);
+      } catch (error) {
+        throw mapAgentError(error, this.#errorContext(), this.#signal);
+      }
     });
   }
 
@@ -1039,6 +1090,15 @@ export class AcpAgent {
       await this.#teardown(false);
       throw this.#signal?.aborted ? this.#signal.reason : mapAgentError(error, this.#errorContext());
     }
+  }
+
+  /** The one mechanism behind every model selection after open (`setModel`, a per-turn `model`):
+   *  `SessionHandle.selectModel` — the same call open makes — then `model` moves to the routed
+   *  spec. Nothing moves when the wire rejects. */
+  async #applyModelSwitch(handle: SessionHandle, next: { modelSpec: string; model: string }): Promise<void> {
+    await handle.selectModel(next.modelSpec);
+    this.#modelSpec = next.modelSpec;
+    this.#model = next.model;
   }
 
   /** Re-apply model selection, config options and the mode on the LIVE handle (fork/resume/load

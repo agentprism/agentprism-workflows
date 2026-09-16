@@ -583,6 +583,7 @@ test("close({ keep: true }) skips session/close, disposes the process, and retai
   await assert.rejects(() => agent.ready(), /is closed/);
   await assert.rejects(() => agent.fork(), /is closed/);
   await assert.rejects(() => agent.setMode("plan"), /is closed/);
+  await assert.rejects(() => agent.setModel("claude/opus"), /is closed/);
   await assert.rejects(() => agent.setConfigOptions({}), /is closed/);
   await agent.cancel(); // never throws after close
 });

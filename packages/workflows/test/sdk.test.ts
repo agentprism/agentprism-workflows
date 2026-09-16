@@ -651,7 +651,7 @@ test("facade re-exports the public surface", () => {
   for (const name of ["open", "probe", "resume", "load", "fork"] as const) {
     assert.equal(typeof AcpAgent[name], "function", `AcpAgent.${name} is a static`);
   }
-  for (const name of ["ready", "prompt", "steer", "cancel", "fork", "setMode", "setConfigOptions", "close"] as const) {
+  for (const name of ["ready", "prompt", "stream", "steer", "cancel", "fork", "setModel", "setMode", "setConfigOptions", "close"] as const) {
     assert.equal(typeof AcpAgent.prototype[name], "function", `AcpAgent#${name}`);
   }
   assert.equal(typeof AcpAgent.prototype[Symbol.asyncDispose], "function");

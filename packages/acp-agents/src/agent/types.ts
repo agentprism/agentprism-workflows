@@ -91,7 +91,9 @@ export interface AcpAgentOptions {
    *  routes to a registered custom backend (wins) or a built-in; the remainder is the backend's
    *  model id VERBATIM and is sent as `session/set_config_option { configId: "model" }` right after
    *  the session opens. An unrouted spec (no known first segment) goes WHOLE to the default backend
-   *  (`AGENTPRISM_DEFAULT_BACKEND`, else `claude`). Omitted = default backend, no model selection. */
+   *  (`AGENTPRISM_DEFAULT_BACKEND`, else `claude`). Omitted = default backend, no model selection.
+   *  This is the model the agent STARTS on: `agent.setModel(spec)` and a per-turn
+   *  `prompt(…, { model })` switch it mid-session (same backend only); `agent.model` follows. */
   model?: string;
   /** Session mode. Explicit ids are strict (unadvertised → INVALID_ARGUMENT at open).
    *  Omitted = the backend's `defaultModeId` when advertised (claude `auto`, codex `agent`,
@@ -174,6 +176,13 @@ export interface AcpAgentPromptOptions {
   /** Turn `_meta` passthrough, merged UNDER the backend's turn meta (backend keys win direct
    *  collisions, exactly like the runner's `mergeTurnMeta`). */
   meta?: Record<string, unknown>;
+  /** Switch the model BEFORE this turn, inside the FIFO (first, ahead of `configOptions` and
+   *  `mode` — open's order); STICKY for the session and reflected in `agent.model`. Same
+   *  validation as `setModel()`: the fork rule (the spec must route to this agent's backend and
+   *  poolKey, `"<backendId>/<model id>"`; a backend-only spec is rejected) → INVALID_ARGUMENT
+   *  before anything is sent; then `session/set_config_option { configId: "model" }` with the
+   *  routed remainder verbatim, a wire rejection mapping through the normal error path. */
+  model?: string;
   /** Applied via `session/set_config_option` BEFORE this turn, inside the FIFO; STICKY for the
    *  session. Same validation as the constructor option. */
   configOptions?: Record<string, string | boolean>;
@@ -184,7 +193,7 @@ export interface AcpAgentPromptOptions {
    *  backend and pointing at the constructor `schema` option. */
   schema?: TSchema;
   /** Per-call abort: queued, or started but not yet on the wire (the lazy open, the per-turn
-   *  `configOptions`/`mode`) → rejects with the reason without sending; in flight →
+   *  `model`/`configOptions`/`mode`) → rejects with the reason without sending; in flight →
    *  `session/cancel`, then rejects with the reason. The one way to stop a turn `cancel()` cannot
    *  reach: `cancel()` targets only a turn whose `session/prompt` is on the wire. */
   signal?: AbortSignal;

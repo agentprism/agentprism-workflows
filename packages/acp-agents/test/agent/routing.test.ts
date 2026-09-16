@@ -9,7 +9,14 @@ import { fileURLToPath } from "node:url";
 import type { AgentSessionRef } from "@automatalabs/shared-types";
 import { isWorkflowError, WorkflowErrorCode } from "@automatalabs/shared-types";
 import { AcpAgent, ClaudeBackend, CodexBackend, CustomAcpBackend, resolveBackendRegistry } from "../../src/index.js";
-import { resolveRefRoute, resolveAgentRegistry, freshBackendFor, validateAgentCwd } from "../../src/agent/routing.js";
+import {
+  freshBackendFor,
+  resolveAgentRegistry,
+  resolveModelSwitch,
+  resolveRefRoute,
+  resolveSameBackendModel,
+  validateAgentCwd,
+} from "../../src/agent/routing.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = (file: string): string => readFileSync(resolve(here, "../../src", file), "utf8");
@@ -92,6 +99,55 @@ test("resolveRefRoute honors custom-shadows-builtin, poolKey mismatch, same-back
   rejects(() => validateAgentCwd("/definitely/missing/dir", undefined, "X"), /does not exist or is not a directory/);
 });
 
+test("resolveSameBackendModel / resolveModelSwitch: the fork rule, shared by a mid-session switch", () => {
+  const builtins = resolveBackendRegistry({});
+  const custom = resolveBackendRegistry({ claude: { command: "wrapped-claude" }, fake: { command: "fake-agent" } });
+  const claude = new ClaudeBackend();
+  const codex = new CodexBackend();
+  const previousDefault = process.env.AGENTPRISM_DEFAULT_BACKEND;
+  delete process.env.AGENTPRISM_DEFAULT_BACKEND; // the default backend is claude
+  try {
+    // Same backend: the prefix is stripped (case-insensitively); backend-only is `undefined`.
+    assert.equal(resolveSameBackendModel("claude/opus", claude, builtins, undefined, "M").modelSpec, "opus");
+    assert.equal(resolveSameBackendModel("CLAUDE/opus[1m]", claude, builtins, undefined, "M").modelSpec, "opus[1m]");
+    assert.equal(resolveSameBackendModel("claude", claude, builtins, undefined, "M").modelSpec, undefined);
+    // Unrouted: the default backend — passes exactly when that is this agent's backend.
+    assert.equal(resolveSameBackendModel("opus", claude, builtins, undefined, "M").modelSpec, "opus");
+    rejects(
+      () => resolveSameBackendModel("opus", codex, builtins, undefined, "M"),
+      /^M: model "opus" routes to backend "claude" but must stay on backend "codex"$/,
+    );
+    // Another known backend: refused, naming both.
+    rejects(
+      () => resolveSameBackendModel("codex/x", claude, builtins, "lbl", "AcpAgent.fork()"),
+      /^AcpAgent\.fork\(\): model "codex\/x" routes to backend "codex" but must stay on backend "claude"$/,
+    );
+    rejects(() => resolveSameBackendModel("fake/x", claude, custom, undefined, "M"), /routes to backend "fake" but must stay on backend "claude"/);
+    // Pool identity, not id: a registry entry shadowing "claude" is a different pool than the built-in.
+    const customClaude = new CustomAcpBackend(custom.get("claude")!);
+    assert.equal(resolveSameBackendModel("claude/opus", customClaude, custom, undefined, "M").modelSpec, "opus");
+    rejects(
+      () => resolveSameBackendModel("claude/opus", claude, custom, undefined, "M"),
+      new RegExp(`^M: model "claude/opus" routes to backend "claude" \\(pool "${customClaude.poolKey}"\\) but must stay on backend "claude" \\(pool "claude"\\)$`),
+    );
+
+    // A switch always names a model id: the routed remainder to send plus the spec `model` takes.
+    assert.deepEqual(resolveModelSwitch("claude/opus[1m]", claude, builtins, undefined, "M"), { modelSpec: "opus[1m]", model: "claude/opus[1m]" });
+    assert.deepEqual(resolveModelSwitch("opus", claude, builtins, undefined, "M"), { modelSpec: "opus", model: "claude/opus" });
+    assert.deepEqual(resolveModelSwitch("claude/vendor/opus", claude, builtins, undefined, "M"), { modelSpec: "vendor/opus", model: "claude/vendor/opus" });
+    rejects(() => resolveModelSwitch("claude", claude, builtins, undefined, "M"), /^M: model "claude" names backend "claude" but no model id; use "claude\/<model id>"$/);
+    rejects(() => resolveModelSwitch("claude/", claude, builtins, undefined, "M"), /no model id/);
+    rejects(() => resolveModelSwitch("claude/  ", claude, builtins, undefined, "M"), /no model id/);
+    rejects(() => resolveModelSwitch("", claude, builtins, undefined, "M"), /^M requires a non-empty model spec \("claude\/<model id>"\)$/);
+    rejects(() => resolveModelSwitch("   ", claude, builtins, undefined, "M"), /requires a non-empty model spec/);
+    rejects(() => resolveModelSwitch(42, claude, builtins, undefined, "M"), /requires a non-empty model spec/);
+    rejects(() => resolveModelSwitch("codex/x", claude, builtins, undefined, "M"), /must stay on backend "claude"/);
+  } finally {
+    if (previousDefault === undefined) delete process.env.AGENTPRISM_DEFAULT_BACKEND;
+    else process.env.AGENTPRISM_DEFAULT_BACKEND = previousDefault;
+  }
+});
+
 test(
   "validateAgentCwd reports a cwd it cannot stat (EACCES) as INVALID_ARGUMENT, not a raw Node error",
   { skip: process.platform === "win32" || process.getuid?.() === 0 ? "needs a non-root POSIX user" : false },
@@ -137,10 +193,16 @@ test("the helpers copied from runner.ts cannot drift silently", () => {
   assert.ok(runner.includes(modeRule), "runner.ts default-mode rule");
   assert.ok(agent.includes(modeRule), "acp-agent.ts default-mode rule");
 
-  // The moved helpers are SHARED, not copied: neither side defines them locally.
+  // The moved helpers are SHARED, not copied: neither side defines them locally. The SDK's own
+  // routing (agent/routing.ts) is the one place that reaches for `resolveModelRoute`; the class
+  // takes the fork / setModel / per-turn rule from there.
+  const agentRouting = src("agent/routing.ts");
   assert.doesNotMatch(runner, /function assertNoModelConfigOption|function sessionRefFor|function resolveModelRoute/);
   assert.doesNotMatch(agent, /function assertNoModelConfigOption|function sessionRefFor|function resolveModelRoute/);
-  assert.match(agent, /import \{ assertNoModelConfigOption, resolveModelRoute \} from "\.\.\/routing\.js";/);
+  assert.doesNotMatch(agentRouting, /function assertNoModelConfigOption|function sessionRefFor|function resolveModelRoute/);
+  assert.match(agent, /import \{ assertNoModelConfigOption, type ModelRoute \} from "\.\.\/routing\.js";/);
+  assert.match(agentRouting, /import \{ asciiLowercase, resolveModelRoute, type ModelRoute \} from "\.\.\/routing\.js";/);
+  assert.match(agent, /resolveModelSwitch,\n\s+resolveRefRoute,\n\s+resolveSameBackendModel,/);
   assert.match(agent, /import \{ sessionRefFor \} from "\.\.\/session-ref\.js";/);
   assert.match(runner, /from "\.\/routing\.js";/);
   assert.match(runner, /from "\.\/session-ref\.js";/);

@@ -6,7 +6,7 @@
 
 AcpAgent SDK round 2: per-agent traits, `INVALID_ARGUMENT` for SDK misuse, system-prompt discovery,
 the message-level transcript (`turn.messages` / `agent.messages`), `stream()`, client-side function
-tools, and the `permissions` rename.
+tools, the `permissions` rename, and mid-session model switching (`setModel()` / a per-turn `model`).
 
 `@automatalabs/shared-types`
 
@@ -90,6 +90,18 @@ tools, and the `permissions` rename.
   `tool_call` / `tool_call_update` events (pi: `mcp__agent_tools__<name>`).
 - Both local MCP hosts now close without waiting on a peer's keep-alive socket: idle connections
   are closed at once, requests still being answered get a bounded grace, then the rest are torn down.
+- New mid-session model switching: `agent.setModel(spec)` (queued in the FIFO like `setMode`;
+  sticky) and `AcpAgentPromptOptions.model` (applied before that turn, ahead of its
+  `configOptions` and `mode` — open's order; sticky). The spec is resolved with the rule `fork()`
+  applies to a `model` override — the runner's routing grammar, and it must route to this agent's
+  backend and poolKey (`"<backendId>/<model id>"`) — otherwise `INVALID_ARGUMENT` naming both
+  backends before anything is sent; a backend-only or blank spec is refused the same way (there is
+  no wire form for "unselect"). The switch is applied exactly like open's selection
+  (`SessionHandle.selectModel`: `session/set_config_option { configId: "model" }` with the routed
+  remainder verbatim; no aliases, coercion, catalog matching, or fallback), a wire rejection maps
+  through the normal error path with `model` unchanged, and on success `agent.model` (now a getter)
+  is the routed spec, so later forks and a cold `AcpAgent.resume(ref, { model: agent.model })`
+  inherit the switch. `"model"` stays reserved in `configOptions`.
 
 `@automatalabs/pi-acp`
 
