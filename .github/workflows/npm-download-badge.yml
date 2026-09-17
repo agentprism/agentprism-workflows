@@ -2,8 +2,9 @@ name: GitHub Pages data
 
 on:
   schedule:
-    # The generator uses an explicit 30-day UTC window ending two full days ago,
-    # after npm's daily aggregation should have settled.
+    # The generator uses an explicit 30-day UTC window ending at least two full
+    # days ago and steps the end back a day (to at most four days ago) while npm
+    # still reports the final day as zero, because its aggregation lag varies.
     - cron: "17 6 * * *"
     # Second attempt: structural or final-day completeness failures publish
     # nothing, so retry later the same day without weakening those guards.

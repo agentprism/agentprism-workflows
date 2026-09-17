@@ -42,7 +42,7 @@ test("download badge uses a complete explicit 30-day UTC window", async () => {
       start: expectedStart,
       end: expectedEnd,
       reportingLagDays: 2,
-      description: "Explicit 30-day UTC window ending two full days before generation; start and end are inclusive.",
+      description: "Explicit 30-day UTC window ending on the most recent settled day at least two full days before generation; start and end are inclusive.",
     });
     assert.equal(details.packageCount, api.requests.length);
     assert.equal(details.method, "Sum of validated npm daily range rows; registry-confirmed pre-creation days contribute zero.");
@@ -179,20 +179,60 @@ test("download badge rejects a structurally incomplete explicit range without pu
   }
 });
 
-test("download badge rejects an explicit final day that has not settled", async () => {
+// npm's aggregation lag varies: the day two days before generation is sometimes still zero
+// while the day before it has settled. The generator steps the window back one day, re-fetches
+// every package for that earlier period, and records the lag it actually used.
+test("download badge steps the window back a day when the final day has not settled", async () => {
+  const outputDir = await mkdtemp(join(tmpdir(), "agentprism-npm-downloads-step-back-"));
+  const shiftedEnd = "2026-08-31";
+  const shiftedStart = "2026-08-02";
+  const shiftedPeriod = `${shiftedStart}:${shiftedEnd}`;
+  const api = await startDownloadsApi(({ period, packageName }) =>
+    period === expectedPeriod
+      ? unsettledResponseFor(packageName, period)
+      : responseForParameter(packageName, period),
+  );
+
+  try {
+    const result = await runGenerator(outputDir, api.url);
+    assert.equal(result.code, 0, result.stderr);
+    const periods = [...new Set(api.requests.map((request) => request.period))];
+    assert.deepEqual(periods, [expectedPeriod, shiftedPeriod]);
+    assert.equal(
+      api.requests.filter((request) => request.period === shiftedPeriod).length,
+      api.requests.filter((request) => request.period === expectedPeriod).length,
+    );
+    assert.match(
+      result.stdout,
+      new RegExp(`zero downloads across all \\d+ packages for ${expectedEnd}.*retrying with the window ending ${shiftedEnd}`),
+    );
+
+    const details = JSON.parse(await readFile(join(outputDir, "npm-downloads-details.json"), "utf8"));
+    assert.equal(details.period.parameter, shiftedPeriod);
+    assert.equal(details.period.start, shiftedStart);
+    assert.equal(details.period.end, shiftedEnd);
+    assert.equal(details.period.reportingLagDays, 3);
+    const perPackage = isoDays(shiftedStart, 30).reduce((sum, _day, index) => sum + index + 1, 0);
+    assert.equal(details.totalDownloads, perPackage * details.packageCount);
+    assert.match(result.stdout, new RegExp(`\\(${shiftedStart}\\.\\.${shiftedEnd}\\)`));
+  } finally {
+    await api.close();
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test("download badge rejects a final day that never settles within the maximum lag", async () => {
   const outputDir = await mkdtemp(join(tmpdir(), "agentprism-npm-downloads-unsettled-"));
-  const api = await startDownloadsApi(({ packageName }) => ({
-    ...responseFor(packageName),
-    downloads: expectedDays.map((day, index) => ({
-      day,
-      downloads: index === expectedDays.length - 1 ? 0 : index + 1,
-    })),
-  }));
+  const api = await startDownloadsApi(({ period, packageName }) => unsettledResponseFor(packageName, period));
 
   try {
     const result = await runGenerator(outputDir, api.url);
     assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /zero downloads across all \d+ packages.*has not settled/s);
+    assert.deepEqual(
+      [...new Set(api.requests.map((request) => request.period))],
+      ["2026-08-03:2026-09-01", "2026-08-02:2026-08-31", "2026-08-01:2026-08-30"],
+    );
+    assert.match(result.stderr, /zero downloads across all \d+ packages for 2026-08-30 and for every earlier final day back to 2 days.*has not settled/s);
     await assertNotPublished(outputDir);
   } finally {
     await api.close();
@@ -202,6 +242,18 @@ test("download badge rejects an explicit final day that has not settled", async 
 
 function responseFor(packageName) {
   return responseForPeriod(packageName, expectedStart, expectedEnd);
+}
+
+function responseForParameter(packageName, parameter) {
+  const [start, end] = parameter.split(":");
+  return responseForPeriod(packageName, start, end);
+}
+
+/** A period whose final day npm has not aggregated yet: it is present, but reported as zero. */
+function unsettledResponseFor(packageName, parameter) {
+  const response = responseForParameter(packageName, parameter);
+  const finalRow = response.downloads.at(-1);
+  return { ...response, downloads: [...response.downloads.slice(0, -1), { ...finalRow, downloads: 0 }] };
 }
 
 function responseForPeriod(packageName, start, end) {
