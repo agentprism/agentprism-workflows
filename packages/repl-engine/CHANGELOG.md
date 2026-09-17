@@ -1,5 +1,12 @@
 # @automatalabs/repl-engine
 
+## 0.4.38
+
+### Patch Changes
+
+- Updated dependencies [a9267d5]
+  - @automatalabs/workflows@6.2.3
+
 ## 0.4.37
 
 ### Patch Changes
