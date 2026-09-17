@@ -1,5 +1,12 @@
 # @automatalabs/mcp-server
 
+## 7.0.6
+
+### Patch Changes
+
+- @automatalabs/repl-engine@0.4.37
+- @automatalabs/workflows@6.2.2
+
 ## 7.0.5
 
 ### Patch Changes
