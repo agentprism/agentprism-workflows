@@ -70,7 +70,7 @@ For MCP server work, preserve the deliberate SDK boundary: production server cod
   ```
 
 - The pre-push hook additionally runs attribution, dependency freshness, and real Claude/Codex/OpenCode/pi plus steering gates. It has no bypass; fix authentication or dependency failures.
-- Any stale package or dependency reported by a repository update gate during any task is immediate maintenance work, not an “unrelated” caveat to leave for delivery. This applies to every dependency, runtime, adapter, source upstream, or workspace package the repository gates for currency. Pause the original delivery, open a separate update PR from current `origin/main`, follow that gate’s prescribed update and merge mechanics, land it, then update and revalidate the original branch.
+- Any stale package or dependency reported by a repository update gate during any task is immediate maintenance work, not an “unrelated” caveat to leave for delivery. This applies to every dependency, runtime, adapter, source upstream, or workspace package the repository gates for currency. Pause the original delivery, open a separate update PR from current `origin/main`, follow that gate’s prescribed update and merge mechanics, land it, then update and revalidate the original branch. Do this proactively and without stopping to ask: this policy pre-authorizes opening, pushing, and merging that maintenance PR, and a stale gate is never a reason to halt the original delivery or hand it back unfinished.
 - Never weaken a guard or assertion merely to make a change pass. Deleting or inverting a test because the behavior it protects is being deliberately redesigned is expected; name it in the PR.
 
 ## Generated and coupled artifacts

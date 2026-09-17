@@ -1,6 +1,6 @@
 ## Worked example — cross-vendor build with every major primitive
 
-**Context:** JavaScript passed to the MCP `workflow` tool. Workflow scripts use `agent(prompt, options?)`; REPL evals use a different API.
+**Context:** JavaScript passed to the MCP `workflow` tool.
 
 ```js
 export const meta = {
@@ -20,7 +20,7 @@ const VERDICT = { type: "object", additionalProperties: false, required: ["ok"],
 phase("Plan");
 const plan = await agent(
   `Study this repo, then write an implementation plan for: ${args.feature}. Keep steps concrete.`,
-  { label: "plan", model: "opencode/zai/glm-5.2", schema: PLAN },
+  { label: "plan", model: "opencode", schema: PLAN },
 );
 
 const approved = await checkpoint(
@@ -35,16 +35,16 @@ const outcome = await gate(
     `Implement: ${args.feature}\nPlan:\n- ${plan.steps.join("\n- ")}\n` +
     `Run the project's tests before finishing and report results.` +
     (feedback ? `\n\nReviewer feedback on attempt ${attempt}:\n${feedback}\nAddress every point.` : ""),
-    { label: `implement:${attempt + 1}`, model: "codex/gpt-5.6-sol", mode: "agent", retries: 1 },
+    { label: `implement:${attempt + 1}`, model: "codex", mode: "agent", retries: 1 },
   ),
   async (report) => {
     if (!report) return { ok: false, feedback: "implementation agent produced no result" };
     phase("Review");
     const reviews = (await parallel([   // two reviewers on different vendors
       () => agent(`Review the working-tree diff for correctness. Implementer's report:\n${report}`,
-                  { label: "review:correctness", model: "claude/opus[1m]", mode: "bypassPermissions", schema: VERDICT }),
+                  { label: "review:correctness", model: "claude", mode: "bypassPermissions", schema: VERDICT }),
       () => agent(`Review the working-tree diff for regressions and missing tests. Report:\n${report}`,
-                  { label: "review:coverage", model: "opencode/zai/glm-5.2", schema: VERDICT }),
+                  { label: "review:coverage", model: "opencode", schema: VERDICT }),
     ])).filter(Boolean);
     const rejections = reviews.filter((r) => !r.ok);
     return rejections.length
@@ -57,10 +57,12 @@ const outcome = await gate(
 return { implemented: outcome.ok, attempts: outcome.attempts, reviewVerdict: outcome.verdict, plan };
 ```
 
-These trusted implementation/review calls pin Codex `agent` and Claude `bypassPermissions` for
-full tool autonomy. Confirm both ids in the live catalog first. Claude `auto` uses a model classifier
-and may request permission; it is not the full-access mode. For a read-only planner, select the
-exact advertised read-only/plan mode instead.
+Every route here is backend-only, so each harness applies its own configured default model and the
+script runs unchanged wherever those backends are logged in. The implementation and review calls pin
+Codex `agent` and Claude `bypassPermissions` for full tool autonomy; confirm both mode ids in the config
+response first. Claude `auto` may raise permission requests instead. For a read-only planner, select the
+advertised read-only/plan mode. To pin an exact model, follow the walkthrough in
+[`models-and-config.md`](models-and-config.md) and replace a backend name with the copied route.
 
 ## Worked example — audit with one shared backend route
 
@@ -111,12 +113,24 @@ log(`${confirmed.length}/${candidates.length} confirmed; complete=${gaps.complet
 return { confirmed, missing: gaps.missing ?? [] };
 ```
 
-## Automatic preparation before live execution
+## What the run request checks before anything executes
 
-The MCP `workflow` tool checks source structure, then prepares the script inside the Run request with a mocked dry run and routed no-prompt config checks before admitting execution. Every actual agent call must have an effective model; no configuration form fills missing routing. Malformed source/meta and validation failure are tool execution errors: no run exists and no live agent is dispatched. A script declaring custom backends is validated, then parked with a backend-approval `setup.request` that `setup-response` answers. When pinning model, mode, or `configOptions`, use `action:"config"` first.
+The run action checks the source structure, then runs a mocked dry run and no-prompt config probes
+before admitting execution. Every agent call reachable on the mocked path must have an effective model;
+malformed source or metadata, a nondeterministic API, a missing route, or an unadvertised mode or option
+is a tool execution error, so no run exists and no agent is dispatched. A script declaring custom
+backends is validated, then parked with a `setup.request` for you to answer with `setup-response`.
 
-The mocked pass executes reachable script control flow with schema-conforming fabricated agent results. It simulates explicit checkpoint replies, including `true` for confirm, with journaling disabled; simulated answers cannot approve live work. It can prove that syntax, metadata, helper calls, and reachable branches are structurally executable, but it cannot prove prompt quality, real-world judgment, or convergence through every branch. Keep loops bounded in script code and inspect validation warnings for declared phases that the fabricated path did not reach.
+The mocked pass executes reachable script control flow with schema-conforming fabricated agent results.
+It simulates explicit checkpoint replies, including `true` for confirm, without journaling them. It proves
+that syntax, metadata, helper calls, and reachable branches are structurally executable; it cannot prove
+prompt quality, real-world judgment, or convergence through every branch. Keep loops bounded in script
+code and read the validation warnings for declared phases the fabricated path did not reach.
 
-The routed config pass probes each distinct backend/model pair without prompting. Unknown option ids, invalid select values, wrong value types, and the reserved `"model"` config key reject the script with direct alternatives. A backend that cannot be probed produces an explicit warning and leaves only that backend's option domain unverified.
+The config pass probes each distinct backend/model pair the script routes to. Unknown option ids, invalid
+select values, wrong value types, unadvertised modes, and the reserved `"model"` config key reject the run
+with the offending call named. A backend that cannot be probed produces a warning and leaves only that
+backend's option domain unverified.
 
-For model/config details, read [`models-and-config.md`](models-and-config.md). For exact-run recovery semantics, read [`determinism-and-resume.md`](determinism-and-resume.md).
+For model and config details, read [`models-and-config.md`](models-and-config.md). For exact-run recovery
+semantics, read [`determinism-and-resume.md`](determinism-and-resume.md).

@@ -221,14 +221,13 @@ After reload, `workflow` and `repl` appear; Apps-capable hosts also discover `wo
 
 ## Agent Skills over MCP
 
-The server declares the accepted SEP-2640 extension `io.modelcontextprotocol/skills` and publishes two version-matched skills:
+The server declares the accepted SEP-2640 extension `io.modelcontextprotocol/skills` and publishes one version-matched skill:
 
 - `skill://agentprism-workflow-authoring/SKILL.md`
-- `skill://agentprism-repl-orchestration/SKILL.md`
 
-Skills-aware hosts discover their complete entries through `skills/list`, refresh one through `skills/get`, and activate them through the host's own skill-loading and approval path. Every entry contains verbatim `SKILL.md` frontmatter plus a complete per-file `{ uri, digest, size }` manifest. Every file is read lazily through standard `resources/read`; SHA-256 digests cover the exact raw bytes returned. The server also advertises `directoryRead: true` and implements non-recursive `resources/directory/read` for skill directories.
+Skills-aware hosts discover its complete entry through `skills/list`, refresh it through `skills/get`, and activate it through the host's own skill-loading and approval path. The entry contains verbatim `SKILL.md` frontmatter plus a complete per-file `{ uri, digest, size }` manifest. Every file is read lazily through standard `resources/read`; SHA-256 digests cover the exact raw bytes returned. The server also advertises `directoryRead: true` and implements non-recursive `resources/directory/read` for skill directories.
 
-Workflow and REPL are separate skills because their `agent()` signatures and lifecycle semantics differ. Canonical sources live under `docs/authoring/` and are bundled into both the published MCP server and the MCP server embedded in `@automatalabs/workflows`. There is no `docs` tool, `agentprism://docs/*` compatibility surface, archive form, or obsolete `skill://index.json` resource.
+The skill is written for the agent that drives the `workflow` tool: it opens with `action:"config"` discovery, ships backend-only routes in its examples, and carries no SDK-host, CLI, or `repl` guidance. Canonical sources live under `docs/authoring/` and are bundled into both the published MCP server and the MCP server embedded in `@automatalabs/workflows`. There is no `docs` tool, `agentprism://docs/*` compatibility surface, archive form, or obsolete `skill://index.json` resource.
 
 ## The `workflow` tool
 
@@ -734,7 +733,7 @@ const run = await runDynamicWorkflow(
 console.log(run.status, run.result);
 ```
 
-This MCP-server package does export its own building blocks, for hosts that want to mount the same surface on a transport they control rather than the default stdio one. `createWorkflowServer(runner)` registers the `workflow` and `repl` tools, the two authoring skills (plus their `skills/list`, `skills/get`, resource-read, and directory-read surface), the capability-gated `workflow_monitor` launcher, app-only `workflow-events`, `workflow-runs`, and `workflow-notifications` tools, and the `author-workflow` prompt. The `repl` workspaces default to a private client-presence ledger and a server-owned eval-break channel. `CreateWorkflowServerOptions` exposes `protocolEra` for SDK serving factories, plus `replRunner`, `replPresence`, `replClientId`, `replEvalBreakChannel`, and `replDrainBoundMs` for host lifecycle integration (the daemon passes shared instances). Workflow setup and continuation use durable run state; the server has no request-state codec or token verifier:
+This MCP-server package does export its own building blocks, for hosts that want to mount the same surface on a transport they control rather than the default stdio one. `createWorkflowServer(runner)` registers the `workflow` and `repl` tools, the workflow authoring skill (plus its `skills/list`, `skills/get`, resource-read, and directory-read surface), the capability-gated `workflow_monitor` launcher, app-only `workflow-events`, `workflow-runs`, and `workflow-notifications` tools, and the `author-workflow` prompt. The `repl` workspaces default to a private client-presence ledger and a server-owned eval-break channel. `CreateWorkflowServerOptions` exposes `protocolEra` for SDK serving factories, plus `replRunner`, `replPresence`, `replClientId`, `replEvalBreakChannel`, and `replDrainBoundMs` for host lifecycle integration (the daemon passes shared instances). Workflow setup and continuation use durable run state; the server has no request-state codec or token verifier:
 
 ```ts
 import { createWorkflowServer, WorkflowPermissionBroker } from "@automatalabs/mcp-server";

@@ -16,7 +16,7 @@ export function buildAuthoringPromptText(task?: string): string {
   return [
     "# Author an AgentPrism workflow",
     "",
-    `Activate the connected server's Agent Skill at \`${WORKFLOW_AUTHORING_SKILL_URI}\` through the host's skill-loading path. Follow its workflow-script guidance and read only the supporting references needed for this task. Do not use the separate REPL skill: workflow scripts and REPL evals have different \`agent()\` signatures and lifecycle semantics.`,
+    `Activate the connected server's Agent Skill at \`${WORKFLOW_AUTHORING_SKILL_URI}\` through the host's skill-loading path. Follow its workflow-script guidance and read only the supporting references needed for this task.`,
     "",
     "When the script pins a model, mode, or configOptions, call the `workflow` tool with `action:\"config\"` first; after choosing a model, use `modelSpecs` to read its exact option domain. Read the harness-owned mode names and descriptions before pinning an advertised id. The run action automatically performs static validation, a mocked dry run, and routed no-prompt config checks before admission. Correct any direct rejection diagnostic and re-run.",
     "",

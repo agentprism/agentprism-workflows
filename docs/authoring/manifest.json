@@ -3,9 +3,6 @@
   "skills": [
     {
       "directory": "agentprism-workflow-authoring"
-    },
-    {
-      "directory": "agentprism-repl-orchestration"
     }
   ]
 }

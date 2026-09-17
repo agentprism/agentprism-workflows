@@ -1,76 +1,55 @@
 ## Running workflows — the MCP `workflow` tool
 
-**Context:** JavaScript passed to the MCP `workflow` tool. Workflow scripts use `agent(prompt, options?)`; REPL evals use a different API.
+**Context:** JavaScript passed to the MCP `workflow` tool.
 
-The server owns admitted execution across client-session churn. Both legacy 2025 and modern
-`2026-07-28` transports expose the same lifecycle. Run and Resume prepare inside the request under
-a 120-second preparation ceiling and honor request cancellation; every observation request has a
-45-second bound. Neither bound limits live workflow duration. Each project allows four active runs,
-including runs preparing or waiting for setup; a settled or rejected run releases its slot.
+The server owns admitted execution: a run keeps going after your client disconnects, and every
+later call addresses it by `runId`. Run and Resume prepare inside the request (up to 120 seconds)
+and return once execution has started or been parked for setup; every observation request returns
+within 45 seconds. Neither bound limits how long a workflow may run. Each project allows four
+active runs, including runs preparing or waiting for setup; a settled or rejected run releases its slot.
 
-On the shared daemon, Config and Run require absolute `projectDir`. Other actions locate the
-project through `runId` and reject `projectDir`. A single-project server defaults to its own project.
-The input schema is a strict eight-action union. Omitted actions, aliases, execution-mode fields,
-cross-action fields, and retired request-state tokens are rejected in both protocol eras.
+On the shared daemon, `config` and `run` require an absolute `projectDir`. Every other action locates
+the project through `runId` and rejects `projectDir`. The input is a strict nine-action union: send
+only the fields of the selected action, and never an execution-mode field or an alias.
 
 ### Actions
 
-- **Config** (`{ action:"config", projectDir, harnesses?, modelSpecs?, modelFilter? }`): read bounded no-prompt model/mode/config catalogs without creating a run. Use `modelSpecs` for a selected model's exact option domain. Preserve backend-advertised ids and descriptions.
-- **Run** (`{ action:"run", projectDir, script | scriptPath, args?, maxAgents?, concurrency?, agentRetries? }`): provide exactly one source. The request reads the source, checks its structure, runs the mocked dry run and routed no-prompt probes, and only then admits execution; a path is read at admission, and later edits cannot change the admitted source of the current run. The acknowledgement contains `accepted:true`, `runId`, current `status`, `scriptUri` (a `file://` URI) with `scriptPath`, resource links, limits, and optional `setup`. An inline script is copied into the run store as `{runId}.script.js`; a `scriptPath` run's resource is the caller's own file. It contains no final result. Malformed source, validation failure, and a full project are tool execution errors that create no run. A script declaring custom backends is parked in durable setup instead of started; decline/cancel leaves an aborted run. Cancelling the request before admission abandons preparation without persisting anything.
-- **Resume** (`{ action:"resume", runId, checkpointReplies?, maxAgents?, concurrency?, agentRetries? }`): continue the exact run using its args, configuration, journal, events, usage, and checkpoint decisions, with the script re-read from the run's file. An unchanged or missing file continues the persisted script; an edited file is a revision, validated exactly like a new run and limited to backends the setup already approved, that continues with an identity-matched replay of the run's own journal (unchanged calls replay, edited or new calls run live). An accepted acknowledgement adds `continuation` (`scriptRevised:true` for a revision); observe later state with Status. A revision that does not parse, fails validation, or widens backends is a tool execution error that changes nothing. Paused, failed, and stopped (`aborted`) runs continue; stopped runs replay their journal and re-run the interrupted calls. Running, completed, auth-blocked, or unanswered-checkpoint states return an observation when no continuation is admitted. Resume never accepts replacement logical inputs in the request or opens an inline human interaction.
-- **Setup response** (`{ action:"setup-response", runId, setupId, response }`): answer `status.setup.request.id`. Acceptance is exactly `{ action:"accept", content:{ ... } }`, matching the advertised `requestedSchema`. Backend approval is the only setup kind and requires `{ approve:true }`; it never chooses agent routes. `{ action:"decline" }` and `{ action:"cancel" }` have no content and stop setup. Identical retransmissions are idempotent; conflicting or stale responses cannot authorize a new request.
-- **Status** (`{ action:"status", runId, lastN?, labelGlob?, logLines? }`): return an immediate bounded observation with calls, durable `latestActivity`, log tail, usage, safe pending permissions, setup state, and resource links. Settled runs add `outcome`; a checkpoint appears at `outcome.checkpointContext`. Reading a failed workflow is a successful tool request. Status never waits for execution or collects input.
-- **Result** (`{ action:"result", runId, offset?, maxBytes? }`): page exact completed JSON results in chunks up to 16,384 UTF-8 bytes. If `hasMore`, continue from `endOffset`; code points are never split.
-- **Permission response** (`{ action:"permissions-response", runId, permissionId, response:{ outcome:{ outcome:"selected", optionId } } }`): select an exact advertised ACP option. Cancellation is `response:{ outcome:{ outcome:"cancelled" } }`. The request must still belong to the live execution owner. Caller response `_meta` is forbidden. These bounded controls work with or without an App.
-- **Pause** (`{ action:"pause", runId }`): ask the live execution owner to pause. Agents already executing finish and journal, nothing new starts, and the run settles as `paused` with `reason:"requested"`. The response carries `pauseRequested` and `paused`; it waits up to two seconds for executing agents, and a `running` answer settles on its own (poll Status). An already paused run is a no-op; a terminal or setup-parked run is an error. Resume continues from the journal.
-- **Stop** (`{ action:"stop", runId }`): interrupt a whole run now, including pending setup; in-flight agents are cancelled and recorded as interrupted rows, and the run settles as `aborted`. Resume continues it from the journal. Add `callIndex` to cancel one live agent while preserving the run. Status filters are accepted. `forceOwner:true` authorizes a whole-run superseded-owner stop and cannot accompany `callIndex`; cross-daemon forwarding targets the owner. Losing a panel or transport never implies Stop.
+- **Config** (`{ action:"config", projectDir, harnesses?, modelSpecs?, modelFilter? }`): read the live backend, model, mode, and config-option catalog without creating a run. See [models-and-config.md](models-and-config.md).
+- **Run** (`{ action:"run", projectDir, script | scriptPath, args?, maxAgents?, concurrency?, agentRetries? }`): provide exactly one source (inline text, or an absolute server-side path read at admission). The request checks the source, runs the mocked dry run and the no-prompt config probes, and only then starts execution. The acknowledgement contains `accepted:true`, `runId`, `status`, `scriptUri` (a `file://` URI) with `scriptPath`, `limits`, and, for scripts that declare custom backends, `setup`. It never contains the result. Malformed source, validation failure, and a full project are tool execution errors (`isError:true`) that create no run. Cancelling the request before it returns abandons preparation without persisting anything.
+- **Status** (`{ action:"status", runId, lastN?, labelGlob?, logLines? }`): an immediate bounded snapshot. It reports `status` (`pending`, `running`, `paused`, `completed`, `failed`, `aborted`), `currentPhase`, the latest `calls` (index, kind, label, phase, model, backend, `queued`/`running` state, and a result preview), `latestActivity` per live call, `logTail`, `tokenUsage`, `pendingPermissions`, `setup`, and resource links. A settled run adds `outcome` with `reason`, `errorCode`, `checkpointContext`, or `authContext`. `lastN` (default 20, max 50) and `labelGlob` (whole-label glob with `*` and `?`) filter the calls; `logLines` (default 20, max 50) bounds the log tail. Status never waits for execution.
+- **Result** (`{ action:"result", runId, offset?, maxBytes? }`): page the exact JSON result of a completed run in chunks of at most 16,384 UTF-8 bytes. The response carries `chunk`, `totalBytes`, `endOffset`, and `hasMore`; continue from `endOffset` until `hasMore` is false. Code points are never split.
+- **Resume** (`{ action:"resume", runId, checkpointReplies?, maxAgents?, concurrency?, agentRetries? }`): continue the exact run using its args, journal, cumulative usage, and checkpoint decisions, re-reading the script from `scriptPath`. An unchanged or missing file continues the admitted script; an edited file is a revision, validated exactly like a new run and limited to backends already approved, that continues with an identity-matched replay (unchanged calls replay, edited or new calls run live). The acknowledgement adds `continuation` (`scriptRevised:true` for a revision). Paused, failed, and stopped runs continue; a stopped run replays its journal and re-runs the interrupted calls. A run that is running or completed, or paused on a checkpoint you did not answer, returns an observation instead. Resume never accepts a replacement `script` or `args`.
+- **Setup response** (`{ action:"setup-response", runId, setupId, response }`): answer the pending `status.setup.request` (`setupId` is `setup.request.id`). Acceptance is `{ action:"accept", content:{ approve:true } }`; `{ action:"decline" }` or `{ action:"cancel" }` carry no content and leave an inspectable aborted run. Backend approval is the only setup kind. Identical retransmissions are idempotent.
+- **Permission response** (`{ action:"permissions-response", runId, permissionId, response:{ outcome:{ outcome:"selected", optionId } } }`): answer one entry of `status.pendingPermissions`, selecting an `optionId` from that entry's `request.options`. Cancel with `response:{ outcome:{ outcome:"cancelled" } }`. Permission requests arise from backend modes that ask before acting (for example Claude `auto`).
+- **Pause** (`{ action:"pause", runId }`): executing agents finish and journal, nothing new starts, and the run settles as `paused` with `reason:"requested"`. The response carries `pauseRequested` and `paused`; it waits up to two seconds, and a run still `running` afterwards settles on its own (poll status). Pausing an already paused run is a no-op; a terminal or setup-parked run is an error. Resume continues from the journal.
+- **Stop** (`{ action:"stop", runId }`): interrupt the whole run now, including pending setup. In-flight agents are cancelled and recorded as interrupted, and the run settles as `aborted`; resume continues it from the journal. Add `callIndex` to cancel one live agent while the run keeps going (that call resolves `null` in the script). Status filters are accepted on stop. `forceOwner:true` authorizes stopping a run whose execution owner was superseded and cannot accompany `callIndex`. Closing a monitor or dropping the transport never stops a run.
 
-### Cancellation, continuation, and checkpoint rules
+### Request cancellation and continuation
 
-A Run or Resume request is cancelled the way its transport defines: closing the Streamable HTTP
-response stream, or `notifications/cancelled` on stdio. Cancellation before admission stops
-preparation, persists nothing, and releases capacity; cancellation after admission is ignored and
-the started run stays discoverable through the script file resources (`resources/list`). A Run carries no
-retry identity: sending the same input again starts an independent run. Progress notifications
-report preparation stages when the request carries `_meta.progressToken`.
+A Run or Resume request is cancelled the way your transport defines (closing the HTTP response
+stream, or `notifications/cancelled` on stdio). Cancellation before admission stops preparation,
+persists nothing, and releases capacity; cancellation after admission is ignored and the started
+run remains discoverable through its script file resource. Sending the same run input again starts an
+independent run. Add `_meta.progressToken` to the run request to receive preparation-stage progress notifications.
 
-One run ID names one immutable source, event stream, usage total, and final result. Before live
-dispatch, the host persists format-3 routing admission: `strict:true`, captured tier configuration
-and named-agent definitions, optional host default, approved backends, integrity hash, and timestamp.
-Every actual call must resolve a model. Configured calls on unseen live branches are valid; missing
-routes fail before dispatch with bounded discovery guidance. There is no agent-configuration setup
-or automatic default selection. Continuation validates admission and reuses its immutable inputs
-without routing-file drift; old admissions remain inspectable but cannot execute. Same-ID replay
-adds no duplicate journal rows or provider usage.
+One `runId` names one immutable script text, args, event stream, usage total, and final result. Every
+`agent()` and `checkpoint()` call must resolve a model before dispatch; a call on a branch the dry run did
+not visit still fails at that call if it has no route. Resume reuses the admitted routing; it never
+re-selects models or widens backend approval. Replaying a journaled call adds no provider usage.
 
-Every unanswered script checkpoint pauses. Resume with `checkpointReplies:{ [context.callIndex]:
-decision }`, using the exact pending index and a strict-JSON value. The first answer is durable
-under the run lease before continuation; repeats are idempotent and conflicts are reported but
-ignored. A repeat/conflict cannot answer another pending checkpoint. Explicit negative answers
-follow the authored script. Current checkpoint journals and result call records require
-`checkpointDecision:"explicit-v1"`; ambiguous historical answers cannot authorize replay, same-run
-continuation, or isolation reuse. Unsupported records remain readable but require a fresh run.
+Every unanswered `checkpoint()` pauses the run. Resume with
+`checkpointReplies:{ [checkpointContext.callIndex]: decision }`, using the exact pending index and a
+strict-JSON value. The first answer is durable; repeats are idempotent and conflicting later answers
+are ignored. Answering an earlier checkpoint again cannot advance a later one. Explicit negative answers
+follow the script's authored control flow.
 
-Runtime controls may change on a fresh continuation; logical inputs cannot. Authentication pauses
-use a fresh Resume after the same provider's credentials are configured. Live sessions survive
-client disconnect; after execution-owner process loss, persisted unfinished work is reconciled
-under the lease and can be continued from its durable prefix. Pending setup can recover from its
-stored source and exact pending request. Stop intent remains durable through cold recovery.
+Runtime limits (`maxAgents`, `concurrency`, `agentRetries`) may change on resume; the script text, args,
+and routing cannot. An authentication pause resumes after the same backend's credentials are configured.
 
-### Monitor, events, and notifications
+### Monitor and events
 
-Call the model-facing **`workflow_monitor`** with `{ runId }` to open a view for an existing run.
-Only that tool advertises the shared static UI resource. Lifecycle calls never attach a panel,
-and the server has no hyphenated monitor alias. A host may retain multiple views or replace one;
-each surviving monitor can switch among active/recent runs in its anchor run's project.
-
-App data tools (`workflow-runs`, `workflow-events`, and notification coordination) are capability
-gated and app-only. All state-changing controls use the same bounded lifecycle actions described
-above. Events are also available at `workflow://runs/{runId}/events` with a durable `streamId` and
-cursor. Use `status.latestActivity` for compact current activity; fetch exact results separately.
-
-Required-input and terminal transitions notify through available host capabilities. Routine
-selection, phase, and activity changes stay quiet. Multiple/reopened panels share notification
-receipts to suppress duplicates; reopening history does not replay a backlog. Hosts without
-unsolicited delivery use bounded Status. No notification or panel is required to retain work,
-answer a checkpoint/permission, stop, or retrieve the result.
+If your host lists the `workflow_monitor` tool, `{ runId }` opens a live view of that run; the view can switch
+among the project's active and recent runs. It is never required: status, checkpoint replies, permission
+responses, pause, stop, and result work without it. The run's event log is also readable as the MCP resource
+`workflow://runs/{runId}/events` (`eventsUri` in status), with a durable cursor for paging. Use
+`status.latestActivity` for compact current activity and `result` for the exact final value.

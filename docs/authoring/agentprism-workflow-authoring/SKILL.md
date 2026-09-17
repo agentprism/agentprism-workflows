@@ -1,13 +1,23 @@
 ---
 name: agentprism-workflow-authoring
-description: Write and run deterministic AgentPrism workflow scripts through the MCP workflow tool. Use for workflow DSL syntax, agent routing, structured output, explicit checkpoints, composition, validation, durable setup, monitoring, status, stop, result retrieval, and same-run resume.
+description: Write and run deterministic AgentPrism workflow scripts through the MCP workflow tool. Use for workflow DSL syntax, live backend/model/mode discovery with action:"config", agent routing, structured output, explicit checkpoints, composition, run status, pause, stop, result retrieval, and same-run resume.
 ---
 
 # Workflow scripts: quickstart
 
-**Context:** JavaScript passed to the MCP `workflow` tool. This is not REPL code: workflow scripts use `agent(prompt, options?)`, allow top-level `return`, and start from a required metadata export.
+**Context:** JavaScript passed to the MCP `workflow` tool. Scripts use `agent(prompt, options?)`, allow top-level `await` and top-level `return`, and start with a required metadata export.
 
-A workflow script is a deterministic orchestrator. Script code owns loops, fan-out, conditionals, aggregation, and checkpoints; `agent()` workers perform repository or research tasks. Workers start fresh sessions and do not share memory, so interpolate every prior result a later worker needs into its prompt.
+A workflow script is a deterministic orchestrator. Script code owns loops, fan-out, conditionals, aggregation, and checkpoints; `agent()` workers perform repository or research tasks. Workers start fresh sessions and share no memory, so interpolate every prior result a later worker needs into its prompt.
+
+## Before you write: discover the live catalog
+
+Backend availability, model ids, mode ids, and config-option ids differ per machine, login, and harness version. Never write one from memory. Call the `workflow` tool first:
+
+```json
+{ "action": "config", "projectDir": "/absolute/project" }
+```
+
+The response lists every backend (`claude`, `codex`, `opencode`, `pi`, plus registered custom backends) with whether it could be probed, its advertised modes and default mode, its config options, and its model catalog. Pin only values copied from that response. A backend name alone (`model: "codex"`) is always a valid route and keeps that backend's own default model, so most scripts never need a pinned model id. Read [`references/models-and-config.md`](references/models-and-config.md) for the response fields and the pinning walkthrough.
 
 ## Minimal valid script
 
@@ -29,7 +39,7 @@ return { report };
 
 The metadata export must be the first statement and a pure object literal. `name` and `description` are required non-empty strings. `phases`, when present, is an array of objects shaped `{ title: string, detail?: string, model?: string }`, never strings.
 
-Submit the source without Markdown fences using the `workflow` tool's run form, with an absolute `projectDir` on the shared daemon. `args` is the JSON value supplied by the tool call. Some hosts may carry caller data as a JSON string, so harden scripts that accept external input:
+Submit the source without Markdown fences through the run action, with an absolute `projectDir` on the shared daemon. `args` is the JSON value supplied by the tool call. Some hosts carry caller data as a JSON string, so harden scripts that accept external input:
 
 ```js
 const raw = typeof args === "string" ? (() => {
@@ -60,19 +70,17 @@ const results = (await parallel([
 
 ## Model selection
 
-Every actual call must resolve a model from its own options, a named-agent definition, a resolved
-tier, the current phase, or `meta.model`. A backend-only value such as `"codex"` explicitly retains
-that backend's configured default model. Omit a call's `model` only when it inherits a route.
-Missing routing fails with bounded discovery guidance for every client; there is no configuration
-form or automatically selected backend. Mode and config options remain optional. Before pinning a model id, `mode`, or `configOptions`, call `workflow` with `action:"config"` and use `modelSpecs` for that model's exact domain. For trusted implementation/review work, select Claude `bypassPermissions` or Codex `agent` when advertised. Claude `auto` is classifier-driven and may request permission; do not treat it as full-access autonomy. Pin only exact advertised ids and never guess model or option ids. The effective choices are persisted canonically for the run and reused unchanged by continuation.
+Every `agent()` call must resolve a model from its own `model` option, its `agentType` definition, the current phase's `model`, or `meta.model`. A backend name alone (`"codex"`) keeps that backend's configured default model. Omit a call's `model` only when it inherits one of those routes; a call with no route is rejected at preflight before anything runs.
+
+`mode` and `configOptions` are optional. Set them only with ids copied from the config response. For trusted implementation or review work, select Claude `bypassPermissions` or Codex `agent` when advertised. Claude `auto` is classifier-driven and may request permission, which you must answer through `permissions-response`.
 
 ## Validation and execution
 
-Run prepares the workflow inside the request: bounded input/source checks, a mocked dry run, routed no-prompt config probes, and immutable routing admission. Only when every step succeeds does the server start execution and return the `runId`. Malformed source, a failed dry run, missing routing, or a full project are tool execution errors (`isError:true`) that create no run. A script declaring custom backends is validated the same way, then parked in durable setup (`status:"pending"` with `setup.request`) until approved; declined setup remains an inspectable aborted run. No live worker starts before validation, required backend approval, and admission finish.
+Run prepares the workflow inside the request: source checks, a mocked dry run, and no-prompt config probes for every routed backend/model pair. Only when every step succeeds does the server start execution and return the `runId`. Malformed source, a failed dry run, missing routing, an unadvertised mode or config option, or a full project (four active runs) are tool execution errors (`isError:true`) that create no run. A script declaring custom backends is validated the same way, then parked (`status:"pending"` with `setup.request`) until you approve it with `setup-response`.
 
-Cancel a Run by cancelling the request: close the Streamable HTTP response stream, or send `notifications/cancelled` on stdio. Preparation stops, nothing is persisted, and the capacity slot is released. Cancellation that arrives after admission is ignored; a run whose acknowledgement was lost is listed among the script file resources. Each run's script is a `file://` resource (`scriptUri`, with `scriptPath`): the store copy of an inline script, or the caller's own `scriptPath` file. Supply `_meta.progressToken` to receive preparation stage notifications. Retain `runId` for status, setup, checkpoint replies, stop, and results. No workflow execution-mode field is accepted.
+Cancelling the run request before it returns abandons preparation; nothing is persisted. Once admitted, the run belongs to the server and survives client disconnects. Each run's script is a `file://` resource (`scriptUri`, `scriptPath`). Retain `runId` for status, setup, checkpoint replies, pause, stop, and results.
 
-The input is a strict action union: send only fields belonging to the selected action. In particular, `projectDir` belongs to `config` and `run`, not `status`, `result`, `resume`, or `stop`. Some MCP clients report every rejected union branch; when that happens, first check the branch matching your `action` and remove cross-action fields.
+The input is a strict action union: send only fields belonging to the selected action. `projectDir` belongs to `config` and `run` only. Some MCP clients report every rejected union branch; when that happens, read the branch matching your `action` and remove cross-action fields.
 
 ## Minimal MCP lifecycle
 
@@ -93,11 +101,11 @@ Observe the current state. Status is always an immediate snapshot; issue it agai
 { "action": "status", "runId": "RUN_ID" }
 ```
 
-If `setup.state` is `"input-required"`, answer the backend-approval request at the exact `setup.request.id` with `action:"setup-response"` and fields matching its `requestedSchema`. Setup acceptance is `{ action:"accept", content:{ ... } }`; decline/cancel has no content. A checkpoint is different: it appears in `outcome.checkpointContext` and requires a new Resume with `checkpointReplies`.
+Act on what status reports:
 
-Every unanswered `checkpoint()` pauses. For example, answer the exact observed checkpoint index with `{ action:"resume", runId:"RUN_ID", checkpointReplies:{ "1":false } }`. The explicit value follows the script's authored control flow. Timeouts, absent panels, and dismissed interactions cannot supply an answer.
-
-To open an App, call the separate `workflow_monitor` tool with `{ "runId":"RUN_ID" }`. Lifecycle operations carry no UI attachment. A monitor can switch among active/recent runs; status and results remain available without an App.
+- `setup.state:"input-required"`: approve the declared custom backends with `{ action:"setup-response", runId, setupId: setup.request.id, response:{ action:"accept", content:{ approve:true } } }`, or send `response:{ action:"decline" }`.
+- `pendingPermissions[]`: answer one with `{ action:"permissions-response", runId, permissionId, response:{ outcome:{ outcome:"selected", optionId } } }`, using an `optionId` from that entry's `request.options`.
+- `outcome.checkpointContext`: the run is paused on a `checkpoint()`. Answer its exact `callIndex` and continue with `{ action:"resume", runId, checkpointReplies:{ "1": false } }`. The reply reaches the script verbatim; a negative answer follows the script's own control flow. Nothing else can answer a checkpoint.
 
 After completion, retrieve the exact result. If `hasMore` is true, repeat with `offset` set to the previous `endOffset`:
 
@@ -105,32 +113,26 @@ After completion, retrieve the exact result. If `hasMore` is true, repeat with `
 { "action": "result", "runId": "RUN_ID", "offset": 0, "maxBytes": 16384 }
 ```
 
-Continue an incomplete run in place; do not resend `script` or `args`:
+Continue a paused, failed, or stopped run in place; do not resend `script` or `args`:
 
 ```json
 { "action": "resume", "runId": "RUN_ID" }
 ```
 
-The response keeps the same `runId` without exposing an execution-attempt identity. It reuses the
-run's args, immutable routing inputs, journal, event stream, cumulative usage, and durable
-checkpoint decisions, and re-reads the script from the run's file (`scriptPath`): an unchanged file
-continues the admitted text, an edited file is validated like a new run and continues with an
-identity-matched replay (unchanged calls replay, edited or new calls run live; `continuation.scriptRevised`).
-A revision may not declare backends the setup never approved. Use `status` on that same ID, then
-`result` after completion.
-Pause with `{ action:"pause", runId:"RUN_ID" }` to let executing agents finish and journal before the run pauses; stop with `{ action:"stop", runId:"RUN_ID" }` to interrupt it now. Both leave a run that `resume` continues from its journal. Once a run is admitted, client disconnection leaves it owned by the server; process loss preserves durable state for later inspection/recovery.
+Resume keeps the same `runId`, reuses the run's args, journal, and checkpoint decisions, and re-reads the script from `scriptPath`. An unchanged file continues where the run left off; an edited file is validated like a new run and continues with an identity-matched replay (unchanged calls replay, edited or new calls run live).
+
+Pause with `{ action:"pause", runId }` to let executing agents finish and journal first; stop with `{ action:"stop", runId }` to interrupt now. Both leave a run that `resume` continues. If your host lists a `workflow_monitor` tool, `{ "runId": "RUN_ID" }` opens a live view; it is never required.
 
 ## What to read next
 
 Read only the references needed for the task:
 
 - [`references/composition-and-failure.md`](references/composition-and-failure.md) — metadata, fan-out, phases, and null semantics.
-- [`references/api-agents.md`](references/api-agents.md) — every `agent()` option and structured output.
-- [`references/run-lifecycle.md`](references/run-lifecycle.md) — config, run, status, stop, and resume.
-- [`references/models-and-config.md`](references/models-and-config.md) — backend routing and live model/config discovery.
+- [`references/api-agents.md`](references/api-agents.md) — every `agent()` option, model specs, and structured output.
+- [`references/run-lifecycle.md`](references/run-lifecycle.md) — every tool action, its fields, and what status reports.
+- [`references/models-and-config.md`](references/models-and-config.md) — reading the config response and pinning models, modes, and options.
 - [`references/checkpoints-and-quality.md`](references/checkpoints-and-quality.md) — quality loops and human checkpoints.
-- [`references/environment-and-tools.md`](references/environment-and-tools.md) — execution roots, isolation, tools, and custom backends.
-- [`references/determinism-and-resume.md`](references/determinism-and-resume.md) — replay identity and continuation.
-- [`references/api-control-flow.md`](references/api-control-flow.md) — complete control-flow signatures.
-- [`references/api-resume-and-backends.md`](references/api-resume-and-backends.md) — detailed resume and backend-extension contracts.
+- [`references/environment-and-tools.md`](references/environment-and-tools.md) — working directory, isolation, tools, and custom backends.
+- [`references/determinism-and-resume.md`](references/determinism-and-resume.md) — what is journaled and how resume replays it.
+- [`references/api-control-flow.md`](references/api-control-flow.md) — complete control-flow signatures and error codes.
 - [`references/examples.md`](references/examples.md) — complete composition patterns.

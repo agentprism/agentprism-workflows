@@ -16,10 +16,7 @@ import {
 test("@automatalabs/mcp-server public entry is reachable via ../src", () => {
   assert.equal(typeof createWorkflowServer, "function");
   assert.equal(SKILLS_EXTENSION_ID, "io.modelcontextprotocol/skills");
-  assert.deepEqual(AUTHORING_SKILL_URIS, [
-    "skill://agentprism-workflow-authoring/SKILL.md",
-    "skill://agentprism-repl-orchestration/SKILL.md",
-  ]);
+  assert.deepEqual(AUTHORING_SKILL_URIS, ["skill://agentprism-workflow-authoring/SKILL.md"]);
   assert.equal(EVENTS_RESOURCE_MIME_TYPE, "application/json");
   assert.equal(WORKFLOW_RUN_EVENTS_SCHEMA_VERSION, 1);
   assert.equal(workflowRunEventsUri("run-one"), "workflow://runs/run-one/events");

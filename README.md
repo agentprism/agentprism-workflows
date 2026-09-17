@@ -35,7 +35,7 @@ The backend is chosen **per `agent()` call**: a `claude/opus[1m]` review step, a
 
 You describe the workflow in plain language; your agent designs it with the right APIs, validates it, and runs it. The connected MCP server is self-documenting:
 
-- **Agent Skills over MCP** — the server advertises separate, version-matched workflow and REPL skills through SEP-2640. Skills-aware hosts expose their names and descriptions first, then load `SKILL.md` and only the referenced files needed for the task.
+- **Agent Skills over MCP** — the server advertises the version-matched `agentprism-workflow-authoring` skill through SEP-2640. Skills-aware hosts expose its name and description first, then load `SKILL.md` and only the referenced files needed for the task.
 - **MCP prompt** — prompt-capable hosts also expose **`author-workflow`** (optional `task`). It frames the task and directs the assistant to activate the workflow-authoring skill without injecting the guide.
 
 A representative ask:
@@ -523,7 +523,7 @@ both call rows and activity. Its structured payload, including `latestActivity`,
 UTF-8 bytes and its text at 8,192 bytes.
 Paused, failed, and aborted outcomes also include a redacted final-20 `logTail` immediately.
 
-The model-facing tools are `workflow`, `repl`, and the capability-gated `workflow_monitor`; `repl` is a persistent QuickJS-in-WASM JavaScript VM (one per project) for live, stateful orchestration. The server also advertises `agentprism-workflow-authoring` and `agentprism-repl-orchestration` through the MCP Skills Extension, and prompt-capable hosts get the compact user-controlled **`author-workflow`** MCP prompt (optional `task` argument). Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `{ "action":"resume", "runId":"…" }` for the paused source. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
+The model-facing tools are `workflow`, `repl`, and the capability-gated `workflow_monitor`; `repl` is a persistent QuickJS-in-WASM JavaScript VM (one per project) for live, stateful orchestration. The server also advertises `agentprism-workflow-authoring` through the MCP Skills Extension, and prompt-capable hosts get the compact user-controlled **`author-workflow`** MCP prompt (optional `task` argument). Backend auth belongs to the agents' credential sources (`claude /login`, `codex login`, `opencode auth login`, Pi provider environment keys, or `~/.pi/agent/auth.json`) — configured credentials need no extra step. An `AUTH_REQUIRED` fault pauses the workflow with `reason: "auth_required"` and a non-secret `authContext` naming the backend; configure that credential out-of-band, then call `{ "action":"resume", "runId":"…" }` for the paused source. Programmatic auth/provider management lives in the `@automatalabs/workflows` SDK runner APIs.
 
 ---
 
@@ -672,7 +672,7 @@ Script-declared backends spawn commands on the host, so they are **inert until a
 - [`packages/workflows/examples/`](packages/workflows/examples/) — **runnable examples**, from a single gated script to a complete standalone project (`repo-triage`) that mixes three selected backends in one autonomous multi-stage run.
 - [`docs/api.md`](docs/api.md) — **the API reference**: `WorkflowManager` options/lifecycle/events (incl. auth pauses and the `agentEvent` token-level stream), `ExecOptions`, the runner surface (`run()`, auth controller, session hand-off, model routing, event bus, interactive sessions, capabilities), backend resolution + environment variables, the SDK auth/provider APIs, and the full `WorkflowError` code table.
 - [`docs/archive/`](docs/archive/) — historical design records from past implementation trains. Not maintained and not an authority; the code and the documents above describe current behavior.
-- [`docs/authoring/`](docs/authoring/) — the canonical workflow and REPL Agent Skills bundled with the MCP server through SEP-2640.
+- [`docs/authoring/`](docs/authoring/) — the canonical workflow Agent Skill bundled with the MCP server through SEP-2640.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — local development, testing (including the gated live-backend e2e), and releasing.
 - [Agent Client Protocol](https://agentclientprotocol.com) · [Model Context Protocol](https://modelcontextprotocol.io)
 

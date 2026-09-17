@@ -296,7 +296,10 @@ test("auth, MCP, and authoring docs retain the implemented contracts", () => {
 
   const agentReference = readRepoFile("docs/authoring/agentprism-workflow-authoring/references/api-agents.md");
   const controlFlowReference = readRepoFile("docs/authoring/agentprism-workflow-authoring/references/api-control-flow.md");
-  assert.ok(agentReference.includes("| `keepSession` |"), "the exhaustive agent option table must include keepSession");
+  // keepSession only pays off through the SDK's agentSessions/loadSession surface, which an agent
+  // driving the MCP tool cannot reach, so the MCP-served option table must not advertise it.
+  assert.ok(!agentReference.includes("keepSession"), "the MCP-facing agent option table omits SDK-only keepSession");
+  assert.ok(agentReference.includes("| `mcpServers` |"), "the agent option table must still document mcpServers");
   assert.ok(controlFlowReference.includes('reason: "auth_required"'), "authoring reference must explain auth pauses");
 });
 

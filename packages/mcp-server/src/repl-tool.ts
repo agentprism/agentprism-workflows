@@ -404,7 +404,7 @@ export function registerReplTool(mcp: McpServer, options: ReplToolOptions): void
         "running eval (no id). Named bindings, pending subagent calls, raised checkpoints, and `_` (the previous " +
         "eval's completion value) PERSIST in the VM between calls — a later eval sees the same variables and awaits " +
         "the same promises. Console logging produces output text only and creates no persistent value; nothing lives " +
-        "in the transcript. For deeper syntax and examples, activate skill://agentprism-repl-orchestration/SKILL.md through the host's skill-loading path and read only the needed references. " +
+        "in the transcript. " +
         // The guest API.
         "Inside code (JavaScript; top-level await is allowed, top-level return is a syntax error; console output " +
         "is captured) the host bridge provides agent(modelSpec, task, opts?) → Promise: spawn an ACP subagent on " +
