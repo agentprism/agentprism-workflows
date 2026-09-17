@@ -17,9 +17,11 @@ on:
       - scripts/generate-npm-download-badge.mjs
       - docs/assets/agentprism-mark.svg
       - packages/*/package.json
-  # A Version Packages merge can race npm publication. The push run refuses
-  # to advertise that not-yet-published version; this post-release run refreshes
-  # the registry only after release.yml has completed successfully.
+  # A Version Packages merge bumps packages/*/package.json while release.yml is
+  # still publishing, so its push run is skipped below (the generator would only
+  # refuse the not-yet-published versions). This post-release run is the real
+  # refresh: it fires once release.yml has completed successfully and waits,
+  # bounded, for npm's `latest` records to catch up with the checked-in versions.
   workflow_run:
     workflows: [Release]
     types: [completed]
@@ -35,9 +37,18 @@ concurrency:
 jobs:
   build:
     name: Generate site data
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # Run for schedule, workflow_dispatch, and pushes that are not the
+    # "Version Packages (#NNN)" squash merge: at that push npm has not yet
+    # published the bumped versions, so the run would only refuse. The
+    # post-release workflow_run below covers that refresh, and it runs only when
+    # release.yml succeeded. `head_commit` exists only on push events; the other
+    # events never evaluate that operand.
+    if: >-
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+      && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Version Packages'))
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Fits the bounded post-release wait below plus the generators themselves.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -50,8 +61,18 @@ jobs:
       - name: Generate aggregate download data
         run: node scripts/generate-npm-download-badge.mjs --output-dir "$RUNNER_TEMP/agentprism-site"
 
+      # Scheduled, manual, and non-release push runs expect npm to be current
+      # already and refuse any mismatch immediately.
       - name: Generate ACP registry
+        if: github.event_name != 'workflow_run'
         run: node scripts/generate-acp-registry.mjs --output-dir "$RUNNER_TEMP/agentprism-site"
+
+      # npm's read path has served the previous `latest` for minutes after
+      # "packages published successfully"; give it up to 15 minutes to catch up
+      # before the same exact-version refusal applies.
+      - name: Generate ACP registry (wait for npm to serve the release)
+        if: github.event_name == 'workflow_run'
+        run: node scripts/generate-acp-registry.mjs --output-dir "$RUNNER_TEMP/agentprism-site" --wait-for-publish 900
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v6

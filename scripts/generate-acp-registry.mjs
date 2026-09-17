@@ -6,6 +6,13 @@
 // a Version Packages merge from advertising an artifact before release.yml has
 // actually published it. The successful Release workflow triggers the Pages
 // workflow again after npm publication.
+//
+// npm's read path lags publication by minutes, so that post-release run passes
+// `--wait-for-publish <seconds>`: while `latest` is semver-behind the checked-in
+// version the generator polls until they match or the deadline passes, then the
+// exact-equality check above applies unchanged. A `latest` that is AHEAD of the
+// checkout (a stale checkout) is refused immediately, and without the flag every
+// mismatch is refused immediately.
 
 import { copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -20,6 +27,10 @@ const REGISTRY_VERSION = "1.0.0";
 const REGISTRY_SITE_PATH = "acp-registry/v1/latest";
 const SITE_BASE_URL = "https://agentprism.github.io/agentprism-workflows/";
 const NPM_REGISTRY = process.env.AGENTPRISM_ACP_REGISTRY_NPM_API ?? "https://registry.npmjs.org";
+const PUBLISH_POLL_MS = parsePositiveInteger(
+  process.env.AGENTPRISM_ACP_REGISTRY_POLL_MS ?? "30000",
+  "AGENTPRISM_ACP_REGISTRY_POLL_MS must be a positive integer number of milliseconds",
+);
 const FETCH_ATTEMPTS = 3;
 const FETCH_TIMEOUT_MS = 10_000;
 const RETRY_DELAY_MS = 1_000;
@@ -74,15 +85,19 @@ const AGENT_DEFINITIONS = Object.freeze([
   }),
 ]);
 
-const outputDir = parseOutputDir(process.argv.slice(2));
+const { outputDir, waitForPublishMs } = parseArguments(process.argv.slice(2));
 const localPackages = await discoverPublishedAcpPackages();
 requireCompleteDefinitions(localPackages);
 await validateIconSources();
 
 // Finish every network/package validation before creating output. A failed
 // refresh therefore cannot leave a plausible but incomplete registry artifact.
+// One deadline bounds the whole publish wait, not each package's wait.
+const publishDeadline = waitForPublishMs === null ? null : Date.now() + waitForPublishMs;
 const agents = await Promise.all(
-  AGENT_DEFINITIONS.map((definition) => buildAgent(definition, localPackages.get(definition.package))),
+  AGENT_DEFINITIONS.map((definition) =>
+    buildAgent(definition, localPackages.get(definition.package), publishDeadline),
+  ),
 );
 agents.sort((left, right) => left.id.localeCompare(right.id));
 
@@ -103,11 +118,38 @@ for (const agent of agents) {
   console.log(`acp-registry: ${agent.id} ${agent.version} (${agent.distribution.npx.package})`);
 }
 
-function parseOutputDir(args) {
-  if (args.length !== 2 || args[0] !== "--output-dir" || args[1].length === 0) {
-    throw new Error("usage: node scripts/generate-acp-registry.mjs --output-dir <directory>");
+function parseArguments(args) {
+  const usage =
+    "usage: node scripts/generate-acp-registry.mjs --output-dir <directory> " +
+    "[--wait-for-publish <seconds>]";
+  let outputDir;
+  let waitForPublishMs = null;
+
+  for (let index = 0; index < args.length; index += 2) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (value === undefined || value.length === 0) throw new Error(usage);
+
+    if (flag === "--output-dir" && outputDir === undefined) {
+      outputDir = resolve(repoRoot, value);
+    } else if (flag === "--wait-for-publish" && waitForPublishMs === null) {
+      waitForPublishMs =
+        parsePositiveInteger(
+          value,
+          `--wait-for-publish must be a positive integer number of seconds\n${usage}`,
+        ) * 1000;
+    } else {
+      throw new Error(usage);
+    }
   }
-  return resolve(repoRoot, args[1]);
+
+  if (outputDir === undefined) throw new Error(usage);
+  return { outputDir, waitForPublishMs };
+}
+
+function parsePositiveInteger(value, message) {
+  if (!/^[1-9]\d*$/.test(value)) throw new Error(message);
+  return Number(value);
 }
 
 async function discoverPublishedAcpPackages() {
@@ -176,7 +218,7 @@ function requireCompleteDefinitions(localPackages) {
   }
 }
 
-async function buildAgent(definition, localPackage) {
+async function buildAgent(definition, localPackage, publishDeadline) {
   if (!localPackage) throw new Error(`missing local package for ${definition.package}`);
   if (!/^[a-z][a-z0-9-]*$/.test(definition.id)) {
     throw new Error(`invalid ACP registry id: ${definition.id}`);
@@ -185,17 +227,11 @@ async function buildAgent(definition, localPackage) {
     throw new Error(`${localPackage.manifestPath}: missing expected ${definition.bin} bin`);
   }
 
-  const published = await fetchLatestPackage(definition.package);
-  if (published.name !== definition.package) {
-    throw new Error(
-      `invalid npm latest record for ${definition.package}: name was ${JSON.stringify(published.name)}`,
-    );
-  }
-  if (!SEMVER.test(published.version)) {
-    throw new Error(
-      `invalid npm latest record for ${definition.package}: version was ${JSON.stringify(published.version)}`,
-    );
-  }
+  const published = await awaitPublishedPackage(
+    definition.package,
+    localPackage.manifest.version,
+    publishDeadline,
+  );
   if (published.version !== localPackage.manifest.version) {
     throw new Error(
       `${definition.package}: npm latest is ${published.version}, but the checked-in version is ` +
@@ -226,6 +262,55 @@ async function buildAgent(definition, localPackage) {
       },
     },
   };
+}
+
+// Returns the validated npm `latest` record. With a deadline, keeps polling while
+// npm is semver-BEHIND the checked-in version (publication has not propagated
+// yet) and returns once it catches up or the deadline passes. A record that is
+// equal or AHEAD returns immediately; the caller's exact-equality check decides.
+async function awaitPublishedPackage(packageName, localVersion, publishDeadline) {
+  for (;;) {
+    const published = await fetchLatestPackage(packageName);
+    if (published.name !== packageName) {
+      throw new Error(
+        `invalid npm latest record for ${packageName}: name was ${JSON.stringify(published.name)}`,
+      );
+    }
+    if (!SEMVER.test(published.version)) {
+      throw new Error(
+        `invalid npm latest record for ${packageName}: version was ${JSON.stringify(published.version)}`,
+      );
+    }
+    if (publishDeadline === null || compareSemver(published.version, localVersion) >= 0) {
+      return published;
+    }
+
+    const remainingMs = publishDeadline - Date.now();
+    if (remainingMs <= 0) return published;
+    const delayMs = Math.min(PUBLISH_POLL_MS, remainingMs);
+    console.log(
+      `acp-registry: ${packageName}: npm latest is ${published.version}, waiting for ` +
+        `${localVersion} to publish (next check in ${formatSeconds(delayMs)}, ` +
+        `${formatSeconds(remainingMs)} left)`,
+    );
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+  }
+}
+
+// Numeric x.y.z comparison; both inputs have already passed SEMVER.
+function compareSemver(left, right) {
+  const leftParts = left.split(".").map(Number);
+  const rightParts = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) {
+      return leftParts[index] < rightParts[index] ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+function formatSeconds(milliseconds) {
+  return `${Math.ceil(milliseconds / 1000)}s`;
 }
 
 async function fetchLatestPackage(packageName) {
