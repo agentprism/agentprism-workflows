@@ -48,14 +48,14 @@ test("Skills Extension manifests and resources are served over HTTP", async () =
       { method: SKILLS_LIST_METHOD, params: {} },
       skillsListResultSchema,
     );
-    const repl = listed.skills.find(
-      (skill) => skill.uri === "skill://agentprism-repl-orchestration/SKILL.md",
+    const workflow = listed.skills.find(
+      (skill) => skill.uri === "skill://agentprism-workflow-authoring/SKILL.md",
     );
-    assert.ok(repl && Array.isArray(repl.resources));
-    const manifestResource = repl.resources.find((resource) => resource.uri === repl.uri);
+    assert.ok(workflow && Array.isArray(workflow.resources));
+    const manifestResource = workflow.resources.find((resource) => resource.uri === workflow.uri);
     assert.ok(manifestResource);
 
-    const read = await session.client.readResource({ uri: repl.uri });
+    const read = await session.client.readResource({ uri: workflow.uri });
     assert.equal(read.contents.length, 1);
     assert.ok("text" in read.contents[0]!);
     const bytes = Buffer.from(String(read.contents[0]!.text), "utf8");

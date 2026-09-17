@@ -124,8 +124,8 @@ export const SERVER_VERSION: string =
     : (require("../package.json") as { version: string }).version;
 
 // Server-wide guidance returned in the MCP initialize response (ServerOptions.instructions),
-// surfaced by hosts to orient the calling agent to the two model-facing tools and the two
-// version-matched Agent Skills. Kept short and behavioral — exhaustive guidance is loaded through
+// surfaced by hosts to orient the calling agent to the two model-facing tools and the
+// version-matched workflow Agent Skill. Kept short and behavioral — exhaustive guidance is loaded through
 // the host's skill activation path only when needed.
 export const SERVER_INSTRUCTIONS = [
   "This server exposes workflow and repl orchestration tools, plus workflow_monitor for Apps-capable hosts. They " +
@@ -133,10 +133,9 @@ export const SERVER_INSTRUCTIONS = [
     "pi, plus any registered custom agents — and key durable state by an absolute projectDir " +
     "(required on the shared daemon; defaulted by a single-project server). Backend credentials come " +
     "from each agent's own login, so there is nothing auth-shaped to configure here.",
-  "Version-matched authoring guidance is available through the server's Agent Skills. Activate " +
-    "skill://agentprism-workflow-authoring/SKILL.md for deterministic workflow scripts, or " +
-    "skill://agentprism-repl-orchestration/SKILL.md for the persistent REPL. Load a skill through " +
-    "the host's skill-loading path, then read only the supporting resources it references as needed.",
+  "Version-matched workflow authoring guidance is available through the server's Agent Skill " +
+    "skill://agentprism-workflow-authoring/SKILL.md. Load it through the host's skill-loading path, " +
+    "then read only the supporting resources it references as needed.",
   "• workflow — DETERMINISTIC BATCH orchestration. Use action:\"run\" with a JavaScript workflow " +
     "script that fans out agent() subagents and optional checkpoint() gates. Run and resume always return " +
     "a durable runId for bounded status, permissions-response, result, pause, and stop calls; resume continues " +

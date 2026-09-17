@@ -23,10 +23,7 @@ import {
 } from "../../../scripts/generate-authoring-skills.mjs";
 import { connect, makeRunner } from "./_harness.js";
 
-const EXPECTED_SKILL_URIS = [
-  "skill://agentprism-workflow-authoring/SKILL.md",
-  "skill://agentprism-repl-orchestration/SKILL.md",
-];
+const EXPECTED_SKILL_URIS = ["skill://agentprism-workflow-authoring/SKILL.md"];
 
 test("generated authoring-skill bundle is byte-for-byte in sync with canonical sources", () => {
   const fresh = buildAuthoringSkillsBundle();
@@ -65,35 +62,27 @@ test("generated manifests account for the exact bytes of every canonical source 
   }
 });
 
-test("workflow and REPL guidance remain context-separated and cover their public primitives", () => {
+test("workflow guidance covers its public primitives and carries no REPL, SDK, or CLI leakage", () => {
   const workflow = AUTHORING_SKILLS.find((skill) => skill.directory === "agentprism-workflow-authoring")!;
   const workflowText = workflow.resources.map((resource) => resource.text).join("\n");
   for (const name of [
     "agent(prompt, options?)",
     "parallel(thunks)",
     "pipeline(items, ...stages)",
-    "workflow(nameOrScript, args?)",
+    "workflow(script, args?)",
     "gate(thunk, validator",
     "checkpoint(promptText, options?)",
     "phase(title)",
     "log(message)",
   ]) assert.ok(workflowText.includes(name), `workflow skill includes ${name}`);
-
-  const repl = AUTHORING_SKILLS.find((skill) => skill.directory === "agentprism-repl-orchestration")!;
-  const replText = repl.resources.map((resource) => resource.text).join("\n");
-  for (const name of [
-    "agent(modelSpec, task, options?)",
-    "checkpoint(question, options?)",
-    "checkpoint.answer(callId, value)",
-    "workspace()",
-    "agents()",
-    "reset()",
-    "handle.queue",
-    "handle.steer",
-    "handle.cancel",
-  ]) assert.ok(replText.includes(name), `REPL skill includes ${name}`);
   assert.match(workflow.resources.find((resource) => resource.uri === workflow.uri)!.text, /Context:.*workflow/i);
-  assert.match(repl.resources.find((resource) => resource.uri === repl.uri)!.text, /Context:.*repl/i);
+  // The skill is read by an agent driving the MCP tool. Surfaces that agent cannot reach — the
+  // retired REPL skill, SDK host options, CLI exit codes, host-file tier routing — must not leak in.
+  assert.doesNotMatch(workflowText, /\brepl\b/i);
+  assert.doesNotMatch(
+    workflowText,
+    /exit code|probeTimeoutMs|probeConcurrency|ExecOptions|allowScriptBackends|createAcpRunner|AGENTPRISM_DEFAULT_BACKEND|keepSession|loadSession|onModelFallback|\btiers?\b/i,
+  );
 });
 
 test("initialize advertises SEP-2640 with directory reads and removes the docs tool", async () => {
@@ -110,7 +99,7 @@ test("initialize advertises SEP-2640 with directory reads and removes the docs t
   }
 });
 
-test("skills/list returns both complete entries without executing runner work", async () => {
+test("skills/list returns the workflow entry without executing runner work", async () => {
   let runs = 0;
   const { client, dispose } = await connect(makeRunner(() => { runs += 1; return "unexpected"; }));
   try {

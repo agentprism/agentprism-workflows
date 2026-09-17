@@ -172,10 +172,7 @@ test("the bundled stdio server initializes once and serves workflow/repl plus au
     const skillsResult = skillsList.result as { skills?: Array<{ uri?: unknown }> };
     assert.deepEqual(
       skillsResult.skills?.map((skill) => skill.uri).sort(),
-      [
-        "skill://agentprism-repl-orchestration/SKILL.md",
-        "skill://agentprism-workflow-authoring/SKILL.md",
-      ],
+      ["skill://agentprism-workflow-authoring/SKILL.md"],
     );
     // The workflow tool registers per-session in oninitialized (capability negotiation), so the
     // SDK legitimately emits notifications/tools/list_changed after initialize. Responses must
