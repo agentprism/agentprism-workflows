@@ -16,6 +16,7 @@ import {expect, vi} from "vitest";
 import type {Model, ReasoningEffortOption} from "../app-server/v2";
 import {CodexSubagentEventRouter} from "../subagents/CodexSubagentEventRouter";
 import {CodexBackgroundTerminalTasks} from "../async-tasks/CodexBackgroundTerminalTasks";
+import {CodexSessionCompactions} from "../CodexSessionCompactions";
 import {AUTH_STATUS_UPDATE_METHOD} from "../AuthStatusMeta";
 
 export type MethodCallEvent = { method: string; args: any[] };
@@ -445,6 +446,7 @@ export function createTestSessionState(overrides?: Partial<SessionState>): Sessi
         loadedTurnEndedBeforeWatch: null,
         sessionTitle: null,
         sessionTitleSource: "unknown",
+        compactions: new CodexSessionCompactions(),
         subagents: new CodexSubagentEventRouter(
             sessionId,
             false,

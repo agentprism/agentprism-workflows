@@ -154,6 +154,7 @@ import {
 } from "./AirExtension";
 import {ASYNC_TASK_STOP_METHOD} from "./async-tasks/AsyncTaskExtension";
 import {CodexBackgroundTerminalTasks} from "./async-tasks/CodexBackgroundTerminalTasks";
+import {clientSupportsCompaction, CodexSessionCompactions, createCompactionUpdate} from "./CodexSessionCompactions";
 import {
     type AgentFileChangeReport,
     type AgentFileChangeReportRequest,
@@ -246,6 +247,7 @@ export interface SessionState {
     titleGen?: TitleGenerator;
     subagents: CodexSubagentEventRouter;
     asyncTasks: CodexBackgroundTerminalTasks;
+    compactions: CodexSessionCompactions;
 }
 
 export type SessionFailureCategory =
@@ -793,6 +795,7 @@ export class CodexAcpServer {
                 new ACPSessionConnection(this.connection, sessionId),
             ),
             asyncTasks: this.createAsyncTasks(sessionId),
+            compactions: new CodexSessionCompactions(),
         };
         if (shouldGenerateSessionTitle(request._meta)) {
             sessionState.titleGen = new TitleGenerator(
@@ -2261,6 +2264,7 @@ export class CodexAcpServer {
                 new ACPSessionConnection(this.connection, sessionId),
             ),
             asyncTasks: this.createAsyncTasks(sessionId),
+            compactions: new CodexSessionCompactions(),
         };
         if (shouldGenerateSessionTitle(request._meta)) {
             sessionState.titleGen = new TitleGenerator(
@@ -2592,7 +2596,9 @@ export class CodexAcpServer {
             case "exitedReviewMode":
                 return [this.createReviewModeUpdate(item, false)];
             case "contextCompaction":
-                return [createCompletedContextCompactionUpdate(item)];
+                return [clientSupportsCompaction(this.clientCapabilities)
+                    ? createCompactionUpdate(item.id, "completed")
+                    : createCompletedContextCompactionUpdate(item)];
             case "plan":
                 return item.text.length > 0 ? [this.createPlanHistoryUpdate(item)] : [];
         }
@@ -3112,6 +3118,7 @@ export class CodexAcpServer {
                 sessionState.subagents,
                 (accountUpdated) => this.handleAccountUpdated(accountUpdated),
                 agentFileChangeReportRequest !== null,
+                clientSupportsCompaction(this.clientCapabilities),
                 // Fork-owned (#282): thread the client-backed file reader into fileChange updates.
                 this.clientFileSystem.createFileReader(params.sessionId),
                 // The ended push scheduler: the handler's own per-event
@@ -3519,7 +3526,7 @@ export class CodexAcpServer {
                         : "failed",
                 );
             } catch (error) {
-                logger.error("Failed to publish terminal subagent state during prompt cleanup", error);
+                logger.error("Failed to publish terminal compaction or subagent state during prompt cleanup", error);
             }
             if (agentFileChangeReportRequest !== null && agentFileChangeWorkspace !== null) {
                 if (promptWasCancelled || activePrompt.signal.aborted || this.sessionIsClosing(params.sessionId)) {
