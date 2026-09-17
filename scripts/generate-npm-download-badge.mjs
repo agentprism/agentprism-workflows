@@ -11,11 +11,16 @@
 //
 // npm's named `last-month` alias can lag behind its explicit-date data even
 // when cache-busting and no-cache headers are used. Build an exact 30-day UTC
-// range instead, ending two full days ago so npm's daily aggregation has time
-// to settle. Range responses must contain every requested day in order, and
-// the aggregate final day must be non-zero. A failed completeness check writes
-// nothing, preserving the previously published badge rather than presenting
-// incomplete counts as fresh.
+// range instead, ending at least two full days ago so npm's daily aggregation
+// has time to settle. Range responses must contain every requested day in
+// order, and the aggregate final day must be non-zero. npm's aggregation lag
+// is not fixed: a day is sometimes still reported as zero more than two days
+// later, and the post-release refresh runs at whatever hour the release lands.
+// When the final day is still zero the window steps back one day at a time,
+// up to a bounded maximum lag, and the day actually used is recorded in the
+// details document. A window whose final day never settles within that bound
+// writes nothing, preserving the previously published badge rather than
+// presenting incomplete counts as fresh.
 
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -27,21 +32,17 @@ const packagesDir = join(repoRoot, "packages");
 const DOWNLOADS_API = process.env.AGENTPRISM_NPM_DOWNLOADS_API ?? "https://api.npmjs.org";
 const NPM_REGISTRY = process.env.AGENTPRISM_NPM_REGISTRY ?? "https://registry.npmjs.org";
 const WINDOW_DAYS = 30;
-const REPORTING_LAG_DAYS = 2;
+const MIN_REPORTING_LAG_DAYS = 2;
+const MAX_REPORTING_LAG_DAYS = 4;
 const EXTERNAL_PACKAGES = Object.freeze(["@automatalabs/codex-acp"]);
 const FETCH_ATTEMPTS = 3;
 const FETCH_TIMEOUT_MS = 10_000;
 const RETRY_DELAY_MS = 1_000;
 
 const generatedAt = reportingNow();
-const period = reportingPeriod(generatedAt);
 const outputDir = parseOutputDir(process.argv.slice(2));
 const packageNames = await discoverPublishedPackages();
-const rows = await Promise.all(
-  packageNames.map((packageName) => fetchPackageDownloads(packageName, period)),
-);
-const { start, end } = requireMatchingPeriod(rows, period);
-requireCompleteFinalDay(rows, end);
+const { period, rows, start, end } = await fetchSettledWindow(packageNames, generatedAt);
 const total = rows.reduce((sum, row) => sum + row.downloads, 0);
 
 if (!Number.isSafeInteger(total)) {
@@ -63,8 +64,10 @@ const details = {
     parameter: period.parameter,
     start,
     end,
-    reportingLagDays: REPORTING_LAG_DAYS,
-    description: "Explicit 30-day UTC window ending two full days before generation; start and end are inclusive.",
+    reportingLagDays: period.lagDays,
+    description:
+      "Explicit 30-day UTC window ending on the most recent settled day at least two full days " +
+      "before generation; start and end are inclusive.",
   },
   packageCount: rows.length,
   totalDownloads: total,
@@ -352,12 +355,36 @@ function reportingNow() {
   return now;
 }
 
-function reportingPeriod(now) {
+function reportingPeriod(now, lagDays) {
   const today = now.toISOString().slice(0, 10);
-  const end = shiftIsoDate(today, -REPORTING_LAG_DAYS);
+  const end = shiftIsoDate(today, -lagDays);
   const start = shiftIsoDate(end, -(WINDOW_DAYS - 1));
   const days = Array.from({ length: WINDOW_DAYS }, (_, index) => shiftIsoDate(start, index));
-  return { parameter: `${start}:${end}`, start, end, days };
+  return { parameter: `${start}:${end}`, start, end, days, lagDays };
+}
+
+/** Fetch the newest complete window. Every package is fetched for the same explicit period,
+ *  so a shift re-fetches the whole set: partial windows are never mixed. Nothing is written
+ *  until one period passes every check. */
+async function fetchSettledWindow(names, now) {
+  for (let lagDays = MIN_REPORTING_LAG_DAYS; ; lagDays += 1) {
+    const period = reportingPeriod(now, lagDays);
+    const rows = await Promise.all(names.map((packageName) => fetchPackageDownloads(packageName, period)));
+    const { start, end } = requireMatchingPeriod(rows, period);
+    const finalDayDownloads = aggregateFinalDay(rows, end);
+    if (finalDayDownloads > 0) return { period, rows, start, end };
+    if (lagDays >= MAX_REPORTING_LAG_DAYS) {
+      throw new Error(
+        `npm reported zero downloads across all ${rows.length} packages for ${end} and for every ` +
+          `earlier final day back to ${MIN_REPORTING_LAG_DAYS} days before generation; ` +
+          "the explicit reporting window has not settled — refusing to publish incomplete counts",
+      );
+    }
+    console.log(
+      `npm-download-badge: npm reported zero downloads across all ${rows.length} packages for ${end}; ` +
+        `that day has not settled — retrying with the window ending ${shiftIsoDate(end, -1)}`,
+    );
+  }
 }
 
 function shiftIsoDate(date, days) {
@@ -388,8 +415,9 @@ function requireMatchingPeriod(results, expected) {
 
 /** Explicit date endpoints represent not-yet-ingested days as zero rather than reporting that
  *  the day is unavailable. Across the complete published package set a zero aggregate is a
- *  reliable fail-closed signal that the requested final day has not settled yet. */
-function requireCompleteFinalDay(results, endDate) {
+ *  reliable fail-closed signal that the requested final day has not settled yet; the caller
+ *  decides whether an earlier window may be tried. */
+function aggregateFinalDay(results, endDate) {
   let downloads = 0;
   for (const row of results) {
     const finalDay = row.daily.at(-1);
@@ -401,12 +429,7 @@ function requireCompleteFinalDay(results, endDate) {
       throw new Error(`aggregate downloads for final day ${endDate} is not a safe integer`);
     }
   }
-  if (downloads === 0) {
-    throw new Error(
-      `npm reported zero downloads across all ${results.length} packages for ${endDate}; ` +
-        "the explicit reporting window has not settled — refusing to publish incomplete counts",
-    );
-  }
+  return downloads;
 }
 
 function ensureTrailingSlash(value) {
