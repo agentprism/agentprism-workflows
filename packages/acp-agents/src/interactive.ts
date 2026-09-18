@@ -29,6 +29,7 @@ import {
 } from "./acp-client.js";
 import type { AcpEventListener, AcpEventName } from "./events.js";
 import { mapThrownError } from "./errors-map.js";
+import { routedModelSpec } from "./session-ref.js";
 import type { ElicitationResolver, PermissionResolver } from "./permissions.js";
 import {
   appendPromptImages,
@@ -922,7 +923,8 @@ export class InteractiveSession {
   }
 
   /** The re-attach handle for this session — persist it, then re-open later with
-   *  `runner.loadSession()`/`resumeSession()` (`backendId` doubles as the `model` routing spec).
+   *  `runner.loadSession()`/`resumeSession()` with `model: ref.model ?? ref.backendId` (`model` is the
+   *  routed spec of the model selected on the session; the backend id alone routes without selecting).
    *  Reopen flags mirror the connected agent's advertised persistence; an agent that persists
    *  nothing leaves them all false and this ref is a tombstone once released. */
   get sessionRef(): AgentSessionRef {
@@ -940,6 +942,9 @@ export class InteractiveSession {
         list: caps?.supportsListSessions === true,
         fork: caps?.supportsForkSession === true,
       },
+      ...(this.session.selectedModel !== undefined
+        ? { model: routedModelSpec(this.backendId, this.session.selectedModel) }
+        : {}),
     };
   }
 

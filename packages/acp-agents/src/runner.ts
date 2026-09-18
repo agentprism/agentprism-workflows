@@ -968,19 +968,28 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
       }
       const activeSession = session;
       opts.signal?.throwIfAborted();
-      // Hand the host the re-attach identity BEFORE any turn runs: the session id plus the
-      // agent-advertised reopen surface (session/load|resume|list). Best-effort observer —
-      // a throwing host callback never fails the run.
-      if (opts.onSessionOpen) {
+      // Hand the host the re-attach identity BEFORE any turn runs: the session id, the
+      // agent-advertised reopen surface (session/load|resume|list), and the model selected on it.
+      // Best-effort observer — a throwing host callback never fails the run.
+      const reportSessionOpen = (): void => {
+        if (!opts.onSessionOpen) return;
         try {
           opts.onSessionOpen(sessionRefFor(activeSession, prepared.backend, cwd));
         } catch {
           // observer only; the run result never depends on it.
         }
-      }
+      };
       // A registered first segment is routing only. Everything after it is sent verbatim;
       // an unregistered first segment leaves the entire authored string intact for the default.
-      await applyModelSelection(activeSession, prepared.modelSpec, opts);
+      // The ref records the selection, so it is reported once the selection settled — and on a
+      // rejected selection too, without a model: the session exists and stays a debugging handle.
+      try {
+        await applyModelSelection(activeSession, prepared.modelSpec, opts);
+      } catch (error) {
+        reportSessionOpen();
+        throw error;
+      }
+      reportSessionOpen();
       opts.signal?.throwIfAborted();
       await activeSession.setConfigOptions(opts.configOptions);
       opts.signal?.throwIfAborted();

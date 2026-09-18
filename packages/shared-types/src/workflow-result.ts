@@ -103,6 +103,13 @@ export interface AgentSessionRef {
     /** `session/fork` — driven via `runner.forkSession()`; optional for pre-fork records. */
     fork?: boolean;
   };
+  /** The model the session was on when this ref was captured, as a routing spec that leads back
+   *  to the same backend (`<backendId>/<model id>`, e.g. `"claude/opus[1m]"`). Present only when a
+   *  model was SELECTED on the session (`session/set_config_option`); a session left on its
+   *  backend's default records none. A reopen by ref selects it again, because what an agent
+   *  restores by itself differs: OpenCode, pi and Codex return to the session's model, while
+   *  Claude lets `ANTHROPIC_MODEL` / `settings.model` outrank it. ADDITIVE and NOT a hash input. */
+  model?: string;
   /** The session's latest CUMULATIVE cost gauge (`usage_update.cost.amount`, in the agent's
    *  currency) observed when this ref was captured — the session's total so far, not any one
    *  call's spend. A reopened or forked session's gauge can carry this total forward (every

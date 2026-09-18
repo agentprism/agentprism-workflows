@@ -2724,6 +2724,7 @@ interface ActiveTurn {
  */
 export class SessionHandle implements StructuredSource {
   private configOptions: SessionConfigOption[];
+  private selectedModelSpec: string | undefined;
   private removeAbort: (() => void) | undefined;
   private releasePromise: Promise<void> | undefined;
   private abortCancellation: Promise<void> | undefined;
@@ -2801,6 +2802,13 @@ export class SessionHandle implements StructuredSource {
   /** Pass the routed model id straight to the agent. Its catalog and validation are authoritative. */
   async selectModel(spec: string): Promise<void> {
     await this.applyConfigOption("model", spec);
+    this.selectedModelSpec = spec;
+  }
+
+  /** The verbatim model id last selected on this session (`selectModel`); `undefined` while the
+   *  session is on whatever its backend chose. What an `AgentSessionRef` records as `model`. */
+  get selectedModel(): string | undefined {
+    return this.selectedModelSpec;
   }
 
   /** Apply authored session config options verbatim in deterministic option-id order. */

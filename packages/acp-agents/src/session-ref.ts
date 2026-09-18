@@ -7,9 +7,16 @@ import type { Backend } from "./backend.js";
 import { costGaugeInheritance } from "./protocol-coverage.js";
 import type { BackendRegistry } from "./registry.js";
 
+/** A verbatim model id as the routing spec that leads back to `backendId` — the form
+ *  `AgentSessionRef.model` and `AcpAgent.model` share. */
+export function routedModelSpec(backendId: string, modelSpec: string): string {
+  return `${backendId}/${modelSpec}`;
+}
+
 /** The re-attach handle for an open session: id + backend routing name + cwd + the
- *  agent-advertised reopen surface. Contains no secrets; JSON-round-trippable. `backendId`
- *  doubles as the `model` routing spec for loadSession/resumeSession/listSessions. */
+ *  agent-advertised reopen surface + the model selected on it. Contains no secrets;
+ *  JSON-round-trippable. `model ?? backendId` is the `model` routing spec for
+ *  loadSession/resumeSession; `backendId` alone routes listSessions. */
 export function sessionRefFor(session: SessionHandle, backend: Backend, cwd: string): AgentSessionRef {
   const caps = session.capabilities;
   return {
@@ -26,6 +33,7 @@ export function sessionRefFor(session: SessionHandle, backend: Backend, cwd: str
       list: caps?.supportsListSessions === true,
       fork: caps?.supportsForkSession === true,
     },
+    ...(session.selectedModel !== undefined ? { model: routedModelSpec(backend.id, session.selectedModel) } : {}),
     ...(session.usage.costGauge !== undefined ? { costGauge: session.usage.costGauge } : {}),
   };
 }

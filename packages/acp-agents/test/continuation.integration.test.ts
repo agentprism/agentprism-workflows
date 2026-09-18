@@ -166,7 +166,10 @@ test("resume continuation wins once, reports provenance before setup, omits orig
     ...sessionRef(cwd),
     sessionId: "persisted-session",
     poolKey: "claude",
+    // Reported once the selection settled, so a host can reopen by ref alone.
+    model: "claude/claude-opus-4-1",
   });
+  assert.equal(observations[1], "model-resolved", "the ref follows the selection it records");
 
   const log = readLog();
   assert.equal(count(log, "resumeSession"), 1);
@@ -875,4 +878,42 @@ test("a continuation baselines the recorded cost gauge: onUsage is the call's ow
   const silentGauges: number[] = [];
   await harness.makeRunner().run("work", { model: "claude", cwd: silent.cwd, onSessionCostGauge: (amount) => silentGauges.push(amount) });
   assert.deepEqual(silentGauges, []);
+});
+
+test("onSessionOpen records the selected model, fires once the selection settled, and still reports a session whose selection was rejected", async () => {
+  // Selected: the ref carries the routed spec, and the selection is on the wire before the report.
+  const selected = harness.configure<LogEntry>({ configOptions: CONFIG_OPTIONS, turns: [{ text: "done" }] });
+  const opened: AgentSessionRef[] = [];
+  const wireAtReport: string[][] = [];
+  await harness.makeRunner().run("work", {
+    model: "claude/claude-opus-4-1",
+    cwd: selected.cwd,
+    onSessionOpen: (value) => {
+      opened.push(value);
+      wireAtReport.push(methods(selected.readLog()));
+    },
+  });
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0]?.model, "claude/claude-opus-4-1");
+  assert.ok(wireAtReport[0]!.includes("setSessionConfigOption"), "the selection precedes the report");
+  assert.equal(wireAtReport[0]!.includes("prompt"), false, "and the report still precedes the first prompt");
+
+  // Backend-only route: nothing selected, nothing recorded.
+  await harness.cleanup();
+  const unselected = harness.configure<LogEntry>({ configOptions: CONFIG_OPTIONS, turns: [{ text: "done" }] });
+  const plain: AgentSessionRef[] = [];
+  await harness.makeRunner().run("work", { model: "claude", cwd: unselected.cwd, onSessionOpen: (value) => plain.push(value) });
+  assert.equal(plain.length, 1);
+  assert.equal("model" in plain[0]!, false);
+
+  // Rejected selection: the session exists, so its ref is still reported — without a model.
+  await harness.cleanup();
+  const rejected = harness.configure<LogEntry>({ setConfigOptionError: "unknown model id", configOptions: CONFIG_OPTIONS, turns: [{ text: "never" }] });
+  const failed: AgentSessionRef[] = [];
+  await assert.rejects(() =>
+    harness.makeRunner().run("work", { model: "claude/bogus", cwd: rejected.cwd, onSessionOpen: (value) => failed.push(value) }),
+  );
+  assert.equal(failed.length, 1, "exactly one report, on the rejection path");
+  assert.equal("model" in failed[0]!, false);
+  assert.equal(count(rejected.readLog(), "prompt"), 0);
 });

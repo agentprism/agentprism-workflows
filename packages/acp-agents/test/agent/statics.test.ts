@@ -63,7 +63,7 @@ test("AcpAgent.open is new + ready", async () => {
   assert.equal((await agent.prompt("hi")).text, "ok");
 });
 
-test("resume(ref) routes by ref.backendId, passes ref.cwd, sends session/resume then prompt, and keeps the model only when passed back", async () => {
+test("resume(ref) routes by ref.backendId, passes ref.cwd, sends session/resume then prompt, and lands on the ref's model", async () => {
   const { cwd, readLog } = configure({ lifecycleSupport: true, resumeSession: {}, turns: [{ text: "one" }, { text: "two" }] });
   const original = track(await AcpAgent.open({ cwd, model: "claude/opus" }));
   assert.equal(original.model, "claude/opus", "the routed spec the agent selected");
@@ -72,15 +72,15 @@ test("resume(ref) routes by ref.backendId, passes ref.cwd, sends session/resume 
   await original.close({ keep: true });
   assert.equal(ref.backendId, "claude");
   assert.equal(ref.cwd, cwd);
-  assert.equal("model" in ref, false, "the ref carries no model");
+  assert.equal(ref.model, "claude/opus", "the ref records the model the session was on");
   assert.deepEqual(ref.reopen, { load: true, resume: true, list: true, fork: true });
 
-  const resumed = track(await AcpAgent.resume(ref, { label: "resumed", model: original.model }));
+  const resumed = track(await AcpAgent.resume(ref, { label: "resumed" }));
   assert.equal(resumed.sessionId, ref.sessionId);
   assert.equal(resumed.cwd, ref.cwd);
   assert.equal(resumed.backendId, "claude");
   assert.equal(resumed.model, "claude/opus");
-  assert.equal(resumed.configOptions.find((option) => option.id === "model")?.currentValue, "opus", "the passed-back model was selected");
+  assert.equal(resumed.configOptions.find((option) => option.id === "model")?.currentValue, "opus", "the ref's model was selected");
   assert.equal(resumed.history.length, 0, "resume replays nothing");
   // The resumed agent is a FRESH fake process with its own turn cursor: it serves turns[0].
   assert.equal((await resumed.prompt("again")).text, "one");
@@ -95,17 +95,27 @@ test("resume(ref) routes by ref.backendId, passes ref.cwd, sends session/resume 
   assert.equal(count(log, "__start"), 2, "a fresh dedicated process for the resumed agent");
   assert.deepEqual(withoutSessionId(resumed.sessionRef!), withoutSessionId(ref), "the resumed agent reports the same ref");
 
-  // Without `model` the reopen selects nothing: the session runs on the backend's current default.
+  // An explicit `model` still wins over the ref's.
+  const switched = track(await AcpAgent.resume(ref, { model: "claude/sonnet" }));
+  assert.equal(switched.model, "claude/sonnet");
+  assert.equal(switched.sessionRef!.model, "claude/sonnet");
+  await switched.close({ keep: true });
+
+  // A ref with no model (nothing was ever selected on the session) selects nothing: the session
+  // runs on whatever the backend restores or defaults to.
+  const { model: _model, ...modelless } = ref;
   const selections = count(readLog(), "setSessionConfigOption");
-  const plain = track(await AcpAgent.resume(ref));
+  const plain = track(await AcpAgent.resume(modelless));
   assert.equal(plain.model, undefined);
-  assert.equal(count(readLog(), "setSessionConfigOption"), selections, "no model passed back: no selection on the wire");
+  assert.equal("model" in plain.sessionRef!, false);
+  assert.equal(count(readLog(), "setSessionConfigOption"), selections, "no model on the ref: no selection on the wire");
   await plain.close({ keep: true });
 
   // Behavioral companion to the routing weld: the agent's ref IS the runner's builder output,
-  // which is InteractiveSession.sessionRef plus poolKey (modulo sessionId).
+  // which is InteractiveSession.sessionRef plus poolKey (modulo sessionId) — the selected model
+  // included, on all three.
   const runner = harness.track(createAcpRunner());
-  const interactive = await runner.openSession({ model: "claude", cwd });
+  const interactive = await runner.openSession({ model: "claude/opus", cwd });
   const fromInteractive = interactive.sessionRef;
   await interactive.release();
   assert.deepEqual(withoutSessionId(ref), { ...withoutSessionId(fromInteractive), poolKey: "claude" });
@@ -113,6 +123,8 @@ test("resume(ref) routes by ref.backendId, passes ref.cwd, sends session/resume 
   const connection = harness.track(PooledConnection.create(backend, { onDead: () => undefined }));
   const sessionOptions: AcpSessionOptions = { cwd, schema: undefined, policy: {} };
   const handle = await connection.openSession(sessionOptions);
+  assert.equal("model" in sessionRefFor(handle, backend, cwd), false, "nothing selected yet: the ref records no model");
+  await handle.selectModel("opus");
   assert.deepEqual(withoutSessionId(ref), withoutSessionId(sessionRefFor(handle, backend, cwd)));
   await handle.release();
   assert.deepEqual(JSON.parse(JSON.stringify(ref)), ref, "JSON-round-trippable");
@@ -328,9 +340,15 @@ test("resume(ref) baselines the gauge the ref recorded: the first turn reports i
   assert.equal(restarted.sessionRef!.costGauge, 0.004);
 });
 
-test("a malformed ref.costGauge fails the reopen before any process spawns", async () => {
+test("a malformed ref.model or ref.costGauge fails the reopen before any process spawns", async () => {
   const { cwd, readLog } = configure({ lifecycleSupport: true, resumeSession: {}, turns: [{ text: "ok" }] });
   const ref = { sessionId: "s-1", backendId: "claude", cwd, reopen: { load: true, resume: true, list: true, fork: true } };
+  for (const model of ["", "   ", 7]) {
+    await assert.rejects(
+      AcpAgent.resume({ ...ref, model } as unknown as AgentSessionRef),
+      validation(/model, when present, is a non-empty string/),
+    );
+  }
   for (const costGauge of [-0.01, Number.NaN, "0.03"]) {
     await assert.rejects(
       AcpAgent.resume({ ...ref, costGauge } as unknown as AgentSessionRef),
