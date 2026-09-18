@@ -10,7 +10,7 @@ import type {Thread} from "../../app-server/v2";
 import {LOADED_TURN_ENDED_METHOD, LOADED_TURN_QUERY_METHOD} from "../../AcpExtensions";
 
 /**
- * The `_session/loaded_turn` extension (the REPL broker's re-attach arm's
+ * The `_session/loaded_turn` extension (a re-attaching host's
  * authoritative completion evidence): the query answers whether the
  * loaded session's founding turn is still running right now, and the
  * ended notification is pushed when a turn that a query classified

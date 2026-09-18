@@ -27,7 +27,7 @@ test("released SDK v1 client retains the sessionful legacy end-to-end path", asy
     assert.deepEqual(client.getServerCapabilities()?.extensions?.[SKILLS_EXTENSION_ID], { directoryRead: true });
     const tools = await client.listTools();
     assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
-      "repl", "workflow", "workflow-events", "workflow-notifications", "workflow-runs", "workflow_monitor",
+      "workflow", "workflow-events", "workflow-notifications", "workflow-runs", "workflow_monitor",
     ]);
     const accepted = await client.callTool({
       name: "workflow",

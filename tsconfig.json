@@ -5,7 +5,6 @@
     { "path": "packages/acp-agents" },
     { "path": "packages/acp-server" },
     { "path": "packages/workflow-engine" },
-    { "path": "packages/repl-engine" },
     { "path": "packages/mcp-server" },
     { "path": "packages/pi-acp" },
     { "path": "packages/workflows" },

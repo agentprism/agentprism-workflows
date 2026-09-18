@@ -34,7 +34,7 @@ test("tool discovery exposes asynchronous lifecycle separately from the dedicate
   const { client, dispose } = await connect(okRunner(), { listTools: true, uiCapability: "matching" });
   try {
     const { tools } = await client.listTools();
-    assert.deepEqual(tools.map(tool => tool.name).sort(), ["repl", "workflow", "workflow-events", "workflow-notifications", "workflow-runs", "workflow_monitor"]);
+    assert.deepEqual(tools.map(tool => tool.name).sort(), ["workflow", "workflow-events", "workflow-notifications", "workflow-runs", "workflow_monitor"]);
     const workflow = tools.find(tool => tool.name === "workflow")!;
     const monitor = tools.find(tool => tool.name === "workflow_monitor")!;
     assert.equal(field(workflow._meta, "ui"), undefined);

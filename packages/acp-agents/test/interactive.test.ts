@@ -262,7 +262,7 @@ test("InteractiveSession.prompt fires the handoff acknowledgment only after the 
   });
   // Preflight rejection: a second prompt while one is in flight. The
   // acknowledgment must never fire for a turn the backend was never
-  // handed (the REPL broker records its delivered marker in it — a
+  // handed (a host records its delivered marker in it — a
   // false positive would make a restore skip a never-delivered turn).
   const first = session.prompt("one", { onHandoff: () => order.push("handoff") });
   assert.deepEqual(

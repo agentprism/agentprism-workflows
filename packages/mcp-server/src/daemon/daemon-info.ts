@@ -38,7 +38,7 @@ import {
 import { dirname, join } from "node:path";
 import { workflowHomeDir } from "@automatalabs/workflows";
 
-import { DAEMON_NAME, DAEMON_IDLE_TTL_ENV, REPL_DRAIN_BOUND_ENV, SESSION_IDLE_TTL_ENV } from "./constants.js";
+import { DAEMON_NAME, DAEMON_IDLE_TTL_ENV, SESSION_IDLE_TTL_ENV } from "./constants.js";
 
 export interface DaemonInfo {
   name: typeof DAEMON_NAME;
@@ -55,13 +55,6 @@ export interface DaemonInfo {
   controlUrl?: string;
   /** Internal run-control protocol version. */
   controlProtocol?: 1;
-  /** The REPL eval-break relay's loopback endpoint (see
-   *  `repl-engine`'s `EvalBreakChannel`): the shim fires the interrupt
-   *  tool's no-id break here while the daemon's main thread is blocked
-   *  in a synchronous eval. Absent on older daemons (the shim then
-   *  skips the out-of-band fire and the per-eval deadline remains the
-   *  bound). */
-  replBreakUrl?: string;
 }
 
 export interface SpawnLock {
@@ -340,7 +333,7 @@ export function isDaemonProcess(pid: number): boolean {
  * The lifetime knobs are excluded — they do not change what the daemon serves.
  */
 const ENV_FINGERPRINT_PREFIXES = ["AGENTPRISM_", "OPENCODE_ACP_", "PI_ACP_", "CODEX_ACP_"];
-const ENV_FINGERPRINT_EXCLUDED = new Set([DAEMON_IDLE_TTL_ENV, SESSION_IDLE_TTL_ENV, REPL_DRAIN_BOUND_ENV]);
+const ENV_FINGERPRINT_EXCLUDED = new Set([DAEMON_IDLE_TTL_ENV, SESSION_IDLE_TTL_ENV]);
 
 export function envFingerprint(env: Record<string, string | undefined> = process.env): string {
   const relevant = Object.entries(env)

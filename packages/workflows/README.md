@@ -12,7 +12,7 @@ or a registered custom ACP agent — driving the actual subprocess to completion
 This package is the **canonical SDK** that the stdio MCP server
 [`@automatalabs/mcp-server`](https://www.npmjs.com/package/@automatalabs/mcp-server) is built on.
 Its CLI can also delegate to a build-time embedded copy of that server with the `mcp` subcommand,
-so an MCP host can expose `workflow`, `workflow_monitor`, and `repl` without a separate package install. The
+so an MCP host can expose `workflow` and `workflow_monitor` without a separate package install. The
 standalone MCP server package remains independently published, while programs embedding the runner
 continue to use this package's workflow/runner APIs.
 
@@ -879,8 +879,8 @@ hosts (Claude Code `--transport http`, Codex `config.toml` `url`), which can ski
 entirely. See the [`@automatalabs/mcp-server` README](../mcp-server#the-workflow-daemon) for
 the daemon's full contract (discovery, project routing, idle shutdown, security posture).
 
-The bundled server exposes `workflow`, the separate `workflow_monitor` view entry on App-capable
-hosts, and `repl`; it has no auth tools. `workflow` has the strict
+The bundled server exposes `workflow` and the separate `workflow_monitor` view entry on App-capable
+hosts; it has no auth tools. `workflow` has the strict
 config/run/resume/setup-response/status/result/permissions-response/stop lifecycle. Run prepares
 the script inside the request (structure checks, mocked dry run, routed probes, routing admission)
 and acknowledges only an admitted run; malformed input and validation failures are tool execution
@@ -896,12 +896,6 @@ host replacing panels; non-App clients use Status, Result, and the same controls
 and terminal notifications use available host capabilities with duplicate suppression; routine
 activity remains quiet. Panel closure and request timeout never stop an accepted run. Explicit
 Stop is durable; cold recovery preserves the source, setup receipts, and checkpoint answers. See the [lifecycle reference](../../docs/authoring/agentprism-workflow-authoring/references/run-lifecycle.md).
-
-The `repl` tool is a persistent QuickJS-in-WASM JavaScript REPL, **one VM per `projectDir`**
-(the same per-project model as `workflow`), for live, stateful subagent orchestration: workspace
-state (bindings, pending subagent calls, checkpoints, logged values) persists in the VM across tool
-calls and daemon restarts through the per-project `repl/` store, and drains when the project's last
-MCP client disconnects. See [The `repl` tool](../mcp-server#the-repl-tool) for its full contract.
 
 For the source inner loop, build workflows before launching its compiled CLI:
 
@@ -1084,7 +1078,7 @@ globals documented by the ambient `dsl.d.ts`.)
 
 ## Authoring guidance for MCP agents
 
-The MCP server bundled in this package publishes version-matched workflow and REPL Agent Skills
+The MCP server bundled in this package publishes the version-matched workflow Agent Skill
 through the accepted SEP-2640 Skills Extension. A skills-aware host discovers
 `skill://agentprism-workflow-authoring/SKILL.md`, activates it through its own approval path, and
 reads supporting references lazily through MCP resources. The concise canonical sources live under
@@ -1100,7 +1094,7 @@ reads supporting references lazily through MCP resources. The concise canonical 
   MCP-wired image producer.
 - **[`@automatalabs/mcp-server`](https://www.npmjs.com/package/@automatalabs/mcp-server)** — the
   stdio MCP server built on this SDK. It wraps the same engine + ACP backend behind the `workflow`
-  and `repl` tools, with a separate `workflow_monitor` view (bin: `agentprism-workflow`; no auth tools). Use it when you want
+  tool, with a separate `workflow_monitor` view (bin: `agentprism-workflow`; no auth tools). Use it when you want
   the **MCP-tool route** instead of embedding the runner in code.
 
 ## License

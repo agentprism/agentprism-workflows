@@ -148,7 +148,7 @@ async function exerciseEra(
     }
     const listed = await connected.client.listTools();
     const tools = listed.tools.map((tool) => tool.name).sort();
-    assert.deepEqual(tools, ["repl", "workflow", "workflow-events", "workflow-notifications", "workflow-runs", "workflow_monitor"]);
+    assert.deepEqual(tools, ["workflow", "workflow-events", "workflow-notifications", "workflow-runs", "workflow_monitor"]);
     const workflow = listed.tools.find((tool) => tool.name === "workflow");
     assert.ok(workflow);
     const panel = await connected.client.readResource({
@@ -635,7 +635,7 @@ test("legacy and modern requests both keep the Apps surface capability-gated", a
         const connected = await connectHttp(daemon.url, { protocolMode, uiCapability });
         try {
           const listed = await connected.client.listTools();
-          assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), ["repl", "workflow"]);
+          assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), ["workflow"]);
           assert.equal(listed.tools.find((tool) => tool.name === "workflow")?._meta, undefined);
           const directAppCall = await connected.client.callTool({
             name: "workflow-events",

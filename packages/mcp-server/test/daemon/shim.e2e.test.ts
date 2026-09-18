@@ -44,6 +44,28 @@ const NO_AGENT_SCRIPT = [
   'export const meta = { name: "no-agent", description: "no subagents" };',
   "return 42;",
 ].join("\n");
+/**
+ * A request the daemon ACCEPTS and cannot finish before it dies: a live config probe spawns real
+ * backend adapters (seconds of work, none of it blocking the daemon's event loop, so the response
+ * stream is open), and the daemon is frozen mid-probe so the answer can never be written. A
+ * request that never reached the daemon is a different case — the legacy path replays it.
+ */
+function startUnanswerableRequest(client: Client, daemonPid: number): ReturnType<Client["callTool"]> {
+  const inflight = client.callTool(
+    { name: "workflow", arguments: { action: "config", projectDir: e2eHome, harnesses: ["claude", "codex"] } },
+    { timeout: 50_000 },
+  );
+  // Observe the failure from the start: the rejection may land before the caller awaits it.
+  inflight.catch(() => undefined);
+  setTimeout(() => {
+    try {
+      process.kill(daemonPid, "SIGSTOP");
+    } catch {
+      /* already gone */
+    }
+  }, 300);
+  return inflight;
+}
 
 interface E2eDaemonInfo {
   pid: number;
@@ -401,13 +423,8 @@ test("a request in flight when the daemon dies is answered with an error (never 
   const before = readInfo();
   assert.ok(before);
 
-  // A request that will never complete on this daemon: a synchronous never-yielding eval
-  // blocks the daemon's main thread (the repl-break e2e's fixture). It is in flight when the
-  // daemon is killed outright.
-  const inflight = session.client.callTool(
-    { name: "repl", arguments: { action: "eval", projectDir: e2eHome, code: "while (true) {}" } },
-    { timeout: 50_000 },
-  );
+  // It is in flight when the daemon is killed outright.
+  const inflight = startUnanswerableRequest(session.client, before.pid);
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
   process.kill(before.pid, "SIGKILL");
   await waitFor(() => !pidAlive(before.pid), "old daemon to die");
@@ -433,10 +450,7 @@ test("a modern in-flight request is failed as ambiguous and never replayed after
     const before = readInfo();
     assert.ok(before);
 
-    const inflight = session.client.callTool(
-      { name: "repl", arguments: { action: "eval", projectDir: e2eHome, code: "while (true) {}" } },
-      { timeout: 50_000 },
-    );
+    const inflight = startUnanswerableRequest(session.client, before.pid);
     const inflightFailure = inflight.then(
       () => undefined,
       (error: unknown) => error,
@@ -455,7 +469,7 @@ test("a modern in-flight request is failed as ambiguous and never replayed after
     assert.equal(
       (await second)?.status,
       "completed",
-      "the ambiguous eval was not replayed onto the successor and did not block it",
+      "the ambiguous request was failed, and the successor serves the same client",
     );
   } finally {
     await session.close();

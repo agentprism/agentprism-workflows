@@ -3004,7 +3004,7 @@ export class SessionHandle implements StructuredSource {
    *  The trailing kind is PROGRESS evidence, never completion by itself —
    *  the seam classifies completion from the LOAD BOUNDARY plus whether
    *  any content update followed the load (see `loadBoundaryState`).
-   *  Added for the REPL broker's re-attach arm; additive passthrough to
+   *  For a host's re-attach arm; additive passthrough to
    *  `SessionState`. */
   loadedTurnState(): { hasUserMessage: boolean; trailingContentKind: 'assistant-message' | 'other' } {
     return this.state.loadedTurnState();
@@ -3029,21 +3029,21 @@ export class SessionHandle implements StructuredSource {
   }
 
   /** The most recent instant a session/update arrived for this session
-   *  (the re-attach arm's stream-settled clock). Added for the REPL
-   *  broker's re-attach arm; additive passthrough to `SessionState`. */
+   *  (the re-attach arm's stream-settled clock). For a host's re-attach
+   *  arm; additive passthrough to `SessionState`. */
   lastUpdateAtMs(): number {
     return this.state.lastUpdateAtMs();
   }
 
   /** Watch the session/update stream (fires after every applied update;
-   *  returns the unsubscribe thunk). Added for the REPL broker's re-attach
+   *  returns the unsubscribe thunk). For a host's re-attach
    *  arm; additive passthrough to `SessionState`. */
   subscribeUpdates(listener: () => void): () => void {
     return this.state.subscribeUpdates(listener);
   }
 
   /** The founding turn's assistant text (the transcript accumulated after
-   *  the last user-message boundary). Added for the REPL broker's re-attach
+   *  the last user-message boundary). For a host's re-attach
    *  arm; additive passthrough to `SessionState`. */
   loadedTurnText(): string {
     return this.state.loadedTurnText();
@@ -3051,7 +3051,7 @@ export class SessionHandle implements StructuredSource {
 
   /** The recorded `_session/loaded_turn/ended` terminal state (the
    *  re-attach arm's authoritative completion evidence), or null when a
-   *  running founding turn has not ended yet. Added for the REPL broker's
+   *  running founding turn has not ended yet. For a host's
    *  re-attach arm; additive passthrough to `SessionState`. */
   loadedTurnEndedState(): { stopReason?: string; error?: { name: string; message: string } } | null {
     return this.state.loadedTurnEndedState();
@@ -3059,8 +3059,8 @@ export class SessionHandle implements StructuredSource {
 
   /** Watch the loaded-turn-ended channel (fires when the
    *  `_session/loaded_turn/ended` notification arrives — and immediately
-   *  when one already arrived). Returns the unsubscribe thunk. Added for
-   *  the REPL broker's re-attach arm; additive passthrough to
+   *  when one already arrived). Returns the unsubscribe thunk. For
+   *  a host's re-attach arm; additive passthrough to
    *  `SessionState`. */
   subscribeLoadedTurnEnded(listener: () => void): () => void {
     return this.state.subscribeLoadedTurnEnded(listener);

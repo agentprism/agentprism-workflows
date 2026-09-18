@@ -636,88 +636,25 @@ test("live workflow config discovery: no-prompt catalogs create no run and inval
     const thinking = (exactPiRow.options as Array<Record<string, unknown>>).find((option) => option.id === "thinkingLevel");
     assert.equal(typeof thinking?.currentValue, "string", JSON.stringify(exactPiRow));
 
-    const replFailure = await client.callTool({
-      name: "repl",
+    // An unadvertised mode is refused at preparation — no run is created and the agent is never
+    // prompted — and the refusal names the mode, never the (valid) config option beside it.
+    const invalidMode = await client.callTool({
+      name: "workflow",
       arguments: {
-        action: "eval",
+        action: "run",
         projectDir,
-        timeoutMs: 120_000,
-        code: `await agent(${JSON.stringify(`pi/${PI_E2E_MODEL}`)}, "must never prompt", { mode: "default", configOptions: { thinkingLevel: ${JSON.stringify(thinking?.currentValue)} } }).catch(e => e.name + ": " + e.message)`,
+        script: [
+          "export const meta = { name: 'invalid-mode', description: 'an unadvertised session mode is refused before execution' }",
+          `return await agent("must never prompt", { model: ${JSON.stringify(`pi/${PI_E2E_MODEL}`)}, mode: "default", configOptions: { thinkingLevel: ${JSON.stringify(thinking?.currentValue)} } })`,
+        ].join("\n"),
       },
     }, { timeout: 240_000, maxTotalTimeout: 240_000 });
-    assert.notEqual(replFailure.isError, true, JSON.stringify(replFailure));
-    const replResult = (replFailure.structuredContent as Record<string, unknown>).result;
-    assert.equal(typeof replResult, "string", JSON.stringify(replFailure.structuredContent));
-    assert.match(replResult as string, /cannot apply session mode "default" \(advertised modes: none\)/);
-    assert.doesNotMatch(replResult as string, /ConfigOptionsError|offending key|thinkingLevel/);
-  } finally {
-    await client.close().catch(() => undefined);
-    await transport.close().catch(() => undefined);
-  }
-});
-
-test("live REPL queue smoke: Claude, OpenCode, Pi, and (when opted in) Codex continue one session through broker-owned FIFO prompts", {
-  skip: SKIP,
-  timeout: 600_000,
-}, async () => {
-  assert.ok(existsSync(SERVER_ENTRY), `built server entry missing — run \`pnpm build\` first: ${SERVER_ENTRY}`);
-  const projectDir = fileURLToPath(new URL("../../..", import.meta.url));
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [SERVER_ENTRY],
-    env: env as Record<string, string>,
-    stderr: "pipe",
-    cwd: projectDir,
-  });
-  const client = new Client({ name: "live-repl-queue", version: "0.0.0" }, { capabilities: {} });
-  const specs: Record<string, string> = {
-    claude: CLAUDE_E2E_MODEL,
-    ...(CODEX_LIVE ? { codex: "codex" } : {}),
-    opencode: OPENCODE_E2E_MODEL,
-    pi: `pi/${PI_E2E_MODEL}`,
-  };
-  const names = Object.keys(specs);
-  const suffix = `${Date.now().toString(36)}_${process.pid}`;
-  const handleName = (name: string): string => `live_${name}_${suffix}`;
-  const queueName = (name: string): string => `queued_${name}_${suffix}`;
-  const lastLine = (value: unknown): string =>
-    typeof value === "string" ? (value.trim().split("\n").at(-1)?.trim() ?? "") : "";
-  try {
-    await client.connect(transport);
-    const foundingSource = names.map((name) =>
-      `const ${handleName(name)} = agent(${JSON.stringify(specs[name])}, ${JSON.stringify(`Reply with exactly FOUNDING_${name.toUpperCase()} and no other text. Do not call tools.`)});`,
-    ).join("\n") +
-      `\nJSON.stringify(await Promise.all([${names.map(handleName).join(", ")}]))`;
-    const founding = await client.callTool({
-      name: "repl",
-      arguments: { action: "eval", projectDir, code: foundingSource, timeoutMs: 120_000 },
-    }, { timeout: 240_000, maxTotalTimeout: 240_000 });
-    assert.notEqual(founding.isError, true, JSON.stringify(founding));
-    const foundingResult = (founding.structuredContent as Record<string, unknown> | undefined)?.result;
-    assert.equal(typeof foundingResult, "string", JSON.stringify(founding.structuredContent));
-    const foundingValues = JSON.parse(foundingResult as string) as unknown[];
-    assert.deepEqual(
-      foundingValues.map(lastLine),
-      names.map((name) => `FOUNDING_${name.toUpperCase()}`),
-    );
-
-    const queueSource = names.map((name) =>
-      `const ${queueName(name)} = ${handleName(name)}.queue(${JSON.stringify(`Reply with exactly QUEUE_${name.toUpperCase()} and no other text. Do not call tools.`)});`,
-    ).join("\n") +
-      `\nJSON.stringify(await Promise.all([${names.map(queueName).join(", ")}]))`;
-    const queued = await client.callTool({
-      name: "repl",
-      arguments: { action: "eval", projectDir, code: queueSource, timeoutMs: 120_000 },
-    }, { timeout: 240_000, maxTotalTimeout: 240_000 });
-    assert.notEqual(queued.isError, true, JSON.stringify(queued));
-    const queuedResult = (queued.structuredContent as Record<string, unknown> | undefined)?.result;
-    assert.equal(typeof queuedResult, "string", JSON.stringify(queued.structuredContent));
-    const queuedValues = JSON.parse(queuedResult as string) as unknown[];
-    assert.deepEqual(
-      queuedValues.map(lastLine),
-      names.map((name) => `QUEUE_${name.toUpperCase()}`),
-    );
+    const invalidModeText = JSON.stringify(invalidMode);
+    assert.equal(invalidMode.isError, true, invalidModeText);
+    assert.equal(asObject(invalidMode.structuredContent)?.runId, undefined, "a refused preparation creates no workflow run");
+    assert.match(invalidModeText, /Workflow run was not started/);
+    assert.match(invalidModeText, /mode authored value \\"default\\" is not advertised by pi model/);
+    assert.doesNotMatch(invalidModeText, /ConfigOptionsError|offending key/);
   } finally {
     await client.close().catch(() => undefined);
     await transport.close().catch(() => undefined);

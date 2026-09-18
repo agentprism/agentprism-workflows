@@ -2,8 +2,8 @@ import { RequestError } from "@agentclientprotocol/sdk";
 
 /**
  * The `_session/loaded_turn` vendor extension — turn-TERMINAL state for
- * loaded sessions (the steering-extension precedent; the REPL broker's
- * re-attach arm's authoritative completion evidence). Advertised at
+ * loaded sessions (the steering-extension precedent; a re-attaching
+ * host's authoritative completion evidence). Advertised at
  * initialize via `_meta.loadedTurn.supported === true`; a client seam
  * against a server without the advertisement degrades guest-visibly
  * (never settles partial output, never re-issues a possibly-running

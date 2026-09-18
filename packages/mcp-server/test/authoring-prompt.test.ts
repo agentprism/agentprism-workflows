@@ -70,7 +70,7 @@ test("prompt registration leaves a non-Apps client's core tool inventory unchang
     const { tools } = await client.listTools();
     assert.deepEqual(
       tools.map((tool) => tool.name).sort(),
-      ["repl", "workflow"],
+      ["workflow"],
     );
   } finally {
     await dispose();

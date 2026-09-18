@@ -39,7 +39,7 @@ test("only workflow_monitor carries the panel resource; app-only support tools c
     const { tools } = await client.listTools();
     assert.deepEqual(
       tools.map((tool) => tool.name).sort(),
-      ["repl", "workflow", WORKFLOW_MONITOR_TOOL_NAME, WORKFLOW_EVENTS_TOOL_NAME, WORKFLOW_RUNS_TOOL_NAME, WORKFLOW_NOTIFICATIONS_TOOL_NAME].sort(),
+      ["workflow", WORKFLOW_MONITOR_TOOL_NAME, WORKFLOW_EVENTS_TOOL_NAME, WORKFLOW_RUNS_TOOL_NAME, WORKFLOW_NOTIFICATIONS_TOOL_NAME].sort(),
     );
 
     const workflow = tools.find((tool) => tool.name === "workflow");
@@ -95,7 +95,7 @@ test("only the exact well-formed extensions capability receives the MCP Apps sur
       malformedString,
     ]) {
       const tools = (await session.client.listTools()).tools;
-      assert.deepEqual(tools.map((tool) => tool.name).sort(), ["repl", "workflow"]);
+      assert.deepEqual(tools.map((tool) => tool.name).sort(), ["workflow"]);
       const workflow = tools.find((tool) => tool.name === "workflow");
       assert.ok(workflow);
       assert.equal(workflow._meta, undefined, "text workflow has no UI metadata");

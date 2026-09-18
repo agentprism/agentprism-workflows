@@ -1,6 +1,6 @@
 # Contributing
 
-This is a **pnpm workspace** (monorepo) of ten packages under the `@automatalabs` scope. The user-facing overview is in [`README.md`](README.md); the integration API is in [`docs/api.md`](docs/api.md).
+This is a **pnpm workspace** (monorepo) of nine packages under the `@automatalabs` scope. The user-facing overview is in [`README.md`](README.md); the integration API is in [`docs/api.md`](docs/api.md).
 
 ## Prerequisites
 
@@ -30,14 +30,13 @@ pnpm typecheck      # pnpm -r exec tsc --noEmit
 | `packages/workflow-engine` | The deterministic engine (realm, parallel/pipeline, journal/resume, budget, worktree). |
 | `packages/acp-agents` | ACP client + Claude/Codex/OpenCode/pi/custom backends (the `AgentRunner` implementation, pooling, auth/session lifecycle). |
 | `packages/acp-server` | Connection-pinned ACP V1 proxy over stdio, Streamable HTTP, or WebSocket, with extension-negotiated backend discovery (bin `agentprism-acp-server`). |
-| `packages/mcp-server` | The stdio MCP server / composition root (bin `agentprism-workflow`; the `workflow` and `repl` tools plus the Apps-capable `workflow_monitor` launcher — no auth tools). |
+| `packages/mcp-server` | The stdio MCP server / composition root (bin `agentprism-workflow`; the `workflow` tool plus the Apps-capable `workflow_monitor` launcher — no auth tools). |
 | `packages/workflows` | The importable SDK facade. |
 | `packages/agentprism-otel` | Optional OpenTelemetry bridge for `WorkflowManager` events. |
-| `packages/repl-engine` | The REPL orchestrator engine: persistent JS REPL in a QuickJS-in-WASM VM (workspace lifecycle, eval + job drain, per-VM memory limits, per-eval interrupts). |
 | `packages/pi-acp` | Standalone in-process ACP server and library adapter for the pi coding agent. |
 | `packages/codex-acp` | Our codex-acp fork (full upstream history, non-squashed subtree): the ACP server the Codex backend spawns. |
 
-`workflow-engine` and `acp-agents` are **siblings** — neither imports the other; they meet only at the `AgentRunner` seam in `shared-types`. `workflows` is the single facade that composes them; `mcp-server` builds on `workflows`, while `acp-server` builds directly on `acp-agents`. So the primary dependency direction is `mcp-server → workflows → { workflow-engine, acp-agents, shared-types }` and `acp-server → acp-agents`. `agentprism-otel` is an independent leaf with an `@opentelemetry/api` peer dependency; it observes the manager structurally and is not in that runtime chain. `repl-engine` is **not** a leaf: it composes the `quickjs-wasi` shim with `workflows`, `acp-agents`, and `shared-types`, and its `repl` MCP tool is registered in `mcp-server` (which depends on `repl-engine`) — the `repl-orchestrator` roadmap phase is implemented (`docs/roadmap/repl-orchestrator.md`) and the package is published independently.
+`workflow-engine` and `acp-agents` are **siblings** — neither imports the other; they meet only at the `AgentRunner` seam in `shared-types`. `workflows` is the single facade that composes them; `mcp-server` builds on `workflows`, while `acp-server` builds directly on `acp-agents`. So the primary dependency direction is `mcp-server → workflows → { workflow-engine, acp-agents, shared-types }` and `acp-server → acp-agents`. `agentprism-otel` is an independent leaf with an `@opentelemetry/api` peer dependency; it observes the manager structurally and is not in that runtime chain.
 
 ### Conventions
 

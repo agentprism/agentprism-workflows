@@ -85,7 +85,7 @@ normal structured error path.
 
 Pi also advertises the `_session/loaded_turn` extension at top-level initialize metadata as
 `_meta: { loadedTurn: { supported: true } }` — the re-attach arm's AUTHORITATIVE completion
-evidence for a session re-opened with `session/load` (the REPL broker's restore path).
+evidence for a session re-opened with `session/load` (a restarted host's restore path).
 `_session/loaded_turn/query { sessionId }` answers whether the loaded session's founding turn is
 still running right now: `running` while a turn executes in this process (the client then waits
 for the `_session/loaded_turn/ended` push — sent with the turn's stop reason, or its error, when

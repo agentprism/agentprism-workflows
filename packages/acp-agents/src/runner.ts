@@ -594,9 +594,8 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
   /** The configured DEFAULT backend id — the registry's own routing for
    *  an omitted model (`selectBackend({})`: the `AGENTPRISM_DEFAULT_BACKEND`
    *  env-configured backend when registered, the built-in `claude`
-   *  otherwise). The repl-engine's broker serves this to the guest library
-   *  (verify/judgePanel resolve their reviewer/grader spec through it — a
-   *  real registered segment, never the deleted reserved sentinel). */
+   *  otherwise). A host that resolves a model spec on a caller's behalf reads it
+   *  to name a real registered segment. */
   defaultBackendId(): string {
     return selectBackend({}, this.backends).id;
   }
