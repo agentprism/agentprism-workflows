@@ -1,5 +1,27 @@
 # @automatalabs/acp-agents
 
+## 3.1.0
+
+### Minor Changes
+
+- 4618813: Carry the wrapped Claude Code runtime to `@anthropic-ai/claude-agent-sdk@0.3.277` through a workspace override, ahead of `@agentclientprotocol/claude-agent-acp@0.79.0`'s own 0.3.274 pin, and stop counting a reopened or forked session's carried-over cost as new spend.
+
+  **Cost accounting fix.** Per-turn and per-call cost is the growth of the agent's cumulative `usage_update.cost.amount` gauge, and that growth was measured from zero on every new handle. A gauge that carries the source session's total into a reopened or forked session therefore charged the whole earlier total to the first turn after the boundary. 0.3.277 makes Claude do exactly that on `session/resume` (a resumed session's `total_cost_usd` now continues from the earlier turns); OpenCode and pi already did it on resume, load, **and** fork, so the over-count predates this release for them. Now:
+
+  - `AgentSessionRef` gains an optional `costGauge`: the session's latest cumulative cost gauge when the ref was captured. `AcpAgent.sessionRef` reads it live and keeps it after `close()`. `RunOptions` gains `onSessionCostGauge(amount)`, fired at most once at release next to `onUsage` (`onSessionOpen` fires before the first prompt and cannot carry it); the workflow engine folds it into the recorded `AgentSessionRecord`, so a paused call's gauge rides the `continueFromSession` directive on resume.
+  - `UsageAccumulator.settleInheritedCost(seed?)` baselines the inherited total at the acquisition boundary, and every figure the accumulator reports (`baseline()`, `delta()`, `toAgentUsage()`) is the handle's own spend. `AcpAgent.resume/load/fork`, `agent.fork()`, and the runner's `continueFromSession` reattach seed it. A first reading below the seed proves the agent restarted its gauge, and nothing is subtracted; a reading that arrived during the reopen is itself the inherited total. `UsageAccumulator.costGauge` exposes the agent's cumulative figure for the ref.
+  - New `COST_GAUGE_INHERITANCE` table (with `costGaugeInheritance()` and `COST_GAUGE_INHERITANCE_DEFAULT`) records, per built-in, whether the gauge `inherits` or `restarts` on reopen and on fork: Claude inherits on reopen and restarts on fork; OpenCode and pi inherit on both; Codex reports no cost; unknown and custom agents follow ACP's cumulative-session definition. The fork/resume live e2e asserts each installed agent against its row.
+  - `AcpAgentTurn.usage.session.cost` is accordingly this agent's own spend rather than the raw gauge. A `costGauge` that is present but not a non-negative finite number fails `AcpAgent.resume/load/fork` validation and invalidates a recorded continuation session.
+
+  **Runtime.** 0.3.275 fixes session history the adapter reads on `session/load` and fork (`getSessionMessages()` / `forkSession()` no longer miss a turn's assistant message right after its `result`, a queued message or task notification read while a tool was running comes back where it was read, `forkSession` accepts the id returned for a message sent mid-turn). 0.3.276 / Claude Code 2.1.276 fixes a 2.1.275 regression that failed every request with HTTP 400 behind an `ANTHROPIC_BASE_URL` gateway. 0.3.277 / 2.1.277 additionally reports an internal error and exits instead of hanging a headless session with no result, reads `AGENTS.md` in a project with no `CLAUDE.md`, and removes the deprecated `TaskOutput` tool.
+
+### Patch Changes
+
+- Updated dependencies [4618813]
+- Updated dependencies [67668a6]
+  - @automatalabs/shared-types@3.2.0
+  - @automatalabs/codex-acp@2.8.1
+
 ## 3.0.2
 
 ### Patch Changes
