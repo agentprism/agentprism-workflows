@@ -140,11 +140,20 @@ async function forkAndResumeLiveBackend(backend: LiveBackend): Promise<void> {
     // 7. Keep the session on close, then reattach it cold from the ref.
     const ref = primary.sessionRef;
     assert.ok(ref, `${backend}: the ref must survive until close`);
+    const modelOptionOf = (agent: AcpAgent) =>
+      agent.configOptions.find((option) => option.id === "model" || option.category === "model")?.currentValue;
+    const modelBeforeClose = modelOptionOf(primary);
     await primary.close({ keep: true });
     agents.delete(primary);
+    // By ref ALONE: the ref records the model, so the reopen lands on it whatever the agent would
+    // restore by itself (Claude lets `ANTHROPIC_MODEL` / `settings.model` outrank the transcript's
+    // model; a developer machine with such a pin is exactly where this leg earns its keep).
+    assert.equal(ref.model, primary.model, `${backend}: the ref must record the model the session ran on`);
     const resumed = await AcpAgent.resume(ref, { label: `${backend}-resumed` });
     agents.add(resumed);
     assert.equal(resumed.sessionId, ref.sessionId, `${backend}: resume must reattach the same session id`);
+    assert.equal(resumed.model, primary.model, `${backend}: a reopen by ref alone must land on the ref's model`);
+    assert.equal(modelOptionOf(resumed), modelBeforeClose, `${backend}: the reopened session must advertise the model it was closed on`);
     const t4 = await resumed.prompt("What was the first codeword? Reply with only the codeword.");
     assert.ok(t4.text.includes(word1), `${backend}: the resumed session must recall ${word1} — ${diag(backend, t4)}`);
     assertCostBaselined(backend, "reopen", resumed, t4, ref.costGauge);

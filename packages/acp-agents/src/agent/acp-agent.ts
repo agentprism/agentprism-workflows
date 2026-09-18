@@ -233,6 +233,9 @@ function assertSessionRef(ref: AgentSessionRef, label: string | undefined, metho
   if (typeof ref.backendId !== "string" || ref.backendId.trim() === "") {
     throw agentValidationError(`${method} requires a session ref with a non-empty backendId`, label);
   }
+  if (ref.model !== undefined && (typeof ref.model !== "string" || ref.model.trim() === "")) {
+    throw agentValidationError(`${method} requires a session ref whose model, when present, is a non-empty string`, label);
+  }
   if (ref.costGauge !== undefined && !(typeof ref.costGauge === "number" && Number.isFinite(ref.costGauge) && ref.costGauge >= 0)) {
     throw agentValidationError(`${method} requires a session ref whose costGauge, when present, is a non-negative number`, label);
   }
@@ -445,7 +448,9 @@ export class AcpAgent {
       const cwd = options.cwd ?? ref.cwd;
       validateAgentCwd(cwd, label, method);
       const registry = resolveAgentRegistry(options.backends, label);
-      const route = resolveRefRoute(ref, options.model, registry, label);
+      // The ref's own model is the default: a reopen lands on the model the session was running
+      // unless the caller names another.
+      const route = resolveRefRoute(ref, options.model ?? ref.model, registry, label);
       assertSystemPromptSupported(route.backend, options.systemPrompt, label);
       const base = { registry, backend: route.backend, modelSpec: route.modelSpec };
       if (kind === "fork") {
@@ -473,9 +478,8 @@ export class AcpAgent {
   /** The model this agent is on, as a routing spec that leads back to the same backend
    *  (`<backendId>/<model id>`, e.g. `"claude/opus[1m]"`): the constructor's `model` until a
    *  `setModel()` or a per-turn `model` applied, then the switched one; `undefined` when nothing
-   *  was ever selected (the backend's default). Inherited by forks taken after the switch. An
-   *  `AgentSessionRef` carries no model, so a cold reopen keeps it only when told:
-   *  `AcpAgent.resume(agent.sessionRef!, { model: agent.model })`. */
+   *  was ever selected (the backend's default). Inherited by forks taken after the switch, and
+   *  recorded on `sessionRef.model`, so a cold reopen by ref lands on it again. */
   get model(): string | undefined {
     return this.#model;
   }
@@ -496,9 +500,16 @@ export class AcpAgent {
   /** The re-attach handle computed at open (drives `AcpAgent.resume/load/fork`); retained after close. */
   get sessionRef(): AgentSessionRef | undefined {
     const ref = this.#sessionRef;
-    // The gauge moves with every turn, so it is read live (the handle is retained after close).
+    if (ref === undefined) return undefined;
+    // The model moves with `setModel()` / a per-turn switch and the gauge with every turn, so both
+    // are read live (the handle is retained after close).
+    const { model: _model, costGauge: _costGauge, ...identity } = ref;
     const costGauge = this.#handle?.usage.costGauge;
-    return ref === undefined || costGauge === undefined ? ref : { ...ref, costGauge };
+    return {
+      ...identity,
+      ...(this.#model === undefined ? {} : { model: this.#model }),
+      ...(costGauge === undefined ? {} : { costGauge }),
+    };
   }
 
   /** Capabilities negotiated on this agent's dedicated connection. */

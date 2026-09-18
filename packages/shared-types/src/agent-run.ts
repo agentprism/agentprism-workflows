@@ -228,8 +228,9 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
   /** The run's ACP session identity, fired EXACTLY ONCE for whichever acquisition wins:
    *  `session/new`, or `session/resume`/`session/load` on a successful reattach — never
    *  twice. A failed reattach that falls to a fresh `session/new` fires it exactly once for
-   *  the fresh handle. Fires before the first prompt with the re-attach handle — sessionId,
-   *  backend, cwd, and the agent-advertised reopen capabilities. Best-effort observer (a
+   *  the fresh handle. Fires before the first prompt, once the model selection settled, with the
+   *  re-attach handle — sessionId, backend, cwd, the agent-advertised reopen capabilities, and the
+   *  model selected on the session (a rejected selection still reports the session, without one). Best-effort observer (a
    *  throwing callback is isolated, never fails the run) and, like every on* callback,
    *  OUT-OF-BAND: run()'s return value stays the bare AgentResult. NOT part of the resume
    *  identity hash. */

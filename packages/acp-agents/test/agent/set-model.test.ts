@@ -150,7 +150,7 @@ test("setModel queues FIFO behind the in-flight turn, sends set_config_option mo
   ]);
 });
 
-test("a switched model is inherited by a later fork and by a cold resume that passes agent.model back; the ref itself carries none", async () => {
+test("a switched model is inherited by a later fork and by a cold resume by ref alone: the ref records the model the agent is on", async () => {
   const { cwd, readLog } = configure({
     lifecycleSupport: true,
     resumeSession: {},
@@ -178,8 +178,9 @@ test("a switched model is inherited by a later fork and by a cold resume that pa
 
   const ref = parent.sessionRef!;
   await parent.close({ keep: true });
-  assert.equal("model" in ref, false, "the ref carries no model");
-  const resumed = track(await AcpAgent.resume(ref, { model: parent.model }));
+  assert.equal(ref.model, "claude/sonnet", "the ref records the SWITCHED model, not the constructor option");
+  assert.equal(parent.sessionRef!.model, "claude/sonnet", "and keeps it after close");
+  const resumed = track(await AcpAgent.resume(ref));
   assert.equal(resumed.model, "claude/sonnet");
   assert.equal(modelValue(resumed), "sonnet");
   const resumes = readLog().filter((entry) => entry.method === "resumeSession" && entry.params?.sessionId === ref.sessionId);
@@ -187,15 +188,16 @@ test("a switched model is inherited by a later fork and by a cold resume that pa
   const selectedAfterResume = readLog()
     .filter((entry) => entry.pid === resumes[0]!.pid && entry.method === "setSessionConfigOption")
     .map(describe);
-  assert.deepEqual(selectedAfterResume, ["setSessionConfigOption:model=sonnet"], "the passed-back model is selected on the fresh process");
+  assert.deepEqual(selectedAfterResume, ["setSessionConfigOption:model=sonnet"], "the ref's model is selected on the fresh process");
   // A fresh fake process serves its script from `turns[0]` again; the point is that the turn ran.
   assert.equal((await resumed.prompt("second")).text, "parent");
 
-  // Without `model` the reopen selects nothing: the switch lives in the agent, never in the ref.
+  // A ref stripped of its model selects nothing: the reopen is left to the backend.
+  const { model: _model, ...modelless } = ref;
   const selections = count(readLog(), "setSessionConfigOption");
-  const plain = track(await AcpAgent.resume(ref));
+  const plain = track(await AcpAgent.resume(modelless));
   assert.equal(plain.model, undefined);
-  assert.equal(count(readLog(), "setSessionConfigOption"), selections, "no model passed back: no selection on the wire");
+  assert.equal(count(readLog(), "setSessionConfigOption"), selections, "no model on the ref: no selection on the wire");
 });
 
 test("a spec routing to another backend, a backend-only spec, and a blank spec are INVALID_ARGUMENT before anything is sent; model is unchanged", async () => {
