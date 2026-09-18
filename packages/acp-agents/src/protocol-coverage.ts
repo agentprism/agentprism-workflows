@@ -449,6 +449,47 @@ export function promptUsageScope(agent: string): PromptUsageScopeRow["scope"] {
   return promptUsageScopeRow(agent).scope;
 }
 
+/** Whether a session's cumulative cost gauge (`usage_update.cost.amount`) carries the source
+ *  session's total into a reopened (`session/resume` / `session/load`) or forked session, from
+ *  live observation of the installed agents. `inherits`: the first reading already includes the
+ *  earlier spend, so the client baselines it (`UsageAccumulator.settleInheritedCost`) and reports
+ *  only what follows. `restarts`: the gauge starts again at zero. Claude Code persists a session's
+ *  totals and restores them on resume (claude-agent-sdk 0.3.277), but `session/fork` writes a new
+ *  transcript without them; OpenCode and pi derive the gauge from the stored transcript, which a
+ *  fork copies. Codex reports no dollar cost, so its row is inert. */
+export interface CostGaugeInheritanceRow {
+  readonly agent: string;
+  readonly reopen: "inherits" | "restarts";
+  readonly fork: "inherits" | "restarts";
+}
+
+const COST_GAUGE_INHERITANCE_ROWS = [
+  { agent: "claude", reopen: "inherits", fork: "restarts" },
+  { agent: "codex", reopen: "inherits", fork: "inherits" },
+  { agent: "opencode", reopen: "inherits", fork: "inherits" },
+  { agent: "pi", reopen: "inherits", fork: "inherits" },
+] satisfies readonly CostGaugeInheritanceRow[];
+
+/** Per-built-in cost-gauge carry-over. Grounded by the live cost-accounting e2e. */
+export const COST_GAUGE_INHERITANCE: readonly CostGaugeInheritanceRow[] = Object.freeze(
+  COST_GAUGE_INHERITANCE_ROWS.map((row) => Object.freeze(row)),
+);
+
+/** Unknown agents: ACP defines `cost` as the cumulative SESSION cost, so a reopened or forked
+ *  session is assumed to carry it; a first reading below the seed still proves a restart. */
+export const COST_GAUGE_INHERITANCE_DEFAULT: CostGaugeInheritanceRow = Object.freeze({
+  agent: "*",
+  reopen: "inherits",
+  fork: "inherits",
+});
+
+/** The built-in row for `agent`; a custom registry entry (`custom: true`) never inherits a
+ *  built-in's row by name — it is a different program. */
+export function costGaugeInheritance(agent: string, custom = false): CostGaugeInheritanceRow {
+  if (custom) return COST_GAUGE_INHERITANCE_DEFAULT;
+  return COST_GAUGE_INHERITANCE.find((row) => row.agent === agent) ?? COST_GAUGE_INHERITANCE_DEFAULT;
+}
+
 /** One built-in's reference to universal ACP classifications and backend-specific live evidence. */
 export interface BuiltinProtocolCoverageRow {
   readonly clientMethods: Readonly<Record<string, ClientMethodCoverage>>;

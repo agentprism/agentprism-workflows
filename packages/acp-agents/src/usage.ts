@@ -7,7 +7,8 @@
 // Field mapping (frozen contract, agent-run.ts AgentUsage doc):
 //   input      <- inputTokens          output     <- outputTokens
 //   cacheRead  <- cachedReadTokens ?? 0 cacheWrite <- cachedWriteTokens ?? 0
-//   total      <- totalTokens ?? 0      cost       <- Claude: usage_update.cost.amount (USD);
+//   total      <- totalTokens ?? 0      cost       <- usage_update.cost.amount (USD) minus the
+//                                                     total a reopened/forked session inherited;
 //                                                     Codex: 0 (no dollar cost reported)
 //
 // PromptResponse.usage is AUTHORITATIVE (it carries the input/output/cache breakdown).
@@ -19,13 +20,20 @@ import type { AgentUsage } from "@automatalabs/shared-types";
 import type { Cost, Usage } from "@agentclientprotocol/sdk";
 
 export interface UsageBaseline {
+  /** Cost this handle has spent so far: the cumulative gauge minus what it inherited. */
   costAmount: number;
   contextUsedTokens: number;
 }
 
 export class UsageAccumulator {
   private promptUsage: Usage | undefined;
+  /** The latest cumulative gauge reading, or the inherited seed until the first reading. */
   private costAmount = 0;
+  /** The part of the gauge spent BEFORE this handle (a reopened or forked session's carry-over). */
+  private costOrigin = 0;
+  /** `costOrigin` is a recorded seed the agent's first reading has not confirmed yet. */
+  private costOriginProvisional = false;
+  private costObserved = false;
   private contextUsedTokens = 0;
   private contextSizeTokens = 0;
 
@@ -37,8 +45,44 @@ export class UsageAccumulator {
   /** Record the latest cumulative dollar cost carried by a usage_update notification. */
   recordCost(cost: Cost | null | undefined): void {
     if (cost && typeof cost.amount === "number" && Number.isFinite(cost.amount)) {
+      // A gauge that carried the seed forward can only read at or above it. A first reading
+      // below the seed proves the agent restarted the gauge, so nothing was inherited.
+      if (this.costOriginProvisional && cost.amount < this.costOrigin) this.costOrigin = 0;
+      this.costOriginProvisional = false;
       this.costAmount = cost.amount;
+      this.costObserved = true;
     }
+  }
+
+  /**
+   * Settle what a reopened or forked session's cumulative gauge inherited, at the acquisition
+   * boundary and before the handle's first turn. A reading that already arrived (an agent that
+   * announces its gauge on reopen) IS the inherited total. Otherwise `seed` — the gauge recorded
+   * when the session was last held, or the live parent's — stands in until the first reading
+   * confirms it (`recordCost`). Omit `seed` for a gauge known to restart. Every figure this
+   * accumulator reports is then the handle's own spend, never the carry-over.
+   */
+  settleInheritedCost(seed?: number): void {
+    if (this.costObserved) {
+      this.costOrigin = this.costAmount;
+      this.costOriginProvisional = false;
+      return;
+    }
+    if (typeof seed === "number" && Number.isFinite(seed) && seed > 0) {
+      this.costOrigin = seed;
+      this.costAmount = seed;
+      this.costOriginProvisional = true;
+    }
+  }
+
+  /** The session's cumulative gauge as the agent reports it (inherited spend included) — what an
+   *  `AgentSessionRef` records. Undefined while no cost is known. */
+  get costGauge(): number | undefined {
+    return this.costObserved || this.costOriginProvisional ? this.costAmount : undefined;
+  }
+
+  private get costSpent(): number {
+    return Math.max(0, this.costAmount - this.costOrigin);
   }
 
   /**
@@ -55,14 +99,14 @@ export class UsageAccumulator {
   /** Snapshot the cumulative/gauge channels before a continuation turn begins. */
   baseline(): UsageBaseline {
     return {
-      costAmount: this.costAmount,
+      costAmount: this.costSpent,
       contextUsedTokens: this.contextUsedTokens,
     };
   }
 
   /** Report only usage observed after a reopened session's replay/setup boundary. */
   delta(baseline: UsageBaseline): AgentUsage {
-    const cost = Math.max(0, this.costAmount - baseline.costAmount);
+    const cost = Math.max(0, this.costSpent - baseline.costAmount);
     const u = this.promptUsage;
     if (u) {
       return {
@@ -93,7 +137,7 @@ export class UsageAccumulator {
         cacheRead: u.cachedReadTokens ?? 0,
         cacheWrite: u.cachedWriteTokens ?? 0,
         total: u.totalTokens ?? 0,
-        cost: this.costAmount,
+        cost: this.costSpent,
       };
     }
     // No authoritative per-turn breakdown: fall back to the usage_update context tokens so
@@ -104,7 +148,7 @@ export class UsageAccumulator {
       cacheRead: 0,
       cacheWrite: 0,
       total: this.contextUsedTokens,
-      cost: this.costAmount,
+      cost: this.costSpent,
     };
   }
 }

@@ -203,7 +203,7 @@ test("the helpers copied from runner.ts cannot drift silently", () => {
   assert.match(agent, /import \{ assertNoModelConfigOption, type ModelRoute \} from "\.\.\/routing\.js";/);
   assert.match(agentRouting, /import \{ asciiLowercase, resolveModelRoute, type ModelRoute \} from "\.\.\/routing\.js";/);
   assert.match(agent, /resolveModelSwitch,\n\s+resolveRefRoute,\n\s+resolveSameBackendModel,/);
-  assert.match(agent, /import \{ sessionRefFor \} from "\.\.\/session-ref\.js";/);
+  assert.match(agent, /import \{ inheritedCostSeed, sessionRefFor \} from "\.\.\/session-ref\.js";/);
   assert.match(runner, /from "\.\/routing\.js";/);
   assert.match(runner, /from "\.\/session-ref\.js";/);
   assert.match(probe, /import \{ resolveModelRoute \} from "\.\.\/routing\.js";/);

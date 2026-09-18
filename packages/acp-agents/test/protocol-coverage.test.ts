@@ -19,12 +19,15 @@ import {
   FORK_SESSION_TRAIT_DEFAULT,
   HANDLED_AUTH_METHOD_TYPES,
   PI_ACP_PROTOCOL_CONTRACT,
+  COST_GAUGE_INHERITANCE,
+  COST_GAUGE_INHERITANCE_DEFAULT,
   PROMPT_USAGE_SCOPES,
   SESSION_STEERING_METHOD,
   SYSTEM_PROMPT_SUPPORT,
   assertAuthCapabilityShape,
   clientCapabilitiesFor,
   forkSessionTrait,
+  costGaugeInheritance,
   promptUsageScope,
   systemPromptSupport,
 } from "../src/index.js";
@@ -426,4 +429,28 @@ test("system-prompt support rows are grounded in the installed agent dists", () 
   assert.deepEqual(systemPromptSupport("pi"), { replace: true, append: true });
   assert.deepEqual(systemPromptSupport("unknown-custom"), { replace: false, append: false });
   assert.ok(Object.isFrozen(SYSTEM_PROMPT_SUPPORT) && SYSTEM_PROMPT_SUPPORT.every((row) => Object.isFrozen(row)));
+});
+
+// The cumulative cost gauge (`usage_update.cost.amount`) across reopen and fork. Observed live, not
+// readable from a dist: the fork/resume live e2e (`assertCostBaselined`) fails when an installed
+// agent stops matching its row.
+test("the cost gauge carries over on reopen everywhere, and on fork everywhere but claude", () => {
+  assert.deepEqual(
+    COST_GAUGE_INHERITANCE.map(({ agent, reopen, fork }) => ({ agent, reopen, fork })),
+    [
+      { agent: "claude", reopen: "inherits", fork: "restarts" },
+      { agent: "codex", reopen: "inherits", fork: "inherits" },
+      { agent: "opencode", reopen: "inherits", fork: "inherits" },
+      { agent: "pi", reopen: "inherits", fork: "inherits" },
+    ],
+  );
+  assert.ok(Object.isFrozen(COST_GAUGE_INHERITANCE));
+  for (const id of BUILTIN_IDS) {
+    assert.strictEqual(costGaugeInheritance(id), COST_GAUGE_INHERITANCE.find((row) => row.agent === id));
+  }
+  // Unknown and custom agents follow ACP (`cost` is the cumulative SESSION cost); a custom entry
+  // named like a built-in is a different program and never takes the built-in's row.
+  assert.strictEqual(costGaugeInheritance("somebody-elses-agent"), COST_GAUGE_INHERITANCE_DEFAULT);
+  assert.strictEqual(costGaugeInheritance("claude", true), COST_GAUGE_INHERITANCE_DEFAULT);
+  assert.deepEqual({ ...COST_GAUGE_INHERITANCE_DEFAULT }, { agent: "*", reopen: "inherits", fork: "inherits" });
 });

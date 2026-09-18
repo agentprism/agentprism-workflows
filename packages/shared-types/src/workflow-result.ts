@@ -103,6 +103,13 @@ export interface AgentSessionRef {
     /** `session/fork` — driven via `runner.forkSession()`; optional for pre-fork records. */
     fork?: boolean;
   };
+  /** The session's latest CUMULATIVE cost gauge (`usage_update.cost.amount`, in the agent's
+   *  currency) observed when this ref was captured — the session's total so far, not any one
+   *  call's spend. A reopened or forked session's gauge can carry this total forward (every
+   *  built-in that reports cost does on `session/resume`/`session/load`), so the reopening side
+   *  baselines it and reports only the spend that follows. Absent when the agent reported no
+   *  cost. ADDITIVE and NOT a hash input. */
+  costGauge?: number;
 }
 
 /** One run's session ref PLUS its workflow-call context — what lands in JournalEntry.session,

@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { AcpAgent, type AcpAgentTurn } from "../src/index.js";
+import { AcpAgent, costGaugeInheritance, type AcpAgentTurn } from "../src/index.js";
 
 const LIVE = process.env.AGENTPRISM_LIVE_E2E === "1";
 const SKIP: string | false = LIVE
@@ -46,6 +46,34 @@ function diag(backend: LiveBackend, turn: AcpAgentTurn): string {
   return `${backend}: ${JSON.stringify({ stopReason: turn.stopReason, text: turn.text.slice(0, 200) })}`;
 }
 
+/**
+ * Grounds `COST_GAUGE_INHERITANCE` on the installed agent. `sourceGauge` is the source session's
+ * cumulative cost gauge when it was forked/closed; `agent` just ran its FIRST turn, a cached
+ * one-line reply that costs less than everything the source spent. So a gauge that carried the
+ * total over reads ABOVE `sourceGauge` and the turn's cost is only the growth; a gauge that
+ * restarted reads BELOW it and IS the turn's cost. An agent that reports no dollar cost (Codex)
+ * has no gauge and is skipped.
+ */
+function assertCostBaselined(
+  backend: LiveBackend,
+  kind: "reopen" | "fork",
+  agent: AcpAgent,
+  turn: AcpAgentTurn,
+  sourceGauge: number | undefined,
+): void {
+  const gauge = agent.sessionRef?.costGauge;
+  if (gauge === undefined || sourceGauge === undefined) return;
+  const expected = costGaugeInheritance(backend)[kind];
+  const detail = `${backend} ${kind}: source gauge ${sourceGauge}, gauge after the first turn ${gauge}, turn cost ${turn.usage.turn.cost}`;
+  if (expected === "inherits") {
+    assert.ok(gauge > sourceGauge, `the gauge must carry the source's total over — ${detail}`);
+    assert.ok(Math.abs(turn.usage.turn.cost - (gauge - sourceGauge)) < 1e-9, `the turn's cost must exclude the inherited total — ${detail}`);
+  } else {
+    assert.ok(gauge < sourceGauge, `the gauge must restart — ${detail}`);
+    assert.ok(Math.abs(turn.usage.turn.cost - gauge) < 1e-9, `a restarted gauge's reading is the turn's cost — ${detail}`);
+  }
+}
+
 async function closeAll(agents: Iterable<AcpAgent>): Promise<void> {
   const results = await Promise.allSettled([...agents].map((agent) => agent.close()));
   const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -78,6 +106,8 @@ async function forkAndResumeLiveBackend(backend: LiveBackend): Promise<void> {
     assert.ok(t1.updates.length > 0, `${backend}: the turn must carry session/update records — ${diag(backend, t1)}`);
     assert.ok(t1.usage.session.total >= 0, diag(backend, t1));
 
+    const gaugeAtFork = primary.sessionRef?.costGauge;
+
     // 3. Two parallel forks: distinct sessions, each seeded with the parent's transcript.
     const [f1, f2] = await Promise.all([primary.fork(), primary.fork()]);
     agents.add(f1);
@@ -91,6 +121,8 @@ async function forkAndResumeLiveBackend(backend: LiveBackend): Promise<void> {
     const [a1, a2] = await Promise.all([f1.prompt(CODEWORD_QUESTION), f2.prompt(CODEWORD_QUESTION)]);
     assert.ok(a1.text.includes(word1), `${backend}: fork 1 must recall ${word1} — ${diag(backend, a1)}`);
     assert.ok(a2.text.includes(word1), `${backend}: fork 2 must recall ${word1} — ${diag(backend, a2)}`);
+    assertCostBaselined(backend, "fork", f1, a1, gaugeAtFork);
+    assertCostBaselined(backend, "fork", f2, a2, gaugeAtFork);
 
     // 5. The parent keeps going after its forks.
     const t2 = await primary.prompt(`The second codeword is ${word2}. Reply with exactly ACK.`);
@@ -115,6 +147,7 @@ async function forkAndResumeLiveBackend(backend: LiveBackend): Promise<void> {
     assert.equal(resumed.sessionId, ref.sessionId, `${backend}: resume must reattach the same session id`);
     const t4 = await resumed.prompt("What was the first codeword? Reply with only the codeword.");
     assert.ok(t4.text.includes(word1), `${backend}: the resumed session must recall ${word1} — ${diag(backend, t4)}`);
+    assertCostBaselined(backend, "reopen", resumed, t4, ref.costGauge);
   } finally {
     try {
       await closeAll(agents);

@@ -73,7 +73,7 @@ import {
 import { mapThrownError } from "./errors-map.js";
 import { assertNoModelConfigOption, resolveModelRoute } from "./routing.js";
 import { assertSystemPromptSupported } from "./system-prompt.js";
-import { sessionRefFor } from "./session-ref.js";
+import { inheritedCostSeed, sessionRefFor, validCostGauge } from "./session-ref.js";
 import { describeBackendTraits, type AcpAgentTraits } from "./traits.js";
 import {
   buildAuthDescriptor,
@@ -915,6 +915,10 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
             continuationMethod = reattached.method;
             // Provenance is committed at the reopen-handle boundary, before any post-open setup.
             reportContinuation({ reattached: true, method: reattached.method });
+            // The reopened gauge can carry the earlier calls' total; this call reports only its own spend.
+            session.usage.settleInheritedCost(
+              inheritedCostSeed(prepared.backend, registry, "reopen", validCostGauge(recorded.costGauge)),
+            );
             continuationUsageBaseline = session.usage.baseline();
           } catch (error) {
             if (opts.signal?.aborted) throw error;
@@ -1072,6 +1076,12 @@ export class AcpAgentRunner implements AgentRunner, AuthCapableRunner, ProviderC
           );
         } catch {
           // usage is best-effort; never let it mask the real result/error.
+        }
+        try {
+          const costGauge = session.usage.costGauge;
+          if (costGauge !== undefined) opts.onSessionCostGauge?.(costGauge);
+        } catch {
+          // best-effort observer, like onUsage.
         }
         try {
           opts.onHistory?.(session.history);

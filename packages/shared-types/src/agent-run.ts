@@ -234,6 +234,13 @@ export interface RunOptions<S extends TSchema | undefined = undefined> {
    *  OUT-OF-BAND: run()'s return value stays the bare AgentResult. NOT part of the resume
    *  identity hash. */
   onSessionOpen?: (session: AgentSessionRef) => void;
+  /** The session's latest CUMULATIVE cost gauge at release (`AgentSessionRef.costGauge`): the
+   *  session's total so far, NOT this call's spend (that is `onUsage`'s `cost`). Fires at most
+   *  once, next to `onUsage`, and only when the agent reported a cost. `onSessionOpen` fires
+   *  before the first prompt and so cannot carry it; a host that records the ref for a later
+   *  `continueFromSession` folds this value into the recorded ref. Best-effort and out-of-band
+   *  like every on* callback; NOT part of the resume identity hash. */
+  onSessionCostGauge?: (amount: number) => void;
   /** RESUME-ONLY reattach directive. When set, the runner attempts to reopen this exact ACP
    *  session (via session/resume, else session/load) and CONTINUE the interrupted turn instead of
    *  opening a fresh session/new. Advisory: a runner that ignores it — or any reattach failure —

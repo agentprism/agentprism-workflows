@@ -215,3 +215,57 @@ test("delta with no post-baseline update preserves the all-zero sentinel", () =>
     cost: 0,
   });
 });
+
+// ---- inherited cost: a reopened or forked session's cumulative gauge carries the source's total ----
+
+const usd = (amount: number): Cost => ({ amount, currency: "USD" });
+
+test("a seeded gauge that carries the total forward reports only the handle's own spend", () => {
+  const acc = new UsageAccumulator();
+  acc.settleInheritedCost(0.0357);
+  // Before any reading: nothing spent, and the recorded gauge is handed on unchanged.
+  assert.equal(acc.toAgentUsage().cost, 0);
+  assert.equal(acc.costGauge, 0.0357);
+  const before = acc.baseline();
+  assert.equal(before.costAmount, 0);
+
+  acc.recordCost(usd(0.0407)); // the agent's first reading already includes the 0.0357
+  assert.ok(Math.abs(acc.delta(before).cost - 0.005) < 1e-9);
+  assert.ok(Math.abs(acc.toAgentUsage().cost - 0.005) < 1e-9);
+  assert.equal(acc.costGauge, 0.0407, "the ref records the agent's cumulative gauge, inherited spend included");
+
+  acc.recordCost(usd(0.0483));
+  assert.ok(Math.abs(acc.toAgentUsage().cost - 0.0126) < 1e-9);
+});
+
+test("a first reading below the seed proves the gauge restarted: nothing was inherited", () => {
+  const acc = new UsageAccumulator();
+  acc.settleInheritedCost(0.0357);
+  const before = acc.baseline();
+  acc.recordCost(usd(0.0052));
+  assert.equal(acc.delta(before).cost, 0.0052);
+  assert.equal(acc.toAgentUsage().cost, 0.0052);
+  assert.equal(acc.costGauge, 0.0052);
+  // Only the FIRST reading can rebase; a later dip is the ordinary clamped counter reset.
+  acc.recordCost(usd(0.004));
+  assert.equal(acc.toAgentUsage().cost, 0.004);
+});
+
+test("a reading that arrived before the boundary IS the inherited total and wins over the seed", () => {
+  const acc = new UsageAccumulator();
+  acc.recordCost(usd(0.02)); // an agent that announces its gauge while reopening
+  acc.settleInheritedCost(0.5);
+  assert.equal(acc.toAgentUsage().cost, 0);
+  acc.recordCost(usd(0.03));
+  assert.ok(Math.abs(acc.toAgentUsage().cost - 0.01) < 1e-9);
+});
+
+test("no seed (a gauge known to restart, or no recorded gauge) leaves a fresh accumulator untouched", () => {
+  for (const seed of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const acc = new UsageAccumulator();
+    acc.settleInheritedCost(seed);
+    assert.equal(acc.costGauge, undefined);
+    acc.recordCost(usd(0.0052));
+    assert.equal(acc.toAgentUsage().cost, 0.0052);
+  }
+});

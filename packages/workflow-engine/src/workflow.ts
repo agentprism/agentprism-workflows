@@ -1293,6 +1293,8 @@ export async function runWorkflow<T = unknown>(
         sealed: boolean;
         usage?: AgentUsage;
         sessionRef?: AgentSessionRef;
+        /** The session's cumulative cost gauge at release; folded into the recorded ref. */
+        sessionCostGauge?: number;
         modelResolved?: string;
         modelFallbacks: string[];
         provenance?: AgentResultProvenance;
@@ -1325,6 +1327,9 @@ export async function runWorkflow<T = unknown>(
         slot.sessionRef
           ? deepFreeze({
               ...slot.sessionRef,
+              // `onSessionOpen` fires before the first prompt; the release-time gauge is what a
+              // later continuation must baseline.
+              ...(slot.sessionCostGauge === undefined ? {} : { costGauge: slot.sessionCostGauge }),
               callIndex,
               label,
               phase: assignedPhase,
@@ -1536,6 +1541,10 @@ export async function runWorkflow<T = unknown>(
                     if (slot.sealed) return;
                     const copied = cloneTelemetry(ref);
                     if (copied) slot.sessionRef = copied;
+                  },
+                  onSessionCostGauge: (amount: number) => {
+                    if (slot.sealed) return;
+                    if (Number.isFinite(amount) && amount >= 0) slot.sessionCostGauge = amount;
                   },
                   onModelResolved: (id: string) => {
                     if (slot.sealed) return;

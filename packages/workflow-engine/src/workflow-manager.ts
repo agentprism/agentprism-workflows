@@ -544,6 +544,8 @@ function isContinuationSession(
     typeof value.backendId === "string" &&
     (value.cwd === undefined || typeof value.cwd === "string") &&
     isOptionalString(value, "poolKey") &&
+    (value.costGauge === undefined ||
+      (typeof value.costGauge === "number" && Number.isFinite(value.costGauge) && value.costGauge >= 0)) &&
     typeof value.reopen.load === "boolean" &&
     typeof value.reopen.resume === "boolean" &&
     typeof value.reopen.list === "boolean" &&
