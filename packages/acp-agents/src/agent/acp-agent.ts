@@ -53,7 +53,7 @@ import type { AcpSessionUpdate } from "../events.js";
 import { appendPromptImages, buildRunPrompt, mergeTurnMeta, validatePromptImages } from "../prompt.js";
 import type { BackendRegistry, CustomBackendConfig } from "../registry.js";
 import { assertNoModelConfigOption, type ModelRoute } from "../routing.js";
-import { sessionRefFor } from "../session-ref.js";
+import { inheritedCostSeed, sessionRefFor } from "../session-ref.js";
 import { repairPromptText } from "../structured-output.js";
 import { StructuredOutputToolHost } from "../structured-tool.js";
 import { assertSystemPromptSupported } from "../system-prompt.js";
@@ -111,10 +111,17 @@ import {
  *  the others are handed in by the statics and `fork()` through the module-private slot below. */
 type AcpAgentSeed =
   | { readonly kind: "new" }
-  | { readonly kind: "resume" | "load"; readonly sessionId: string }
+  | {
+      readonly kind: "resume" | "load";
+      readonly sessionId: string;
+      /** The session's cumulative cost gauge when its ref was captured (`AgentSessionRef.costGauge`). */
+      readonly sourceCostGauge?: number;
+    }
   | {
       readonly kind: "fork";
       readonly sourceSessionId: string;
+      /** The source session's cumulative cost gauge: the live parent's, or the cold ref's. */
+      readonly sourceCostGauge?: number;
       /** The id-only reattach's preferred method: `resume` for the live `fork()` (the child is
        *  seeded from the parent), `load` for the cold static (the replay IS the child's transcript). */
       readonly reattach: ReattachPreference;
@@ -225,6 +232,9 @@ function assertSessionRef(ref: AgentSessionRef, label: string | undefined, metho
   }
   if (typeof ref.backendId !== "string" || ref.backendId.trim() === "") {
     throw agentValidationError(`${method} requires a session ref with a non-empty backendId`, label);
+  }
+  if (ref.costGauge !== undefined && !(typeof ref.costGauge === "number" && Number.isFinite(ref.costGauge) && ref.costGauge >= 0)) {
+    throw agentValidationError(`${method} requires a session ref whose costGauge, when present, is a non-negative number`, label);
   }
 }
 
@@ -443,9 +453,12 @@ export class AcpAgent {
         if (trait.cwd === "source-only" && cwd !== ref.cwd) {
           throw agentValidationError(`fork on ${route.backend.id} must keep the source cwd (${ref.cwd})`, label);
         }
-        return { cwd, seed: { kind, sourceSessionId: ref.sessionId, reattach: "load", ...base } satisfies ResolvedSeed };
+        return {
+          cwd,
+          seed: { kind, sourceSessionId: ref.sessionId, sourceCostGauge: ref.costGauge, reattach: "load", ...base } satisfies ResolvedSeed,
+        };
       }
-      return { cwd, seed: { kind, sessionId: ref.sessionId, ...base } satisfies ResolvedSeed };
+      return { cwd, seed: { kind, sessionId: ref.sessionId, sourceCostGauge: ref.costGauge, ...base } satisfies ResolvedSeed };
     });
     return AcpAgent.#opened(AcpAgent.#seeded({ ...options, cwd }, seed));
   }
@@ -482,7 +495,10 @@ export class AcpAgent {
 
   /** The re-attach handle computed at open (drives `AcpAgent.resume/load/fork`); retained after close. */
   get sessionRef(): AgentSessionRef | undefined {
-    return this.#sessionRef;
+    const ref = this.#sessionRef;
+    // The gauge moves with every turn, so it is read live (the handle is retained after close).
+    const costGauge = this.#handle?.usage.costGauge;
+    return ref === undefined || costGauge === undefined ? ref : { ...ref, costGauge };
   }
 
   /** Capabilities negotiated on this agent's dedicated connection. */
@@ -890,6 +906,7 @@ export class AcpAgent {
       const child = AcpAgent.#seeded(merged, {
         kind: "fork",
         sourceSessionId: handle.sessionId,
+        sourceCostGauge: handle.usage.costGauge,
         // The parent's snapshot seeds the child: reattach without a replay (load is the fallback).
         reattach: "resume",
         registry: this.#registry,
@@ -1142,6 +1159,10 @@ export class AcpAgent {
         // The replay is complete at the load response; mark synchronously, before any later
         // wire message can be applied.
         if (replayed) handle.markLoadBoundary();
+        // Whatever the gauge carried in from the source session is not this agent's spend.
+        handle.usage.settleInheritedCost(
+          inheritedCostSeed(this.#backend, this.#registry, seed.kind === "fork" ? "fork" : "reopen", seed.sourceCostGauge),
+        );
       }
       this.#handle = handle;
       this.#plan = plan;

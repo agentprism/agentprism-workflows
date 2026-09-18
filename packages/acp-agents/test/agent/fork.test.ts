@@ -528,3 +528,43 @@ test("live fork (codex): systemPrompt rides session/fork _meta in the Codex dial
   assert.equal(count(log, "loadSession"), 0);
   assert.equal(overridden.state, "ready");
 });
+
+// ---- inherited cost gauge on fork (`COST_GAUGE_INHERITANCE`) ----
+
+const forkCostUpdate = (amount: number) => ({ sessionUpdate: "usage_update", used: 10, size: 100, cost: { amount, currency: "USD" } });
+
+test("a fork baselines the parent's gauge only where the agent's fork carries it (pi/opencode), never on claude", async () => {
+  // The child's first reading is 0.05 on every backend; the parent's gauge was 0.03.
+  const scenario = (fork: Record<string, unknown>) => ({
+    lifecycleSupport: true,
+    forkSession: { ...fork, turns: [{ text: "child", updates: [forkCostUpdate(0.05)] }] },
+    // Claude's id-only fork is reattached by resume, which serves the top-level turns again.
+    resumeSession: {},
+    turns: [{ text: "parent", updates: [forkCostUpdate(0.03)] }],
+  });
+
+  for (const backend of ["pi", "opencode"] as const) {
+    const { cwd } = configure(scenario({}), { backends: [backend] });
+    const parent = track(await AcpAgent.open({ cwd, model: backend }));
+    await parent.prompt("p");
+    const child = track(await parent.fork());
+    const turn = await child.prompt("c");
+    assert.ok(Math.abs(turn.usage.turn.cost - 0.02) < 1e-9, `${backend}: the fork inherited 0.03, so the turn cost 0.02 (got ${turn.usage.turn.cost})`);
+    assert.equal(child.sessionRef!.costGauge, 0.05);
+    await harness.cleanup();
+  }
+
+  const { cwd } = configure(
+    { lifecycleSupport: true, forkSession: { idOnly: true }, resumeSession: {}, turns: [{ text: "t", updates: [forkCostUpdate(0.05)] }] },
+    { backends: ["claude"] },
+  );
+  const parent = track(await AcpAgent.open({ cwd, model: "claude" }));
+  await parent.prompt("p");
+  assert.equal(parent.sessionRef!.costGauge, 0.05);
+  const child = track(await parent.fork());
+  assert.equal(child.sessionRef!.costGauge, undefined, "claude's fork restarts the gauge: nothing is seeded");
+  // The reattached child is a fresh fake process, so it reads 0.05 again — AT the parent's gauge,
+  // the one reading a seed-and-compare rule would misread as "nothing spent".
+  const turn = await child.prompt("c");
+  assert.equal(turn.usage.turn.cost, 0.05, "claude: the restarted gauge's reading is the turn's cost");
+});

@@ -174,4 +174,32 @@ return a`;
     assert.equal(run.agentSessions?.length, 1, "one record for the call, not one per attempt");
     assert.equal(run.agentSessions![0]!.sessionId, "attempt-2");
   });
+
+  it("folds the release-time cost gauge into the record, so a continuation can baseline it", async () => {
+    const gauged = {
+      async run(_prompt: string, opts: Record<string, any> = {}): Promise<string> {
+        // onSessionOpen fires before the first prompt: the ref cannot carry the gauge yet.
+        opts.onSessionOpen?.({ sessionId: "sess-cost", backendId: "claude", cwd: "/work", reopen: { load: true, resume: true, list: true } });
+        opts.onSessionCostGauge?.(0.035);
+        return "ok";
+      },
+    };
+    const script = `export const meta = { name: 'c', description: 'cost gauge' }
+return await agent('spend', { label: 'spender' })`;
+    const run = await runWorkflow(script, { agent: gauged, persistLogs: false });
+    assert.equal(run.agentSessions?.length, 1);
+    assert.equal(run.agentSessions![0]!.costGauge, 0.035);
+
+    // A malformed report is dropped rather than recorded.
+    const malformed = {
+      async run(_prompt: string, opts: Record<string, any> = {}): Promise<string> {
+        opts.onSessionOpen?.({ sessionId: "sess-bad", backendId: "claude", cwd: "/work", reopen: { load: true, resume: true, list: true } });
+        opts.onSessionCostGauge?.(Number.NaN);
+        opts.onSessionCostGauge?.(-1);
+        return "ok";
+      },
+    };
+    const bad = await runWorkflow(script, { agent: malformed, persistLogs: false });
+    assert.equal("costGauge" in bad.agentSessions![0]!, false);
+  });
 });

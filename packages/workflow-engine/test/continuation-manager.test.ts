@@ -80,6 +80,8 @@ class ContinuationRunner implements AgentRunner {
         cwd: options.cwd ?? "",
         reopen: { load: true, resume: true, list: true },
       });
+      // The runner reports the session's cumulative cost gauge at release, error path included.
+      options.onSessionCostGauge?.(0.03);
       if (this.mode === "auth-pause") {
         throw new WorkflowError("credentials expired", WorkflowErrorCode.AUTH_REQUIRED, {
           recoverable: false,
@@ -129,6 +131,7 @@ describe("WorkflowManager continuation wiring", () => {
       assert.equal(completed.result, "continued result");
       assert.equal(runner.directives.length, 1);
       assert.equal(runner.directives[0]?.sessionId, "usage-pause-session");
+      assert.equal(runner.directives[0]?.costGauge, 0.03, "the paused call's release-time gauge rides the reattach directive");
       assert.equal(completed.fallbacks?.[0]?.kind, "continuation");
       assert.equal(completed.resumeReport, undefined, "same-ID recovery builds no PreparedResume");
     } finally {

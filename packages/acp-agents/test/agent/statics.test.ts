@@ -286,3 +286,56 @@ test("resume(ref, { systemPrompt }) carries the instructions on session/resume; 
   );
   assert.equal(count(readLog(), "__start"), spawns, "refused before any process spawned");
 });
+
+// ---- inherited cost gauge: a reopened session's cumulative `usage_update.cost` carries the ----
+// ---- earlier total (claude-agent-sdk 0.3.277 on resume; OpenCode and pi always)            ----
+
+const costUpdate = (amount: number) => ({ sessionUpdate: "usage_update", used: 10, size: 100, cost: { amount, currency: "USD" } });
+const near = (actual: number, expected: number, message: string) =>
+  assert.ok(Math.abs(actual - expected) < 1e-9, `${message}: expected ${expected}, got ${actual}`);
+
+test("resume(ref) baselines the gauge the ref recorded: the first turn reports its own cost, not the session's total", async () => {
+  const first = configure({ lifecycleSupport: true, turns: [{ text: "one", updates: [costUpdate(0.03)] }] });
+  const original = track(await AcpAgent.open({ cwd: first.cwd, model: "claude" }));
+  assert.equal(original.sessionRef!.costGauge, undefined, "no cost reported yet: the ref carries no gauge");
+  const t1 = await original.prompt("first");
+  near(t1.usage.turn.cost, 0.03, "a fresh session's first turn");
+  const ref = original.sessionRef!;
+  assert.equal(ref.costGauge, 0.03, "the ref tracks the live cumulative gauge");
+  await original.close({ keep: true });
+  assert.equal(original.sessionRef!.costGauge, 0.03, "and keeps it after close");
+
+  // The reopened agent's gauge CONTINUES from 0.03: its first reading is 0.035.
+  configure({ lifecycleSupport: true, resumeSession: {}, turns: [{ text: "two", updates: [costUpdate(0.035)] }, { text: "three", updates: [costUpdate(0.045)] }] });
+  const resumed = track(await AcpAgent.resume(ref));
+  assert.equal(resumed.sessionRef!.costGauge, 0.03, "before any turn the recorded gauge is handed on unchanged");
+  const t2 = await resumed.prompt("second");
+  near(t2.usage.turn.cost, 0.005, "the resumed turn's own cost");
+  near(t2.usage.session.cost, 0.005, "the resumed agent's running sum covers its own turns only");
+  const t3 = await resumed.prompt("third");
+  near(t3.usage.turn.cost, 0.01, "later turns are plain gauge deltas");
+  near(t3.usage.session.cost, 0.015, "running sum");
+  assert.equal(resumed.sessionRef!.costGauge, 0.045, "the ref records the agent's cumulative gauge, inherited spend included");
+  const ref2 = resumed.sessionRef!;
+  await resumed.close({ keep: true });
+
+  // An agent that RESTARTED its gauge (a crash before the totals were saved): the first reading
+  // is below the recorded gauge, so nothing was inherited and the reading is the turn's cost.
+  configure({ lifecycleSupport: true, resumeSession: {}, turns: [{ text: "four", updates: [costUpdate(0.004)] }] });
+  const restarted = track(await AcpAgent.resume(ref2));
+  const t4 = await restarted.prompt("fourth");
+  near(t4.usage.turn.cost, 0.004, "a restarted gauge is not baselined");
+  assert.equal(restarted.sessionRef!.costGauge, 0.004);
+});
+
+test("a malformed ref.costGauge fails the reopen before any process spawns", async () => {
+  const { cwd, readLog } = configure({ lifecycleSupport: true, resumeSession: {}, turns: [{ text: "ok" }] });
+  const ref = { sessionId: "s-1", backendId: "claude", cwd, reopen: { load: true, resume: true, list: true, fork: true } };
+  for (const costGauge of [-0.01, Number.NaN, "0.03"]) {
+    await assert.rejects(
+      AcpAgent.resume({ ...ref, costGauge } as unknown as AgentSessionRef),
+      validation(/costGauge, when present, is a non-negative number/),
+    );
+  }
+  assert.equal(count(readLog(), "__start"), 0);
+});

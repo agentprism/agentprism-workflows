@@ -831,3 +831,48 @@ for (const usageCase of [
     for (const value of Object.values(usages[0] ?? {})) assert.ok(value >= 0);
   });
 }
+
+test("a continuation baselines the recorded cost gauge: onUsage is the call's own spend, onSessionCostGauge the session's total", async () => {
+  const costUpdate = (amount: number) => ({ sessionUpdate: "usage_update", used: 10, size: 100, cost: { amount, currency: "USD" } });
+  const near = (actual: number | undefined, expected: number) =>
+    assert.ok(actual !== undefined && Math.abs(actual - expected) < 1e-9, `expected ${expected}, got ${actual}`);
+
+  // Fresh call: the gauge starts at zero, so spend and gauge agree.
+  const fresh = harness.configure<LogEntry>({ lifecycleSupport: true, turns: [{ text: "one", updates: [costUpdate(0.03)] }] });
+  const freshUsage: AgentUsage[] = [];
+  const freshGauges: number[] = [];
+  await harness.makeRunner().run("work", {
+    model: "claude",
+    cwd: fresh.cwd,
+    onUsage: (usage) => freshUsage.push(usage),
+    onSessionCostGauge: (amount) => freshGauges.push(amount),
+  });
+  near(freshUsage[0]?.cost, 0.03);
+  assert.deepEqual(freshGauges, [0.03]);
+
+  // Continuation of that session: the reopened gauge reads 0.035 — the earlier 0.03 plus this call.
+  await harness.cleanup();
+  const continued = harness.configure<LogEntry>({ lifecycleSupport: true, turns: [{ text: "two", updates: [costUpdate(0.035)] }] });
+  const usage: AgentUsage[] = [];
+  const gauges: number[] = [];
+  const opened: AgentSessionRef[] = [];
+  await harness.makeRunner().run("work", {
+    model: "claude",
+    cwd: continued.cwd,
+    continueFromSession: sessionRef(continued.cwd, { costGauge: 0.03 }),
+    onSessionOpen: (value) => opened.push(value),
+    onUsage: (value) => usage.push(value),
+    onSessionCostGauge: (amount) => gauges.push(amount),
+  });
+  assert.equal(count(continued.readLog(), "resumeSession"), 1);
+  near(usage[0]?.cost, 0.005);
+  assert.deepEqual(gauges, [0.035]);
+  assert.equal(opened[0]?.costGauge, 0.03, "the reopened ref hands the recorded gauge on until a reading replaces it");
+
+  // No cost reported: no gauge to record.
+  await harness.cleanup();
+  const silent = harness.configure<LogEntry>({ turns: [{ text: "three" }] });
+  const silentGauges: number[] = [];
+  await harness.makeRunner().run("work", { model: "claude", cwd: silent.cwd, onSessionCostGauge: (amount) => silentGauges.push(amount) });
+  assert.deepEqual(silentGauges, []);
+});
