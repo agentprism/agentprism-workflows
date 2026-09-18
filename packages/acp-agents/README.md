@@ -165,7 +165,7 @@ bus only; it is not delivered through `session.on()`.
 the agent to replay the entire persisted conversation before resolving (the runner marks the LOAD
 BOUNDARY synchronously after the response). `InteractiveSession.awaitCurrentTurn()` resolves with
 the founding turn (the turn that was in flight when the host died) so a re-attached call's
-continuation fires exactly once — the REPL broker's re-attach arm. Completion evidence is the
+continuation fires exactly once — the re-attach arm of a host that survives its own restart. Completion evidence is the
 vendor **`_session/loaded_turn` extension** (the `_session/steering` precedent), an AUTHORITATIVE
 turn-terminal channel for loaded sessions advertised at initialize
 (`InitializeResponse._meta.loadedTurn.supported === true`; pi-acp and codex-acp advertise it):

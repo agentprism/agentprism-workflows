@@ -12,7 +12,7 @@ const WORKFLOWS_DIST_ENTRY = resolve(WORKFLOWS_ROOT, "dist/index.js");
 const MCP_SOURCE_ENTRY = resolve(REPOSITORY_ROOT, "packages/mcp-server/src/index.ts");
 // The bundle lives under the MCP server's OWN tree so the externalized
 // `@automatalabs/*` imports resolve exactly like the published package's
-// (the mcp-server node_modules links repl-engine, shared-types, and
+// (the mcp-server node_modules links shared-types and
 // workflows — the workflows link is what keeps WORKFLOWS_DIST_ENTRY
 // load-bearing).
 const MCP_BUNDLE = resolve(REPOSITORY_ROOT, "packages/mcp-server/dist/mcp-server-bundle-smoke.js");
@@ -50,7 +50,7 @@ function request(id: number, method: string, params?: unknown): string {
   return `${JSON.stringify({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) })}\n`;
 }
 
-test("the bundled stdio server initializes once and serves workflow/repl plus authoring skills", { timeout: 30_000 }, async () => {
+test("the bundled stdio server initializes once and serves the workflow tool plus authoring skills", { timeout: 30_000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "automatalabs-workflows-mcp-bundle-"));
   const child = spawn(process.execPath, [MCP_BUNDLE], {
     cwd: REPOSITORY_ROOT,
@@ -168,7 +168,7 @@ test("the bundled stdio server initializes once and serves workflow/repl plus au
     );
 
     const toolsResult = toolsList.result as { tools?: Array<{ name?: unknown }> };
-    assert.deepEqual(toolsResult.tools?.map((tool) => tool.name).sort(), ["repl", "workflow"]);
+    assert.deepEqual(toolsResult.tools?.map((tool) => tool.name).sort(), ["workflow"]);
     const skillsResult = skillsList.result as { skills?: Array<{ uri?: unknown }> };
     assert.deepEqual(
       skillsResult.skills?.map((skill) => skill.uri).sort(),

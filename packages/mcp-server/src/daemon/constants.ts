@@ -32,15 +32,6 @@ export const DAEMON_IDLE_TTL_ENV = "AGENTPRISM_DAEMON_IDLE_TTL_MS";
 export const SESSION_IDLE_TTL_MS = 5 * 60_000;
 export const SESSION_IDLE_TTL_ENV = "AGENTPRISM_SESSION_TTL_MS";
 
-/**
- * The REPL client-presence drain bound: after a project's last client disconnects, in-flight
- * subagent turns may drain for up to this long before idle children are closed. Its own knob,
- * deliberately decoupled from the session-eviction TTL above (the two used to share one
- * constant, which forced dead-client eviction to wait hours).
- */
-export const REPL_DRAIN_BOUND_MS = 2 * 60 * 60_000;
-export const REPL_DRAIN_BOUND_ENV = "AGENTPRISM_REPL_DRAIN_BOUND_MS";
-
 export const REAPER_INTERVAL_MS = 60_000;
 
 export const EVENT_STORE_MAX_EVENTS_PER_STREAM = 1_000;

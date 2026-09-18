@@ -4,8 +4,7 @@
 
 The validator — static parse, mock dry run with scripted mock answers, and the per-harness
 config-options probe — ships in `@automatalabs/workflows` as a CLI and a programmatic API, but
-the MCP `workflow` tool's actions are `run`/`inspect`/`await`/`stop` only (the server also
-registers a separate `repl` tool, which is unrelated to script validation). An MCP host that
+the MCP `workflow` tool's actions are `run`/`inspect`/`await`/`stop` only. An MCP host that
 wants to validate a script before spending tokens has to shell out to the CLI or embed the SDK,
 neither of which fits hosts that only speak MCP.
 

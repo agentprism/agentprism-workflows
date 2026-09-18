@@ -84,7 +84,7 @@ test("the negotiated MCP Apps surface still waits for client capabilities, then 
     -1, // hold indefinitely until we release it
   );
   const before = await capable.client.listTools();
-  assert.deepEqual(before.tools.map((tool) => tool.name).sort(), ["repl", "workflow"]);
+  assert.deepEqual(before.tools.map((tool) => tool.name).sort(), ["workflow"]);
   assert.equal(
     before.tools.some((tool) => tool.name === WORKFLOW_EVENTS_TOOL_NAME),
     false,
@@ -113,7 +113,7 @@ test("the negotiated MCP Apps surface still waits for client capabilities, then 
   const plain = await connectWithDelayedInitialized({}, 0);
   await new Promise((resolve) => setTimeout(resolve, 150));
   const plainTools = await plain.client.listTools();
-  assert.deepEqual(plainTools.tools.map((tool) => tool.name).sort(), ["repl", "workflow"]);
+  assert.deepEqual(plainTools.tools.map((tool) => tool.name).sort(), ["workflow"]);
   assert.equal(
     plainTools.tools.some((tool) => tool.name === WORKFLOW_EVENTS_TOOL_NAME),
     false,

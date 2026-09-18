@@ -1,4 +1,4 @@
-// The `_session/loaded_turn` extension (the REPL broker's re-attach arm's
+// The `_session/loaded_turn` extension (a re-attaching host's
 // authoritative completion evidence): the query answers whether the loaded
 // session's founding turn is still running right now — `completed` when
 // the session journal's last message entry is an assistant message (pi

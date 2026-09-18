@@ -201,7 +201,7 @@ export class InteractiveSession {
   }
 
   /** The latest turn's assistant text (turn-segmented, like `run()`'s
-   *  no-schema result path). Added for the REPL broker's result shaping;
+   *  no-schema result path). For a host's own result shaping;
    *  additive passthrough to `SessionHandle`. */
   currentTurnText(): string {
     return this.session.currentTurnText();
@@ -210,7 +210,7 @@ export class InteractiveSession {
   /** The latest turn's FINAL assistant message (the schema-extraction
    *  source `run()` uses; prose extraction over the whole turn would
    *  resurrect the first-JSON-wins bug for schema-shaped progress
-   *  messages). Added for the REPL broker's structured-output ladder;
+   *  messages). For a host's own structured-output ladder;
    *  additive passthrough to `SessionHandle`. */
   finalMessageText(): string {
     return this.session.finalMessageText();
@@ -231,7 +231,7 @@ export class InteractiveSession {
 
   /** Claude's raw `structured_output` for the latest turn, if any (the
    *  native structured channel the runner's ladder tries first). Added
-   *  for the REPL broker's structured-output ladder; additive passthrough
+   *  for a host's own structured-output ladder; additive passthrough
    *  to `SessionHandle`. */
   rawStructuredOutput(): unknown {
     return this.session.rawStructuredOutput();
@@ -252,8 +252,8 @@ export class InteractiveSession {
    *  prompt-in-flight, image validation) AND the underlying ACP session/prompt request has
    *  actually been invoked — the call below runs synchronously through request construction
    *  and the wire send, so by the time the acknowledgment fires the payload is on the wire:
-   *  the point of no return. A host that records a "delivered" marker for the prompt (the
-   *  REPL broker's queued-steer delivery marker) MUST record it here rather than when the
+   *  the point of no return. A host that records a "delivered" marker for the prompt (a
+   *  queued-steer delivery marker, say) MUST record it here rather than when the
    *  returned promise is created: an async pre-handoff rejection (released session, aborted
    *  signal, or prompt-in-flight) never reaches this line, and a marker recorded before it
    *  would make a restore skip a turn that was never delivered. The acknowledgment firing
@@ -409,9 +409,8 @@ export class InteractiveSession {
 
   /**
    * The loaded session's founding-turn completion — the re-attach arm's task
-   * source (phase D of the REPL orchestrator roadmap; the broker drives this
-   * on a session re-opened with `runner.loadSession()` after a daemon
-   * restart). Resolves with the turn that was in flight at the backend when
+   * source (a host drives this on a session re-opened with
+   * `runner.loadSession()` after its own restart). Resolves with the turn that was in flight at the backend when
    * the session was loaded, so a re-attached call's continuation fires
    * exactly once, through the same record → settle → consume pump as a live
    * call.

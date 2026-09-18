@@ -285,8 +285,8 @@ export class WorkflowPermissionBroker {
   private detachEvents: (() => void) | undefined;
 
   readonly resolver: PermissionResolver = (request, context) => {
-    // The daemon's runner is shared with the REPL. Engine workflow calls always stamp both an
-    // engine runId and callIndex; other callers retain the SDK's autonomous auto-response path.
+    // Engine workflow calls always stamp both an engine runId and callIndex; any other caller of
+    // the shared runner retains the SDK's autonomous auto-response path.
     if (
       context.backendId === "pi" ||
       context.runId === undefined ||

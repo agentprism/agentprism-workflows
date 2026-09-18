@@ -103,7 +103,7 @@ test("envFingerprint tracks runner-relevant vars and ignores unrelated or TTL-on
   assert.notEqual(base, envFingerprint({ AGENTPRISM_BACKENDS: '{"a":2}' }));
   assert.notEqual(base, envFingerprint({}));
   assert.equal(
-    envFingerprint({ AGENTPRISM_DAEMON_IDLE_TTL_MS: "1", AGENTPRISM_SESSION_TTL_MS: "2", AGENTPRISM_REPL_DRAIN_BOUND_MS: "3" }),
+    envFingerprint({ AGENTPRISM_DAEMON_IDLE_TTL_MS: "1", AGENTPRISM_SESSION_TTL_MS: "2" }),
     envFingerprint({}),
   );
 });

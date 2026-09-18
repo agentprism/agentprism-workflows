@@ -8,14 +8,10 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 import { createAcpRunner } from "@automatalabs/workflows";
-import { createEvalBreakChannel } from "@automatalabs/repl-engine";
-import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 
-import { REPL_DRAIN_BOUND_MS } from "./daemon/constants.js";
 import { installMcpServerLifecycle } from "./lifecycle.js";
 import { WorkflowProjectRegistry } from "./project-registry.js";
-import { ReplPresenceLedger } from "./repl-presence.js";
-import { ReplRelayStdioTransport } from "./repl-stdio-transport.js";
 import { createWorkflowServer, type WorkflowServer } from "./server.js";
 import { workflowRunEventsUri } from "./workflow-resources.js";
 import { WorkflowPermissionBroker } from "./workflow-permissions.js";
@@ -117,17 +113,6 @@ export type {
   GeneratedAuthoringSkill,
   GeneratedAuthoringSkillResource,
 } from "./generated/authoring-skills-content.js";
-export { replToolInputShape, replToolOutputShape } from "./repl-tool.js";
-export type { ReplToolOptions } from "./repl-tool.js";
-export {
-  createReplProjectState,
-  ensureReplWorkspace,
-  disposeReplProjectState,
-  resetReplProjectState,
-  renameAsideNeverOverwriting,
-} from "./repl-project.js";
-export type { ReplProjectState } from "./repl-project.js";
-export { ReplPresenceLedger } from "./repl-presence.js";
 export {
   RUN_MONITOR_RESOURCE_URI,
   WORKFLOW_EVENTS_TOOL_NAME,
@@ -170,11 +155,6 @@ export type {
  * AgentRunner, inject it into the workflow-engine via the server shell, and serve on
  * stdin/stdout. Backend auth stays with the agents' own CLI credential stores; a run that
  * hits AUTH_REQUIRED pauses and continues under the same run ID after an out-of-band CLI login.
- * The stdio transport is the RELAY transport (phase-F review round 3): its stdin reader
- * lives on a worker thread that fires the server's out-of-band eval-break relay for
- * `repl` interrupt calls, so the documented no-id interrupt works for a synchronously
- * running eval in this mode too (the daemon mode's shim does the same from a separate
- * process).
  */
 export async function main(): Promise<void> {
   const permissionBroker = new WorkflowPermissionBroker();
@@ -185,17 +165,12 @@ export async function main(): Promise<void> {
   permissionBroker.attach(runner);
   const projects = new WorkflowProjectRegistry(runner);
   const defaultContext = projects.getOrCreate(process.cwd());
-  const replPresence = new ReplPresenceLedger(REPL_DRAIN_BOUND_MS);
-  const evalBreakChannel = createEvalBreakChannel();
   let activeServer: WorkflowServer | undefined;
   let activeEra: "legacy" | "modern" | undefined;
 
-  // The relay transport still owns the worker-thread eval-break fast path. serveStdio owns
-  // protocol-era arbitration and pins one factory instance to this long-lived connection.
-  const transport = new ReplRelayStdioTransport(
-    () => evalBreakChannel.breakUrl(),
-    () => defaultContext.projectDir,
-  );
+  // serveStdio owns protocol-era arbitration and pins one factory instance to this long-lived
+  // connection; the transport is built here so the lifecycle below can watch it close.
+  const transport = new StdioServerTransport();
   const detachModernEvents = projects.onRunEventPersisted((record) => {
     if (activeEra !== "modern") return;
     void activeServer?.server.sendResourceUpdated({ uri: workflowRunEventsUri(record.runId) }).catch(() => undefined);
@@ -207,12 +182,7 @@ export async function main(): Promise<void> {
         manager: defaultContext.manager,
         activeRuns: defaultContext.activeRuns,
         projects,
-        replPresence,
-        replClientId: () => "stdio-client",
-        replDrainBoundMs: REPL_DRAIN_BOUND_MS,
-        replEvalBreakChannel: evalBreakChannel,
         protocolEra: era,
-        disconnectReplClientOnClose: true,
         permissionBroker,
       });
       activeServer = server;
@@ -229,14 +199,9 @@ export async function main(): Promise<void> {
     transport,
     server: {
       stopAcceptingWork: () => activeServer?.stopAcceptingWork(),
-      replBreakUrl: () => evalBreakChannel.breakUrl(),
-      replDefaultProjectDir: () => defaultContext.projectDir,
-      async disposeReplEvalBreakChannel() {
+      async dispose() {
         detachModernEvents();
         permissionBroker.dispose();
-        await projects.disposeReplStates();
-        replPresence.disconnectAll();
-        await evalBreakChannel.dispose();
       },
     },
   });

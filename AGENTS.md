@@ -9,7 +9,7 @@ Before changing code, read the relevant parts of:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — development, tests, generated artifacts, dependency gates, attribution, PRs, and releases.
 - [`README.md`](README.md) — product surface and package map.
 - [`docs/api.md`](docs/api.md) — supported integration APIs.
-- [`docs/authoring/`](docs/authoring/) — canonical workflow and REPL authoring documentation shipped through MCP.
+- [`docs/authoring/`](docs/authoring/) — canonical workflow authoring documentation shipped through MCP.
 
 Then read the code. The source and its tests are the current state; prose describes it and never governs it. When prose and code disagree, fix the prose.
 
@@ -36,20 +36,19 @@ Do not add temporary compatibility layers unless the user explicitly requests on
 
 ## Architecture and package boundaries
 
-This is a pnpm monorepo of ten `@automatalabs/*` packages:
+This is a pnpm monorepo of nine `@automatalabs/*` packages:
 
 - `shared-types`: shared seams and wire/result types.
 - `workflow-engine`: deterministic workflow execution, journaling, resume, checkpoints, and isolation.
 - `acp-agents`: ACP client and backend integration for Claude, Codex, OpenCode, pi, and custom agents.
 - `acp-server`: connection-pinned ACP proxy and backend-discovery server.
 - `workflows`: the public SDK facade composing the engine and ACP runner.
-- `repl-engine`: persistent QuickJS REPL orchestration over the same backend stack.
-- `mcp-server`: MCP composition root exposing `workflow`, `repl`, the Apps-capable `workflow_monitor`, and SEP-2640 authoring skills.
+- `mcp-server`: MCP composition root exposing `workflow`, the Apps-capable `workflow_monitor`, and SEP-2640 authoring skills.
 - `pi-acp`: in-process pi ACP server.
 - `codex-acp`: published fork maintained as a non-squashed upstream subtree.
 - `agentprism-otel`: optional observability bridge.
 
-Keep `workflow-engine` backend-agnostic and `acp-agents` engine-agnostic; they meet through `shared-types`. The primary runtime direction is `mcp-server → {workflows, repl-engine, shared-types}`, `acp-server → acp-agents`, `workflows → {workflow-engine, acp-agents, shared-types}`, `repl-engine → {workflows, acp-agents, shared-types}`, and `acp-agents → {codex-acp, pi-acp, shared-types}`.
+Keep `workflow-engine` backend-agnostic and `acp-agents` engine-agnostic; they meet through `shared-types`. The primary runtime direction is `mcp-server → {workflows, shared-types}`, `acp-server → acp-agents`, `workflows → {workflow-engine, acp-agents, shared-types}`, and `acp-agents → {codex-acp, pi-acp, shared-types}`.
 
 For MCP server work, preserve the deliberate SDK boundary: production server code uses the split MCP SDK v2 packages, legacy 2025 and modern `2026-07-28` traffic share one implementation through era-specific transport seams, and no v1 SDK object may be passed into a v2 API. `@modelcontextprotocol/ext-apps` remains browser-build/test-side; production server code must not import its v1 server helpers.
 

@@ -147,8 +147,8 @@ export async function steerSession(
 
 /**
  * The `_session/loaded_turn` vendor extension (the steering-extension
- * precedent): turn-TERMINAL state for loaded sessions — the REPL broker's
- * re-attach arm's authoritative completion evidence. `query` asks whether
+ * precedent): turn-TERMINAL state for loaded sessions — a re-attaching
+ * host's authoritative completion evidence. `query` asks whether
  * the loaded session's founding turn is still running right now
  * (`"running"`), observably completed while the host was down
  * (`"completed"` — the replayed thread's last turn completed, so its

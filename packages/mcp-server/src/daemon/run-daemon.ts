@@ -15,8 +15,6 @@ import {
   DAEMON_NAME,
   DAEMON_PORT_ENV,
   DEFAULT_DAEMON_PORT,
-  REPL_DRAIN_BOUND_ENV,
-  REPL_DRAIN_BOUND_MS,
   SESSION_IDLE_TTL_ENV,
   SESSION_IDLE_TTL_MS,
 } from "./constants.js";
@@ -30,7 +28,6 @@ import {
 } from "./daemon-info.js";
 import { installDaemonLifecycle } from "./daemon-lifecycle.js";
 import { createDaemon, DaemonPortInUseError } from "./http-daemon.js";
-import { createEvalBreakChannel } from "@automatalabs/repl-engine";
 import { WorkflowPermissionBroker } from "../workflow-permissions.js";
 
 export interface RunDaemonOptions {
@@ -78,7 +75,6 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
 
   let daemon;
   const sessionTtlMs = envInt(SESSION_IDLE_TTL_ENV, SESSION_IDLE_TTL_MS);
-  const replDrainBoundMs = envInt(REPL_DRAIN_BOUND_ENV, REPL_DRAIN_BOUND_MS);
   const describePortHolder = (port: number): string => {
     const holder = findDaemonInstanceOnPort(port);
     if (holder === undefined) return `port ${port} is taken by another process`;
@@ -87,13 +83,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
       `(v${holder.info.version}, started ${holder.info.startedAt})`
     );
   };
-  // The eval-break relay (phase-F review round 2): a worker-thread
-  // channel whose loopback endpoint stays reachable while the daemon's
-  // main thread is blocked in a synchronous eval — the `interrupt`
-  // tool's no-id break. Its address travels in daemon.json so the shim
-  // can fire it out of band.
-  const evalBreakChannel = createEvalBreakChannel();
-  const daemonOptions = { runner, permissionBroker, log, replDrainBoundMs, evalBreakChannel, ownInstanceId: instanceId };
+  const daemonOptions = { runner, permissionBroker, log, ownInstanceId: instanceId };
   if (supersede) {
     // Succession: the stale predecessor may still hold the default port and is left running
     // to finish its in-flight work, so never contend for it — bind the explicitly requested
@@ -144,10 +134,6 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<"starte
     instanceId: daemon.instanceId,
     controlUrl: daemon.controlUrl,
     controlProtocol: 1,
-    ...(await evalBreakChannel
-      .breakUrl()
-      .then((url) => ({ replBreakUrl: url }))
-      .catch(() => ({}))),
   });
 
   installDaemonLifecycle({

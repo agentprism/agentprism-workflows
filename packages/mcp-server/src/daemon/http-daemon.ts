@@ -26,16 +26,14 @@ import {
   toWebRequest,
 } from "@modelcontextprotocol/node";
 import type { AgentRunner } from "@automatalabs/shared-types";
-import type { BrokerRunner, EvalBreakChannel } from "@automatalabs/repl-engine";
 
 import { createWorkflowServer, SERVER_VERSION } from "../server.js";
 import { workflowRunEventsUri } from "../workflow-resources.js";
 import { WorkflowProjectRegistry } from "../project-registry.js";
-import { ReplPresenceLedger } from "../repl-presence.js";
 import { WorkflowPermissionBroker } from "../workflow-permissions.js";
 import { workflowLifecycle } from "../workflow-lifecycle.js";
 import { workflowToolInputBranches } from "../workflow-tool-input.js";
-import { DAEMON_NAME, HEALTHZ_PATH, MCP_ENDPOINT_PATH, REPL_DRAIN_BOUND_MS } from "./constants.js";
+import { DAEMON_NAME, HEALTHZ_PATH, MCP_ENDPOINT_PATH } from "./constants.js";
 import { envFingerprint, readDaemonInfo } from "./daemon-info.js";
 import { BoundedEventStore } from "./event-store.js";
 import { validateRequest } from "./middleware.js";
@@ -61,29 +59,6 @@ export interface CreateDaemonOptions {
   host?: string;
   env?: Record<string, string | undefined>;
   log?: (line: string) => void;
-  /**
-   * The REPL workspaces' ACP runner (the broker's structural seam;
-   * omitted: every workspace's broker owns its own `AcpAgentRunner`).
-   */
-  replRunner?: BrokerRunner;
-  /**
-   * The concrete REPL client-presence drain bound: a project whose last
-   * client disconnected drains its in-flight subagent turns up to this
-   * bound, then closes idle children. Defaults to `REPL_DRAIN_BOUND_MS`
-   * (its own knob — decoupled from the session-eviction TTL, which is
-   * now short enough to collect dead clients promptly).
-   */
-  replDrainBoundMs?: number;
-  /** @deprecated alias of `replDrainBoundMs` (the two used to share one constant). */
-  sessionTtlMs?: number;
-  /** The REPL eval-break relay (phase-F review round 2; see
-   *  repl-engine's `EvalBreakChannel`): the worker-thread channel whose
-   *  loopback endpoint the shim fires while the daemon's main thread is
-   *  blocked in a synchronous eval. The daemon passes its own channel
-   *  (single-project servers own one by default — round 3: the
-   *  in-process mode's relay transport fires it, see
-   *  `repl-stdio-transport.ts`). */
-  evalBreakChannel?: EvalBreakChannel;
   /**
    * This daemon's identity for discovery/succession accounting. Defaults to `process.pid`;
    * injected in tests. It is the pid reported by /healthz and compared against `daemon.json`
@@ -115,21 +90,12 @@ export interface DaemonHandle {
   sessions: SessionRegistry;
   projects: WorkflowProjectRegistry;
   activeRunCount(): number;
-  /**
-   * The number of REPL workspaces with a client-presence drain scheduled
-   * or in flight (the daemon idleness accounting seam — phase-E review
-   * rejection round 2: a drain may legitimately run for the full
-   * session-eviction TTL after the last session is gone, and the idle
-   * shutdown must never replace that bound with the shutdown deadline).
-   */
-  activeReplDrainCount(): number;
   /** Requests (POSTs) being processed right now, across every session. */
   inflightRequestCount(): number;
   /** True when a newer daemon owns this family's discovery pointer (this one is a lame duck). */
   isSuperseded(): boolean;
   /**
-   * The lame-duck migration: close every session with no request in flight and no REPL
-   * workspace mid-turn, so its client transparently re-initializes on the successor. Returns
+   * The lame-duck migration: close every session with no request in flight, so its client transparently re-initializes on the successor. Returns
    * the closed session ids.
    */
   evictDrainableSessions(): string[];
@@ -375,22 +341,6 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     respondSetup: (context, input) => workflowLifecycle(context, options.runner).respond(input),
     log,
   });
-  // The REPL client-presence ledger: every session touches the projects it addresses; on
-  // last-connection-closed a project with no clients left is drained (the doc's
-  // client-presence policy; the bound reuses the session-eviction TTL).
-  const replDrainBoundMs = options.replDrainBoundMs ?? options.sessionTtlMs ?? REPL_DRAIN_BOUND_MS;
-  const replPresence = new ReplPresenceLedger(replDrainBoundMs);
-  // The three presence signals (phase-E review rejection: only the
-  // disconnect was wired — a transient standalone-GET drop followed by a
-  // reconnect of the SAME live session used to leave the session's
-  // projects draining while the client was connected, because the
-  // reconnect never re-added its presence). A connection OPEN re-adds
-  // the session's project presence from its retained affinity; the
-  // last-connection-closed removes presence and schedules the drain; a
-  // session DELETE drops the retained affinity.
-  sessions.onConnectionOpened = (sessionId) => replPresence.reconnect(sessionId);
-  sessions.onLastConnectionClosed = (sessionId) => replPresence.disconnect(sessionId);
-  sessions.onSessionDeleted = (sessionId) => replPresence.forget(sessionId);
   let boundPort = options.port;
   let modernInflight = 0;
 
@@ -403,17 +353,10 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
   };
   modernHandler = createMcpHandler(
     () => {
-      const clientId = `modern:${randomUUID()}`;
       return createWorkflowServer(options.runner, {
         projects,
         requireProjectDir: true,
-        replRunner: options.replRunner,
-        replPresence,
-        replClientId: () => clientId,
-        replDrainBoundMs,
-        replEvalBreakChannel: options.evalBreakChannel,
         protocolEra: "modern",
-        disconnectReplClientOnClose: true,
         modernNotifier,
         runControl,
         permissionBroker,
@@ -518,11 +461,7 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     const server = createWorkflowServer(options.runner, {
       projects,
       requireProjectDir: true,
-      replRunner: options.replRunner,
-      replPresence,
-      replClientId: () => transport.sessionId,
-      replDrainBoundMs,
-      replEvalBreakChannel: options.evalBreakChannel,
+      clientId: () => transport.sessionId,
       runControl,
       permissionBroker,
     });
@@ -613,21 +552,14 @@ export async function createDaemon(options: CreateDaemonOptions): Promise<Daemon
     sessions,
     projects,
     activeRunCount: () => projects.activeRunCount(),
-    activeReplDrainCount: () => replPresence.drainingCount(),
     inflightRequestCount: () => sessions.inflightCount() + modernInflight,
     isSuperseded,
-    evictDrainableSessions: () => sessions.evictDrainable((sessionId) => replPresence.sessionHasBusyWorkspace(sessionId)),
+    evictDrainableSessions: () => sessions.evictDrainable(),
     processPendingControlIntents: () => runControl.processPendingIntents(),
     async close() {
       const closed = new Promise<void>((resolvePromise) => {
         httpServer.close(() => resolvePromise());
       });
-      // Shutdown drains each repl workspace with the shutdown bound
-      // before the broker teardown (the reviewer-mandated drain-then-
-      // close posture; the last-client-disconnect path uses the full
-      // session-eviction TTL instead).
-      await projects.disposeReplStates();
-      replPresence.disconnectAll();
       await sessions.closeAll();
       detachModernRunEvent();
       detachModernRunDeleted();

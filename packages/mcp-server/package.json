@@ -49,7 +49,6 @@
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
-    "@automatalabs/repl-engine": "workspace:*",
     "@automatalabs/shared-types": "workspace:*",
     "@automatalabs/workflows": "workspace:*",
     "@modelcontextprotocol/client": "^2.0.0",

@@ -12,8 +12,8 @@ import type {
 
 // packages/mcp-server/src/server.ts
 //
-// The MCP shell: constructs an McpServer, registers the `workflow` and `repl` model-facing
-// tools, serves their version-matched Agent Skills, and adds the user-controlled
+// The MCP shell: constructs an McpServer, registers the `workflow` model-facing
+// tool, serves its version-matched Agent Skill, and adds the user-controlled
 // `author-workflow` prompt. This is the composition root where all three packages meet — the injected acp-agents
 // AgentRunner is wired into a workflow-engine WorkflowManager (DI) and every tool call runs
 // through WorkflowManager.runSync.
@@ -45,13 +45,6 @@ import {
 import { createProgressReporter } from "./progress.js";
 import { CLAUDE_CHANNEL_CAPABILITY, ClaudeChannelNotifier } from "./channel-notifier.js";
 import {
-  createEvalBreakChannel,
-  loadShippedWasm,
-  type BrokerRunner,
-  type EvalBreakChannel,
-} from "@automatalabs/repl-engine";
-
-import {
   clampWorkflowInput,
   parseWorkflowToolInput,
   workflowToolInputSchema,
@@ -81,11 +74,7 @@ import type {
 } from "./workflow-tool-output.js";
 import { registerAuthoringPrompt } from "./authoring-prompt.js";
 import { registerAuthoringSkills, SKILLS_EXTENSION_ID } from "./authoring-skills.js";
-import { registerReplTool } from "./repl-tool.js";
-import { ReplPresenceLedger } from "./repl-presence.js";
 import { CapabilityAwareToolCatalog } from "./tool-catalog.js";
-import { createReplProjectState, DEFAULT_REPL_EVAL_TIMEOUT_MS } from "./repl-project.js";
-import { REPL_DRAIN_BOUND_MS } from "./daemon/constants.js";
 import type { WorkflowRunControlRouter } from "./daemon/run-control.js";
 import {
   configSummary,
@@ -124,12 +113,12 @@ export const SERVER_VERSION: string =
     : (require("../package.json") as { version: string }).version;
 
 // Server-wide guidance returned in the MCP initialize response (ServerOptions.instructions),
-// surfaced by hosts to orient the calling agent to the two model-facing tools and the
+// surfaced by hosts to orient the calling agent to the model-facing `workflow` tool and the
 // version-matched workflow Agent Skill. Kept short and behavioral — exhaustive guidance is loaded through
 // the host's skill activation path only when needed.
 export const SERVER_INSTRUCTIONS = [
-  "This server exposes workflow and repl orchestration tools, plus workflow_monitor for Apps-capable hosts. They " +
-    "spawn subagents over the same ACP backends — the registry built-ins Claude, Codex, OpenCode, and " +
+  "This server exposes the workflow orchestration tool, plus workflow_monitor for Apps-capable hosts. It " +
+    "spawns subagents over the same ACP backends — the registry built-ins Claude, Codex, OpenCode, and " +
     "pi, plus any registered custom agents — and key durable state by an absolute projectDir " +
     "(required on the shared daemon; defaulted by a single-project server). Backend credentials come " +
     "from each agent's own login, so there is nothing auth-shaped to configure here.",
@@ -141,12 +130,6 @@ export const SERVER_INSTRUCTIONS = [
     "a durable runId for bounded status, permissions-response, result, pause, and stop calls; resume continues " +
     "the exact run (paused or stopped) from its durable admission and journal. action:\"config\" discovers the live backend " +
     "and model option catalog. Every agent call must resolve an explicit model route (backend-only routes are valid). Accepted runs prepare durably; custom backends require approval. Checkpoints always require an explicit answer.",
-  "• repl — INTERACTIVE STATEFUL orchestration. A persistent per-project JavaScript VM driven with " +
-    "action:\"eval\". Named bindings, pending subagent handles, queued turns, checkpoints, and `_` " +
-    "persist between calls and survive daemon restarts. Use it when the next orchestration step depends " +
-    "on inspecting intermediate results.",
-  "Rule of thumb: use workflow when you can script the whole plan ahead of time; use repl when you " +
-    "want a live session that evolves call by call.",
   "Claude Code channels: when this server is loaded as a channel, the updates the run monitor would " +
     "show arrive as <channel source=\"<this server's configured name>\" run_id=\"…\" " +
     "kind=\"terminal|paused|checkpoint|permission|setup\" status=\"…\"> events for every workflow run " +
@@ -795,7 +778,7 @@ function formatStatusSummary(result: WorkflowStatusToolResult): string {
 }
 
 /**
- * Build the MCP server with the `workflow` and `repl` model-facing tools, their Agent Skills,
+ * Build the MCP server with the `workflow` model-facing tool, its Agent Skill,
  * plus the user-controlled `author-workflow` prompt. Prompts are a separate MCP primitive and never enter the model's tool-selection
  * loop). Backend auth is the agents' own concern (their CLI credential stores); a run that
  * genuinely hits AUTH_REQUIRED pauses with authContext and resumes after an out-of-band CLI
@@ -804,17 +787,6 @@ function formatStatusSummary(result: WorkflowStatusToolResult): string {
  * through manager.runSync or startInBackground. The returned McpServer is not yet connected — the caller attaches a
  * transport (see index.ts).
  */
-/** The per-eval wall-clock deadline (see `repl-project.ts`); the
- *  `AGENTPRISM_REPL_EVAL_TIMEOUT_MS` env knob, clamped to >= 1 ms. */
-function replEvalTimeoutMs(): number {
-  const env = process.env.AGENTPRISM_REPL_EVAL_TIMEOUT_MS;
-  if (env !== undefined) {
-    const parsed = Number.parseInt(env, 10);
-    if (Number.isFinite(parsed) && parsed >= 1) return parsed;
-  }
-  return DEFAULT_REPL_EVAL_TIMEOUT_MS;
-}
-
 export interface CreateWorkflowServerOptions {
   /** Pin a pre-built manager as this server's own project (composition/back-compat seam). */
   manager?: WorkflowManager;
@@ -831,42 +803,14 @@ export interface CreateWorkflowServerOptions {
    */
   requireProjectDir?: boolean;
   /**
-   * The REPL workspaces' ACP runner (the broker's structural seam). Omitted: every
-   * workspace's broker owns its own `AcpAgentRunner` (disposed with the workspace). Tests
-   * inject a fake and own its lifetime.
+   * This server's MCP client identity on a legacy-era connection (daemon mode: the per-session
+   * transport's id). Scopes `workflow_monitor` notification claims so one client's claim never
+   * answers for another's. Omitted: a single-client server uses one fixed scope. Modern-era
+   * requests carry their own scope and ignore it.
    */
-  replRunner?: BrokerRunner;
-  /**
-   * The REPL client-presence ledger (daemon mode: one ledger per daemon, shared by every
-   * session; single-project mode: a private ledger). Drives the doc's last-client-
-   * disconnect drain. Omitted: a private ledger is created (the single-project mode's
-   * own client presence).
-   */
-  replPresence?: ReplPresenceLedger;
-  /**
-   * This server's MCP session id (daemon mode: the per-session transport's id, resolved
-   * per call; single-project mode: a fixed client id). The `repl` tool touches presence
-   * under it.
-   */
-  replClientId?: () => string | undefined;
-  /** The REPL eval-break relay (phase-F review round 2; daemon mode —
-   *  the shim fires it while the daemon's main thread is blocked in a
-   *  synchronous eval). OMITTED in single-project mode: the server owns
-   *  a channel of its own by default (round 3 — the documented no-id
-   *  interrupt must work in every supported mode; the stdio transport's
-   *  worker-reader fires it, and `replBreakUrl()` exposes the relay to
-   *  library hosts). */
-  replEvalBreakChannel?: EvalBreakChannel;
-  /**
-   * The concrete client-presence drain bound — the daemon reuses its session-eviction
-   * TTL (the spec-owed decision; see `repl-presence.ts`). Defaults to
-   * `SESSION_IDLE_TTL_MS`.
-   */
-  replDrainBoundMs?: number;
+  clientId?: () => string | undefined;
   /** Protocol era selected by an SDK serving entry. Hand-connected servers remain legacy. */
   protocolEra?: "legacy" | "modern";
-  /** Modern request instances have request-scoped presence and disconnect when the instance closes. */
-  disconnectReplClientOnClose?: boolean;
   /** Daemon-scoped publisher for modern subscriptions/listen change delivery. */
   modernNotifier?: ServerNotifier;
   /** Daemon-only location-transparent run-control router. */
@@ -891,37 +835,9 @@ export function createWorkflowServer(
   );
   const toolCatalog = new CapabilityAwareToolCatalog(mcp, options.protocolEra ?? "legacy");
   let acceptingWork = true;
-  // The REPL eval-break channel (phase-F review round 3): the in-process/
-  // library server OWNS one by default — the documented no-id interrupt
-  // for a synchronously running eval is deliverable in every supported
-  // mode, not only daemon mode (the daemon passes its own channel and
-  // owns its lifetime; `disposeReplEvalBreakChannel` disposes only a
-  // server-owned channel). The relay address is exposed as
-  // `replBreakUrl()` on the server control — the stdio transport's
-  // worker-reader fires it (see `repl-stdio-transport.ts`), and a
-  // library host can fire it from another thread.
-  const ownsReplEvalBreakChannel = options.replEvalBreakChannel === undefined;
-  const replEvalBreakChannel = options.replEvalBreakChannel ?? createEvalBreakChannel();
   const server = Object.assign(mcp, {
     stopAcceptingWork() {
       acceptingWork = false;
-    },
-    replBreakUrl() {
-      return replEvalBreakChannel.breakUrl();
-    },
-    replDefaultProjectDir() {
-      // The single-project server's own project: the FIRST registry
-      // context — exactly what the repl tool's projectDir-omitted
-      // resolution returns (`resolveContext`: `stores()[0]`). The
-      // relay transport fires its out-of-band break under this key
-      // when the client omits projectDir (phase-F review round 4: the
-      // omitted-projectDir interrupt used to skip the relay entirely
-      // and run to the per-eval deadline). Undefined in daemon mode
-      // (projectDir is required there) and when no context exists yet.
-      return projects.stores()[0]?.projectDir;
-    },
-    async disposeReplEvalBreakChannel() {
-      if (ownsReplEvalBreakChannel) await replEvalBreakChannel.dispose();
     },
   });
 
@@ -956,17 +872,6 @@ export function createWorkflowServer(
   registerAuthoringSkills(mcp, {
     registerResourceReader: (uri, read) => scriptResources.registerExternalResourceReader(uri, read),
   });
-  // The REPL client-presence ledger (see `repl-presence.ts`): one per
-  // server, shared by the repl tool AND the workflow tool — a session
-  // that addresses a project through WORKFLOW calls is present on that
-  // project exactly like one that touched the repl workspace (phase-E
-  // review rejection round 2: the workflow handler resolved the same
-  // project context without registering presence, so a workflow-only
-  // client's presence was invisible to the last-client-disconnect drain
-  // and a repl client's disconnect could drain children while the
-  // workflow client was still connected).
-  const replPresence = options.replPresence ?? new ReplPresenceLedger(options.replDrainBoundMs ?? REPL_DRAIN_BOUND_MS);
-
   /** Route a parsed input to its project context; undefined = runId found in no known store. */
   const resolveContext = (input: ReturnType<typeof parseWorkflowToolInput>): ProjectContext | undefined => {
     if (
@@ -992,24 +897,6 @@ export function createWorkflowServer(
 
   registerAuthoringPrompt(mcp);
   const probeRunner = workflowProbeRunner(runner);
-
-  // The REPL tool (roadmap doc's Surface section; phase D wiring): one
-  // persistent VM per project context, restored from the daemon's
-  // per-project repl store on first touch and reconciled; the snapshot
-  // sink attached by `ensureReplWorkspace` persists every state-changing
-  // boundary. The wasm is the engine's shipped binary (its hash is the
-  // snapshot envelope's identity — a version bump refuses loudly).
-  registerReplTool(mcp, {
-    projects,
-    wasm: loadShippedWasm(),
-    requireProjectDir,
-    runner: options.replRunner,
-    evalTimeoutMs: replEvalTimeoutMs(),
-    presence: replPresence,
-    clientId: options.replClientId ?? (() => "single-project"),
-    evalBreakChannel: replEvalBreakChannel,
-    acceptingWork: () => acceptingWork,
-  });
 
   const workflowToolOutputSchema = workflowToolOutputShape;
   const workflowToolConfig = {
@@ -1125,19 +1012,6 @@ export function createWorkflowServer(
           isError: true,
         };
       }
-      // Project-presence registration for the REPL's client-presence
-      // drain (phase-E review rejection round 2): the workflow tool
-      // resolves the SAME per-project context the repl tool addresses,
-      // and a session that calls it is connected to the project for the
-      // doc's "any MCP client connected to the project" warmth rule.
-      // The repl STATE is created if missing — a pure-workflow project
-      // keeps a stateless context (no VM: the workspace is materialized
-      // only on the first repl tool touch); the state is what the
-      // presence ledger keys presence by, so a workflow-only client B
-      // staying connected keeps the workspace warm when repl-client A
-      // disconnects.
-      if (context.repl === undefined) context.repl = createReplProjectState(context.projectDir);
-      replPresence.touch(context.repl, options.replClientId?.() ?? "unknown");
       const manager = context.manager;
       const activeRuns = context.activeRuns;
       if ("runId" in parsedInput) workflowLifecycle(context, runner).recover(parsedInput.runId);
@@ -1762,7 +1636,7 @@ export function createWorkflowServer(
       if (!projects.storeFor(request.runId)) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No workflow run found for ${request.runId}`);
       const scope = options.protocolEra === "modern"
         ? `modern:${request.scopeId ?? request.viewId}`
-        : `legacy:${options.replClientId?.() ?? "single-project"}`;
+        : `legacy:${options.clientId?.() ?? "single-project"}`;
       return projects.notificationClaims.handle(scope, request);
     },
     readEventsPage: (request) => scriptResources.readEventsPage(request),
@@ -1804,21 +1678,6 @@ export function createWorkflowServer(
       void mcp.sendToolListChanged();
     }
   };
-
-  if (options.disconnectReplClientOnClose) {
-    const previousOnClose = mcp.server.onclose;
-    mcp.server.onclose = () => {
-      try {
-        previousOnClose?.();
-      } finally {
-        const clientId = options.replClientId?.();
-        if (clientId !== undefined) {
-          replPresence.disconnect(clientId);
-          replPresence.forget(clientId);
-        }
-      }
-    };
-  }
 
   if (channel) {
     const previousOnClose = mcp.server.onclose;
