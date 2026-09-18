@@ -135,6 +135,11 @@
       "sha": "6ec22f39774320d759bf9ba37fc536c68766d1af",
       "imported": "2026-09-17",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (feat: Add expermental ACP session compaction updates (#515))"
+    },
+    {
+      "sha": "d7b07c1b44a28890cdf3d5450f8974a812db5ae2",
+      "imported": "2026-09-18",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (fix: update codex to 0.155.0 (#523))"
     }
   ]
 }
