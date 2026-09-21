@@ -1,5 +1,16 @@
 # @automatalabs/pi-acp
 
+## 0.9.3
+
+### Patch Changes
+
+- 3c2f672: Embed pi 0.87.0 (`@earendil-works/pi-ai`, `pi-coding-agent`, and `pi-agent-core` from 0.85.1, through 0.86.0 and 0.86.1) and move to `@agentclientprotocol/sdk@1.5.0`.
+
+  - **Session replay.** pi adds two session entry types: `usage` (model-attributed spend outside the conversation, such as prompt-cache warming) and `context_edit` (an append-only change to what the model sees of an earlier entry). Neither is conversation history, so `session/load` replays both as nothing and replays an edited entry as it was originally written — pi itself leaves UI history unchanged by a context edit.
+  - **Prompt-cache warming is on by default.** pi 0.86 re-sends the last request with a one-token budget shortly before a prompt cache expires during a long tool run, when the expected saving is at least $0.05 (mode `"streaming"`; set `"cacheWarming": "off"` in pi's global settings to disable). A refresh's cost is part of the session totals, so it is included in `usage_update.cost.amount`; its tokens are not part of any assistant message, so they are not in `PromptResponse.usage`.
+  - **Error classification.** The captured provider-error fixtures were re-verified against the 0.87.0 dists. pi now also retries Azure peak-load errors and Cloudflare 520 responses and caps agent-level retry backoff at 60 seconds; once pi's retries are exhausted both still classify as `provider_error`. Context overflow (now including z.ai's "Prompt too long", and bodyless 400/413 only on Cerebras) is recovered inside pi and never reaches the classifier. The authentication guidance pi-acp keys on is byte-identical.
+  - pi 0.87 rebuilds the agent's message list from its session store and removes the `shouldStopAfterTurn` option; pi-acp only reads that list and never set the option. Custom stream functions now receive a `TranscriptContext` whose tool declarations ride the transcript's system messages — this only affected a test fixture.
+
 ## 0.9.2
 
 ### Patch Changes
