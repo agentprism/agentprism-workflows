@@ -148,6 +148,7 @@ type ProjectedAcpUpdateKind =
   | "compaction_update"
   | "config_option_update"
   | "current_mode_update"
+  | "notice"
   | "session_info_update";
 type Assert<T extends true> = T;
 type IsNever<T> = [T] extends [never] ? true : false;
@@ -229,6 +230,7 @@ export function projectWorkflowAgentActivity(
     event.name === "compaction_update" ||
     event.name === "config_option_update" ||
     event.name === "current_mode_update" ||
+    event.name === "notice" ||
     event.name === "session_info_update"
   ) {
     return { ...base, kind: "activity" };

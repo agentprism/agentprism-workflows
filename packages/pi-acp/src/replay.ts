@@ -112,6 +112,12 @@ export function replayEntry(entry: SessionEntry): SessionUpdate[] {
         : [];
     case "thinking_level_change":
     case "model_change":
+    // Model-attributed spend outside the conversation (prompt-cache warming); it reaches the
+    // client through the cost gauge, never as history.
+    case "usage":
+    // A context edit changes what the model sees of an earlier entry, not the history the user
+    // saw: the raw target entry replays as it was written.
+    case "context_edit":
     case "compaction":
     case "branch_summary":
     case "custom":

@@ -194,7 +194,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentSession, ModelRuntime, SessionManager } from ${JSON.stringify(pathToFileURL(piCodingAgentEntry).href)};
 import { Agent } from ${JSON.stringify(pathToFileURL(piAgentCoreEntry).href)};
-import { createAssistantMessageEventStream, InMemoryCredentialStore } from ${JSON.stringify(pathToFileURL(piAiEntry).href)};
+import { createAssistantMessageEventStream, getCurrentTools, InMemoryCredentialStore } from ${JSON.stringify(pathToFileURL(piAiEntry).href)};
 import { resolveDeps, runAcp } from ${JSON.stringify(pathToFileURL(piAcpEntry).href)};
 console.log = console.error;
 const credentials = new InMemoryCredentialStore();
@@ -206,8 +206,9 @@ const createAgentSession = async (options) => {
   let callIndex = 0;
   const streamFn = (_model, context) => {
     const stream = createAssistantMessageEventStream();
-    const structured = context.tools?.find((tool) => tool.name.includes("structured_output") && tool.name.endsWith("StructuredOutput"));
-    const http = context.tools?.find((tool) => tool.name === "mcp__release-http__echo");
+    const tools = getCurrentTools(context.messages);
+    const structured = tools.find((tool) => tool.name.includes("structured_output") && tool.name.endsWith("StructuredOutput"));
+    const http = tools.find((tool) => tool.name === "mcp__release-http__echo");
     const tool = callIndex === 0 ? (structured ?? http) : undefined;
     if (callIndex === 0 && !tool) throw new Error("release smoke expected an injected HTTP MCP tool");
     callIndex += 1;

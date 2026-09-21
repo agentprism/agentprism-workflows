@@ -8,9 +8,9 @@ const packageRoot = new URL("../", import.meta.url);
 test("T24 manifest has exact runtime pins and split packed entries", async () => {
   const manifest = JSON.parse(await readFile(new URL("package.json", packageRoot), "utf8"));
   assert.deepEqual(manifest.dependencies, {
-    "@agentclientprotocol/sdk": "1.4.0",
-    "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@agentclientprotocol/sdk": "1.5.0",
+    "@earendil-works/pi-ai": "0.87.0",
+    "@earendil-works/pi-coding-agent": "0.87.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     typebox: "1.3.2",
   });

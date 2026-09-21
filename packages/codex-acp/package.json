@@ -67,8 +67,8 @@
     "vitest": "^4.1.11"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.4.0",
-    "@openai/codex": "^0.155.0",
+    "@agentclientprotocol/sdk": "^1.5.0",
+    "@openai/codex": "^0.155.1",
     "diff": "^9.0.0",
     "open": "^11.0.1",
     "vscode-jsonrpc": "^9.0.1",

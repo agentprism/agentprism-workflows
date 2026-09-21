@@ -86,6 +86,7 @@ test("non-content ACP session updates still advance backend activity counters", 
     "compaction_update",
     "config_option_update",
     "current_mode_update",
+    "notice",
     "session_info_update",
   ] as const) {
     const activity = projectWorkflowAgentActivity({

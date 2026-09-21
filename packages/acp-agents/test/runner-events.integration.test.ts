@@ -114,6 +114,7 @@ const ALL_UPDATE_KINDS = [
   "usage_update",
   "compaction_update",
   "compaction_summary_chunk",
+  "notice",
 ] as const satisfies readonly AcpUpdateKind[];
 
 type Assert<T extends true> = T;
@@ -137,6 +138,9 @@ const ALL_SESSION_UPDATES: AcpSessionUpdate[] = [
   // ACP schema 1.21.0 (SDK 1.4.0) — UNSTABLE session compaction updates (#2002).
   { sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "in_progress" },
   { sessionUpdate: "compaction_summary_chunk", compactionId: "compaction-1", content: { type: "text", text: "summary" } },
+  // ACP schema 1.23.0 (SDK 1.5.0) — UNSTABLE advisory session notices, sent only to clients
+  // that advertise `session.notices` (AgentPrism does not).
+  { sessionUpdate: "notice", severity: "warning", title: "Rate limit approaching" },
   { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "answer" } },
 ];
 

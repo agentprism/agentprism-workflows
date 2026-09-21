@@ -14,6 +14,7 @@ import {
 import { Agent } from "@earendil-works/pi-agent-core";
 import {
   createAssistantMessageEventStream,
+  getCurrentTools,
   InMemoryCredentialStore,
 } from "@earendil-works/pi-ai";
 
@@ -50,7 +51,10 @@ const createAgentSession = async (options) => {
   let callIndex = 0;
   const streamFn = (_activeModel, context) => {
     const stream = createAssistantMessageEventStream();
-    const structuredTool = context.tools?.find(({ name }) => name.startsWith("mcp__structured_output__StructuredOutput"));
+    // pi-ai 0.86 hands providers a TranscriptContext: tool declarations ride the transcript's
+    // system messages, not a `tools` field.
+    const structuredTool = getCurrentTools(context.messages)
+      .find(({ name }) => name.startsWith("mcp__structured_output__StructuredOutput"));
     const toolTurn = Boolean(structuredTool) && callIndex === 0;
     callIndex += 1;
     const message = {
