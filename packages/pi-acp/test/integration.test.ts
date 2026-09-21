@@ -14,9 +14,11 @@ import {
 import { Agent } from "@earendil-works/pi-agent-core";
 import {
   createAssistantMessageEventStream,
+  getCurrentTools,
   InMemoryCredentialStore,
   type AssistantMessage,
   type Model,
+  type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { PiAcpAgent } from "../src/agent.js";
 import { bridgeMcpServers, type McpSessionBinding } from "../src/mcp-bridge.js";
@@ -230,9 +232,11 @@ test("M5 actual Pi turn keeps a selected removed tool, then omits it and tombsto
   let streamCall = 0;
   let realSession: AgentSession | undefined;
   setup.deps.createAgentSession = async (options) => {
-    const streamFn = (_activeModel: unknown, context: { tools?: Array<{ name: string }> }) => {
+    // pi-ai 0.86 hands providers a TranscriptContext: tool declarations ride the transcript's
+    // system messages, not a `tools` field.
+    const streamFn = (_activeModel: unknown, context: TranscriptContext) => {
       const stream = createAssistantMessageEventStream();
-      const names = context.tools?.map(({ name }) => name) ?? [];
+      const names = getCurrentTools(context.messages).map(({ name }) => name);
       toolSnapshots.push(names);
       const alias = names.find((name) => name === "mcp__turn-removal__selected");
       const toolTurn = streamCall === 0;

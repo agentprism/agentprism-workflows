@@ -1,4 +1,16 @@
-export const FIXTURE_PI_PIN = "0.85.1";
+export const FIXTURE_PI_PIN = "0.87.0";
+// 2026-09-21 bump 0.85.1 -> 0.87.0 (through 0.86.0, 0.86.1): auth-guidance.js is byte-identical and
+// agent-session.js still carries the same authentication templates, so the captured guidance is
+// unchanged. pi-ai dist/utils/{error-body,provider-retry}.js are byte-identical. retry.js now also
+// retries Azure peak-load prose ("currently experiencing high demand") and Cloudflare 520, and caps
+// agent-level backoff at retry.maxAgentDelayMs (60s); overflow.js recognizes z.ai "Prompt too long"
+// and limits the bodyless 400/413 overflow rule to Cerebras. Overflow is recovered inside pi and
+// never reaches the classifier; the two newly retried strings are captured below and stay
+// provider_error once pi's retries are exhausted (provider capacity, not an account usage limit).
+// 0.87.0 adds `usage` and `context_edit` session entries (both replay as nothing) and rebuilds
+// agent.state.messages from the SessionManager projection; pi-acp only reads that array, and a
+// retried attempt was already dropped from it at 0.85.1. The removed shouldStopAfterTurn option
+// was never configured here.
 // 2026-09-08 bump 0.85.0 -> 0.85.1: auth-guidance.js, agent-session.js, and pi-ai
 // dist/utils/{retry,overflow,error-body,provider-retry}.js are byte-identical between
 // the installed published packages. Captured guidance and pause/retry classifications stay
@@ -84,6 +96,12 @@ export const PROVIDER_ERROR_FIXTURES = [
   { value: "429 quota exceeded", kind: "billing_error" },
   { value: "overloaded_error", kind: "rate_limit" },
   { value: "524 status code (no body)", kind: "provider_error" },
+  // pi v0.87.0 — packages/ai/test/retry.test.ts:15-16,73-95
+  { value: "520 status code (no body)", kind: "provider_error" },
+  {
+    value: "The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load. For improved capacity reliability, consider switching to Provisioned Throughput.",
+    kind: "provider_error",
+  },
   // pi v0.80.10 — packages/ai/src/api/pi-messages.ts:124-144 + test/pi-messages.test.ts:177-191
   { value: "401 Unauthorized: Token expired (unauthorized)", kind: "auth_error" },
   // pi v0.80.10 — packages/ai/test/error-body.test.ts:129-146

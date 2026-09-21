@@ -129,11 +129,11 @@ or session state exists; an unusable instruction never runs under the default pr
 
 The `pnpm test` script intentionally runs `tsc -p tsconfig.type-tests.json` before the runtime test suite. This is a small deviation from the test-script example in the frozen specification and ensures the T2b public type-contract check is enforced in local and CI test runs.
 
-Run `node scripts/smoke-pi-package.mjs` from the repository root after changing Pi dependencies. It packs this adapter and checks its public SDK import in fresh npm and pnpm installations. Pi 0.85.1 keeps its experimental remote harness out of the published local SDK, so this adapter no longer needs to supply `@earendil-works/pi-server`.
+Run `node scripts/smoke-pi-package.mjs` from the repository root after changing Pi dependencies. It packs this adapter and checks its public SDK import in fresh npm and pnpm installations. Pi 0.87.0 keeps its experimental remote harness out of the published local SDK, so this adapter no longer needs to supply `@earendil-works/pi-server`.
 
 ## Built on pi — THIRD-PARTY notice
 
-This package depends on and embeds `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, and `@earendil-works/pi-ai` version 0.85.1. pi is Copyright Earendil Inc., Mario Zechner, and Armin Ronacher and is distributed under the MIT License. The dependency packages retain the full MIT copyright and license text. pi-acp itself is Apache-2.0.
+This package depends on and embeds `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, and `@earendil-works/pi-ai` version 0.87.0. pi is Copyright Earendil Inc., Mario Zechner, and Armin Ronacher and is distributed under the MIT License. The dependency packages retain the full MIT copyright and license text. pi-acp itself is Apache-2.0.
 
 ## Model discovery preferences
 

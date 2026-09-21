@@ -603,7 +603,9 @@ await runner.dispose();
 `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`,
 `plan_update`, `plan_removed`, `available_commands_update`, `current_mode_update`,
 `config_option_update`, `session_info_update`, `usage_update`, and (ACP schema 1.21.0, UNSTABLE)
-`compaction_update`, `compaction_summary_chunk` — plus a few cross-cutting events:
+`compaction_update`, `compaction_summary_chunk`, and (ACP schema 1.23.0, UNSTABLE) `notice` — an
+advisory an agent may send only to a client that advertises `session.notices`, which AgentPrism
+does not — plus a few cross-cutting events:
 
 | event | payload |
 |-------|---------|

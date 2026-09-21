@@ -344,7 +344,7 @@ test("T13 auth methods are unconditional and exact; authenticate is ambient/no-o
 test("T16 replay projection is total across transcript and bookkeeping entries", () => {
   assert.equal(replayEntry({ type: "message", message: { role: "user", content: "hello" } } as never)[0]?.sessionUpdate, "user_message_chunk");
   assert.deepEqual(replayEntry({ type: "custom_message", content: "hidden", display: false } as never), []);
-  for (const type of ["thinking_level_change", "model_change", "compaction", "branch_summary", "custom", "label", "session_info"] as const) {
+  for (const type of ["thinking_level_change", "model_change", "usage", "context_edit", "compaction", "branch_summary", "custom", "label", "session_info"] as const) {
     assert.deepEqual(replayEntry({ type } as never), []);
   }
 });
