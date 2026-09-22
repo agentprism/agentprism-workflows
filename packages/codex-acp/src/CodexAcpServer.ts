@@ -115,7 +115,11 @@ import packageJson from "../package.json";
 import {ClientFileSystem} from "./ClientFileSystem";
 import {customAgentCapabilities} from "./CustomCapabilities";
 import {isJetBrains2026_1Client} from "./JBUtils";
-import {resolveTerminalOutputMode, type TerminalOutputMode} from "./TerminalOutputMode";
+import {
+    clientSupportsTerminalOutputDelta,
+    resolveTerminalOutputMode,
+    type TerminalOutputMode,
+} from "./TerminalOutputMode";
 import {clientSupportsPlanUpdates} from "./PlanCapabilities";
 import {
     createAgentTextMessageChunk,
@@ -191,6 +195,7 @@ export interface SessionState {
     currentModelSupportsFast: boolean;
     sessionMcpServers?: Array<string>;
     terminalOutputMode: TerminalOutputMode;
+    terminalOutputDeltaSupported: boolean;
     currentGoal?: ThreadGoalSnapshot | null;
     goalRevision: number;
     sessionTitle: string | null;
@@ -327,6 +332,7 @@ export class CodexAcpServer {
     private clientInfo: acp.Implementation | null;
     private clientCapabilities: acp.ClientCapabilities | null;
     private terminalOutputMode: TerminalOutputMode;
+    private terminalOutputDeltaSupported: boolean;
     private booleanConfigOptionsSupported: boolean;
     private clientFileSystem: ClientFileSystem;
     /** Last `authStatus` pushed to the client; used to suppress duplicates. */
@@ -392,6 +398,7 @@ export class CodexAcpServer {
         this.clientInfo = null;
         this.clientCapabilities = null;
         this.terminalOutputMode = "terminal_output_delta";
+        this.terminalOutputDeltaSupported = false;
         this.booleanConfigOptionsSupported = false;
         this.clientFileSystem = new ClientFileSystem(connection, null);
         this.currentAuthStatus = null;
@@ -416,6 +423,7 @@ export class CodexAcpServer {
         this.clientCapabilities = _params.clientCapabilities ?? null;
         this.initializeRequest = _params;
         this.terminalOutputMode = resolveTerminalOutputMode(_params.clientCapabilities);
+        this.terminalOutputDeltaSupported = clientSupportsTerminalOutputDelta(_params.clientCapabilities);
         this.booleanConfigOptionsSupported = clientSupportsBooleanConfigOptions(_params.clientCapabilities);
         this.clientFileSystem = new ClientFileSystem(this.connection, _params.clientCapabilities?.fs ?? null);
         await this.runWithProcessCheck(() => this.codexAcpClient.initialize(_params));
@@ -781,6 +789,7 @@ export class CodexAcpServer {
             currentModelSupportsFast: currentModelSupportsFast,
             sessionMcpServers: sessionMcpServers,
             terminalOutputMode: this.terminalOutputMode,
+            terminalOutputDeltaSupported: this.terminalOutputDeltaSupported,
             goalRevision: 0,
             sessionTitle: null,
             sessionTitleSource: operation === "resume" ? "unknown" : "unset",
@@ -2250,6 +2259,7 @@ export class CodexAcpServer {
             currentModelSupportsFast: currentModelSupportsFast,
             sessionMcpServers: sessionMcpServers,
             terminalOutputMode: this.terminalOutputMode,
+            terminalOutputDeltaSupported: this.terminalOutputDeltaSupported,
             goalRevision: 0,
             sessionTitle: null,
             sessionTitleSource: "unset",

@@ -438,6 +438,7 @@ export function createTestSessionState(overrides?: Partial<SessionState>): Sessi
         fastModeEnabled: false,
         currentModelSupportsFast: false,
         terminalOutputMode: "terminal_output_delta",
+        terminalOutputDeltaSupported: false,
         goalRevision: 0,
         loadedActiveTurnId: null,
         loadedActiveTurnIsAny: false,
