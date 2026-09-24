@@ -1684,10 +1684,16 @@ The server declares the SEP-2640 extension `io.modelcontextprotocol/skills` with
 
 #### Input parameters
 
-Discovery and runtime use the same strict eight-action `oneOf`:
-config/run/resume/setup-response/status/result/permissions-response/stop.
-Each branch requires its literal `action` and rejects extra fields. Run requires exactly one
-of `script` and `scriptPath`. There are no aliases or completion-wait controls.
+Discovery publishes one flat, strict JSON Schema object (`type:"object"`,
+`additionalProperties:false`, no top-level `oneOf`/`anyOf`/`allOf`, which the Anthropic API rejects
+in a tool `input_schema`). `action` is required and is one of the nine actions
+config/run/resume/setup-response/status/result/permissions-response/stop/pause; every other field
+is an optional property. The same schema enforces each action's rules at the MCP validation
+boundary: an action accepts only the fields in the table below, required fields must be present,
+run requires exactly one of `script` and `scriptPath`, stop forbids `callIndex` with `forceOwner`,
+and `response` must have the shape of its action. Violations are rejected, never stripped, with a
+message naming the action, the field, and the fields that action accepts. There are no aliases or
+completion-wait controls.
 
 | Field | Actions | Contract |
 | --- | --- | --- |

@@ -3,9 +3,14 @@ import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 
-// The published schema is an action-discriminated oneOf. Every object variant is strict, so
-// cross-action fields fail at the MCP validation boundary instead of being stripped and rejected
-// later by a prose-maintained discriminator. There are no action aliases or hidden preprocessors.
+// Discovery publishes ONE flat strict object: `action` plus every field as an optional property.
+// A top-level oneOf/anyOf/allOf is rejected by the Anthropic API tool input_schema, so hosts
+// either drop such a tool or flatten it lossily on their own. Per-action rules the flat shape
+// cannot express (required fields, fields that belong to another action, run's script/scriptPath
+// choice, stop's callIndex/forceOwner exclusion, and each action's response shape) are enforced
+// by the same schema at the MCP validation boundary, with action-specific messages, before the
+// input is narrowed through the strict per-action branches. Cross-action fields are rejected,
+// never stripped. There are no action aliases or hidden preprocessors.
 
 const permissionResponseSchema = z
   .object({
@@ -20,9 +25,79 @@ export const WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT = 16_384;
 export const WORKFLOW_RESULT_CHUNK_BYTES_MAX = 16_384;
 export const WORKFLOW_RESULT_CHUNK_BYTES_MIN = 4;
 
+const WORKFLOW_ACTIONS = [
+  "config",
+  "run",
+  "resume",
+  "setup-response",
+  "status",
+  "result",
+  "permissions-response",
+  "stop",
+  "pause",
+] as const;
+type WorkflowAction = (typeof WORKFLOW_ACTIONS)[number];
+
+type WorkflowToolField = Exclude<keyof typeof workflowToolInputShape, "action">;
+
+interface ActionFieldRules {
+  readonly required: readonly WorkflowToolField[];
+  readonly optional: readonly WorkflowToolField[];
+  /** Exactly one of these fields must be present. */
+  readonly exactlyOne?: readonly [WorkflowToolField, WorkflowToolField];
+  /** At most one of these (optional) fields may be present. */
+  readonly atMostOne?: readonly [WorkflowToolField, WorkflowToolField];
+}
+
+const INSPECTION_FIELDS = ["lastN", "labelGlob", "logLines"] as const;
+const EXECUTION_LIMIT_FIELDS = ["maxAgents", "concurrency", "agentRetries"] as const;
+
+/**
+ * Which fields each action accepts. This is the flat schema's per-action contract; a test pins it
+ * to the strict branches in workflowToolInputBranches, which remain the final narrowing step.
+ */
+const ACTION_FIELD_RULES: Readonly<Record<WorkflowAction, ActionFieldRules>> = {
+  config: { required: [], optional: ["projectDir", "harnesses", "modelSpecs", "modelFilter"] },
+  run: {
+    required: [],
+    optional: ["projectDir", "args", ...EXECUTION_LIMIT_FIELDS],
+    exactlyOne: ["script", "scriptPath"],
+  },
+  resume: { required: ["runId"], optional: [...EXECUTION_LIMIT_FIELDS, "checkpointReplies"] },
+  "setup-response": { required: ["runId", "setupId", "response"], optional: [] },
+  status: { required: ["runId"], optional: INSPECTION_FIELDS },
+  result: { required: ["runId"], optional: ["offset", "maxBytes"] },
+  "permissions-response": { required: ["runId", "permissionId", "response"], optional: [] },
+  stop: {
+    required: ["runId"],
+    optional: [...INSPECTION_FIELDS, "callIndex", "forceOwner"],
+    atMostOne: ["callIndex", "forceOwner"],
+  },
+  pause: { required: ["runId"], optional: INSPECTION_FIELDS },
+};
+
+function acceptedFields(rules: ActionFieldRules): WorkflowToolField[] {
+  return [...rules.required, ...(rules.exactlyOne ?? []), ...rules.optional];
+}
+
+function describeActionFields(action: WorkflowAction): string {
+  const rules = ACTION_FIELD_RULES[action];
+  const parts = [
+    ...rules.required,
+    ...(rules.exactlyOne ? [`exactly one of ${rules.exactlyOne.join("|")}`] : []),
+    ...rules.optional.map((field) => `${field}?`),
+  ];
+  return `${action}(${parts.join(", ")})`;
+}
+
 const actionSchema = z
-  .enum(["config", "run", "resume", "setup-response", "status", "result", "permissions-response", "stop"])
-  .describe("Workflow operation. Activate the agentprism-workflow-authoring skill for the action guide.");
+  .enum(WORKFLOW_ACTIONS)
+  .describe(
+    "Workflow operation; each action accepts only its own fields (? = optional): " +
+      `${WORKFLOW_ACTIONS.map(describeActionFields).join("; ")}. ` +
+      "Stop takes callIndex or forceOwner, not both. " +
+      "Activate the agentprism-workflow-authoring skill for the action guide.",
+  );
 const scriptSchema = z
   .string()
   .min(1)
@@ -83,11 +158,21 @@ const setupResponseSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("decline") }).strict(),
   z.object({ action: z.literal("cancel") }).strict(),
 ]);
+const RESPONSE_SHAPES = {
+  "setup-response": '{ action:"accept", content:{...} } | { action:"decline" } | { action:"cancel" }',
+  "permissions-response": '{ outcome:{ outcome:"selected", optionId } } | { outcome:{ outcome:"cancelled" } }',
+} as const;
+const responseSchema = z
+  .union([setupResponseSchema, permissionResponseSchema])
+  .describe(
+    `Setup-response: ${RESPONSE_SHAPES["setup-response"]}. ` +
+      `Permissions-response: ${RESPONSE_SHAPES["permissions-response"]}.`,
+  );
 const runIdSchema = z
   .string()
   .max(128)
   .regex(/^[a-z0-9]+-[a-z0-9]+$/, "runId must be an engine-generated run ID")
-  .describe("Project-scoped engine run ID.");
+  .describe("Project-scoped engine run ID; required by every action except config and run.");
 const permissionIdSchema = z
   .string()
   .uuid()
@@ -133,8 +218,9 @@ const maxBytesSchema = z
   .describe(`Result chunk bound; default and maximum ${WORKFLOW_RESULT_CHUNK_BYTES_DEFAULT} bytes.`);
 
 /**
- * Public field catalog retained for hosts that reuse individual validators. It is not the tool
- * schema: workflowToolInputBranches and workflowToolInputSchema are the canonical action union.
+ * Public field catalog: one validator per tool field. Every field except `action` is published as
+ * an optional property of the flat workflowToolInputSchema; which fields an action accepts is
+ * enforced by that schema, not by this catalog.
  */
 export const workflowToolInputShape = {
   action: actionSchema,
@@ -152,7 +238,7 @@ export const workflowToolInputShape = {
   setupId: setupIdSchema,
   runId: runIdSchema,
   permissionId: permissionIdSchema,
-  response: permissionResponseSchema,
+  response: responseSchema,
   callIndex: callIndexSchema,
   forceOwner: forceOwnerSchema,
   lastN: lastNSchema,
@@ -287,6 +373,10 @@ export const workflowToolInputBranches = {
   pause: pauseInputSchema,
 } as const;
 
+/**
+ * The strict per-action union. Runtime-only: it is the typed narrowing step behind
+ * workflowToolInputSchema and is never published, because its JSON Schema is a top-level oneOf.
+ */
 export const workflowToolCanonicalInputSchema = z.xor([
   workflowToolInputBranches.config,
   workflowToolInputBranches.run,
@@ -297,10 +387,68 @@ export const workflowToolCanonicalInputSchema = z.xor([
   workflowToolInputBranches["permissions-response"],
   workflowToolInputBranches.stop,
   workflowToolInputBranches.pause,
-]).meta({ type: "object" });
+]);
 
-/** Runtime and discovery use the same strict canonical schema. */
-export const workflowToolInputSchema = workflowToolCanonicalInputSchema;
+const workflowToolFlatInputSchema = z
+  .object({
+    action: workflowToolInputShape.action,
+    ...Object.fromEntries(
+      Object.entries(workflowToolInputShape)
+        .filter(([field]) => field !== "action")
+        .map(([field, schema]) => [field, schema.optional()]),
+    ) as { [K in WorkflowToolField]: z.ZodOptional<(typeof workflowToolInputShape)[K]> },
+  })
+  .strict();
+
+function checkActionFields(
+  input: z.infer<typeof workflowToolFlatInputSchema>,
+  ctx: z.RefinementCtx,
+): void {
+  const { action } = input;
+  const rules = ACTION_FIELD_RULES[action];
+  const accepted = acceptedFields(rules);
+  const present = (field: WorkflowToolField) => input[field] !== undefined;
+  const fail = (message: string, path: PropertyKey[] = []) =>
+    ctx.addIssue({ code: "custom", message, path });
+
+  for (const field of Object.keys(input) as Array<keyof typeof input>) {
+    if (field === "action" || input[field] === undefined || accepted.includes(field)) continue;
+    fail(
+      `action "${action}" does not accept ${field}; it accepts ${accepted.length === 0 ? "no other fields" : accepted.join(", ")}`,
+      [field],
+    );
+  }
+  for (const field of rules.required) {
+    if (!present(field)) fail(`action "${action}" requires ${field}`, [field]);
+  }
+  if (rules.exactlyOne) {
+    const [first, second] = rules.exactlyOne;
+    if (present(first) === present(second)) {
+      fail(`action "${action}" requires exactly one of ${first} or ${second}`);
+    }
+  }
+  if (rules.atMostOne) {
+    const [first, second] = rules.atMostOne;
+    if (present(first) && present(second)) {
+      fail(`action "${action}" accepts ${first} or ${second}, not both`);
+    }
+  }
+  if ((action === "setup-response" || action === "permissions-response") && present("response")) {
+    const expected = action === "setup-response" ? setupResponseSchema : permissionResponseSchema;
+    if (!expected.safeParse(input.response).success) {
+      fail(`action "${action}" requires response to be ${RESPONSE_SHAPES[action]}`, ["response"]);
+    }
+  }
+}
+
+/**
+ * The published and runtime tool schema. Its JSON Schema (the pipe's input side) is one flat
+ * strict object; validation additionally enforces each action's field rules and then narrows the
+ * input through the strict per-action union to the WorkflowToolInput shapes.
+ */
+export const workflowToolInputSchema = workflowToolFlatInputSchema
+  .superRefine(checkActionFields)
+  .pipe(workflowToolCanonicalInputSchema);
 
 interface WorkflowExecuteToolInputBase {
   action: "run";

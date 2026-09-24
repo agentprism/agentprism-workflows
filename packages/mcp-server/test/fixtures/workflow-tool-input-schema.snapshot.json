@@ -1,187 +1,44 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "branches": [
-    {
-      "action": "config",
-      "properties": [
-        "action",
-        "projectDir",
-        "harnesses",
-        "modelSpecs",
-        "modelFilter"
-      ],
-      "required": [
-        "action"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "variants": [
-        {
-          "action": "run",
-          "properties": [
-            "action",
-            "script",
-            "projectDir",
-            "args",
-            "maxAgents",
-            "concurrency",
-            "agentRetries"
-          ],
-          "required": [
-            "action",
-            "script"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "action": "run",
-          "properties": [
-            "action",
-            "scriptPath",
-            "projectDir",
-            "args",
-            "maxAgents",
-            "concurrency",
-            "agentRetries"
-          ],
-          "required": [
-            "action",
-            "scriptPath"
-          ],
-          "additionalProperties": false
-        }
-      ]
-    },
-    {
-      "action": "resume",
-      "properties": [
-        "action",
-        "runId",
-        "maxAgents",
-        "concurrency",
-        "agentRetries",
-        "checkpointReplies"
-      ],
-      "required": [
-        "action",
-        "runId"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "action": "setup-response",
-      "properties": [
-        "action",
-        "runId",
-        "setupId",
-        "response"
-      ],
-      "required": [
-        "action",
-        "runId",
-        "setupId",
-        "response"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "action": "status",
-      "properties": [
-        "action",
-        "runId",
-        "lastN",
-        "labelGlob",
-        "logLines"
-      ],
-      "required": [
-        "action",
-        "runId"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "action": "result",
-      "properties": [
-        "action",
-        "runId",
-        "offset",
-        "maxBytes"
-      ],
-      "required": [
-        "action",
-        "runId"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "action": "permissions-response",
-      "properties": [
-        "action",
-        "runId",
-        "permissionId",
-        "response"
-      ],
-      "required": [
-        "action",
-        "runId",
-        "permissionId",
-        "response"
-      ],
-      "additionalProperties": false
-    },
-    {
-      "variants": [
-        {
-          "action": "stop",
-          "properties": [
-            "action",
-            "runId",
-            "lastN",
-            "labelGlob",
-            "logLines",
-            "forceOwner"
-          ],
-          "required": [
-            "action",
-            "runId"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "action": "stop",
-          "properties": [
-            "action",
-            "runId",
-            "lastN",
-            "labelGlob",
-            "logLines",
-            "callIndex"
-          ],
-          "required": [
-            "action",
-            "runId",
-            "callIndex"
-          ],
-          "additionalProperties": false
-        }
-      ]
-    },
-    {
-      "action": "pause",
-      "properties": [
-        "action",
-        "runId",
-        "lastN",
-        "labelGlob",
-        "logLines"
-      ],
-      "required": [
-        "action",
-        "runId"
-      ],
-      "additionalProperties": false
-    }
+  "required": [
+    "action"
+  ],
+  "additionalProperties": false,
+  "actions": [
+    "config",
+    "run",
+    "resume",
+    "setup-response",
+    "status",
+    "result",
+    "permissions-response",
+    "stop",
+    "pause"
+  ],
+  "properties": [
+    "action",
+    "script",
+    "scriptPath",
+    "projectDir",
+    "harnesses",
+    "modelSpecs",
+    "modelFilter",
+    "args",
+    "maxAgents",
+    "concurrency",
+    "agentRetries",
+    "checkpointReplies",
+    "setupId",
+    "runId",
+    "permissionId",
+    "response",
+    "callIndex",
+    "forceOwner",
+    "lastN",
+    "labelGlob",
+    "logLines",
+    "offset",
+    "maxBytes"
   ]
 }

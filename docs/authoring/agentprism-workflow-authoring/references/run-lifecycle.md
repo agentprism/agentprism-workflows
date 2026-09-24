@@ -9,8 +9,9 @@ within 45 seconds. Neither bound limits how long a workflow may run. Each projec
 active runs, including runs preparing or waiting for setup; a settled or rejected run releases its slot.
 
 On the shared daemon, `config` and `run` require an absolute `projectDir`. Every other action locates
-the project through `runId` and rejects `projectDir`. The input is a strict nine-action union: send
-only the fields of the selected action, and never an execution-mode field or an alias.
+the project through `runId` and rejects `projectDir`. The input is one flat object whose nine actions
+each accept only their own fields: send only the fields of the selected action, and never an
+execution-mode field or an alias.
 
 ### Actions
 
