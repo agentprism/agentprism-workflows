@@ -57,21 +57,38 @@ function object(value: unknown): JsonObject {
   return value as JsonObject;
 }
 
-function branchSnapshot(schema: JsonObject): JsonObject {
-  const variants = schema.oneOf;
-  if (Array.isArray(variants)) {
-    return { variants: variants.map((variant) => branchSnapshot(object(variant))) };
-  }
-  const properties = object(schema.properties);
-  return {
-    action: object(properties.action).const,
-    properties: Object.keys(properties),
-    required: schema.required,
-    additionalProperties: schema.additionalProperties,
-  };
+/** One valid value per flat field, used to cross-check the flat rules against the strict branches. */
+const sampleFieldValues: Record<string, unknown> = {
+  script: "x",
+  scriptPath: "/tmp/workflow.js",
+  projectDir: "/tmp/project",
+  harnesses: ["codex"],
+  modelSpecs: ["codex/gpt-5"],
+  modelFilter: "gpt",
+  args: { any: "json" },
+  maxAgents: 3,
+  concurrency: 2,
+  agentRetries: 1,
+  checkpointReplies: { "0": true },
+  setupId: PERMISSION_ID,
+  runId: "source-1",
+  permissionId: PERMISSION_ID,
+  callIndex: 0,
+  forceOwner: true,
+  lastN: 5,
+  labelGlob: "review:*",
+  logLines: 5,
+  offset: 0,
+  maxBytes: 1024,
+};
+
+function sampleResponse(action: string): unknown {
+  return action === "setup-response"
+    ? { action: "decline" }
+    : { outcome: { outcome: "cancelled" } };
 }
 
-test("canonical schema publishes nine strict action branches and matches the committed snapshot", async () => {
+test("discovery publishes one flat strict object with no top-level composition keyword", async () => {
   assert.deepEqual(Object.keys(workflowToolInputBranches), [
     "config",
     "run",
@@ -86,22 +103,89 @@ test("canonical schema publishes nine strict action branches and matches the com
   const published = object(
     await workflowToolInputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" }),
   );
-  assert.deepEqual(Object.keys(published), ["$schema", "oneOf", "type"]);
-  const oneOf = published.oneOf;
-  assert.ok(Array.isArray(oneOf));
-  assert.equal(oneOf.length, 9);
+  // The Anthropic API rejects a tool input_schema with top-level oneOf/anyOf/allOf; hosts built on
+  // it drop or lossily rewrite such a tool.
+  for (const keyword of ["oneOf", "anyOf", "allOf", "not", "if", "then", "else"]) {
+    assert.equal(Object.hasOwn(published, keyword), false, `top-level ${keyword}`);
+  }
+  assert.deepEqual(Object.keys(published), ["$schema", "type", "properties", "required", "additionalProperties"]);
+  const properties = object(published.properties);
   const actual = {
     $schema: published.$schema,
     type: published.type,
-    branches: oneOf.map((branch) => branchSnapshot(object(branch))),
+    required: published.required,
+    additionalProperties: published.additionalProperties,
+    actions: object(properties.action).enum,
+    properties: Object.keys(properties),
   };
   const expected = JSON.parse(
     readFileSync(join(import.meta.dirname, "fixtures", "workflow-tool-input-schema.snapshot.json"), "utf8"),
   );
   assert.deepEqual(actual, expected);
+  assert.deepEqual(expected.actions, Object.keys(workflowToolInputBranches));
+  assert.deepEqual(expected.properties, Object.keys(workflowToolInputShape));
 });
 
-test("runtime and published JSON Schema accept every canonical action and reject cross-action fields", async () => {
+test("the flat schema accepts exactly what the strict per-action branches accept, field by field", () => {
+  // Schema ends by narrowing through the strict union, so agreement alone cannot catch per-action
+  // rules that are too lenient. Every rejection must also come from the flat stage's own issues,
+  // never from the trailing union (whose only message is a generic invalid_union).
+  const agrees = (input: Record<string, unknown>, label: string) => {
+    const flat = Schema.safeParse(input);
+    const canonical = workflowToolCanonicalInputSchema.safeParse(input);
+    assert.equal(flat.success, canonical.success, label);
+    if (!flat.success) {
+      assert.ok(flat.error.issues.every((issue) => issue.code !== "invalid_union"), `${label}: rejected only by the strict union`);
+    }
+  };
+  for (const action of Object.keys(workflowToolInputBranches)) {
+    const base: Record<string, unknown> = { action };
+    if (action !== "config" && action !== "run") base.runId = "source-1";
+    if (action === "run") base.script = "x";
+    if (action === "setup-response") Object.assign(base, { setupId: PERMISSION_ID, response: sampleResponse(action) });
+    if (action === "permissions-response") Object.assign(base, { permissionId: PERMISSION_ID, response: sampleResponse(action) });
+    assert.equal(Schema.safeParse(base).success, true, `${action} base`);
+    assert.equal(workflowToolCanonicalInputSchema.safeParse(base).success, true, `${action} base canonical`);
+    for (const field of Object.keys(workflowToolInputShape)) {
+      if (field === "action" || field === "response") continue;
+      agrees({ ...base, [field]: sampleFieldValues[field] }, `${action} + ${field}`);
+      const without = { ...base };
+      delete without[field];
+      agrees(without, `${action} - ${field}`);
+    }
+    for (const responseAction of ["setup-response", "permissions-response"]) {
+      agrees({ ...base, response: sampleResponse(responseAction) }, `${action} + ${responseAction} response`);
+    }
+  }
+});
+
+test("per-action violations fail with messages that name the action and the fix", () => {
+  const cases: Array<[unknown, RegExp]> = [
+    [{ action: "run", script: "x", lastN: 1 }, /action "run" does not accept lastN; it accepts script, scriptPath, projectDir/],
+    [{ action: "status" }, /action "status" requires runId/],
+    [{ action: "run" }, /action "run" requires exactly one of script or scriptPath/],
+    [{ action: "run", script: "x", scriptPath: "/tmp/w.js" }, /action "run" requires exactly one of script or scriptPath/],
+    [{ action: "stop", runId: "a-b", callIndex: 1, forceOwner: true }, /action "stop" accepts callIndex or forceOwner, not both/],
+    [
+      { action: "setup-response", runId: "a-b", setupId: PERMISSION_ID, response: { outcome: { outcome: "cancelled" } } },
+      /action "setup-response" requires response to be \{ action:"accept"/,
+    ],
+    [
+      { action: "permissions-response", runId: "a-b", permissionId: PERMISSION_ID, response: { action: "decline" } },
+      /action "permissions-response" requires response to be \{ outcome:/,
+    ],
+  ];
+  for (const [input, message] of cases) {
+    assert.throws(
+      () => parseWorkflowToolInput(input),
+      (error: unknown) =>
+        error instanceof ProtocolError && error.code === ProtocolErrorCode.InvalidParams && message.test(error.message),
+      JSON.stringify(input),
+    );
+  }
+});
+
+test("published JSON Schema accepts every canonical action; runtime also rejects cross-action fields", async () => {
   const published = await workflowToolInputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" });
   const validate = new AjvJsonSchemaValidator().getValidator(published as JsonSchemaType);
   for (const [name, input] of Object.entries(canonicalInputs)) {
@@ -113,7 +197,8 @@ test("runtime and published JSON Schema accept every canonical action and reject
   for (const [name, input] of Object.entries(crossActionInputs)) {
     assert.equal(workflowToolCanonicalInputSchema.safeParse(input).success, false, `${name} canonical runtime`);
     assert.equal(Schema.safeParse(input).success, false, `${name} runtime`);
-    assert.equal(validate(input).valid, false, `${name} published schema`);
+    // Every field is a flat optional property, so which action owns it is a runtime rule only.
+    assert.equal(validate(input).valid, true, `${name} published schema`);
     assert.throws(
       () => parseWorkflowToolInput(input),
       (error: unknown) => error instanceof ProtocolError && error.code === ProtocolErrorCode.InvalidParams,
@@ -174,10 +259,12 @@ test("published and runtime schemas reject every retired wait, alias, and edited
     "resume edited script path": { action: "resume", runId: "source-1", scriptPath: "/tmp/edited.js" },
   } as const;
 
+  // These reuse fields that another action owns, so only the runtime per-action rules reject them.
+  const crossActionOnly = new Set(["resume args", "resume edited inline script", "resume edited script path"]);
   for (const [name, input] of Object.entries(retiredInputs)) {
     assert.equal(workflowToolCanonicalInputSchema.safeParse(input).success, false, `${name} canonical runtime`);
     assert.equal(Schema.safeParse(input).success, false, `${name} runtime`);
-    assert.equal(validate(input).valid, false, `${name} published schema`);
+    assert.equal(validate(input).valid, crossActionOnly.has(name), `${name} published schema`);
     assert.throws(
       () => parseWorkflowToolInput(input),
       (error: unknown) => error instanceof ProtocolError && error.code === ProtocolErrorCode.InvalidParams,
@@ -317,6 +404,8 @@ test("execution resource knobs remain clamp-at-runtime rather than schema maxima
 
 test("field catalog is canonical and points detailed syntax to the authoring skill", () => {
   assert.match(workflowToolInputShape.action.description ?? "", /agentprism-workflow-authoring skill/);
+  assert.match(workflowToolInputShape.action.description ?? "", /run\(exactly one of script\|scriptPath, /);
+  assert.deepEqual(workflowToolInputShape.action.options, Object.keys(workflowToolInputBranches));
   assert.match(workflowToolInputShape.script.description ?? "", /raw JavaScript workflow source/);
   assert.ok(!("startInBackground" in workflowToolInputShape));
 });

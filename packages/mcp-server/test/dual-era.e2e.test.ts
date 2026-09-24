@@ -198,11 +198,12 @@ test("one daemon serves legacy sessions and modern 2026-07-28 requests through t
     assert.deepEqual(
       modern.workflowInputSchema,
       legacy.workflowInputSchema,
-      "legacy and modern discovery publish the same discriminated workflow schema",
+      "legacy and modern discovery publish the same workflow schema",
     );
-    const published = modern.workflowInputSchema as { oneOf?: unknown[]; properties?: unknown };
-    assert.equal(published.oneOf?.length, 9);
-    assert.equal(published.properties, undefined, "neither transport regresses to the flat field superset");
+    const published = modern.workflowInputSchema as { oneOf?: unknown[]; type?: unknown; properties?: Record<string, unknown> };
+    assert.equal(published.oneOf, undefined, "neither transport publishes a top-level oneOf");
+    assert.equal(published.type, "object");
+    assert.ok(published.properties?.action, "both transports publish the flat action-keyed object");
     assert.equal(legacy.status, "completed");
     assert.equal(modern.status, "completed");
     assert.equal(daemon.sessions.size, 1, "only the legacy client allocates an MCP session");

@@ -336,14 +336,15 @@ basic-host setup. `AGENTPRISM_DEV_CWD=<project dir>` serves an existing run stor
 
 **Tool: `workflow`** — input parameters:
 
-Tool discovery and runtime use the same strict eight-action `oneOf`: `action` is required, each
-branch lists only its valid fields, and cross-action or removed fields are rejected as MCP Invalid
-Params. There are no hidden aliases, omitted-action defaults, wait controls, or MCP replay/fork
-inputs.
+Tool discovery publishes one flat, strict object schema with no top-level `oneOf` (which the
+Anthropic API rejects in a tool `input_schema`): `action` is required and every other field is
+optional. The same schema enforces each action's own fields at runtime, so cross-action, missing, or
+removed fields are rejected as MCP Invalid Params with a message naming the fix. There are no hidden
+aliases, omitted-action defaults, wait controls, or MCP replay/fork inputs.
 
 | Param | Type | Notes |
 |---|---|---|
-| `action` | `"config" \| "run" \| "resume" \| "status" \| "result" \| "permissions-response" \| "pause" \| "stop"` | Required canonical discriminator. `resume` continues the exact run ID, including a paused or stopped one; `status` is an immediate observation; `pause` lets executing agents finish before the run pauses; `stop` interrupts. |
+| `action` | `"config" \| "run" \| "resume" \| "setup-response" \| "status" \| "result" \| "permissions-response" \| "pause" \| "stop"` | Required canonical discriminator. `resume` continues the exact run ID, including a paused or stopped one; `status` is an immediate observation; `pause` lets executing agents finish before the run pauses; `stop` interrupts. |
 | `script` | string | Run only: supply **exactly one** of `script` or `scriptPath`. Raw JS (no Markdown fences); first statement must be `export const meta = { name, description, phases? }`. Forbidden for resume/status/result/permissions-response/stop. |
 | `scriptPath` | absolute path string | Run only: the other half of the `script`/`scriptPath` pair — an absolute path on the server's filesystem, read once at admission. Forbidden for resume/status/result/permissions-response/stop. |
 | `projectDir` | absolute path string | Config/run: project-sensitive discovery cwd and the run's project store/default cwd. Required for both on the shared daemon; defaults to the server's project under `--in-process`. Resume locates the project from its source `runId`. |

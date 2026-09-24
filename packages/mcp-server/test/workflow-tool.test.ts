@@ -42,13 +42,11 @@ test("tool discovery exposes asynchronous lifecycle separately from the dedicate
     assert.match(workflow.description ?? "", /skill:\/\/agentprism-workflow-authoring\/SKILL\.md/);
     assert.ok((workflow.description ?? "").length < 1200);
     assert.doesNotMatch(JSON.stringify(workflow.inputSchema), /background|foreground|startInBackground|agentTimeoutMs|agentIdleTimeoutMs/);
-    const branches = workflow.inputSchema.oneOf as Array<Record<string, unknown>>;
-    assert.equal(branches.length, 9);
-    const action = (variant: Record<string, unknown>): unknown => {
-      const variants = variant.oneOf as Array<Record<string, unknown>> | undefined;
-      return variants ? action(variants[0]) : field(field(variant.properties, "action"), "const");
-    };
-    assert.deepEqual(branches.map(action), ["config", "run", "resume", "setup-response", "status", "result", "permissions-response", "stop", "pause"]);
+    for (const keyword of ["oneOf", "anyOf", "allOf"]) assert.equal(Object.hasOwn(workflow.inputSchema, keyword), false, keyword);
+    assert.equal(workflow.inputSchema.type, "object");
+    assert.deepEqual(workflow.inputSchema.required, ["action"]);
+    assert.equal(field(workflow.inputSchema, "additionalProperties"), false);
+    assert.deepEqual(field(field(workflow.inputSchema.properties, "action"), "enum"), ["config", "run", "resume", "setup-response", "status", "result", "permissions-response", "stop", "pause"]);
     assert.ok(workflow.outputSchema);
     const properties = Object.keys(field(workflow.outputSchema, "properties") ?? {});
     for (const name of ["accepted", "continuation", "setup", "outcome", "pendingPermissions"]) assert.ok(properties.includes(name));

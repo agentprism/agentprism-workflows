@@ -80,7 +80,7 @@ Run prepares the workflow inside the request: source checks, a mocked dry run, a
 
 Cancelling the run request before it returns abandons preparation; nothing is persisted. Once admitted, the run belongs to the server and survives client disconnects. Each run's script is a `file://` resource (`scriptUri`, `scriptPath`). Retain `runId` for status, setup, checkpoint replies, pause, stop, and results.
 
-The input is a strict action union: send only fields belonging to the selected action. `projectDir` belongs to `config` and `run` only. Some MCP clients report every rejected union branch; when that happens, read the branch matching your `action` and remove cross-action fields.
+The input is one flat object, but each action accepts only its own fields: send only fields belonging to the selected action. The `action` field's description lists every action's fields. `projectDir` belongs to `config` and `run` only. A rejected call names the action, the offending or missing field, and the fields that action accepts.
 
 ## Minimal MCP lifecycle
 
