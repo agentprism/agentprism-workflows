@@ -966,6 +966,11 @@ export class CodexAcpClient {
      * (`pushLoadedTurnEnded`), so the watch is never unobserved.
      */
     onSessionNotification(sessionId: string, eventHandler: (event: ServerNotification) => void): void {
+        // Replacing the session's one handler orphans any earlier prompt subscription, whose
+        // router record would otherwise make the next prompt's subscribe() only swap its
+        // dispatch target and never re-register — leaving that prompt's events (and every
+        // session-scoped notice after it) routed to this watcher after a re-load.
+        this.subagents.clear(sessionId);
         this.codexClient.onServerNotification(sessionId, eventHandler);
     }
 
