@@ -1,4 +1,8 @@
-export const FIXTURE_PI_PIN = "0.87.0";
+export const FIXTURE_PI_PIN = "0.87.1";
+// 2026-09-24 bump 0.87.0 -> 0.87.1: auth-guidance.js, agent-session.js, and pi-ai
+// dist/utils/{retry,overflow,error-body,provider-retry}.js are byte-identical between the published
+// tarballs, and pi-agent-core's dist is unchanged. The release adds models and changes the xAI
+// default model; captured guidance and pause/retry classifications stay unchanged.
 // 2026-09-21 bump 0.85.1 -> 0.87.0 (through 0.86.0, 0.86.1): auth-guidance.js is byte-identical and
 // agent-session.js still carries the same authentication templates, so the captured guidance is
 // unchanged. pi-ai dist/utils/{error-body,provider-retry}.js are byte-identical. retry.js now also

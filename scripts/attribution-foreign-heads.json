@@ -145,6 +145,11 @@
       "sha": "acc035a7444bf7550aabcc24597ed845ba3e593b",
       "imported": "2026-09-21",
       "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (fix: update codex to 0.155.1 (#525))"
+    },
+    {
+      "sha": "7fee150a55098f7140a03907fec5f11edbe45086",
+      "imported": "2026-09-24",
+      "what": "codex-acp upstream sync: agentclientprotocol/codex-acp main (fix: restore read-only mode and clarify access presets (#480))"
     }
   ]
 }
