@@ -45,6 +45,10 @@ test(
     assert.ok(address && typeof address !== "string");
     const url = `http://127.0.0.1:${address.port}/preview.html`;
     const profile = await mkdtemp(resolve(tmpdir(), "agentprism-ui-host-"));
+    // A throwaway-profile test browser must not touch the OS keyring: in a session with a
+    // D-Bus bus but no display (a remote or headless shell), Chrome's network service blocks
+    // on a keyring unlock prompt nothing can answer, so every request, even to the loopback
+    // Vite server, hangs until the test times out. --password-store=basic keeps it in-profile.
     const browser = spawn(
       chrome!,
       [
@@ -52,6 +56,7 @@ test(
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--password-store=basic",
         "--remote-debugging-port=0",
         `--user-data-dir=${profile}`,
         "about:blank",
