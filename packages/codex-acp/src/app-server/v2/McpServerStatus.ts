@@ -11,13 +11,27 @@ import type { McpServerConnectionStatus } from "./McpServerConnectionStatus";
 
 export type McpServerStatus = { name: string,
 /**
+ * Environment that contributed this registration; null for a thread-wide server.
+ * Older servers omit this field.
+ */
+environmentId?: string | null,
+/**
  * Current thread-runtime connection state; null when unavailable or the configuration changed.
  */
-runtimeStatus: McpServerConnectionStatus | null, pluginId: string | null, serverInfo: McpServerInfo | null,
+runtimeStatus: McpServerConnectionStatus | null, pluginId: string | null,
+/**
+ * HTTP origin of the effective configured endpoint, including plugin servers.
+ * Excludes credentials, path, query, and fragment; null for non-HTTP transports.
+ */
+httpOrigin: string | null, serverInfo: McpServerInfo | null,
 /**
  * Capabilities advertised by the initialized MCP server; null when unavailable.
  */
-serverCapabilities: JsonValue | null, tools: { [key in string]?: Tool },
+serverCapabilities: JsonValue | null,
+/**
+ * Opaque `_meta` from the first page of the corresponding MCP tool catalog. Null when unavailable.
+ */
+toolListMeta: JsonValue | null, tools: { [key in string]?: Tool },
 /**
  * Tool discovery failed and no catalog was returned.
  * Null when a catalog is returned, including cached or empty catalogs.
